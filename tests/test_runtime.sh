@@ -13,7 +13,7 @@
 set -euo pipefail
 
 IMG="./oci2bin.img"
-TAP_COUNT=15
+TAP_COUNT=17
 FAIL=0
 T=0
 
@@ -258,7 +258,19 @@ run_test "HOME set to /root inside container" \
     0 "/root" \
     "$IMG" /bin/sh -c 'echo $HOME'
 
-# ── Test 15: Binary runs without docker in PATH ───────────────────────────
+# ── Test 15: -e sets environment variable ────────────────────────────────
+
+run_test "-e sets env var inside container" \
+    0 "env_var_ok" \
+    "$IMG" -e MY_VAR=env_var_ok /bin/sh -c 'echo $MY_VAR'
+
+# ── Test 16: -e overrides built-in default (PATH) ────────────────────────
+
+run_test "-e overrides built-in PATH" \
+    0 "/custom/path" \
+    "$IMG" -e PATH=/custom/path /bin/sh -c 'echo $PATH'
+
+# ── Test 17: Binary runs without docker in PATH ───────────────────────────
 
 T=$(( T + 1 ))
 out=""

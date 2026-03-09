@@ -261,13 +261,59 @@ static void test_parse_opts(void)
         ASSERT_INT_EQ(r, -1, "parse_opts: --entrypoint missing arg returns -1");
     }
 
-    /* Combined: -v + --entrypoint + CMD */
+    /* -e KEY=VALUE */
+    {
+        char env1[] = "FOO=bar";
+        char *argv[] = {"prog", "-e", env1, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: -e returns 0");
+        ASSERT_INT_EQ(opts.n_env, 1, "parse_opts: -e n_env=1");
+        ASSERT_STR_EQ(opts.env_vars[0], "FOO=bar", "parse_opts: -e value");
+    }
+
+    /* Two -e flags */
+    {
+        char e1[] = "A=1";
+        char e2[] = "B=2";
+        char *argv[] = {"prog", "-e", e1, "-e", e2, NULL};
+        int r = parse_opts(5, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: two -e returns 0");
+        ASSERT_INT_EQ(opts.n_env, 2, "parse_opts: two -e n_env=2");
+    }
+
+    /* -e missing arg */
+    {
+        char *argv[] = {"prog", "-e", NULL};
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: -e missing arg returns -1");
+    }
+
+    /* -e without = */
+    {
+        char bad[] = "NOEQUALSSIGN";
+        char *argv[] = {"prog", "-e", bad, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: -e without = returns -1");
+    }
+
+    /* -e with empty key */
+    {
+        char bad[] = "=value";
+        char *argv[] = {"prog", "-e", bad, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: -e with empty key returns -1");
+    }
+
+    /* Combined: -v + -e + --entrypoint + CMD */
     {
         char spec[] = "/data:/mnt";
-        char *argv[] = {"prog", "-v", spec, "--entrypoint", "/bin/sh", "arg1", NULL};
-        int r = parse_opts(6, argv, &opts);
+        char env[] = "DEBUG=1";
+        char *argv[] = {"prog", "-v", spec, "-e", env, "--entrypoint", "/bin/sh", "arg1", NULL};
+        int r = parse_opts(8, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: combined returns 0");
         ASSERT_INT_EQ(opts.n_vols, 1, "parse_opts: combined n_vols=1");
+        ASSERT_INT_EQ(opts.n_env, 1, "parse_opts: combined n_env=1");
+        ASSERT_STR_EQ(opts.env_vars[0], "DEBUG=1", "parse_opts: combined env_vars[0]");
         ASSERT_STR_EQ(opts.entrypoint, "/bin/sh", "parse_opts: combined entrypoint");
         ASSERT_INT_EQ(opts.n_extra, 1, "parse_opts: combined n_extra=1");
         ASSERT_STR_EQ(opts.extra_args[0], "arg1", "parse_opts: combined extra_args[0]");
