@@ -22,9 +22,27 @@ static volatile unsigned long OCI_DATA_OFFSET = 0xDEADBEEFCAFEBABEUL;
 static volatile unsigned long OCI_DATA_SIZE   = 0xCAFEBABEDEADBEEFUL;
 static volatile unsigned long OCI_PATCHED     = 0xAAAAAAAAAAAAAAAAUL;
 
-/* Max layers we support */
-#define MAX_LAYERS 128
+/* Max layers / volumes / exec args we support */
+#define MAX_LAYERS  128
+#define MAX_VOLUMES  32
+#define MAX_ARGS     64
 #define BUF_SIZE   65536
+
+/* ── runtime options parsed from argv ───────────────────────────────────── */
+
+struct container_opts {
+    /* -v host:container  (up to MAX_VOLUMES pairs) */
+    char *vol_host[MAX_VOLUMES];
+    char *vol_ctr[MAX_VOLUMES];
+    int   n_vols;
+
+    /* --entrypoint /path  (overrides OCI Entrypoint) */
+    char *entrypoint;
+
+    /* extra args after flags (overrides OCI Cmd) */
+    char **extra_args;
+    int    n_extra;
+};
 
 /* ── tiny JSON helpers (just enough to parse manifest.json and config) ─── */
 
@@ -89,8 +107,12 @@ static int json_parse_string_array(const char *arr, char **out, int max)
         p = strchr(p, '"');
         if (!p) break;
         p++; /* skip opening quote */
-        const char *end = strchr(p, '"');
-        if (!end) break;
+        const char *end = p;
+        /* handle escaped quotes */
+        while (*end && *end != '"') {
+            if (*end == '\\') end++;
+            if (*end) end++;
+        }
         size_t len = end - p;
         out[count] = malloc(len + 1);
         memcpy(out[count], p, len);
@@ -307,14 +329,6 @@ static int setup_uid_map(uid_t real_uid, gid_t real_gid)
 /*
  * Patch the extracted rootfs so that tools which try to drop privileges
  * (e.g. apt's _apt sandbox) succeed inside a single-UID user namespace.
- *
- * The kernel only lets an unprivileged process map one UID/GID without
- * newuidmap, so we remap every non-root entry in /etc/passwd and /etc/group
- * to UID/GID 0.  That way seteuid(42) becomes seteuid(0) — a no-op — and
- * setegid/setgroups calls likewise succeed.
- *
- * For apt specifically we also drop an apt.conf snippet that disables its
- * privilege sandbox entirely, so it never calls seteuid in the first place.
  */
 static void patch_rootfs_ids(const char *rootfs)
 {
@@ -324,7 +338,6 @@ static void patch_rootfs_ids(const char *rootfs)
     size_t passwd_sz;
     char *passwd = read_file(passwd_path, &passwd_sz);
     if (passwd) {
-        /* Format: name:pw:uid:gid:gecos:home:shell  (7 colon-separated fields) */
         FILE *out = fopen(passwd_path, "w");
         if (out) {
             char *line = passwd;
@@ -336,7 +349,6 @@ static void patch_rootfs_ids(const char *rootfs)
                 memcpy(linebuf, line, line_len);
                 linebuf[line_len] = '\0';
 
-                /* Split on ':' to reach uid (field 3) and gid (field 4) */
                 char *f[7]; int nf = 0;
                 char *p = linebuf;
                 while (nf < 7) {
@@ -348,13 +360,11 @@ static void patch_rootfs_ids(const char *rootfs)
                 if (nf == 7) {
                     unsigned long uid = strtoul(f[2], NULL, 10);
                     unsigned long gid = strtoul(f[3], NULL, 10);
-                    /* Leave root (0) and nobody (65534) alone; remap everything else */
                     if (uid != 0 && uid != 65534) snprintf(f[2], 8, "0");
                     if (gid != 0 && gid != 65534) snprintf(f[3], 8, "0");
                     fprintf(out, "%s:%s:%s:%s:%s:%s:%s\n",
                             f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
                 } else {
-                    /* Malformed line: pass through unchanged */
                     fwrite(line, 1, line_len, out);
                     if (!nl) fputc('\n', out);
                 }
@@ -371,7 +381,6 @@ static void patch_rootfs_ids(const char *rootfs)
     size_t group_sz;
     char *grp = read_file(group_path, &group_sz);
     if (grp) {
-        /* Format: name:pw:gid:members */
         FILE *out = fopen(group_path, "w");
         if (out) {
             char *line = grp;
@@ -417,60 +426,103 @@ static void patch_rootfs_ids(const char *rootfs)
         write_file(apt_conf, conf, strlen(conf));
     }
 
-    /*
-     * ── /etc/resolv.conf ──
-     * The container shares the host network namespace (no CLONE_NEWNET), so
-     * the host's resolver is reachable.  But the rootfs /etc/resolv.conf is
-     * often a dangling symlink (e.g. Ubuntu points it at
-     * /run/systemd/resolve/stub-resolv.conf which doesn't exist in the chroot).
-     * Replace it with the host's actual file content.
-     */
+    /* ── /etc/resolv.conf ── copy host resolver into chroot ── */
     {
         size_t resolv_sz;
         char *resolv = read_file("/etc/resolv.conf", &resolv_sz);
         if (resolv) {
             char resolv_path[PATH_MAX];
             snprintf(resolv_path, sizeof(resolv_path), "%s/etc/resolv.conf", rootfs);
-            unlink(resolv_path);   /* remove symlink if present */
+            unlink(resolv_path);
             write_file(resolv_path, resolv, resolv_sz);
             free(resolv);
         }
     }
 }
 
-static int container_main(const char *rootfs)
+/*
+ * Set up volume bind mounts.  Called inside container_main() after chroot,
+ * so paths are relative to the container rootfs (i.e. / is the rootfs).
+ *
+ * We receive host paths as absolute host paths — but after chroot those are
+ * unreachable.  So we must do the mounts BEFORE chroot.  See container_main()
+ * for the ordering.
+ */
+static void setup_volumes(const char *rootfs, struct container_opts *opts)
 {
-    /* Read entrypoint/cmd config */
+    for (int i = 0; i < opts->n_vols; i++) {
+        char dst[PATH_MAX];
+        snprintf(dst, sizeof(dst), "%s%s", rootfs, opts->vol_ctr[i]);
+
+        /* Create mount point if it doesn't exist */
+        struct stat st;
+        if (stat(dst, &st) != 0) {
+            mkdir(dst, 0755);
+        }
+
+        /* Bind mount: host path → container path (pre-chroot, both accessible) */
+        if (mount(opts->vol_host[i], dst, NULL, MS_BIND | MS_REC, NULL) < 0) {
+            fprintf(stderr, "oci2bin: bind mount %s -> %s failed: %s\n",
+                    opts->vol_host[i], opts->vol_ctr[i], strerror(errno));
+        } else {
+            fprintf(stderr, "oci2bin: mounted %s -> %s\n",
+                    opts->vol_host[i], opts->vol_ctr[i]);
+        }
+    }
+}
+
+static int container_main(const char *rootfs, struct container_opts *opts)
+{
+    /* Read entrypoint/cmd config written by extract_oci_rootfs() */
     char config_path[PATH_MAX];
     snprintf(config_path, sizeof(config_path), "%s/.oci2bin_config", rootfs);
     char *config = read_file(config_path, NULL);
 
-    /* Default entrypoint */
-    char *exec_args[64] = {"/bin/sh", NULL};
-    int exec_argc = 1;
+    /* Build exec_args: [entrypoint...] [cmd...] */
+    char *exec_args[MAX_ARGS + 1];
+    int exec_argc = 0;
 
-    if (config) {
-        /* Try Entrypoint first, then Cmd */
-        char *entrypoint = json_get_array(config, "Entrypoint");
-        char *cmd = json_get_array(config, "Cmd");
-
-        char *to_parse = entrypoint;
-        if (!to_parse || strcmp(to_parse, "null") == 0) {
-            to_parse = cmd;
+    /* --- Determine entrypoint --- */
+    if (opts->entrypoint) {
+        /* User supplied --entrypoint: use it as a single string */
+        exec_args[exec_argc++] = opts->entrypoint;
+    } else if (config) {
+        char *ep_json = json_get_array(config, "Entrypoint");
+        if (ep_json && strcmp(ep_json, "null") != 0) {
+            exec_argc += json_parse_string_array(ep_json, exec_args + exec_argc,
+                                                  MAX_ARGS - exec_argc);
         }
-
-        if (to_parse && strcmp(to_parse, "null") != 0) {
-            exec_argc = json_parse_string_array(to_parse, exec_args, 63);
-            exec_args[exec_argc] = NULL;
-        }
-
-        free(entrypoint);
-        free(cmd);
-        free(config);
+        free(ep_json);
     }
+
+    /* --- Determine cmd / extra args --- */
+    if (opts->n_extra > 0) {
+        /* User supplied extra args: they replace OCI Cmd entirely */
+        for (int i = 0; i < opts->n_extra && exec_argc < MAX_ARGS; i++)
+            exec_args[exec_argc++] = opts->extra_args[i];
+    } else if (config) {
+        char *cmd_json = json_get_array(config, "Cmd");
+        if (cmd_json && strcmp(cmd_json, "null") != 0) {
+            exec_argc += json_parse_string_array(cmd_json, exec_args + exec_argc,
+                                                  MAX_ARGS - exec_argc);
+        }
+        free(cmd_json);
+    }
+
+    free(config);
+
+    /* Fallback: if nothing resolved, run /bin/sh */
+    if (exec_argc == 0) {
+        exec_args[0] = "/bin/sh";
+        exec_argc = 1;
+    }
+    exec_args[exec_argc] = NULL;
 
     /* Remove our temp config file */
     unlink(config_path);
+
+    /* Set up volume bind mounts BEFORE chroot (host paths still reachable) */
+    setup_volumes(rootfs, opts);
 
     /* Chroot into rootfs */
     if (chroot(rootfs) < 0) {
@@ -482,17 +534,16 @@ static int container_main(const char *rootfs)
     /* Mount /proc */
     mkdir("/proc", 0555);
     if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) {
-        /* Non-fatal: some environments block this */
         perror("mount /proc (non-fatal)");
     }
 
-    /* Mount /dev/null etc. minimally */
+    /* Mount /dev minimally */
     mkdir("/dev", 0755);
 
     /* Set hostname */
     sethostname("oci2bin", 10);
 
-    /* Set PATH (containers expect this) */
+    /* Set standard env */
     setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
     setenv("HOME", "/root", 1);
     setenv("TERM", "xterm", 1);
@@ -509,6 +560,82 @@ static int container_main(const char *rootfs)
     return 1;
 }
 
+/* ── argument parsing ────────────────────────────────────────────────────── */
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s [OPTIONS] [-- CMD [ARGS...]]\n"
+        "       %s [OPTIONS] CMD [ARGS...]\n"
+        "\n"
+        "Options:\n"
+        "  -v HOST:CONTAINER   Bind mount a host path into the container\n"
+        "                      (may be repeated)\n"
+        "  --entrypoint PATH   Override the image entrypoint\n"
+        "  --                  End of options; remaining args are CMD\n"
+        "\n"
+        "Examples:\n"
+        "  %s                          # run image default entrypoint\n"
+        "  %s /bin/ls /                # run ls inside the container\n"
+        "  %s --entrypoint /bin/bash   # open bash shell\n"
+        "  %s -v /data:/mnt /bin/ls /mnt  # mount /data and list it\n",
+        prog, prog, prog, prog, prog, prog);
+}
+
+static int parse_opts(int argc, char *argv[], struct container_opts *opts)
+{
+    memset(opts, 0, sizeof(*opts));
+    int i = 1;
+    for (; i < argc; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            i++;
+            break;
+        } else if (strcmp(argv[i], "-v") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "oci2bin: -v requires HOST:CONTAINER argument\n");
+                return -1;
+            }
+            i++;
+            char *spec = argv[i];
+            char *colon = strchr(spec, ':');
+            if (!colon) {
+                fprintf(stderr, "oci2bin: -v argument must be HOST:CONTAINER\n");
+                return -1;
+            }
+            if (opts->n_vols >= MAX_VOLUMES) {
+                fprintf(stderr, "oci2bin: too many -v flags (max %d)\n", MAX_VOLUMES);
+                return -1;
+            }
+            *colon = '\0';
+            opts->vol_host[opts->n_vols] = spec;
+            opts->vol_ctr[opts->n_vols]  = colon + 1;
+            opts->n_vols++;
+        } else if (strcmp(argv[i], "--entrypoint") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "oci2bin: --entrypoint requires a path argument\n");
+                return -1;
+            }
+            opts->entrypoint = argv[++i];
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            exit(0);
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "oci2bin: unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return -1;
+        } else {
+            /* First non-flag arg: treat rest as CMD */
+            break;
+        }
+    }
+    /* Remaining args are extra CMD */
+    if (i < argc) {
+        opts->extra_args = &argv[i];
+        opts->n_extra    = argc - i;
+    }
+    return 0;
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
@@ -522,10 +649,15 @@ int main(int argc, char *argv[])
     }
     self_path[len] = '\0';
 
+    /* 2. Parse command-line options */
+    struct container_opts opts;
+    if (parse_opts(argc, argv, &opts) < 0)
+        return 1;
+
     fprintf(stderr, "oci2bin: self=%s offset=0x%lx size=0x%lx\n",
             self_path, OCI_DATA_OFFSET, OCI_DATA_SIZE);
 
-    /* 2. Sanity check the markers */
+    /* 3. Sanity check the markers */
     if (OCI_PATCHED != 1) {
         fprintf(stderr,
                 "oci2bin: OCI data markers not patched!\n"
@@ -533,7 +665,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* 3. Extract OCI image into rootfs */
+    /* 4. Extract OCI image into rootfs */
     char *rootfs = extract_oci_rootfs(self_path);
     if (!rootfs) {
         fprintf(stderr, "oci2bin: failed to extract OCI rootfs\n");
@@ -542,32 +674,31 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "oci2bin: rootfs at %s\n", rootfs);
 
-    /* 4. Patch rootfs so privilege-dropping tools work in a single-UID namespace */
+    /* 5. Patch rootfs so privilege-dropping tools work in a single-UID namespace */
     patch_rootfs_ids(rootfs);
 
-    /* 5. Capture real UID/GID before entering user namespace */
+    /* 6. Capture real UID/GID before entering user namespace */
     uid_t real_uid = getuid();
     gid_t real_gid = getgid();
 
-    /* 6. Enter user namespace first (needed before we can map UIDs) */
+    /* 7. Enter user namespace first (needed before we can map UIDs) */
     if (unshare(CLONE_NEWUSER) < 0) {
         perror("unshare(CLONE_NEWUSER)");
         fprintf(stderr, "oci2bin: user namespaces may be disabled on this kernel\n");
         return 1;
     }
 
-    /* 7. Map UID/GID (must happen right after CLONE_NEWUSER, before other namespaces) */
-    if (setup_uid_map(real_uid, real_gid) < 0) {
+    /* 8. Map UID/GID */
+    if (setup_uid_map(real_uid, real_gid) < 0)
         return 1;
-    }
 
-    /* 8. Now enter the remaining namespaces (we have CAP_SYS_ADMIN in our user ns) */
+    /* 9. Enter mount + PID + UTS namespaces */
     if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS) < 0) {
         perror("unshare(NEWNS|NEWPID|NEWUTS)");
         return 1;
     }
 
-    /* 9. Fork for PID namespace (child becomes PID 1) */
+    /* 10. Fork for PID namespace (child becomes PID 1) */
     pid_t child = fork();
     if (child < 0) {
         perror("fork");
@@ -575,24 +706,21 @@ int main(int argc, char *argv[])
     }
 
     if (child == 0) {
-        /* Child: PID 1 in the new PID namespace */
-        _exit(container_main(rootfs));
+        _exit(container_main(rootfs, &opts));
     }
 
     /* Parent: wait for container to exit */
     int status;
     waitpid(child, &status, 0);
 
-    /* Cleanup: best effort */
+    /* Cleanup: best effort — remove the whole tmpdir */
     char rm_cmd[PATH_MAX + 16];
-    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", rootfs);
-    /* rootfs is inside /tmp/oci2bin.XXXXXX, go up one level */
     char *last_slash = strrchr(rootfs, '/');
     if (last_slash) {
         *last_slash = '\0';
         snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", rootfs);
+        system(rm_cmd);
     }
-    system(rm_cmd);
 
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# oci2bin — package a Docker image as a self-contained ELF+tar polyglot
+#
+# Usage:
+#   oci2bin <image[:tag]> [output]
+#
+# The output file runs as a rootless container AND can be imported with
+# docker load. It accepts the same runtime flags as the embedded loader:
+#
+#   ./output [OPTIONS] [-- CMD [ARGS...]]
+#   ./output [OPTIONS] CMD [ARGS...]
+#
+# Runtime options (passed directly to the output binary):
+#   -v HOST:CONTAINER     Bind mount a host path into the container
+#   --entrypoint PATH     Override the image entrypoint
+#   --                    End of options; remaining args are CMD
+#
+# Examples:
+#   oci2bin alpine:latest               # -> alpine_latest
+#   oci2bin ubuntu:22.04 my-ubuntu      # -> my-ubuntu (explicit name)
+#
+#   ./alpine_latest                     # run default shell
+#   ./alpine_latest /bin/ls /           # override CMD
+#   ./alpine_latest --entrypoint /bin/sh -c "echo hi"
+#   ./alpine_latest -v /data:/mnt /bin/ls /mnt
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OCI2BIN_HOME="${OCI2BIN_HOME:-$SCRIPT_DIR}"
+
+usage() {
+    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//'
+    exit 1
+}
+
+# ── dependency checks ─────────────────────────────────────────────────────
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || { echo "oci2bin: '$1' not found in PATH" >&2; exit 1; }
+}
+need musl-gcc
+need python3
+need docker
+
+# ── argument parsing ──────────────────────────────────────────────────────
+
+if [[ $# -lt 1 || "$1" == "--help" || "$1" == "-h" ]]; then
+    usage
+fi
+
+IMAGE="$1"
+# Derive output name from image: "nginx:1.25" -> "nginx_1.25"
+OUTPUT="${2:-${IMAGE//[:\/]/_}}"
+
+# ── build loader if needed ────────────────────────────────────────────────
+
+LOADER="$OCI2BIN_HOME/build/loader"
+SRC="$OCI2BIN_HOME/src/loader.c"
+
+if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
+    echo "oci2bin: building loader..."
+    mkdir -p "$OCI2BIN_HOME/build"
+    musl-gcc -static -O2 -s -o "$LOADER" "$SRC"
+fi
+
+# ── pull image if not local ───────────────────────────────────────────────
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "oci2bin: pulling $IMAGE..."
+    docker pull "$IMAGE"
+fi
+
+# ── build polyglot ────────────────────────────────────────────────────────
+
+python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
+    --loader "$LOADER" \
+    --image  "$IMAGE"  \
+    --output "$OUTPUT"
+
+echo "oci2bin: done → $OUTPUT"
