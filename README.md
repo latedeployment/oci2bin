@@ -75,6 +75,16 @@ Arguments provided after the binary name replace the image's default command:
 
 When the command following `--entrypoint` begins with a `-`, use `--` to terminate option parsing before it.
 
+### Setting environment variables
+
+`-e KEY=VALUE` sets an environment variable inside the container. It can be specified multiple times. User-supplied variables take precedence over the built-in defaults (`PATH`, `HOME`, `TERM`).
+
+```bash
+./alpine_latest -e DEBUG=1 /bin/sh -c 'echo $DEBUG'
+./alpine_latest -e API_URL=https://example.com -e TIMEOUT=30 /bin/sh
+./alpine_latest -e PATH=/custom/bin:/bin /bin/sh -c 'echo $PATH'
+```
+
 ### Volume mounts
 
 `-v HOST_PATH:CONTAINER_PATH` bind-mounts a host directory into the container. The mount point is created inside the container if it does not exist. Multiple `-v` flags are accepted.
