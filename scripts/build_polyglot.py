@@ -226,7 +226,7 @@ def patch_markers(data, oci_offset, oci_size):
     patched = data.replace(OFFSET_MARKER, offset_packed)
     patched = patched.replace(SIZE_MARKER, size_packed)
     patched = patched.replace(PATCHED_MARKER, patched_flag)
-    print(f"  Patched: offset({n_off}x) size({n_sz}x) flag({n_pf}x)")
+    print(f"  Patched: offset({n_off}x) size({n_sz}x) flag({n_pf}x)", file=sys.stderr)
     if n_off == 0 or n_sz == 0:
         print("WARNING: markers not found in loader binary!", file=sys.stderr)
     return patched
