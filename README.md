@@ -35,11 +35,20 @@ When executed as an ELF, the embedded loader:
 **Dependencies:** `musl-gcc`, `python3`, `docker`
 
 ```bash
+# Arch Linux
+sudo pacman -S musl
+
 # Fedora
 sudo dnf install musl-gcc musl-devel musl-libc-static
 
 # Debian/Ubuntu
 sudo apt install musl-tools
+
+# openSUSE Tumbleweed
+sudo zypper install musl-devel
+
+# NixOS / nix-shell
+nix-shell -p musl python3 docker
 ```
 
 Run `oci2bin` with any image — it compiles the loader on first use and pulls the image if it isn't local:
