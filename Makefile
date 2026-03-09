@@ -4,7 +4,11 @@ IMAGE   ?= alpine:latest
 OUTPUT  ?= oci2bin.img
 PREFIX  ?= /usr/local
 
-.PHONY: all clean polyglot loader install uninstall
+TESTS_DIR  = tests
+TEST_C_BIN = build/test_c_units
+
+.PHONY: all clean polyglot loader install uninstall \
+        test test-unit test-integration test-c test-python
 
 all: polyglot
 
@@ -41,3 +45,29 @@ uninstall:
 
 clean:
 	rm -rf build $(OUTPUT)
+
+# ── Test targets ──────────────────────────────────────────────────────────────
+
+test: test-unit test-integration
+
+test-unit: test-c test-python
+
+test-c: $(TEST_C_BIN)
+	@echo "=== C unit tests ==="
+	@$(TEST_C_BIN)
+
+$(TEST_C_BIN): $(TESTS_DIR)/test_c_units.c src/loader.c
+	@mkdir -p build
+	$(CC) -static -Wno-return-local-addr -o $@ $<
+
+test-python:
+	@echo "=== Python unit tests ==="
+	python3 -m unittest discover -s tests -p 'test_build.py' -v
+	@echo "=== Polyglot structure tests ==="
+	python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
+
+test-integration: polyglot
+	@echo "=== Runtime integration tests ==="
+	@bash $(TESTS_DIR)/test_runtime.sh
+	@echo "=== Build integration tests ==="
+	python3 -m unittest tests.test_polyglot.TestBuildPolyglotIntegration -v

@@ -1,0 +1,5 @@
+build/
+oci2bin.img
+__pycache__/
+*.pyc
+*.pyo
