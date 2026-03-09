@@ -50,7 +50,9 @@ struct container_opts {
 static char *json_get_string(const char *json, const char *key)
 {
     char needle[256];
-    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    int nlen = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (nlen < 0 || (size_t)nlen >= sizeof(needle))
+        return NULL; /* key too long — refuse to match a truncated needle */
     const char *p = strstr(json, needle);
     if (!p)
         return NULL;
@@ -60,11 +62,20 @@ static char *json_get_string(const char *json, const char *key)
     if (*p != '"')
         return NULL;
     p++; /* skip opening quote */
-    const char *end = strchr(p, '"');
-    if (!end)
+    /* scan forward, honouring backslash escapes */
+    const char *end = p;
+    while (*end && *end != '"') {
+        if (*end == '\\') {
+            end++;
+            if (!*end) break; /* truncated escape — stop */
+        }
+        end++;
+    }
+    if (*end != '"')
         return NULL;
     size_t len = end - p;
     char *result = malloc(len + 1);
+    if (!result) return NULL;
     memcpy(result, p, len);
     result[len] = '\0';
     return result;
@@ -74,7 +85,9 @@ static char *json_get_string(const char *json, const char *key)
 static char *json_get_array(const char *json, const char *key)
 {
     char needle[256];
-    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    int nlen = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (nlen < 0 || (size_t)nlen >= sizeof(needle))
+        return NULL; /* key too long — refuse to match a truncated needle */
     const char *p = strstr(json, needle);
     if (!p)
         return NULL;
@@ -91,8 +104,11 @@ static char *json_get_array(const char *json, const char *key)
         if (*p == ']') { depth--; if (depth == 0) break; }
         p++;
     }
+    if (depth != 0)
+        return NULL; /* unmatched '[', string was truncated */
     size_t len = p - start + 1;
     char *result = malloc(len + 1);
+    if (!result) return NULL;
     memcpy(result, start, len);
     result[len] = '\0';
     return result;
@@ -108,13 +124,18 @@ static int json_parse_string_array(const char *arr, char **out, int max)
         if (!p) break;
         p++; /* skip opening quote */
         const char *end = p;
-        /* handle escaped quotes */
+        /* handle escaped characters safely */
         while (*end && *end != '"') {
-            if (*end == '\\') end++;
-            if (*end) end++;
+            if (*end == '\\') {
+                end++;
+                if (!*end) break; /* truncated escape at NUL — stop */
+            }
+            end++;
         }
+        if (*end != '"') break; /* unterminated string */
         size_t len = end - p;
         out[count] = malloc(len + 1);
+        if (!out[count]) break;
         memcpy(out[count], p, len);
         out[count][len] = '\0';
         count++;
@@ -131,7 +152,11 @@ static char *read_file(const char *path, size_t *out_size)
     if (fd < 0) return NULL;
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return NULL; }
-    char *buf = malloc(st.st_size + 1);
+    /* Reject files that are implausibly large or would overflow size_t + 1 */
+    if (st.st_size < 0 || st.st_size > (off_t)256 * 1024 * 1024) {
+        close(fd); return NULL;
+    }
+    char *buf = malloc((size_t)st.st_size + 1);
     if (!buf) { close(fd); return NULL; }
     ssize_t n = read(fd, buf, st.st_size);
     close(fd);
@@ -211,22 +236,32 @@ static char *extract_oci_rootfs(const char *self_path)
 
     unsigned long remaining = OCI_DATA_SIZE;
     char buf[BUF_SIZE];
+    int write_error = 0;
     while (remaining > 0) {
         size_t to_read = remaining < BUF_SIZE ? remaining : BUF_SIZE;
         ssize_t n = read(self_fd, buf, to_read);
         if (n <= 0) break;
-        write(out_fd, buf, n);
+        ssize_t written = write(out_fd, buf, n);
+        if (written != n) { write_error = 1; break; }
         remaining -= n;
     }
     close(self_fd);
     close(out_fd);
+    if (write_error) {
+        fprintf(stderr, "oci2bin: write error extracting OCI data (disk full?)\n");
+        return NULL;
+    }
 
     /* 2. Extract the OCI tar into tmpdir/oci/ */
     char oci_dir[PATH_MAX];
     snprintf(oci_dir, sizeof(oci_dir), "%s/oci", tmpdir);
-    mkdir(oci_dir, 0755);
+    if (mkdir(oci_dir, 0755) < 0) {
+        perror("mkdir oci_dir");
+        return NULL;
+    }
 
-    char *tar_argv[] = {"tar", "xf", oci_tar_path, "-C", oci_dir, NULL};
+    char *tar_argv[] = {"tar", "xf", oci_tar_path, "-C", oci_dir,
+                        "--no-same-permissions", "--no-same-owner", NULL};
     if (run_cmd(tar_argv) != 0) {
         fprintf(stderr, "oci2bin: failed to extract OCI tar\n");
         return NULL;
@@ -253,16 +288,32 @@ static char *extract_oci_rootfs(const char *self_path)
 
     /* 5. Extract layers in order into rootfs */
     snprintf(rootfs, sizeof(rootfs), "%s/rootfs", tmpdir);
-    mkdir(rootfs, 0755);
+    if (mkdir(rootfs, 0755) < 0) {
+        perror("mkdir rootfs");
+        return NULL;
+    }
 
     char *layers[MAX_LAYERS];
     int nlayers = json_parse_string_array(layers_json, layers, MAX_LAYERS);
 
     for (int i = 0; i < nlayers; i++) {
-        char layer_path[PATH_MAX];
-        snprintf(layer_path, sizeof(layer_path), "%s/%s", oci_dir, layers[i]);
+        /* Reject any layer path that tries to traverse out of oci_dir */
+        if (strstr(layers[i], "..") != NULL || layers[i][0] == '/') {
+            fprintf(stderr, "oci2bin: rejecting dangerous layer path: %s\n", layers[i]);
+            free(layers[i]);
+            continue;
+        }
 
-        char *layer_argv[] = {"tar", "xf", layer_path, "-C", rootfs, NULL};
+        char layer_path[PATH_MAX];
+        int lplen = snprintf(layer_path, sizeof(layer_path), "%s/%s", oci_dir, layers[i]);
+        if (lplen < 0 || (size_t)lplen >= sizeof(layer_path)) {
+            fprintf(stderr, "oci2bin: layer path too long, skipping: %s\n", layers[i]);
+            free(layers[i]);
+            continue;
+        }
+
+        char *layer_argv[] = {"tar", "xf", layer_path, "-C", rootfs,
+                              "--no-same-permissions", "--no-same-owner", NULL};
         if (run_cmd(layer_argv) != 0) {
             fprintf(stderr, "oci2bin: failed to extract layer %s\n", layers[i]);
         }
@@ -270,8 +321,23 @@ static char *extract_oci_rootfs(const char *self_path)
     }
 
     /* 6. Read the image config to get Cmd/Entrypoint */
+    /* Reject config paths that could traverse outside oci_dir */
+    if (strstr(config_path_rel, "..") != NULL || config_path_rel[0] == '/') {
+        fprintf(stderr, "oci2bin: rejecting dangerous config path: %s\n", config_path_rel);
+        free(config_path_rel);
+        free(layers_json);
+        free(manifest);
+        return NULL;
+    }
     char config_full_path[PATH_MAX];
-    snprintf(config_full_path, sizeof(config_full_path), "%s/%s", oci_dir, config_path_rel);
+    int cfplen = snprintf(config_full_path, sizeof(config_full_path), "%s/%s", oci_dir, config_path_rel);
+    if (cfplen < 0 || (size_t)cfplen >= sizeof(config_full_path)) {
+        fprintf(stderr, "oci2bin: config path too long\n");
+        free(config_path_rel);
+        free(layers_json);
+        free(manifest);
+        return NULL;
+    }
     size_t config_size;
     char *config = read_file(config_full_path, &config_size);
     if (config) {
@@ -451,8 +517,22 @@ static void patch_rootfs_ids(const char *rootfs)
 static void setup_volumes(const char *rootfs, struct container_opts *opts)
 {
     for (int i = 0; i < opts->n_vols; i++) {
+        const char *ctr_path = opts->vol_ctr[i];
+        /* Container path must be absolute and must not contain '..' components */
+        if (ctr_path[0] != '/') {
+            fprintf(stderr, "oci2bin: -v container path must be absolute: %s\n", ctr_path);
+            continue;
+        }
+        if (strstr(ctr_path, "..") != NULL) {
+            fprintf(stderr, "oci2bin: -v container path must not contain '..': %s\n", ctr_path);
+            continue;
+        }
         char dst[PATH_MAX];
-        snprintf(dst, sizeof(dst), "%s%s", rootfs, opts->vol_ctr[i]);
+        int dlen = snprintf(dst, sizeof(dst), "%s%s", rootfs, ctr_path);
+        if (dlen < 0 || (size_t)dlen >= sizeof(dst)) {
+            fprintf(stderr, "oci2bin: -v destination path too long: %s%s\n", rootfs, ctr_path);
+            continue;
+        }
 
         /* Create mount point if it doesn't exist */
         struct stat st;
@@ -529,7 +609,10 @@ static int container_main(const char *rootfs, struct container_opts *opts)
         perror("chroot");
         return 1;
     }
-    chdir("/");
+    if (chdir("/") < 0) {
+        perror("chdir /");
+        return 1;
+    }
 
     /* Mount /proc */
     mkdir("/proc", 0555);
@@ -713,13 +796,14 @@ int main(int argc, char *argv[])
     int status;
     waitpid(child, &status, 0);
 
-    /* Cleanup: best effort — remove the whole tmpdir */
-    char rm_cmd[PATH_MAX + 16];
+    /* Cleanup: best effort — remove the whole tmpdir.
+     * rootfs = tmpdir + "/rootfs"; strip the last component to get tmpdir.
+     * Use execvp directly (no shell) to avoid any injection risk. */
     char *last_slash = strrchr(rootfs, '/');
     if (last_slash) {
-        *last_slash = '\0';
-        snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", rootfs);
-        system(rm_cmd);
+        *last_slash = '\0'; /* rootfs now points to tmpdir */
+        char *rm_argv[] = {"rm", "-rf", rootfs, NULL};
+        run_cmd(rm_argv);
     }
 
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;

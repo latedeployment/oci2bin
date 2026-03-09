@@ -172,14 +172,18 @@ def parse_loader_elf(loader_path):
         elf_data = f.read()
 
     # Verify ELF magic
-    assert elf_data[:4] == ELF_MAGIC, "Not an ELF file"
+    if elf_data[:4] != ELF_MAGIC:
+        print(f"ERROR: Not an ELF file: {loader_path}", file=sys.stderr)
+        sys.exit(1)
 
     # Parse ELF header
     (e_type, e_machine, e_version, e_entry, e_phoff, e_shoff,
      e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum,
      e_shstrndx) = struct.unpack_from('<HHI QQQ I HHHHHH', elf_data, 16)
 
-    assert e_machine == EM_X86_64, f"Expected x86_64, got {e_machine}"
+    if e_machine != EM_X86_64:
+        print(f"ERROR: Expected x86_64 loader, got machine type {e_machine}", file=sys.stderr)
+        sys.exit(1)
 
     # Parse program headers
     segments = []
@@ -326,7 +330,9 @@ def build_polyglot(loader_path, image_name, output_path):
         phoff=PAGE_SIZE + original_phoff,
         phnum=loader['phnum'],
     )
-    assert len(elf_header) == 64
+    if len(elf_header) != 64:
+        print("ERROR: ELF header length is not 64 bytes", file=sys.stderr)
+        sys.exit(1)
 
     # Verify page alignment of shifted segments
     for i, seg in enumerate(loader['segments']):
@@ -350,11 +356,15 @@ def build_polyglot(loader_path, image_name, output_path):
 
     # Tar header #1 (bytes 0-511, contains ELF header in name field)
     polyglot += tar_header_1
-    assert len(polyglot) == TAR_BLOCK
+    if len(polyglot) != TAR_BLOCK:
+        print("ERROR: tar header #1 is not exactly 512 bytes", file=sys.stderr)
+        sys.exit(1)
 
     # Pre-padding: 3584 NUL bytes (tar entry data, before loader)
     polyglot += b'\x00' * pre_pad
-    assert len(polyglot) == PAGE_SIZE
+    if len(polyglot) != PAGE_SIZE:
+        print("ERROR: layout error: polyglot not at PAGE_SIZE after pre-padding", file=sys.stderr)
+        sys.exit(1)
 
     # Loader binary (starts at file offset PAGE_SIZE)
     polyglot += patched_loader
@@ -364,7 +374,9 @@ def build_polyglot(loader_path, image_name, output_path):
     if remainder:
         polyglot += b'\x00' * (TAR_BLOCK - remainder)
 
-    assert len(polyglot) == TAR_BLOCK + tar_entry1_padded
+    if len(polyglot) != TAR_BLOCK + tar_entry1_padded:
+        print("ERROR: layout error: loader entry size mismatch", file=sys.stderr)
+        sys.exit(1)
 
     # Verify OCI data offset
     actual_oci_offset = len(polyglot)
@@ -390,8 +402,12 @@ def build_polyglot(loader_path, image_name, output_path):
     print(f"  OCI data offset: 0x{oci_data_file_offset:x} ({oci_data_file_offset})")
     print(f"  OCI data size: {oci_size} bytes ({oci_size / 1024 / 1024:.1f} MB)")
 
-    assert polyglot[0:4] == ELF_MAGIC, "ELF magic missing at byte 0!"
-    assert polyglot[257:263] == b'ustar\x00', "ustar magic missing at byte 257!"
+    if polyglot[0:4] != ELF_MAGIC:
+        print("ERROR: ELF magic missing at byte 0!", file=sys.stderr)
+        sys.exit(1)
+    if polyglot[257:263] != b'ustar\x00':
+        print("ERROR: ustar magic missing at byte 257!", file=sys.stderr)
+        sys.exit(1)
 
     print(f"\n  Byte 0-3:     {polyglot[0:4].hex()} (ELF magic)")
     print(f"  Byte 257-262: {polyglot[257:263]} (tar magic)")
