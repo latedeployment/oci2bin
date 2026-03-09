@@ -42,20 +42,6 @@ When executed as an ELF, the embedded loader:
 
 It auto-compiles the loader if `build/loader` is missing or stale, and pulls the image if it isn't already local.
 
-## Build
-
-```bash
-# Dependencies: musl-gcc, python3, docker
-sudo dnf install musl-gcc musl-devel musl-libc-static  # Fedora
-sudo apt install musl-tools                              # Debian/Ubuntu
-
-# Build with alpine (default)
-make polyglot
-
-# Build with a different image
-make polyglot IMAGE=ubuntu:latest
-```
-
 ## Usage
 
 ```bash
@@ -84,6 +70,59 @@ $ tar tf oci2bin.img
 blobs/sha256/...
 manifest.json
 ```
+
+## Build
+
+**Dependencies:** `musl-gcc`, `python3`, `docker`
+
+```bash
+# Fedora
+sudo dnf install musl-gcc musl-devel musl-libc-static
+
+# Debian/Ubuntu
+sudo apt install musl-tools
+```
+
+The `oci2bin` script handles everything automatically — it compiles the loader on first run and pulls the image if it isn't local:
+
+```bash
+./oci2bin alpine:latest        # -> alpine_latest
+./oci2bin ubuntu:22.04         # -> ubuntu_22.04
+./oci2bin nginx:1.25 my-nginx  # -> my-nginx (explicit output name)
+```
+
+To build components individually:
+
+```bash
+make loader           # compile src/loader.c -> build/loader (musl-gcc, static)
+make polyglot         # build loader + package alpine:latest -> oci2bin.img
+make polyglot IMAGE=ubuntu:latest OUTPUT=ubuntu.img
+```
+
+## Testing
+
+```bash
+# Fast unit tests — no Docker required (~5s)
+make test-unit
+
+# C unit tests only (TAP output)
+make test-c
+
+# Python unit tests only
+make test-python
+
+# Full suite including runtime tests (needs Docker + oci2bin.img)
+make test
+
+# Runtime integration tests only
+make test-integration
+```
+
+The test suite covers:
+- **`tests/test_build.py`** — 44 Python unit tests for `build_polyglot.py` helpers (`tar_octal`, `tar_checksum`, `build_tar_header`, `build_elf64_header`, `patch_markers`, `tar_pad`)
+- **`tests/test_polyglot.py`** — structural invariants of the built `oci2bin.img` (ELF/TAR magic bytes, marker patching, embedded OCI tar validity, file permissions)
+- **`tests/test_c_units.c`** — 50 TAP unit tests for `loader.c` internals (`json_get_string`, `json_get_array`, `json_parse_string_array`, `parse_opts`), compiled via `#include` trick
+- **`tests/test_runtime.sh`** — 14 shell TAP tests covering `-v` volume mounts, `--entrypoint`, argument/exit-code passthrough, `docker load`, and error handling
 
 ## Disassembly
 
