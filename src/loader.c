@@ -269,7 +269,11 @@ static char *extract_oci_rootfs(const char *self_path)
 
     /* 3. Read manifest.json */
     char manifest_path[PATH_MAX];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", oci_dir);
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", oci_dir)
+            >= (int)sizeof(manifest_path)) {
+        fprintf(stderr, "oci2bin: manifest path too long\n");
+        return NULL;
+    }
     size_t manifest_size;
     char *manifest = read_file(manifest_path, &manifest_size);
     if (!manifest) {
@@ -346,13 +350,15 @@ static char *extract_oci_rootfs(const char *self_path)
         char *entrypoint = json_get_array(config, "Entrypoint");
 
         char info_path[PATH_MAX];
-        snprintf(info_path, sizeof(info_path), "%s/.oci2bin_config", rootfs);
-        char info_buf[4096] = {0};
-        snprintf(info_buf, sizeof(info_buf),
-                 "{\"Cmd\":%s,\"Entrypoint\":%s}",
-                 cmd ? cmd : "null",
-                 entrypoint ? entrypoint : "null");
-        write_file(info_path, info_buf, strlen(info_buf));
+        if (snprintf(info_path, sizeof(info_path), "%s/.oci2bin_config", rootfs)
+                < (int)sizeof(info_path)) {
+            char info_buf[4096] = {0};
+            snprintf(info_buf, sizeof(info_buf),
+                     "{\"Cmd\":%s,\"Entrypoint\":%s}",
+                     cmd ? cmd : "null",
+                     entrypoint ? entrypoint : "null");
+            write_file(info_path, info_buf, strlen(info_buf));
+        }
 
         free(cmd);
         free(entrypoint);
@@ -487,9 +493,11 @@ static void patch_rootfs_ids(const char *rootfs)
     struct stat st;
     if (stat(apt_conf_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
         char apt_conf[PATH_MAX];
-        snprintf(apt_conf, sizeof(apt_conf), "%s/99oci2bin", apt_conf_dir);
-        const char *conf = "APT::Sandbox::User \"root\";\n";
-        write_file(apt_conf, conf, strlen(conf));
+        if (snprintf(apt_conf, sizeof(apt_conf), "%s/99oci2bin", apt_conf_dir)
+                < (int)sizeof(apt_conf)) {
+            const char *conf = "APT::Sandbox::User \"root\";\n";
+            write_file(apt_conf, conf, strlen(conf));
+        }
     }
 
     /* ── /etc/resolv.conf ── copy host resolver into chroot ── */
