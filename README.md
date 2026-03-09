@@ -30,17 +30,25 @@ When executed as an ELF, the embedded loader:
 4. Enters rootless namespaces (`CLONE_NEWUSER`, `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWUTS`)
 5. Chroots into the rootfs and execs the container entrypoint
 
-## CLI tool
+## Getting started
 
-`oci2bin` is a script that wraps the build pipeline. Give it any image name and it produces a ready-to-run executable:
+**Dependencies:** `musl-gcc`, `python3`, `docker`
+
+```bash
+# Fedora
+sudo dnf install musl-gcc musl-devel musl-libc-static
+
+# Debian/Ubuntu
+sudo apt install musl-tools
+```
+
+Run `oci2bin` with any image — it compiles the loader on first use and pulls the image if it isn't local:
 
 ```bash
 ./oci2bin alpine:latest        # -> alpine_latest
 ./oci2bin ubuntu:22.04         # -> ubuntu_22.04
 ./oci2bin nginx:1.25 my-nginx  # -> my-nginx (explicit output name)
 ```
-
-It auto-compiles the loader if `build/loader` is missing or stale, and pulls the image if it isn't already local.
 
 ## Usage
 
@@ -71,34 +79,6 @@ blobs/sha256/...
 manifest.json
 ```
 
-## Build
-
-**Dependencies:** `musl-gcc`, `python3`, `docker`
-
-```bash
-# Fedora
-sudo dnf install musl-gcc musl-devel musl-libc-static
-
-# Debian/Ubuntu
-sudo apt install musl-tools
-```
-
-The `oci2bin` script handles everything automatically — it compiles the loader on first run and pulls the image if it isn't local:
-
-```bash
-./oci2bin alpine:latest        # -> alpine_latest
-./oci2bin ubuntu:22.04         # -> ubuntu_22.04
-./oci2bin nginx:1.25 my-nginx  # -> my-nginx (explicit output name)
-```
-
-To build components individually:
-
-```bash
-make loader           # compile src/loader.c -> build/loader (musl-gcc, static)
-make polyglot         # build loader + package alpine:latest -> oci2bin.img
-make polyglot IMAGE=ubuntu:latest OUTPUT=ubuntu.img
-```
-
 ## Testing
 
 ```bash
@@ -122,7 +102,7 @@ The test suite covers:
 - **`tests/test_build.py`** — 44 Python unit tests for `build_polyglot.py` helpers (`tar_octal`, `tar_checksum`, `build_tar_header`, `build_elf64_header`, `patch_markers`, `tar_pad`)
 - **`tests/test_polyglot.py`** — structural invariants of the built `oci2bin.img` (ELF/TAR magic bytes, marker patching, embedded OCI tar validity, file permissions)
 - **`tests/test_c_units.c`** — 50 TAP unit tests for `loader.c` internals (`json_get_string`, `json_get_array`, `json_parse_string_array`, `parse_opts`), compiled via `#include` trick
-- **`tests/test_runtime.sh`** — 14 shell TAP tests covering `-v` volume mounts, `--entrypoint`, argument/exit-code passthrough, `docker load`, and error handling
+- **`tests/test_runtime.sh`** — 15 shell TAP tests covering `-v` volume mounts, `--entrypoint`, argument/exit-code passthrough, `docker load`, error handling, and Docker-free execution
 
 ## Disassembly
 

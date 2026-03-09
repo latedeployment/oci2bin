@@ -13,7 +13,7 @@
 set -euo pipefail
 
 IMG="./oci2bin.img"
-TAP_COUNT=14
+TAP_COUNT=15
 FAIL=0
 T=0
 
@@ -257,6 +257,21 @@ run_test "PATH set inside container contains /usr/bin" \
 run_test "HOME set to /root inside container" \
     0 "/root" \
     "$IMG" /bin/sh -c 'echo $HOME'
+
+# ── Test 15: Binary runs without docker in PATH ───────────────────────────
+
+T=$(( T + 1 ))
+out=""
+exit_code=0
+out=$(env PATH="$(echo "$PATH" | tr ':' '\n' | grep -v docker | tr '\n' ':')" \
+    timeout 15 "$IMG" /bin/echo no_docker_needed 2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 ]] && echo "$out" | grep -q "no_docker_needed"; then
+    echo "ok $T - binary runs without docker in PATH"
+else
+    echo "not ok $T - binary runs without docker in PATH"
+    echo "# exit=$exit_code output='$out'"
+    FAIL=$(( FAIL + 1 ))
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────
 
