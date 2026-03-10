@@ -172,14 +172,38 @@ def read_meta_block(binary_path):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <binary>", file=sys.stderr)
-        sys.exit(1)
+    import argparse as _argparse
+    parser = _argparse.ArgumentParser(
+        description='Inspect an oci2bin polyglot binary',
+        add_help=True,
+    )
+    parser.add_argument('binary', help='Path to the oci2bin binary')
+    parser.add_argument('--json', action='store_true',
+                        help='Output metadata as JSON (for machine parsing)')
+    args = parser.parse_args()
 
-    binary_path = sys.argv[1]
+    binary_path = args.binary
     if not os.path.isfile(binary_path):
         print(f"inspect: file not found: {binary_path}", file=sys.stderr)
         sys.exit(1)
+
+    if args.json:
+        # JSON mode: return meta block or minimal fallback
+        meta = read_meta_block(binary_path)
+        file_size = os.path.getsize(binary_path)
+        if meta is None:
+            meta = {}
+        # Fill in image name from OCI tar if not in meta
+        if 'image' not in meta:
+            try:
+                oci_bytes = read_oci_data(binary_path)
+                repo_tags, _, _ = parse_config(oci_bytes)
+                meta['image'] = repo_tags[0] if repo_tags else 'unknown'
+            except SystemExit:
+                meta['image'] = 'unknown'
+        meta['size'] = file_size
+        print(json.dumps(meta))
+        return
 
     oci_bytes = read_oci_data(binary_path)
     repo_tags, layers, config = parse_config(oci_bytes)

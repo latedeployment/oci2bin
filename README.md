@@ -482,6 +482,65 @@ Build metadata:
 
 The build metadata block is present if the binary was built with a recent version of oci2bin (Feature 10). ExposedPorts are shown if the image declares any.
 
+## Cache management
+
+When `--cache` is used, built binaries are stored in `~/.cache/oci2bin/<image>_<digest>/output`. Three subcommands help manage this cache.
+
+### oci2bin list
+
+List all cached binaries with image name, size, and build date:
+
+```bash
+oci2bin list
+```
+
+Example output:
+
+```
+IMAGE                            DIGEST         SIZE        BUILT
+redis:7-alpine                   abc123def456    12.4 MB  2026-03-10T12:00:00Z
+nginx:alpine                     deadbeef1234     8.1 MB  2026-03-10T11:00:00Z
+alpine:latest                    cafebabe9876     3.2 MB  2026-03-09T08:30:00Z
+```
+
+Use `--json` for machine-readable output:
+
+```bash
+oci2bin list --json
+```
+
+### oci2bin prune
+
+Remove outdated cache entries, keeping only the most recently built binary for each image name:
+
+```bash
+oci2bin prune          # delete old entries, print space freed
+oci2bin prune --dry-run  # show what would be deleted, without deleting
+```
+
+The cache groups entries by image name (ignoring the digest suffix in the directory name). For each group, only the newest entry (by modification time) is kept.
+
+### oci2bin diff
+
+Compare the filesystem contents of two oci2bin binaries:
+
+```bash
+oci2bin diff ./redis_old ./redis_new
+```
+
+Example output:
+
+```
++ /usr/bin/redis-sentinel  (1.2 MB)
+- /usr/bin/redis-trib.rb   (12.3 KB)
+M /usr/bin/redis-server    (1.1 MB -> 1.2 MB)
+M /etc/redis/redis.conf    (512 B -> 768 B)
+
+1 added, 1 removed, 2 modified
+```
+
+`diff` exits with status 0 if the filesystems are identical, or 1 if there are any differences.
+
 ## Testing
 
 ```bash

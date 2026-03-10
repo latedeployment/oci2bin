@@ -4,6 +4,9 @@
 # Usage:
 #   oci2bin [--arch ARCH] <image[:tag]> [output]
 #   oci2bin inspect <binary>
+#   oci2bin list [--json]
+#   oci2bin prune [--dry-run]
+#   oci2bin diff <binary1> <binary2>
 #
 # The output file runs as a rootless container AND can be imported with
 # docker load. It accepts the same runtime flags as the embedded loader:
@@ -50,6 +53,11 @@
 #   --ulimit TYPE=N       Set resource limit (nofile, nproc, cpu, as, fsize)
 #   --                    End of options; remaining args are CMD
 #
+# Cache subcommands:
+#   list [--json]         List all cached binaries with image name, size, date
+#   prune [--dry-run]     Remove outdated cache entries (keep newest per image)
+#   diff <b1> <b2>        Show filesystem diff between two oci2bin binaries
+#
 # Examples:
 #   oci2bin alpine:latest               # -> alpine_latest (host arch)
 #   oci2bin --arch aarch64 alpine:latest # -> alpine_latest (aarch64 binary)
@@ -59,6 +67,10 @@
 #   ./alpine_latest /bin/ls /           # override CMD
 #   ./alpine_latest --entrypoint /bin/sh -c "echo hi"
 #   ./alpine_latest -v /data:/mnt /bin/ls /mnt
+#
+#   oci2bin list                        # show cached binaries
+#   oci2bin prune                       # remove old cache entries
+#   oci2bin diff alpine_latest redis_7  # compare two binaries
 
 set -euo pipefail
 
@@ -78,7 +90,172 @@ if [[ "${1:-}" == "inspect" ]]; then
         echo "Usage: oci2bin inspect <binary>" >&2
         exit 1
     fi
-    exec python3 "$OCI2BIN_HOME/scripts/inspect_image.py" "$1"
+    exec python3 "$OCI2BIN_HOME/scripts/inspect_image.py" "$@"
+fi
+
+# ── list subcommand ───────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "list" ]]; then
+    shift
+    CACHE_ROOT="$HOME/.cache/oci2bin"
+    LIST_JSON=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) LIST_JSON=1; shift ;;
+            *) echo "oci2bin list: unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+    if [[ ! -d "$CACHE_ROOT" ]]; then
+        echo "oci2bin: no cache found at $CACHE_ROOT" >&2
+        exit 0
+    fi
+    python3 - "$CACHE_ROOT" "$LIST_JSON" "$OCI2BIN_HOME" <<'PYEOF'
+import json, os, sys
+
+cache_root = sys.argv[1]
+want_json  = sys.argv[2] == "1"
+home       = sys.argv[3]
+inspect    = os.path.join(home, "scripts", "inspect_image.py")
+
+import importlib.util, types
+
+# Load inspect_image module without executing main()
+spec = importlib.util.spec_from_file_location("inspect_image", inspect)
+mod  = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+entries = []
+for name in sorted(os.listdir(cache_root)):
+    out = os.path.join(cache_root, name, "output")
+    if not os.path.isfile(out):
+        continue
+    file_size = os.path.getsize(out)
+    mtime = os.path.getmtime(out)
+    meta = mod.read_meta_block(out) or {}
+    if "image" not in meta:
+        try:
+            oci = mod.read_oci_data(out)
+            tags, _, _ = mod.parse_config(oci)
+            meta["image"] = tags[0] if tags else "unknown"
+        except SystemExit:
+            meta["image"] = "unknown"
+    meta["size"]  = file_size
+    meta["mtime"] = mtime
+    meta["cache_dir"] = name
+    entries.append(meta)
+
+# Sort by build timestamp descending, fall back to mtime
+def sort_key(e):
+    ts = e.get("timestamp") or ""
+    return (ts, e.get("mtime", 0))
+
+entries.sort(key=sort_key, reverse=True)
+
+if want_json:
+    print(json.dumps(entries, indent=2))
+else:
+    # Print table
+    FMT = "%-32s %-14s %10s  %s"
+    print(FMT % ("IMAGE", "DIGEST", "SIZE", "BUILT"))
+    print("-" * 76)
+    for e in entries:
+        image  = (e.get("image") or "unknown")[:32]
+        digest = (e.get("digest","").split(":")[-1])[:12] if e.get("digest") else "-" * 12
+        sz     = e["size"]
+        if sz >= 1024*1024:
+            size_s = f"{sz/(1024*1024):.1f} MB"
+        elif sz >= 1024:
+            size_s = f"{sz/1024:.1f} KB"
+        else:
+            size_s = f"{sz} B"
+        built  = (e.get("timestamp") or "-")[:19]
+        print(FMT % (image, digest, size_s, built))
+PYEOF
+    exit 0
+fi
+
+# ── prune subcommand ──────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "prune" ]]; then
+    shift
+    CACHE_ROOT="$HOME/.cache/oci2bin"
+    PRUNE_DRY_RUN=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) PRUNE_DRY_RUN=1; shift ;;
+            *) echo "oci2bin prune: unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+    if [[ ! -d "$CACHE_ROOT" ]]; then
+        echo "oci2bin: no cache found at $CACHE_ROOT" >&2
+        exit 0
+    fi
+    python3 - "$CACHE_ROOT" "$PRUNE_DRY_RUN" "$OCI2BIN_HOME" <<'PYEOF'
+import json, os, shutil, sys
+
+cache_root = sys.argv[1]
+dry_run    = sys.argv[2] == "1"
+home       = sys.argv[3]
+inspect    = os.path.join(home, "scripts", "inspect_image.py")
+
+import importlib.util
+
+spec = importlib.util.spec_from_file_location("inspect_image", inspect)
+mod  = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# Collect all cache entries keyed by base image name
+# Cache dir names look like "redis_7-alpine_abc123def456" — strip the trailing
+# _<12hexchars> digest suffix to get the image group key.
+import re
+
+groups = {}  # image_key -> list of (mtime, size, cache_dir_path)
+for name in os.listdir(cache_root):
+    out = os.path.join(cache_root, name, "output")
+    if not os.path.isfile(out):
+        continue
+    mtime = os.path.getmtime(out)
+    size  = os.path.getsize(out)
+    # Strip digest suffix: last _<12+ hex chars> at end of name
+    key = re.sub(r'_[0-9a-f]{12,}$', '', name)
+    groups.setdefault(key, []).append((mtime, size, os.path.join(cache_root, name)))
+
+total_freed = 0
+total_deleted = 0
+
+for key, items in sorted(groups.items()):
+    if len(items) <= 1:
+        continue
+    # Sort by mtime descending; keep first (newest), delete the rest
+    items.sort(key=lambda x: x[0], reverse=True)
+    for mtime, size, path in items[1:]:
+        if dry_run:
+            print(f"[dry-run] would remove {path}  ({size/(1024*1024):.1f} MB)")
+        else:
+            print(f"removing {path}  ({size/(1024*1024):.1f} MB)")
+            shutil.rmtree(path, ignore_errors=True)
+        total_freed += size
+        total_deleted += 1
+
+if total_deleted == 0:
+    print("oci2bin prune: nothing to remove")
+else:
+    verb = "would free" if dry_run else "freed"
+    mb   = total_freed / (1024 * 1024)
+    print(f"oci2bin prune: {total_deleted} entr{'y' if total_deleted==1 else 'ies'} removed, {verb} {mb:.1f} MB")
+PYEOF
+    exit 0
+fi
+
+# ── diff subcommand ───────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "diff" ]]; then
+    shift
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: oci2bin diff <binary1> <binary2>" >&2
+        exit 1
+    fi
+    exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" "$1" "$2"
 fi
 
 # ── argument parsing ──────────────────────────────────────────────────────
