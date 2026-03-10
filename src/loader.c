@@ -1568,6 +1568,114 @@ static int container_main(const char* rootfs, struct container_opts *opts)
 
 /* ── argument parsing ────────────────────────────────────────────────────── */
 
+/*
+ * load_env_file: read KEY=VALUE pairs from a file into opts->env_vars[].
+ * Uses open()/read() per CLAUDE.md style. Lines starting with '#' or blank
+ * are skipped. Each accepted line is strdup'd so it persists after the call.
+ * Returns 0 on success, -1 on error (with a message printed to stderr).
+ */
+static int load_env_file(const char* path, struct container_opts* opts)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        fprintf(stderr, "oci2bin: --env-file %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    /* Read entire file into a heap buffer (reject files > 1 MiB) */
+    struct stat st;
+    if (fstat(fd, &st) < 0)
+    {
+        fprintf(stderr, "oci2bin: --env-file fstat %s: %s\n", path,
+                strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (st.st_size < 0 || st.st_size > 1024 * 1024)
+    {
+        fprintf(stderr, "oci2bin: --env-file %s: file too large\n", path);
+        close(fd);
+        return -1;
+    }
+
+    size_t sz = (size_t)st.st_size;
+    char* buf = malloc(sz + 1);
+    if (!buf)
+    {
+        fprintf(stderr, "oci2bin: --env-file: out of memory\n");
+        close(fd);
+        return -1;
+    }
+
+    ssize_t n = read(fd, buf, sz);
+    close(fd);
+    if (n < 0)
+    {
+        fprintf(stderr, "oci2bin: --env-file read %s: %s\n", path,
+                strerror(errno));
+        free(buf);
+        return -1;
+    }
+    buf[n] = '\0';
+
+    /* Parse line by line */
+    char* p = buf;
+    while (*p)
+    {
+        char* nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+
+        /* Trim trailing \r */
+        if (len > 0 && p[len - 1] == '\r')
+        {
+            len--;
+        }
+
+        /* Skip blank lines and comments */
+        if (len == 0 || p[0] == '#')
+        {
+            p = nl ? nl + 1 : p + len;
+            continue;
+        }
+
+        /* Validate KEY=VALUE format */
+        char* eq = memchr(p, '=', len);
+        if (!eq || eq == p)
+        {
+            fprintf(stderr,
+                    "oci2bin: --env-file %s: invalid line (missing KEY=): %.*s\n",
+                    path, (int)len, p);
+            free(buf);
+            return -1;
+        }
+
+        if (opts->n_env >= MAX_ENV)
+        {
+            fprintf(stderr, "oci2bin: --env-file: too many env vars (max %d)\n",
+                    MAX_ENV);
+            free(buf);
+            return -1;
+        }
+
+        char* line = malloc(len + 1);
+        if (!line)
+        {
+            fprintf(stderr, "oci2bin: --env-file: out of memory\n");
+            free(buf);
+            return -1;
+        }
+        memcpy(line, p, len);
+        line[len] = '\0';
+        opts->env_vars[opts->n_env++] = line;
+
+        p = nl ? nl + 1 : p + len;
+    }
+
+    free(buf);
+    return 0;
+}
+
 static void usage(const char* prog)
 {
     fprintf(stderr,
@@ -1590,6 +1698,7 @@ static void usage(const char* prog)
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
             "  --hostname NAME     Set the hostname inside the container\n"
+            "  --env-file FILE     Load KEY=VALUE pairs from FILE\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1665,6 +1774,18 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                     NULL; /* default to /run/secrets/<basename> */
             }
             opts->n_secrets++;
+        }
+        else if (strcmp(argv[i], "--env-file") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --env-file requires a FILE argument\n");
+                return -1;
+            }
+            if (load_env_file(argv[++i], opts) < 0)
+            {
+                return -1;
+            }
         }
         else if (strcmp(argv[i], "-e") == 0)
         {

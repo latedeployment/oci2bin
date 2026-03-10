@@ -243,6 +243,22 @@ By default the container's hostname is `oci2bin`. Use `--hostname` to override i
 
 This calls `sethostname(2)` inside the UTS namespace. Failure is non-fatal (a warning is printed and execution continues).
 
+### Loading environment variables from a file
+
+Use `--env-file` to load `KEY=VALUE` pairs from a file:
+
+```bash
+./my-app --env-file /etc/myapp.env
+```
+
+The file format:
+- One `KEY=VALUE` per line
+- Blank lines and lines starting with `#` are ignored
+- Empty values (`KEY=`) are valid
+- Keys must be non-empty and lines must contain `=`
+
+`--env-file` and `-e` are additive. The file is processed first, so `-e` flags override values from the file. Multiple `--env-file` flags are processed in order.
+
 ## Testing
 
 ```bash

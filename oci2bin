@@ -29,6 +29,7 @@
 #   --no-seccomp          Disable the default seccomp syscall filter
 #   --user UID[:GID]      Run as this numeric UID (and optional GID)
 #   --hostname NAME       Set the hostname inside the container
+#   --env-file FILE       Load KEY=VALUE pairs from FILE (additive with -e)
 #   --                    End of options; remaining args are CMD
 #
 # Examples:
