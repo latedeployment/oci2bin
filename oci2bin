@@ -18,6 +18,7 @@
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
 #   --entrypoint PATH     Override the image entrypoint
+#   --workdir PATH        Set the working directory inside the container
 #   --                    End of options; remaining args are CMD
 #
 # Examples:

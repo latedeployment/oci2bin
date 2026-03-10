@@ -77,6 +77,15 @@ Arguments provided after the binary name replace the image's default command:
 
 When the command following `--entrypoint` begins with a `-`, use `--` to terminate option parsing before it.
 
+### Working directory
+
+`--workdir PATH` sets the working directory inside the container before executing the entrypoint. If `--workdir` is not given, the directory from the image's `WorkingDir` field is used instead. If neither is set, the container starts at `/`.
+
+```bash
+./my-app --workdir /app
+./my-app --workdir /tmp /bin/sh -c 'pwd'
+```
+
 ### Setting environment variables
 
 `-e KEY=VALUE` sets an environment variable inside the container. It can be specified multiple times. User-supplied variables take precedence over the built-in defaults (`PATH`, `HOME`, `TERM`).

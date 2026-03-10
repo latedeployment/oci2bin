@@ -43,6 +43,9 @@ struct container_opts
     /* --entrypoint /path  (overrides OCI Entrypoint) */
     char* entrypoint;
 
+    /* --workdir /path  (overrides OCI WorkingDir) */
+    char* workdir;
+
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
     int   n_env;
@@ -207,6 +210,35 @@ static int json_parse_string_array(const char* arr, char** out, int max)
         p = end + 1;
     }
     return count;
+}
+
+/* JSON-escape src into dst (capacity dstsz).  Escapes " and \.
+ * Returns 0 on success, -1 if the output would be truncated. */
+static int json_escape_string(const char* src, char* dst, size_t dstsz)
+{
+    size_t out = 0;
+    for (const char* p = src; *p; p++)
+    {
+        if (*p == '"' || *p == '\\')
+        {
+            if (out + 2 >= dstsz)
+            {
+                return -1;
+            }
+            dst[out++] = '\\';
+            dst[out++] = *p;
+        }
+        else
+        {
+            if (out + 1 >= dstsz)
+            {
+                return -1;
+            }
+            dst[out++] = *p;
+        }
+    }
+    dst[out] = '\0';
+    return 0;
 }
 
 /* ── file helpers ────────────────────────────────────────────────────────── */
@@ -494,15 +526,27 @@ static char* extract_oci_rootfs(const char* self_path)
             char*  info_buf = calloc(1, bufsz);
             if (info_buf)
             {
+                /* JSON-escape WorkingDir to prevent injection into the config */
+                char workdir_escaped[PATH_MAX * 2];
+                const char* wdir_safe = NULL;
+                if (workdir)
+                {
+                    if (json_escape_string(workdir, workdir_escaped,
+                                           sizeof(workdir_escaped)) == 0)
+                    {
+                        wdir_safe = workdir_escaped;
+                    }
+                    /* If escaping fails (path absurdly long), omit WorkingDir */
+                }
                 int n = snprintf(info_buf, bufsz,
                                  "{\"Cmd\":%s,\"Entrypoint\":%s,"
                                  "\"Env\":%s,\"WorkingDir\":%s%s%s}",
                                  cmd        ? cmd        : "null",
                                  entrypoint ? entrypoint : "null",
                                  env_json   ? env_json   : "null",
-                                 workdir    ? "\""       : "null",
-                                 workdir    ? workdir    : "",
-                                 workdir    ? "\""       : "");
+                                 wdir_safe  ? "\""       : "null",
+                                 wdir_safe  ? wdir_safe  : "",
+                                 wdir_safe  ? "\""       : "");
                 if (n > 0 && (size_t)n < bufsz)
                 {
                     write_file(info_path, info_buf, strlen(info_buf));
@@ -821,11 +865,13 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         free(cmd_json);
     }
 
-    /* Save image Env before freeing config — applied after chroot */
+    /* Save image Env and WorkingDir before freeing config — applied after chroot */
     char* image_env_json = NULL;
+    char* image_workdir  = NULL;
     if (config)
     {
         image_env_json = json_get_array(config, "Env");
+        image_workdir  = json_get_string(config, "WorkingDir");
     }
 
     free(config);
@@ -950,6 +996,20 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         *eq = '='; /* restore the string in case it is inspected later */
     }
 
+    /* Apply workdir: --workdir flag overrides image WorkingDir */
+    {
+        const char* wdir = opts->workdir ? opts->workdir : image_workdir;
+        if (wdir && wdir[0] != '\0')
+        {
+            if (chdir(wdir) < 0)
+            {
+                fprintf(stderr, "oci2bin: workdir %s: %s (non-fatal)\n", wdir,
+                        strerror(errno));
+            }
+        }
+    }
+    free(image_workdir);
+
     /* Exec the entrypoint */
     fprintf(stderr, "oci2bin: exec %s\n", exec_args[0]);
     execv(exec_args[0], exec_args);
@@ -976,6 +1036,7 @@ static void usage(const char* prog)
             "  -e KEY=VALUE        Set an environment variable inside the container\n"
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
+            "  --workdir PATH      Set the working directory inside the container\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1051,6 +1112,15 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->entrypoint = argv[++i];
+        }
+        else if (strcmp(argv[i], "--workdir") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --workdir requires a path argument\n");
+                return -1;
+            }
+            opts->workdir = argv[++i];
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
         {
