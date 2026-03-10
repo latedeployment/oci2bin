@@ -101,10 +101,13 @@ When the command following `--entrypoint` begins with a `-`, use `--` to termina
 
 `-e KEY=VALUE` sets an environment variable inside the container. It can be specified multiple times. User-supplied variables take precedence over the built-in defaults (`PATH`, `HOME`, `TERM`).
 
+`-e KEY` (without `=VALUE`) passes the variable from the host environment. If the variable is not set on the host, a warning is printed and the variable is skipped (not an error).
+
 ```bash
 ./alpine_latest -e DEBUG=1 /bin/sh -c 'echo $DEBUG'
 ./alpine_latest -e API_URL=https://example.com -e TIMEOUT=30 /bin/sh
 ./alpine_latest -e PATH=/custom/bin:/bin /bin/sh -c 'echo $PATH'
+./alpine_latest -e HOME -e USER /bin/sh   # pass host HOME and USER through
 ```
 
 ### Volume mounts

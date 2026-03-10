@@ -288,12 +288,15 @@ static void test_parse_opts(void)
         ASSERT_INT_EQ(r, -1, "parse_opts: -e missing arg returns -1");
     }
 
-    /* -e without = */
+    /* -e without = (VAR passthrough — skipped if unset, not an error) */
     {
-        char bad[] = "NOEQUALSSIGN";
+        char bad[] = "OCI2BIN_TEST_UNSET_VAR_XYZ";
         char *argv[] = {"prog", "-e", bad, NULL};
-        int r = parse_opts(3, argv, &opts);
-        ASSERT_INT_EQ(r, -1, "parse_opts: -e without = returns -1");
+        struct container_opts o2;
+        memset(&o2, 0, sizeof(o2));
+        int r = parse_opts(3, argv, &o2);
+        /* Should succeed (return 0) and skip the unset var */
+        ASSERT_INT_EQ(r, 0, "parse_opts: -e without = returns 0 for unset var");
     }
 
     /* -e with empty key */

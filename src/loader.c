@@ -2015,6 +2015,7 @@ static void usage(const char* prog)
             "                      Bind mount a host file read-only; defaults to\n"
             "                      /run/secrets/<basename> (may be repeated)\n"
             "  -e KEY=VALUE        Set an environment variable inside the container\n"
+            "  -e KEY              Pass KEY from host environment (skip if unset)\n"
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
             "  --workdir PATH      Set the working directory inside the container\n"
@@ -2218,13 +2219,13 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         {
             if (i + 1 >= argc)
             {
-                fprintf(stderr, "oci2bin: -e requires KEY=VALUE argument\n");
+                fprintf(stderr, "oci2bin: -e requires KEY[=VALUE] argument\n");
                 return -1;
             }
             i++;
-            if (!strchr(argv[i], '=') || argv[i][0] == '=')
+            if (argv[i][0] == '=')
             {
-                fprintf(stderr, "oci2bin: -e argument must be KEY=VALUE\n");
+                fprintf(stderr, "oci2bin: -e argument must not start with '='\n");
                 return -1;
             }
             if (opts->n_env >= MAX_ENV)
@@ -2232,7 +2233,47 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 fprintf(stderr, "oci2bin: too many -e flags (max %d)\n", MAX_ENV);
                 return -1;
             }
-            opts->env_vars[opts->n_env++] = argv[i];
+            if (!strchr(argv[i], '='))
+            {
+                /* VAR passthrough: look up in host environment */
+                const char* host_val = getenv(argv[i]);
+                if (host_val == NULL)
+                {
+                    fprintf(stderr,
+                            "oci2bin: -e %s: not set in host environment"
+                            " (skipped)\n",
+                            argv[i]);
+                }
+                else
+                {
+                    size_t klen = strlen(argv[i]);
+                    size_t vlen = strlen(host_val);
+                    /* key + '=' + value + '\0'; reject unreasonably large values */
+                    if (klen + 1 + vlen >= 32767)
+                    {
+                        fprintf(stderr,
+                                "oci2bin: -e %s: value too large (skipped)\n",
+                                argv[i]);
+                    }
+                    else
+                    {
+                        char* buf = malloc(klen + 1 + vlen + 1);
+                        if (!buf)
+                        {
+                            fprintf(stderr, "oci2bin: -e: out of memory\n");
+                            return -1;
+                        }
+                        memcpy(buf, argv[i], klen);
+                        buf[klen] = '=';
+                        memcpy(buf + klen + 1, host_val, vlen + 1);
+                        opts->env_vars[opts->n_env++] = buf;
+                    }
+                }
+            }
+            else
+            {
+                opts->env_vars[opts->n_env++] = argv[i];
+            }
         }
         else if (strcmp(argv[i], "--entrypoint") == 0)
         {
