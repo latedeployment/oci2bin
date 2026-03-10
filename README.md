@@ -3,7 +3,7 @@
 **oci2bin** converts any Docker (OCI) image into a single executable file. The output runs as a rootless container on any Linux machine — without Docker, without a daemon, and without any installation on the target.
 
 ```bash
-./oci2bin alpine:latest    # produces ./alpine_latest
+oci2bin alpine:latest    # produces ./alpine_latest
 ./alpine_latest            # runs the container
 ```
 
@@ -96,8 +96,8 @@ make install  # installs oci2bin to /usr/local/bin (PREFIX=/usr/local)
 After cloning the repository, run `oci2bin` with an image name. The loader is compiled on first use; the image is pulled automatically if not already present locally.
 
 ```bash
-./oci2bin alpine:latest        # output: ./alpine_latest
-./oci2bin nginx:1.25 my-nginx  # explicit output name
+oci2bin alpine:latest        # output: ./alpine_latest
+oci2bin nginx:1.25 my-nginx  # explicit output name
 ```
 
 ---
@@ -112,13 +112,13 @@ Build an aarch64 binary on an x86_64 host with `--arch aarch64`:
 # Fedora
 sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
 
-./oci2bin --arch aarch64 alpine:latest
+oci2bin --arch aarch64 alpine:latest
 ```
 
 The sysroot defaults to `/usr/aarch64-redhat-linux/sys-root/fc43`. Override with:
 
 ```bash
-AARCH64_SYSROOT=/path/to/sysroot ./oci2bin --arch aarch64 alpine:latest
+AARCH64_SYSROOT=/path/to/sysroot oci2bin --arch aarch64 alpine:latest
 ```
 
 The output runs only on aarch64 Linux (or under qemu-aarch64).
@@ -185,8 +185,8 @@ The `IMAGE` argument is optional and used only for the output filename default a
 `--cache` stores the output binary in `~/.cache/oci2bin/<image>_<digest>/output` so repeated builds of the same image are instant:
 
 ```bash
-./oci2bin --cache alpine:latest   # builds and caches
-./oci2bin --cache alpine:latest   # returns cached binary immediately
+oci2bin --cache alpine:latest   # builds and caches
+oci2bin --cache alpine:latest   # returns cached binary immediately
 ```
 
 The cache key includes the first 12 hex characters of the image's sha256 digest, so tag updates are detected. See [list](#list), [prune](#prune) for cache management.
