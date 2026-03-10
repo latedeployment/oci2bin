@@ -24,7 +24,8 @@ TEST_C_BIN_AARCH64 = build/test_c_units-aarch64
 
 .PHONY: all clean polyglot loader loader-x86_64 loader-aarch64 loader-all \
         install uninstall test test-unit test-unit-aarch64 \
-        test-integration test-c test-c-aarch64 test-python
+        test-integration test-integration-redis test-integration-nginx \
+        test-c test-c-aarch64 test-python
 
 all: polyglot
 
@@ -105,8 +106,16 @@ test-python:
 	@echo "=== Polyglot structure tests ==="
 	python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
 
-test-integration: polyglot
+test-integration: test-integration-redis test-integration-nginx
 	@echo "=== Runtime integration tests ==="
 	@bash $(TESTS_DIR)/test_runtime.sh
 	@echo "=== Build integration tests ==="
 	python3 -m unittest tests.test_polyglot.TestBuildPolyglotIntegration -v
+
+test-integration-redis:
+	@echo "=== Redis integration test ==="
+	@bash $(TESTS_DIR)/test_integration_redis.sh
+
+test-integration-nginx:
+	@echo "=== nginx integration test ==="
+	@bash $(TESTS_DIR)/test_integration_nginx.sh
