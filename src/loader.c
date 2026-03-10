@@ -479,24 +479,42 @@ static char* extract_oci_rootfs(const char* self_path)
     char* config = read_file(config_full_path, &config_size);
     if (config)
     {
-        /* Write parsed entrypoint info for later use */
-        char* cmd = json_get_array(config, "Cmd");
+        /* Write parsed entrypoint/env info for use inside the container */
+        char* cmd        = json_get_array(config, "Cmd");
         char* entrypoint = json_get_array(config, "Entrypoint");
+        char* env_json   = json_get_array(config, "Env");
+        char* workdir    = json_get_string(config, "WorkingDir");
 
         char info_path[PATH_MAX];
         if (snprintf(info_path, sizeof(info_path), "%s/.oci2bin_config", rootfs)
                 < (int)sizeof(info_path))
         {
-            char info_buf[4096] = {0};
-            snprintf(info_buf, sizeof(info_buf),
-                     "{\"Cmd\":%s,\"Entrypoint\":%s}",
-                     cmd ? cmd : "null",
-                     entrypoint ? entrypoint : "null");
-            write_file(info_path, info_buf, strlen(info_buf));
+            /* Allocate generously — Env arrays can be large */
+            size_t bufsz = 16384;
+            char*  info_buf = calloc(1, bufsz);
+            if (info_buf)
+            {
+                int n = snprintf(info_buf, bufsz,
+                                 "{\"Cmd\":%s,\"Entrypoint\":%s,"
+                                 "\"Env\":%s,\"WorkingDir\":%s%s%s}",
+                                 cmd        ? cmd        : "null",
+                                 entrypoint ? entrypoint : "null",
+                                 env_json   ? env_json   : "null",
+                                 workdir    ? "\""       : "null",
+                                 workdir    ? workdir    : "",
+                                 workdir    ? "\""       : "");
+                if (n > 0 && (size_t)n < bufsz)
+                {
+                    write_file(info_path, info_buf, strlen(info_buf));
+                }
+                free(info_buf);
+            }
         }
 
         free(cmd);
         free(entrypoint);
+        free(env_json);
+        free(workdir);
         free(config);
     }
 
@@ -803,6 +821,13 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         free(cmd_json);
     }
 
+    /* Save image Env before freeing config — applied after chroot */
+    char* image_env_json = NULL;
+    if (config)
+    {
+        image_env_json = json_get_array(config, "Env");
+    }
+
     free(config);
 
     /* Fallback: if nothing resolved, run /bin/sh */
@@ -887,6 +912,26 @@ static int container_main(const char* rootfs, struct container_opts *opts)
            1);
     setenv("HOME", "/root", 1);
     setenv("TERM", "xterm", 1);
+
+    /* Apply image Env from OCI config (overrides built-in defaults above).
+     * image_env_json was extracted before free(config) above. */
+    if (image_env_json && strcmp(image_env_json, "null") != 0)
+    {
+        char* image_envs[MAX_ENV];
+        int n = json_parse_string_array(image_env_json, image_envs, MAX_ENV);
+        for (int i = 0; i < n; i++)
+        {
+            char* eq = strchr(image_envs[i], '=');
+            if (eq && eq != image_envs[i])   /* must have '=' and non-empty key */
+            {
+                *eq = '\0';
+                setenv(image_envs[i], eq + 1, 1);
+                *eq = '=';
+            }
+            free(image_envs[i]);
+        }
+    }
+    free(image_env_json);
 
     /* Apply caller-supplied env vars (-e KEY=VALUE); these override the defaults above */
     for (int i = 0; i < opts->n_env; i++)
