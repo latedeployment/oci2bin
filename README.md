@@ -259,6 +259,16 @@ The file format:
 
 `--env-file` and `-e` are additive. The file is processed first, so `-e` flags override values from the file. Multiple `--env-file` flags are processed in order.
 
+### Extra tmpfs mounts
+
+Use `--tmpfs` to mount a fresh in-memory filesystem at any path inside the container (useful for writable scratch space when running with `--read-only`):
+
+```bash
+./my-app --read-only --tmpfs /tmp --tmpfs /var/cache
+```
+
+Paths must be absolute and must not contain `..`. The mount uses `MS_NOSUID|MS_NODEV` flags. Failure is non-fatal. May be repeated.
+
 ## Testing
 
 ```bash

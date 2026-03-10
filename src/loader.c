@@ -74,6 +74,10 @@ struct container_opts
     /* --hostname NAME  (override the UTS hostname) */
     char* hostname;
 
+    /* --tmpfs PATH  (extra tmpfs mounts inside the container) */
+    char* tmpfs_mounts[MAX_VOLUMES];
+    int   n_tmpfs;
+
     /* --user UID[:GID]  (run as this uid/gid inside the container) */
     uid_t run_uid;
     gid_t run_gid;
@@ -1453,6 +1457,25 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Mount extra --tmpfs paths inside the container */
+    for (int ti = 0; ti < opts->n_tmpfs; ti++)
+    {
+        const char* ctr_path = opts->tmpfs_mounts[ti];
+        /* mkdir at the container path (we are post-chroot) */
+        if (mkdir(ctr_path, 0755) < 0 && errno != EEXIST)
+        {
+            fprintf(stderr, "oci2bin: --tmpfs mkdir %s: %s (non-fatal)\n",
+                    ctr_path, strerror(errno));
+            continue;
+        }
+        if (mount("tmpfs", ctr_path, "tmpfs",
+                  MS_NOSUID | MS_NODEV, "mode=0755") < 0)
+        {
+            fprintf(stderr, "oci2bin: --tmpfs mount %s: %s (non-fatal)\n",
+                    ctr_path, strerror(errno));
+        }
+    }
+
     /* Set hostname (--hostname overrides default) */
     {
         const char* hn = opts->hostname ? opts->hostname : "oci2bin";
@@ -1699,6 +1722,7 @@ static void usage(const char* prog)
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
             "  --hostname NAME     Set the hostname inside the container\n"
             "  --env-file FILE     Load KEY=VALUE pairs from FILE\n"
+            "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1786,6 +1810,37 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             {
                 return -1;
             }
+        }
+        else if (strcmp(argv[i], "--tmpfs") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --tmpfs requires a PATH argument\n");
+                return -1;
+            }
+            i++;
+            const char* tp = argv[i];
+            if (tp[0] != '/')
+            {
+                fprintf(stderr,
+                        "oci2bin: --tmpfs path must be absolute: %s\n", tp);
+                return -1;
+            }
+            if (strstr(tp, ".."))
+            {
+                fprintf(stderr,
+                        "oci2bin: --tmpfs path must not contain '..': %s\n",
+                        tp);
+                return -1;
+            }
+            if (opts->n_tmpfs >= MAX_VOLUMES)
+            {
+                fprintf(stderr,
+                        "oci2bin: too many --tmpfs flags (max %d)\n",
+                        MAX_VOLUMES);
+                return -1;
+            }
+            opts->tmpfs_mounts[opts->n_tmpfs++] = (char*)tp;
         }
         else if (strcmp(argv[i], "-e") == 0)
         {
