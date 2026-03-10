@@ -31,6 +31,7 @@
 #   --hostname NAME       Set the hostname inside the container
 #   --env-file FILE       Load KEY=VALUE pairs from FILE (additive with -e)
 #   --tmpfs PATH          Mount a fresh tmpfs at PATH inside the container
+#   --ulimit TYPE=N       Set resource limit (nofile, nproc, cpu, as, fsize)
 #   --                    End of options; remaining args are CMD
 #
 # Examples:

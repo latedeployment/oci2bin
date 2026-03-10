@@ -78,6 +78,14 @@ struct container_opts
     char* tmpfs_mounts[MAX_VOLUMES];
     int   n_tmpfs;
 
+    /* --ulimit TYPE=VALUE  (resource limits via setrlimit) */
+    struct
+    {
+        int     resource;
+        rlim_t  value;
+    } ulimits[16];
+    int n_ulimits;
+
     /* --user UID[:GID]  (run as this uid/gid inside the container) */
     uid_t run_uid;
     gid_t run_gid;
@@ -1549,6 +1557,21 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     }
     free(image_workdir);
 
+    /* Apply resource limits via setrlimit (non-fatal on failure) */
+    for (int ri = 0; ri < opts->n_ulimits; ri++)
+    {
+        struct rlimit rl;
+        rl.rlim_cur = opts->ulimits[ri].value;
+        rl.rlim_max = opts->ulimits[ri].value;
+        if (setrlimit(opts->ulimits[ri].resource, &rl) < 0)
+        {
+            fprintf(stderr, "oci2bin: setrlimit(%d, %llu): %s (non-fatal)\n",
+                    opts->ulimits[ri].resource,
+                    (unsigned long long)opts->ulimits[ri].value,
+                    strerror(errno));
+        }
+    }
+
     /* Drop to requested UID/GID if --user was given (fatal if it fails) */
     if (opts->has_user)
     {
@@ -1723,6 +1746,7 @@ static void usage(const char* prog)
             "  --hostname NAME     Set the hostname inside the container\n"
             "  --env-file FILE     Load KEY=VALUE pairs from FILE\n"
             "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
+            "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1841,6 +1865,70 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->tmpfs_mounts[opts->n_tmpfs++] = (char*)tp;
+        }
+        else if (strcmp(argv[i], "--ulimit") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --ulimit requires TYPE=VALUE\n");
+                return -1;
+            }
+            i++;
+            char* spec = argv[i];
+            char* eq   = strchr(spec, '=');
+            if (!eq)
+            {
+                fprintf(stderr,
+                        "oci2bin: --ulimit argument must be TYPE=VALUE\n");
+                return -1;
+            }
+            if (opts->n_ulimits >= 16)
+            {
+                fprintf(stderr, "oci2bin: too many --ulimit flags (max 16)\n");
+                return -1;
+            }
+            int res = -1;
+            size_t type_len = (size_t)(eq - spec);
+            if (type_len == 6 && memcmp(spec, "nofile", 6) == 0)
+            {
+                res = RLIMIT_NOFILE;
+            }
+            else if (type_len == 5 && memcmp(spec, "nproc", 5) == 0)
+            {
+                res = RLIMIT_NPROC;
+            }
+            else if (type_len == 3 && memcmp(spec, "cpu", 3) == 0)
+            {
+                res = RLIMIT_CPU;
+            }
+            else if (type_len == 2 && memcmp(spec, "as", 2) == 0)
+            {
+                res = RLIMIT_AS;
+            }
+            else if (type_len == 5 && memcmp(spec, "fsize", 5) == 0)
+            {
+                res = RLIMIT_FSIZE;
+            }
+            if (res < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --ulimit unknown type '%.*s' "
+                        "(use: nofile,nproc,cpu,as,fsize)\n",
+                        (int)type_len, spec);
+                return -1;
+            }
+            char*          endp  = NULL;
+            unsigned long long val =
+                strtoull(eq + 1, &endp, 10);
+            if (!endp || *endp != '\0')
+            {
+                fprintf(stderr,
+                        "oci2bin: --ulimit value must be a non-negative integer\n");
+                return -1;
+            }
+            opts->ulimits[opts->n_ulimits].resource = res;
+            opts->ulimits[opts->n_ulimits].value    = (rlim_t)val;
+            opts->n_ulimits++;
         }
         else if (strcmp(argv[i], "-e") == 0)
         {

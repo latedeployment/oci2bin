@@ -269,6 +269,28 @@ Use `--tmpfs` to mount a fresh in-memory filesystem at any path inside the conta
 
 Paths must be absolute and must not contain `..`. The mount uses `MS_NOSUID|MS_NODEV` flags. Failure is non-fatal. May be repeated.
 
+## Resource limits
+
+Use `--ulimit` to set resource limits via `setrlimit(2)` inside the container:
+
+```bash
+./my-app --ulimit nofile=1024          # max open file descriptors
+./my-app --ulimit nproc=64             # max processes
+./my-app --ulimit cpu=30               # max CPU time in seconds
+./my-app --ulimit as=536870912         # max virtual memory (512 MiB)
+./my-app --ulimit fsize=10485760       # max file size (10 MiB)
+```
+
+Both `rlim_cur` and `rlim_max` are set to the given value. Failure is non-fatal (a warning is printed). May be repeated. Supported types:
+
+| Type | Limit |
+|------|-------|
+| `nofile` | `RLIMIT_NOFILE` — max open file descriptors |
+| `nproc` | `RLIMIT_NPROC` — max processes |
+| `cpu` | `RLIMIT_CPU` — CPU time in seconds |
+| `as` | `RLIMIT_AS` — virtual memory in bytes |
+| `fsize` | `RLIMIT_FSIZE` — max file size in bytes |
+
 ## Testing
 
 ```bash
