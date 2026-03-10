@@ -136,24 +136,43 @@ if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
     $CC_CROSS $CFLAGS_CROSS -static -O2 -s -o "$LOADER" "$SRC"
 fi
 
-# ── cache lookup ──────────────────────────────────────────────────────────
-
-if [[ "$USE_CACHE" -eq 1 ]]; then
-    CACHE_KEY="${IMAGE//[:\/]/_}"
-    CACHE_DIR="$HOME/.cache/oci2bin/$CACHE_KEY"
-    if [[ -s "$CACHE_DIR/output" ]]; then
-        echo "oci2bin: cache hit → $OUTPUT"
-        cp "$CACHE_DIR/output" "$OUTPUT"
-        chmod +x "$OUTPUT"
-        exit 0
-    fi
-fi
-
 # ── pull image if not local ───────────────────────────────────────────────
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "oci2bin: pulling $IMAGE..."
     docker pull "$IMAGE"
+fi
+
+# ── get image digest for cache key and reproducibility ────────────────────
+#
+# docker inspect returns the content-addressed digest (e.g. repo@sha256:abc...)
+# so cache keys are tied to a specific image content, not just the tag name.
+# This prevents silent tag drift where redis:latest changes but the cached
+# binary was built from an older version.
+
+DIGEST=""
+DIGEST_SHORT=""
+if DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null)"; then
+    if [[ -n "$DIGEST" ]]; then
+        # Extract the sha256 hex part
+        sha256_part="${DIGEST##*sha256:}"
+        DIGEST_SHORT="${sha256_part:0:12}"
+        echo "oci2bin: image digest: $DIGEST" >&2
+    fi
+else
+    echo "oci2bin: warning: could not determine image digest (no registry origin?)" >&2
+fi
+
+# Update cache key to include digest so different content gets separate entries
+if [[ "$USE_CACHE" -eq 1 && -n "$DIGEST_SHORT" ]]; then
+    CACHE_KEY="${IMAGE//[:\/]/_}_${DIGEST_SHORT}"
+    CACHE_DIR="$HOME/.cache/oci2bin/$CACHE_KEY"
+    if [[ -s "$CACHE_DIR/output" ]]; then
+        echo "oci2bin: cache hit (digest $DIGEST_SHORT) → $OUTPUT"
+        cp "$CACHE_DIR/output" "$OUTPUT"
+        chmod +x "$OUTPUT"
+        exit 0
+    fi
 fi
 
 # ── merge layers if --layer was given ─────────────────────────────────────
@@ -233,7 +252,7 @@ fi
 
 # ── populate cache if requested ───────────────────────────────────────────
 
-if [[ "$USE_CACHE" -eq 1 ]]; then
+if [[ "$USE_CACHE" -eq 1 && -n "${CACHE_DIR:-}" ]]; then
     mkdir -p "$CACHE_DIR"
     cp "$OUTPUT" "$CACHE_DIR/output"
 fi

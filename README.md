@@ -269,6 +269,16 @@ Use `--tmpfs` to mount a fresh in-memory filesystem at any path inside the conta
 
 Paths must be absolute and must not contain `..`. The mount uses `MS_NOSUID|MS_NODEV` flags. Failure is non-fatal. May be repeated.
 
+## Reproducible builds and digest pinning
+
+After pulling (or when the image is already local), oci2bin prints the content-addressed digest to stderr:
+
+```
+oci2bin: image digest: redis@sha256:abc123...
+```
+
+When `--cache` is active, the cache key includes the first 12 hex characters of the sha256 digest rather than just the tag name. This means that if `redis:latest` is updated, a fresh build gets a new cache entry rather than reusing a stale binary. If the image has no registry origin (locally built with no push), the digest lookup is skipped with a warning and the tag-only key is used.
+
 ## Merging image layers
 
 Use `--layer` to overlay additional Docker images on top of the base image. This lets you compose a binary from multiple images — for example, adding a sidecar tool on top of your application image:
