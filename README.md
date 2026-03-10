@@ -322,6 +322,19 @@ Can be combined with `--layer`:
 oci2bin --strip --layer extra:latest base:latest output
 ```
 
+## Exposing host devices
+
+Use `--device` to expose a host device node inside the container:
+
+```bash
+./my-app --device /dev/nvidia0            # GPU passthrough
+./my-app --device /dev/ttyUSB0            # serial port
+./my-app --device /dev/fuse               # FUSE filesystem support
+./my-app --device /dev/snd:/dev/snd       # audio (explicit container path)
+```
+
+The host path must start with `/dev/`. The container path defaults to the same path as the host if omitted. oci2bin first attempts `mknod` with the host device's `st_rdev`; if that fails (as it often does in user namespaces), it falls back to a bind mount. Failure is non-fatal. May be repeated.
+
 ## Capabilities
 
 Use `--cap-drop` and `--cap-add` to manage Linux capabilities inside the container:

@@ -96,6 +96,11 @@ struct container_opts
     uint64_t cap_drop_mask;    /* bitmask of individual caps to drop */
     uint64_t cap_add_mask;     /* bitmask of caps to add (ambient) */
 
+    /* --device /dev/HOST[:CONTAINER]  (expose host device nodes) */
+    char* devices[MAX_VOLUMES];      /* host device paths */
+    char* device_ctr[MAX_VOLUMES];   /* container paths (NULL = same as host) */
+    int   n_devices;
+
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
     int   n_env;
@@ -1686,6 +1691,54 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Expose --device host devices inside the container */
+    for (int di = 0; di < opts->n_devices; di++)
+    {
+        const char* host_dev = opts->devices[di];
+        const char* ctr_dev  = opts->device_ctr[di]
+                               ? opts->device_ctr[di]
+                               : host_dev;
+
+        struct stat st;
+        if (stat(host_dev, &st) < 0)
+        {
+            fprintf(stderr, "oci2bin: --device stat %s: %s (non-fatal)\n",
+                    host_dev, strerror(errno));
+            continue;
+        }
+
+        /* Create the device node inside the container */
+        if (mknod(ctr_dev, st.st_mode, st.st_rdev) < 0)
+        {
+            /* mknod may fail in user namespaces — fall back to bind mount */
+            if (errno == EPERM || errno == ENOTSUP)
+            {
+                /* Ensure container path exists */
+                int fd = open(ctr_dev, O_CREAT | O_WRONLY, 0600);
+                if (fd >= 0)
+                {
+                    close(fd);
+                }
+                if (mount(host_dev, ctr_dev, NULL, MS_BIND, NULL) < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --device bind-mount %s→%s: %s (non-fatal)\n",
+                            host_dev, ctr_dev, strerror(errno));
+                }
+            }
+            else
+            {
+                fprintf(stderr, "oci2bin: --device mknod %s: %s (non-fatal)\n",
+                        ctr_dev, strerror(errno));
+            }
+        }
+        else
+        {
+            /* Set same permissions as host device */
+            chmod(ctr_dev, st.st_mode & 0777);
+        }
+    }
+
     /* Mount extra --tmpfs paths inside the container */
     for (int ti = 0; ti < opts->n_tmpfs; ti++)
     {
@@ -1973,6 +2026,8 @@ static void usage(const char* prog)
             "  --hostname NAME     Set the hostname inside the container\n"
             "  --cap-drop CAP      Drop a capability (or 'all' to drop all)\n"
             "  --cap-add CAP       Add an ambient capability (use after --cap-drop all)\n"
+            "  --device /dev/PATH[:CONTAINER_PATH]\n"
+            "                      Expose a host device inside the container\n"
             "  --env-file FILE     Load KEY=VALUE pairs from FILE\n"
             "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
             "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
@@ -2266,6 +2321,67 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->cap_add_mask |= (uint64_t)1 << cn;
+        }
+        else if (strcmp(argv[i], "--device") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --device requires /dev/PATH[:CONTAINER_PATH]\n");
+                return -1;
+            }
+            i++;
+            if (opts->n_devices >= MAX_VOLUMES)
+            {
+                fprintf(stderr,
+                        "oci2bin: too many --device flags (max %d)\n",
+                        MAX_VOLUMES);
+                return -1;
+            }
+            char* spec = argv[i];
+            /* Validate host path starts with /dev/ */
+            if (strncmp(spec, "/dev/", 5) != 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --device host path must start with /dev/: %s\n",
+                        spec);
+                return -1;
+            }
+            if (strstr(spec, ".."))
+            {
+                fprintf(stderr,
+                        "oci2bin: --device path must not contain '..': %s\n",
+                        spec);
+                return -1;
+            }
+            char* colon = strchr(spec, ':');
+            if (colon)
+            {
+                *colon = '\0';
+                char* ctr = colon + 1;
+                if (strncmp(ctr, "/dev/", 5) != 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --device container path must start"
+                            " with /dev/: %s\n",
+                            ctr);
+                    return -1;
+                }
+                if (strstr(ctr, ".."))
+                {
+                    fprintf(stderr,
+                            "oci2bin: --device container path must not"
+                            " contain '..': %s\n",
+                            ctr);
+                    return -1;
+                }
+                opts->device_ctr[opts->n_devices] = ctr;
+            }
+            else
+            {
+                opts->device_ctr[opts->n_devices] = NULL;
+            }
+            opts->devices[opts->n_devices++] = spec;
         }
         else if (strcmp(argv[i], "--hostname") == 0)
         {
