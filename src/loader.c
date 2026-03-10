@@ -8,12 +8,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <ftw.h>
 #include <unistd.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
 /*
  * These markers get patched by the polyglot builder.
@@ -60,6 +65,9 @@ struct container_opts
 
     /* --ssh-agent  (forward host SSH_AUTH_SOCK into the container) */
     int ssh_agent;
+
+    /* --no-seccomp  (disable the default seccomp filter) */
+    int no_seccomp;
 
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
@@ -984,6 +992,125 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
     }
 }
 
+/* ── seccomp ─────────────────────────────────────────────────────────────── */
+
+/*
+ * Apply a seccomp-BPF filter that blocks syscalls with no legitimate use
+ * inside a container (kernel load, reboot, raw BPF, keyring, etc.).
+ * Uses the seccomp(2) syscall with TSYNC; falls back to prctl if unavailable.
+ * PR_SET_NO_NEW_PRIVS is set unconditionally — it is good practice regardless.
+ */
+static void apply_seccomp_filter(void)
+{
+    /* Detect architecture at compile time */
+#ifdef __aarch64__
+#define MY_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#else
+#define MY_AUDIT_ARCH AUDIT_ARCH_X86_64
+#endif
+
+    /* Helper macros to build the BPF program */
+#define SC_ALLOW  SECCOMP_RET_ALLOW
+#define SC_KILL   SECCOMP_RET_KILL_PROCESS
+
+    /* BPF_SYSCALL emits a jump-if-equal-to-syscall-number → kill */
+#define BPF_BLOCK(nr) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 1), \
+    BPF_STMT(BPF_RET | BPF_K, SC_KILL)
+
+    struct sock_filter filter[] =
+    {
+        /* 1. Verify architecture — kill if wrong arch */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+        (offsetof(struct seccomp_data, arch))),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, MY_AUDIT_ARCH, 1, 0),
+            BPF_STMT(BPF_RET | BPF_K, SC_KILL),
+
+        /* 2. Load syscall number */
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+            (offsetof(struct seccomp_data, nr))),
+
+            /* 3. Block dangerous syscalls */
+#ifdef __NR_kexec_load
+                BPF_BLOCK(__NR_kexec_load),
+#endif
+#ifdef __NR_kexec_file_load
+                BPF_BLOCK(__NR_kexec_file_load),
+#endif
+#ifdef __NR_reboot
+                BPF_BLOCK(__NR_reboot),
+#endif
+#ifdef __NR_syslog
+                BPF_BLOCK(__NR_syslog),
+#endif
+#ifdef __NR_perf_event_open
+                BPF_BLOCK(__NR_perf_event_open),
+#endif
+#ifdef __NR_bpf
+                BPF_BLOCK(__NR_bpf),
+#endif
+#ifdef __NR_add_key
+                BPF_BLOCK(__NR_add_key),
+#endif
+#ifdef __NR_request_key
+                BPF_BLOCK(__NR_request_key),
+#endif
+#ifdef __NR_keyctl
+                BPF_BLOCK(__NR_keyctl),
+#endif
+#ifdef __NR_userfaultfd
+                BPF_BLOCK(__NR_userfaultfd),
+#endif
+#ifdef __NR_nfsservctl
+                BPF_BLOCK(__NR_nfsservctl),
+#endif
+#ifdef __NR_pivot_root
+                BPF_BLOCK(__NR_pivot_root),
+#endif
+
+            /* 4. Default: allow */
+                BPF_STMT(BPF_RET | BPF_K, SC_ALLOW),
+            };
+
+#undef BPF_BLOCK
+#undef SC_ALLOW
+#undef SC_KILL
+#undef MY_AUDIT_ARCH
+
+    struct sock_fprog prog =
+    {
+        .len    = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+
+    /* PR_SET_NO_NEW_PRIVS: prevent gaining new privileges via setuid/caps */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: prctl(PR_SET_NO_NEW_PRIVS) failed: %s (non-fatal)\n",
+                strerror(errno));
+    }
+
+    /* Try seccomp(2) syscall with TSYNC first */
+    if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0)
+    {
+        fprintf(stderr, "oci2bin: seccomp filter applied\n");
+        return;
+    }
+
+    /* Fall back to prctl */
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0)
+    {
+        fprintf(stderr, "oci2bin: seccomp filter failed: %s (non-fatal)\n",
+                strerror(errno));
+    }
+    else
+    {
+        fprintf(stderr, "oci2bin: seccomp filter applied (via prctl)\n");
+    }
+}
+
 static int container_main(const char* rootfs, struct container_opts *opts)
 {
     /* Read entrypoint/cmd config written by extract_oci_rootfs() */
@@ -1367,6 +1494,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     }
     free(image_workdir);
 
+    /* Apply seccomp filter just before exec (all setup is complete) */
+    if (!opts->no_seccomp)
+    {
+        apply_seccomp_filter();
+    }
+
     /* Exec the entrypoint */
     fprintf(stderr, "oci2bin: exec %s\n", exec_args[0]);
     execv(exec_args[0], exec_args);
@@ -1400,6 +1533,7 @@ static void usage(const char* prog)
             "  --net host|none     Network mode: host (default) or none (isolated)\n"
             "  --read-only         Mount rootfs read-only via overlayfs\n"
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
+            "  --no-seccomp        Disable the default seccomp syscall filter\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1536,6 +1670,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--ssh-agent") == 0)
         {
             opts->ssh_agent = 1;
+        }
+        else if (strcmp(argv[i], "--no-seccomp") == 0)
+        {
+            opts->no_seccomp = 1;
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
         {

@@ -193,6 +193,30 @@ By default containers run in host networking mode — they share the host networ
 
 If the kernel does not support overlayfs (e.g. older kernels without `CONFIG_OVERLAY_FS`), a warning is printed and the container runs read-write instead.
 
+## Security
+
+Containers run with a default seccomp-BPF filter that blocks syscalls with no legitimate use inside a container:
+
+| Blocked syscall | Reason |
+|---|---|
+| `kexec_load`, `kexec_file_load` | Load a new kernel |
+| `reboot` | Reboot the host |
+| `syslog` | Kernel ring buffer access |
+| `perf_event_open` | Used in kernel exploit chains |
+| `bpf` | Load arbitrary BPF programs |
+| `add_key`, `request_key`, `keyctl` | Kernel keyring manipulation |
+| `userfaultfd` | Exploited in kernel escapes |
+| `nfsservctl` | NFS server (irrelevant in containers) |
+| `pivot_root` | Namespace escape vector |
+
+The filter also sets `PR_SET_NO_NEW_PRIVS` so the container process cannot gain new privileges via setuid or capabilities.
+
+To disable the filter (e.g. for debugging or privileged workloads):
+
+```bash
+./my-app --no-seccomp
+```
+
 ## Testing
 
 ```bash
