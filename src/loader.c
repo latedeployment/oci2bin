@@ -840,7 +840,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     mkdir("/dev", 0755);
 
     /* Set hostname */
-    sethostname("oci2bin", 10);
+    sethostname("oci2bin", 7);
 
     /* Set standard env */
     setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

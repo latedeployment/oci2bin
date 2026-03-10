@@ -38,16 +38,22 @@ EV_CURRENT = 1
 ELFOSABI_NONE = 0
 ET_EXEC = 2
 EM_X86_64 = 0x3e
+EM_AARCH64 = 0xb7
 PT_LOAD = 1
 PF_R = 4
 PF_W = 2
 PF_X = 1
 
+SUPPORTED_MACHINES = {
+    EM_X86_64:  'x86_64',
+    EM_AARCH64: 'aarch64',
+}
+
 # Virtual address base for our polyglot. We load everything starting here.
 VADDR_BASE = 0x400000
 
 
-def build_elf64_header(entry, phoff, phnum):
+def build_elf64_header(entry, phoff, phnum, e_machine):
     """Build a 64-byte ELF64 header."""
     e_ident = (
         ELF_MAGIC +
@@ -58,7 +64,7 @@ def build_elf64_header(entry, phoff, phnum):
         '<16s HHI QQQ I HHHHHH',
         e_ident,
         ET_EXEC,           # e_type
-        EM_X86_64,         # e_machine
+        e_machine,         # e_machine
         EV_CURRENT,        # e_version
         entry,             # e_entry
         phoff,             # e_phoff
@@ -181,8 +187,9 @@ def parse_loader_elf(loader_path):
      e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum,
      e_shstrndx) = struct.unpack_from('<HHI QQQ I HHHHHH', elf_data, 16)
 
-    if e_machine != EM_X86_64:
-        print(f"ERROR: Expected x86_64 loader, got machine type {e_machine}", file=sys.stderr)
+    if e_machine not in SUPPORTED_MACHINES:
+        print(f"ERROR: Unsupported loader architecture: e_machine=0x{e_machine:x}", file=sys.stderr)
+        print(f"  Supported: {', '.join(f'{n} (0x{k:x})' for k, n in SUPPORTED_MACHINES.items())}", file=sys.stderr)
         sys.exit(1)
 
     # Parse program headers
@@ -206,6 +213,7 @@ def parse_loader_elf(loader_path):
         'segments': segments,
         'raw': elf_data,
         'phnum': e_phnum,
+        'e_machine': e_machine,
     }
 
 
@@ -259,6 +267,8 @@ def build_polyglot(loader_path, image_name, output_path):
     # 1. Parse the loader ELF
     print(f"Parsing loader: {loader_path}")
     loader = parse_loader_elf(loader_path)
+    arch_name = SUPPORTED_MACHINES[loader['e_machine']]
+    print(f"  Architecture: {arch_name}")
 
     load_segments = [s for s in loader['segments'] if s['type'] == PT_LOAD]
     if not load_segments:
@@ -329,6 +339,7 @@ def build_polyglot(loader_path, image_name, output_path):
         entry=loader['entry'],
         phoff=PAGE_SIZE + original_phoff,
         phnum=loader['phnum'],
+        e_machine=loader['e_machine'],
     )
     if len(elf_header) != 64:
         print("ERROR: ELF header length is not 64 bytes", file=sys.stderr)

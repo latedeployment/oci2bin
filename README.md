@@ -17,23 +17,25 @@ The file can be copied to any Linux host with user namespace support (kernel 3.8
 
 ## Getting started
 
-**Build dependencies:** `musl-gcc`, `python3`, `docker`
+**Build dependencies:** `gcc`, `glibc-static`, `python3`, `docker`
+
+`gcc` and `glibc-static` are needed to compile the embedded loader binary. On most systems `gcc` is already installed; `glibc-static` may need to be added explicitly:
 
 ```bash
-# Arch Linux
-sudo pacman -S musl
+# Arch Linux — gcc is in base-devel (installed by default)
+sudo pacman -S glibc
 
 # Fedora
-sudo dnf install musl-gcc musl-devel musl-libc-static
+sudo dnf install gcc glibc-static
 
 # Debian / Ubuntu
-sudo apt install musl-tools
+sudo apt install gcc libc6-dev
 
 # openSUSE Tumbleweed
-sudo zypper install musl-devel
+sudo zypper install gcc glibc-devel-static
 
 # NixOS / nix-shell
-nix-shell -p musl python3 docker
+nix-shell -p gcc python3 docker
 ```
 
 After cloning the repository, run `oci2bin` with an image name. The loader is compiled on first use; the image is pulled automatically if not already present locally.
@@ -132,12 +134,50 @@ The network namespace is not isolated — the container shares the host network 
 ```bash
 make test-unit        # unit tests only, no Docker required (~5s)
 make test             # full suite, requires Docker and a built image
-make test-c           # C unit tests (TAP)
+make test-c           # C unit tests (TAP, x86_64)
 make test-python      # Python unit tests
 make test-integration # runtime and build integration tests
 ```
 
 The suite covers the polyglot builder, loader internals, structural invariants of the output file, and all runtime features: volume mounts, entrypoint override, argument passthrough, exit code forwarding, and execution without Docker.
+
+### aarch64 unit tests
+
+The C unit tests can be cross-compiled and run under `qemu-aarch64-static` without a real aarch64 machine:
+
+```bash
+# Fedora
+sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc qemu-user-static
+
+make test-unit-aarch64
+```
+
+The `QEMU_AARCH64` variable can be overridden if the binary is in a non-standard path:
+
+```bash
+make test-unit-aarch64 QEMU_AARCH64=/usr/bin/qemu-aarch64-static
+```
+
+## Cross-compilation
+
+To build an aarch64 polyglot on an x86_64 host, pass `--arch aarch64`. This requires `gcc-aarch64-linux-gnu` and its sysroot:
+
+```bash
+# Fedora
+sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
+
+./oci2bin --arch aarch64 alpine:latest
+```
+
+The sysroot defaults to `/usr/aarch64-redhat-linux/sys-root/fc43`. Override it if yours differs:
+
+```bash
+AARCH64_SYSROOT=/path/to/sysroot ./oci2bin --arch aarch64 alpine:latest
+# or for make:
+make loader-aarch64 AARCH64_SYSROOT=/path/to/sysroot
+```
+
+The output binary is an aarch64 ELF and runs only on aarch64 Linux hosts (or under qemu). Cross-compilation in the other direction (aarch64 → x86_64) is not currently supported.
 
 ## How it works
 
@@ -168,7 +208,7 @@ The only runtime dependency on the target machine is `tar`.
 [0-63]       ELF64 header  (embedded in the tar filename field)
 [64-511]     Remaining tar header fields (ustar magic at byte 257)
 [512-4095]   NUL padding   (page-aligns the loader for mmap)
-[4096-~75K]  Loader binary (statically linked against musl libc)
+[4096-~75K]  Loader binary (statically linked)
 [~75K-end]   OCI image tar (manifest.json, config, layer tarballs)
 ```
 
