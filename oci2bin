@@ -3,6 +3,7 @@
 #
 # Usage:
 #   oci2bin [--arch ARCH] <image[:tag]> [output]
+#   oci2bin inspect <binary>
 #
 # The output file runs as a rootless container AND can be imported with
 # docker load. It accepts the same runtime flags as the embedded loader:
@@ -56,6 +57,17 @@ usage() {
     grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//'
     exit 1
 }
+
+# ── inspect subcommand ────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "inspect" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin inspect <binary>" >&2
+        exit 1
+    fi
+    exec python3 "$OCI2BIN_HOME/scripts/inspect_image.py" "$1"
+fi
 
 # ── argument parsing ──────────────────────────────────────────────────────
 

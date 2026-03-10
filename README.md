@@ -344,6 +344,36 @@ Both `rlim_cur` and `rlim_max` are set to the given value. Failure is non-fatal 
 | `as` | `RLIMIT_AS` — virtual memory in bytes |
 | `fsize` | `RLIMIT_FSIZE` — max file size in bytes |
 
+## Inspecting binaries
+
+Use `oci2bin inspect` to display the metadata embedded in any oci2bin binary without running it:
+
+```bash
+oci2bin inspect ./redis_7-alpine
+```
+
+Example output:
+
+```
+Image:        redis:7-alpine
+Architecture: amd64
+Layers:       6
+Entrypoint:   ["docker-entrypoint.sh"]
+Cmd:          ["redis-server"]
+WorkingDir:   /data
+Env:
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              REDIS_VERSION=7.4.2
+
+Build metadata:
+  Image:     redis:7-alpine
+  Digest:    redis@sha256:abc123...
+  Built:     2026-03-10T12:00:00Z
+  oci2bin:   0.2.0
+```
+
+The build metadata block is present if the binary was built with a recent version of oci2bin (Feature 10). ExposedPorts are shown if the image declares any.
+
 ## Testing
 
 ```bash
