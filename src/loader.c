@@ -46,6 +46,9 @@ struct container_opts
     /* --workdir /path  (overrides OCI WorkingDir) */
     char* workdir;
 
+    /* --net host|none  (NULL means host; "none" adds CLONE_NEWNET) */
+    char* net;
+
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
     int   n_env;
@@ -1037,6 +1040,7 @@ static void usage(const char* prog)
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
             "  --workdir PATH      Set the working directory inside the container\n"
+            "  --net host|none     Network mode: host (default) or none (isolated)\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1121,6 +1125,21 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->workdir = argv[++i];
+        }
+        else if (strcmp(argv[i], "--net") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --net requires host or none\n");
+                return -1;
+            }
+            i++;
+            if (strcmp(argv[i], "host") != 0 && strcmp(argv[i], "none") != 0)
+            {
+                fprintf(stderr, "oci2bin: --net must be host or none\n");
+                return -1;
+            }
+            opts->net = argv[i];
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
         {
@@ -1236,11 +1255,18 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    /* 9. Enter mount + PID + UTS namespaces */
-    if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS) < 0)
+    /* 9. Enter mount + PID + UTS namespaces; optionally network namespace */
     {
-        perror("unshare(NEWNS|NEWPID|NEWUTS)");
-        return 1;
+        int ns_flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS;
+        if (opts.net && strcmp(opts.net, "none") == 0)
+        {
+            ns_flags |= CLONE_NEWNET;
+        }
+        if (unshare(ns_flags) < 0)
+        {
+            perror("unshare(NEWNS|NEWPID|NEWUTS)");
+            return 1;
+        }
     }
 
     /* 10. Fork for PID namespace (child becomes PID 1) */

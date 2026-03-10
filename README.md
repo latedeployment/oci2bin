@@ -138,6 +138,17 @@ TERM=xterm
 
 The network namespace is not isolated — the container shares the host network stack. `/etc/resolv.conf` from the host is copied into the rootfs so DNS resolution works correctly.
 
+## Networking
+
+By default containers run in host networking mode — they share the host network stack and can reach the internet. To create an isolated network namespace with no interfaces, use `--net none`:
+
+```bash
+./alpine_latest --net none /bin/sh -c 'ip link'   # only loopback visible
+./alpine_latest --net host /bin/sh -c 'curl ...'  # host networking (default)
+```
+
+`--net none` adds `CLONE_NEWNET` to the namespace flags. The container gets its own network stack with only a loopback interface and cannot reach the host network or internet.
+
 ## Testing
 
 ```bash

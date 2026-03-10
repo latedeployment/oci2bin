@@ -19,6 +19,7 @@
 #   -v HOST:CONTAINER     Bind mount a host path into the container
 #   --entrypoint PATH     Override the image entrypoint
 #   --workdir PATH        Set the working directory inside the container
+#   --net host|none       Network mode: host (default) or none (isolated)
 #   --                    End of options; remaining args are CMD
 #
 # Examples:
