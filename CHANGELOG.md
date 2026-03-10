@@ -2,6 +2,73 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.3.0] - 2026-03-10
+
+### Added
+
+- **`--user UID[:GID]`** — run the container process as a specific numeric UID
+  (and optional GID). Calls `setgroups(0, NULL)` → `setgid` → `setuid` in that
+  order before exec. Fatal if any step fails. Only numeric values ≤ 65534
+  accepted; names like `nobody` are rejected with a clear error.
+- **`--hostname NAME`** — override the UTS hostname inside the container.
+  Defaults to `oci2bin` when omitted. Non-fatal on failure.
+- **`--env-file FILE`** — load `KEY=VALUE` pairs from a file into the container
+  environment. Blank lines and `#`-prefixed comments are skipped. Additive with
+  `-e`; the file is processed first so `-e` flags override file values. Uses
+  `open()`/`read()` (no `fopen`). Files larger than 1 MiB are rejected.
+- **`--tmpfs PATH`** — mount a fresh `tmpfs` at an arbitrary path inside the
+  container (useful with `--read-only`). Path must be absolute and `..`-free.
+  `MS_NOSUID|MS_NODEV` flags. Non-fatal on failure. Repeatable.
+- **`--ulimit TYPE=N`** — set resource limits via `setrlimit(2)`. Supported
+  types: `nofile`, `nproc`, `cpu`, `as`, `fsize`. Both `rlim_cur` and
+  `rlim_max` are set to the given value. Non-fatal on failure. Repeatable.
+- **`--layer IMAGE`** (bash wrapper) — merge additional Docker image layers on
+  top of the base image before packaging. Layers are applied in order. Uses the
+  new `scripts/merge_layers.py` helper. Repeatable.
+- **`--strip`** (bash wrapper) — remove documentation, man pages, locale data,
+  and apt caches from the image before packaging, reducing binary size. Uses the
+  new `scripts/strip_image.py` helper. Can be combined with `--layer`.
+- **Digest pinning in `--cache`** — after pulling, the image's content-addressed
+  digest is obtained via `docker inspect --format '{{index .RepoDigests 0}}'`
+  and printed to stderr. The cache key now includes the first 12 hex chars of
+  the sha256 digest, preventing stale cache hits when a tag is updated.
+- **`oci2bin inspect <binary>`** — new subcommand that reads the embedded OCI
+  tar from a polyglot binary and prints a human-readable summary: architecture,
+  Entrypoint, Cmd, WorkingDir, Env, ExposedPorts, and build metadata block.
+  Implemented in `scripts/inspect_image.py` (stdlib only).
+- **Embedded build metadata block** — every output binary now has a
+  `OCI2BIN_META\x00` magic-prefixed JSON block appended after the tar
+  end-of-archive marker. Contains image name, build timestamp (UTC ISO-8601),
+  OCI digest (if available), and oci2bin version `0.2.0`. Does not affect ELF
+  execution or tar parsing. Displayed by `oci2bin inspect`.
+- **`--no-seccomp`** — disable the default seccomp-BPF syscall filter (added in
+  0.2.0; first documented in this changelog).
+- **seccomp-BPF default filter** — blocks `kexec_load`, `reboot`, `pivot_root`,
+  `bpf`, `ptrace`, `perf_event_open`, `io_uring_setup`, `userfaultfd`, and
+  `keyctl`. Sets `PR_SET_NO_NEW_PRIVS`. Added in 0.2.0.
+- **Redis and nginx integration tests** — `make test-integration-redis` and
+  `make test-integration-nginx` build those images with oci2bin and verify
+  actual protocol responses (`PING`/`SET`/`GET` for Redis; HTTP 200 for nginx).
+
+### Fixed
+
+- **`execv` → `execvp`** — relative entrypoints like `docker-entrypoint.sh`
+  were silently falling back to `/bin/sh` because `execv` requires an absolute
+  path. Fixed to `execvp` which searches `PATH`.
+- **`build_elf64_header` missing default** — the `e_machine` parameter added
+  during aarch64 work had no default, breaking Python unit tests that call it
+  with three positional arguments. Fixed with `e_machine=EM_X86_64` default.
+- **Integration test port conflicts** — tests used hardcoded ports (16379,
+  18080). Fixed to use a random free port via `python3 -c "import socket; ..."`.
+- **Integration test TAP skips** — `test_runtime.sh` emitted `not ok $i - SKIP`
+  instead of `ok $i # SKIP`, causing `make` to fail when `oci2bin.img` was
+  absent. Fixed.
+- **`strtoul` suffix validation for `--user`** — non-numeric suffixes in
+  `--user 1000abc` were silently ignored. Fixed by checking that `endp` points
+  to the expected delimiter after `strtoul` returns.
+
+---
+
 ## [0.2.0] - 2026-03-10
 
 ### Added
@@ -88,5 +155,6 @@ Initial public release.
   `snprintf` truncation checks on all `PATH_MAX` buffers, no `system()`/`popen()`
   anywhere in the codebase.
 
+[0.3.0]: https://github.com/latedeployment/oci2bin/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/latedeployment/oci2bin/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/latedeployment/oci2bin/releases/tag/v0.1.0
