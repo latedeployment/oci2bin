@@ -2,6 +2,72 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.4.0] - 2026-03-10
+
+### Added
+
+- **`--cap-drop CAP` / `--cap-add CAP`** — manage Linux capabilities inside the
+  container. `--cap-drop all` removes all capabilities from the bounding set
+  (caps 0–40) via `PR_CAPBSET_DROP`. `--cap-add` then raises the specified
+  capability as an ambient capability (sets it in the permitted and inheritable
+  sets first, then calls `PR_CAP_AMBIENT_RAISE`) so it survives `exec`. Supports
+  both `CAP_NET_RAW` and `net_raw` spellings. Implemented without libcap using
+  inline `struct cap_header`/`cap_data` and `syscall(SYS_capset, ...)`.
+- **`--device /dev/HOST[:CONTAINER]`** — expose a host device node inside the
+  container. `stat()`s the host path to get `st_rdev`/`st_mode`, then calls
+  `mknod` inside the container; falls back to a bind mount if `mknod` fails
+  (common in user namespaces). Host and container paths must start with `/dev/`
+  and must not contain `..`. Non-fatal on failure. Repeatable.
+- **`-e KEY` passthrough** — `-e VAR` without `=VALUE` now looks up `VAR` in
+  the host environment via `getenv()` and constructs a `KEY=VALUE` string on
+  the heap. If the variable is not set on the host, a warning is printed and
+  the variable is skipped (not an error). Existing `KEY=VALUE` behaviour is
+  unchanged.
+- **`--init`** — run a zombie-reaping init as PID 1. Forks the entrypoint as a
+  child; the parent loops `waitpid(-1, ...)` to reap any zombie. Forwards
+  SIGTERM, SIGINT, SIGHUP, SIGUSR1, and SIGUSR2 to the child. Exit status is
+  preserved (128+signal for signal deaths). Seccomp and capability drops happen
+  before the fork; UID/GID drop happens in the child only.
+- **`--detach` / `-d`** — fork the container to the background, print the child
+  PID to stdout, and exit immediately. The child calls `setsid()` and redirects
+  stdin from `/dev/null`. Can be combined with `--init`.
+- **`--add-file HOST:CONTAINER` / `--add-dir HOST:CONTAINER`** (bash wrapper +
+  `scripts/add_files.py`) — inject host files or directories into the image at
+  build time as a new layer. The layer SHA256 is computed and embedded in
+  `manifest.json` and the config `rootfs.diff_ids`. Both flags are repeatable
+  and can be combined. Pure Python, stdlib only.
+- **`--oci-dir DIR`** (bash wrapper + `scripts/oci_layout_to_tar.py`) — build
+  from an OCI image layout directory instead of pulling via Docker. Reads
+  `index.json` → manifest blob → config and layer blobs from
+  `blobs/sha256/<hex>` and writes a docker-save-format tar passed directly to
+  `build_polyglot.py`. The `IMAGE` argument becomes optional. Compatible with
+  `--add-file`, `--add-dir`, and `--strip`.
+- **`oci2bin list [--json]`** — list all binaries in `~/.cache/oci2bin/` with
+  image name, digest, size, and build date. Reads the `OCI2BIN_META` block from
+  each cached binary via `scripts/inspect_image.py`. `--json` outputs a JSON
+  array for machine parsing.
+- **`oci2bin prune [--dry-run]`** — remove outdated cache entries, keeping only
+  the most recently built binary per image name (grouped by stripping the digest
+  suffix from the cache directory name). Prints space freed. `--dry-run` shows
+  what would be deleted without deleting.
+- **`oci2bin diff <binary1> <binary2>`** — compare the filesystem contents of
+  two oci2bin binaries. Extracts the embedded OCI tar from each, walks all
+  layer tarballs (handling gzip and OCI whiteout entries), and prints `+`
+  added, `-` removed, and `M` modified files with sizes. Summary line at the
+  end. Exits 1 if any difference is found. Implemented in
+  `scripts/diff_images.py` (stdlib only).
+- **`scripts/inspect_image.py --json`** — new `--json` flag outputs the
+  embedded metadata block as a JSON object (used by `oci2bin list`). Falls back
+  to reading `RepoTags` from the OCI tar if no metadata block is present.
+
+### Changed
+
+- **README reorganised** — added a table of contents and regrouped all sections
+  under logical headings: Building binaries, Running containers, Isolation and
+  security, Process management, Subcommands.
+
+---
+
 ## [0.3.0] - 2026-03-10
 
 ### Added
