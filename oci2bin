@@ -25,6 +25,7 @@
 #   --workdir PATH        Set the working directory inside the container
 #   --net host|none       Network mode: host (default) or none (isolated)
 #   --read-only           Mount rootfs read-only via overlayfs
+#   --ssh-agent           Forward host SSH_AUTH_SOCK into the container
 #   --                    End of options; remaining args are CMD
 #
 # Examples:

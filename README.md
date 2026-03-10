@@ -132,6 +132,17 @@ When the command following `--entrypoint` begins with a `-`, use `--` to termina
 
 If the remount read-only step fails the secret is not mounted at all, so container processes can never write to a host secret file.
 
+### SSH agent forwarding
+
+`--ssh-agent` forwards the host `SSH_AUTH_SOCK` Unix socket into the container at `/run/ssh-agent.sock` and sets `SSH_AUTH_SOCK` accordingly. This lets `ssh`, `git`, and other tools authenticate using the host agent without copying private keys:
+
+```bash
+./my-app --ssh-agent                           # git clone, ssh, etc. work inside
+./my-app --ssh-agent /bin/sh -c 'ssh git@github.com'
+```
+
+The socket is bind-mounted read-only (`MS_RDONLY|MS_NOEXEC|MS_NOSUID|MS_NODEV`). The host path is validated to be an absolute path pointing to an actual Unix socket. If `SSH_AUTH_SOCK` is unset or points to a non-socket, a warning is printed and the container runs without agent forwarding.
+
 ### End of options
 
 `--` terminates option parsing. Arguments following it are passed to the container as-is, which is useful when the command begins with a `-`:

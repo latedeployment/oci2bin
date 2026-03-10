@@ -58,6 +58,9 @@ struct container_opts
     /* --read-only  (mount overlay so rootfs is not modified) */
     int read_only;
 
+    /* --ssh-agent  (forward host SSH_AUTH_SOCK into the container) */
+    int ssh_agent;
+
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
     int   n_env;
@@ -1055,6 +1058,136 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     setup_volumes(rootfs, opts);
     setup_secrets(rootfs, opts);
 
+    /* --ssh-agent: forward host SSH_AUTH_SOCK into the container.
+     * The socket is bind-mounted at /run/ssh-agent.sock and SSH_AUTH_SOCK
+     * is set accordingly so tools like ssh and git pick it up automatically. */
+    char ssh_auth_sock_host[PATH_MAX];
+    ssh_auth_sock_host[0] = '\0';
+    if (opts->ssh_agent)
+    {
+        const char* sock = getenv("SSH_AUTH_SOCK");
+        if (!sock || sock[0] == '\0')
+        {
+            fprintf(stderr, "oci2bin: --ssh-agent: SSH_AUTH_SOCK is not set (non-fatal)\n");
+        }
+        else if (sock[0] != '/')
+        {
+            fprintf(stderr,
+                    "oci2bin: --ssh-agent: SSH_AUTH_SOCK must be an absolute path: %s\n",
+                    sock);
+        }
+        else if (strstr(sock, "/../") != NULL ||
+                 (strlen(sock) >= 3 &&
+                  strcmp(sock + strlen(sock) - 3, "/..") == 0))
+        {
+            fprintf(stderr,
+                    "oci2bin: --ssh-agent: SSH_AUTH_SOCK must not contain '..': %s\n",
+                    sock);
+        }
+        else
+        {
+            int slen = snprintf(ssh_auth_sock_host, sizeof(ssh_auth_sock_host), "%s", sock);
+            if (slen < 0 || (size_t)slen >= sizeof(ssh_auth_sock_host))
+            {
+                fprintf(stderr, "oci2bin: --ssh-agent: SSH_AUTH_SOCK path too long\n");
+                ssh_auth_sock_host[0] = '\0';
+            }
+            else
+            {
+                /* Verify that SSH_AUTH_SOCK is actually a Unix socket */
+                struct stat sock_st;
+                if (lstat(ssh_auth_sock_host, &sock_st) < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --ssh-agent: cannot stat SSH_AUTH_SOCK: %s\n",
+                            strerror(errno));
+                    ssh_auth_sock_host[0] = '\0';
+                }
+                else if (!S_ISSOCK(sock_st.st_mode))
+                {
+                    fprintf(stderr,
+                            "oci2bin: --ssh-agent: SSH_AUTH_SOCK is not a socket\n");
+                    ssh_auth_sock_host[0] = '\0';
+                }
+                else
+                {
+                    /* Create target socket file inside rootfs */
+                    char sock_dir[PATH_MAX];
+                    int dlen = snprintf(sock_dir, sizeof(sock_dir), "%s/run", rootfs);
+                    if (dlen > 0 && (size_t)dlen < sizeof(sock_dir))
+                    {
+                        mkdir(sock_dir, 0755);
+                    }
+                    char sock_dst[PATH_MAX];
+                    int tlen = snprintf(sock_dst, sizeof(sock_dst),
+                                        "%s/run/ssh-agent.sock", rootfs);
+                    if (tlen < 0 || (size_t)tlen >= sizeof(sock_dst))
+                    {
+                        fprintf(stderr,
+                                "oci2bin: --ssh-agent: destination path too long\n");
+                        ssh_auth_sock_host[0] = '\0';
+                    }
+                    else
+                    {
+                        /* Create empty placeholder file as bind-mount target.
+                         * O_EXCL ensures we abort if the file already exists
+                         * (e.g. a symlink planted by a malicious image layer)
+                         * rather than silently following it. */
+                        int fd = open(sock_dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                                      0600);
+                        if (fd < 0)
+                        {
+                            fprintf(stderr,
+                                    "oci2bin: --ssh-agent: cannot create socket placeholder"
+                                    " %s: %s\n",
+                                    sock_dst, strerror(errno));
+                            ssh_auth_sock_host[0] = '\0';
+                        }
+                        else
+                        {
+                            close(fd);
+                        }
+                        if (ssh_auth_sock_host[0] != '\0')
+                        {
+                            if (mount(ssh_auth_sock_host, sock_dst,
+                                      NULL, MS_BIND, NULL) < 0)
+                            {
+                                fprintf(stderr,
+                                        "oci2bin: --ssh-agent: bind mount failed: %s\n",
+                                        strerror(errno));
+                                ssh_auth_sock_host[0] = '\0';
+                            }
+                            else if (mount(NULL, sock_dst, NULL,
+                                           MS_BIND | MS_REMOUNT | MS_RDONLY |
+                                           MS_NOEXEC | MS_NOSUID | MS_NODEV,
+                                           NULL) < 0)
+                            {
+                                fprintf(stderr,
+                                        "oci2bin: --ssh-agent: remount read-only"
+                                        " failed: %s\n",
+                                        strerror(errno));
+                                if (umount2(sock_dst, MNT_DETACH) < 0)
+                                {
+                                    fprintf(stderr,
+                                            "oci2bin: --ssh-agent: umount"
+                                            " failed: %s\n",
+                                            strerror(errno));
+                                }
+                                ssh_auth_sock_host[0] = '\0';
+                            }
+                            else
+                            {
+                                fprintf(stderr,
+                                        "oci2bin: ssh-agent socket forwarded"
+                                        " to /run/ssh-agent.sock\n");
+                            }
+                        }
+                    }
+                } /* end S_ISSOCK check */
+            }
+        }
+    }
+
     /* --read-only: mount overlayfs so the rootfs is not modified at runtime.
      * upper/work dirs live in the tmpdir (parent of rootfs). */
     if (opts->read_only)
@@ -1214,6 +1347,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         *eq = '='; /* restore the string in case it is inspected later */
     }
 
+    /* Set SSH_AUTH_SOCK inside the container if ssh-agent was forwarded */
+    if (opts->ssh_agent && ssh_auth_sock_host[0] != '\0')
+    {
+        setenv("SSH_AUTH_SOCK", "/run/ssh-agent.sock", 1);
+    }
+
     /* Apply workdir: --workdir flag overrides image WorkingDir */
     {
         const char* wdir = opts->workdir ? opts->workdir : image_workdir;
@@ -1260,6 +1399,7 @@ static void usage(const char* prog)
             "  --workdir PATH      Set the working directory inside the container\n"
             "  --net host|none     Network mode: host (default) or none (isolated)\n"
             "  --read-only         Mount rootfs read-only via overlayfs\n"
+            "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1392,6 +1532,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--read-only") == 0)
         {
             opts->read_only = 1;
+        }
+        else if (strcmp(argv[i], "--ssh-agent") == 0)
+        {
+            opts->ssh_agent = 1;
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
         {
