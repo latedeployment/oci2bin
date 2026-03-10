@@ -233,6 +233,16 @@ Only numeric UIDs and GIDs are accepted (names like `nobody` require `/etc/passw
 
 The call order is: `setgroups(0, NULL)` (drop supplementary groups) → `setgid(gid)` → `setuid(uid)`. If any of these fail the container exits immediately — running as the wrong user is a security violation.
 
+### Custom hostname
+
+By default the container's hostname is `oci2bin`. Use `--hostname` to override it:
+
+```bash
+./my-app --hostname mycontainer
+```
+
+This calls `sethostname(2)` inside the UTS namespace. Failure is non-fatal (a warning is printed and execution continues).
+
 ## Testing
 
 ```bash

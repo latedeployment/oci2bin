@@ -71,6 +71,9 @@ struct container_opts
     /* --no-seccomp  (disable the default seccomp filter) */
     int no_seccomp;
 
+    /* --hostname NAME  (override the UTS hostname) */
+    char* hostname;
+
     /* --user UID[:GID]  (run as this uid/gid inside the container) */
     uid_t run_uid;
     gid_t run_gid;
@@ -1450,8 +1453,15 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* Set hostname */
-    sethostname("oci2bin", 7);
+    /* Set hostname (--hostname overrides default) */
+    {
+        const char* hn = opts->hostname ? opts->hostname : "oci2bin";
+        if (sethostname(hn, strlen(hn)) < 0)
+        {
+            fprintf(stderr, "oci2bin: sethostname: %s (non-fatal)\n",
+                    strerror(errno));
+        }
+    }
 
     /* Set standard env */
     setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -1579,6 +1589,7 @@ static void usage(const char* prog)
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
+            "  --hostname NAME     Set the hostname inside the container\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1719,6 +1730,15 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-seccomp") == 0)
         {
             opts->no_seccomp = 1;
+        }
+        else if (strcmp(argv[i], "--hostname") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --hostname requires NAME\n");
+                return -1;
+            }
+            opts->hostname = argv[++i];
         }
         else if (strcmp(argv[i], "--user") == 0)
         {
