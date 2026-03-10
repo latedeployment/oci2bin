@@ -15,6 +15,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <ftw.h>
+#include <grp.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
@@ -68,6 +70,11 @@ struct container_opts
 
     /* --no-seccomp  (disable the default seccomp filter) */
     int no_seccomp;
+
+    /* --user UID[:GID]  (run as this uid/gid inside the container) */
+    uid_t run_uid;
+    gid_t run_gid;
+    int   has_user;   /* 1 if --user was given */
 
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
@@ -1509,6 +1516,28 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     }
     free(image_workdir);
 
+    /* Drop to requested UID/GID if --user was given (fatal if it fails) */
+    if (opts->has_user)
+    {
+        if (setgroups(0, NULL) < 0)
+        {
+            fprintf(stderr, "oci2bin: setgroups failed: %s\n", strerror(errno));
+            return 1;
+        }
+        if (setgid(opts->run_gid) < 0)
+        {
+            fprintf(stderr, "oci2bin: setgid(%d) failed: %s\n",
+                    (int)opts->run_gid, strerror(errno));
+            return 1;
+        }
+        if (setuid(opts->run_uid) < 0)
+        {
+            fprintf(stderr, "oci2bin: setuid(%d) failed: %s\n",
+                    (int)opts->run_uid, strerror(errno));
+            return 1;
+        }
+    }
+
     /* Apply seccomp filter just before exec (all setup is complete) */
     if (!opts->no_seccomp)
     {
@@ -1549,6 +1578,7 @@ static void usage(const char* prog)
             "  --read-only         Mount rootfs read-only via overlayfs\n"
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
+            "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1689,6 +1719,68 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-seccomp") == 0)
         {
             opts->no_seccomp = 1;
+        }
+        else if (strcmp(argv[i], "--user") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --user requires UID[:GID]\n");
+                return -1;
+            }
+            i++;
+            char* spec = argv[i];
+            /* Only numeric UIDs/GIDs are accepted — no name lookup pre-chroot */
+            char* colon = strchr(spec, ':');
+            char* endp  = NULL;
+            unsigned long uid_val;
+            unsigned long gid_val;
+            if (spec[0] < '0' || spec[0] > '9')
+            {
+                fprintf(stderr,
+                        "oci2bin: --user requires a numeric UID, not a name\n");
+                return -1;
+            }
+            uid_val = strtoul(spec, &endp, 10);
+            /* endp must point to ':' (if a colon was given) or '\0' */
+            if (endp != (colon ? colon : spec + strlen(spec)))
+            {
+                fprintf(stderr,
+                        "oci2bin: --user UID contains non-numeric characters\n");
+                return -1;
+            }
+            if (uid_val > 65534)
+            {
+                fprintf(stderr, "oci2bin: --user UID must be <= 65534\n");
+                return -1;
+            }
+            opts->run_uid = (uid_t)uid_val;
+            if (colon)
+            {
+                if (colon[1] < '0' || colon[1] > '9')
+                {
+                    fprintf(stderr,
+                            "oci2bin: --user GID must be numeric\n");
+                    return -1;
+                }
+                gid_val = strtoul(colon + 1, &endp, 10);
+                if (*endp != '\0')
+                {
+                    fprintf(stderr,
+                            "oci2bin: --user GID contains non-numeric characters\n");
+                    return -1;
+                }
+                if (gid_val > 65534)
+                {
+                    fprintf(stderr, "oci2bin: --user GID must be <= 65534\n");
+                    return -1;
+                }
+                opts->run_gid = (gid_t)gid_val;
+            }
+            else
+            {
+                opts->run_gid = (gid_t)uid_val;
+            }
+            opts->has_user = 1;
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
         {

@@ -220,6 +220,19 @@ To disable the filter (e.g. for debugging or privileged workloads):
 ./my-app --no-seccomp
 ```
 
+### Running as a non-root user
+
+By default the container process runs as UID 0 inside the user namespace (which maps to your host UID). Use `--user` to run as a different numeric UID inside the container:
+
+```bash
+./my-app --user 1000          # run as UID 1000, GID 1000
+./my-app --user 1000:2000     # run as UID 1000, GID 2000
+```
+
+Only numeric UIDs and GIDs are accepted (names like `nobody` require `/etc/passwd` inside the container and cannot be resolved before chroot). Values must be ≤ 65534.
+
+The call order is: `setgroups(0, NULL)` (drop supplementary groups) → `setgid(gid)` → `setuid(uid)`. If any of these fail the container exits immediately — running as the wrong user is a security violation.
+
 ## Testing
 
 ```bash
