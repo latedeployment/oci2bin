@@ -19,6 +19,7 @@ Layout:
 """
 
 import argparse
+import datetime
 import io
 import json
 import os
@@ -258,11 +259,35 @@ def get_oci_tar(image_name, output_path):
         sys.exit(1)
 
 
-def build_polyglot(loader_path, image_name, output_path, tar_path=None):
+META_MAGIC = b'OCI2BIN_META\x00'
+OCI2BIN_VERSION = '0.2.0'
+
+
+def build_meta_block(image_name, digest=None):
+    """
+    Build the OCI2BIN_META block appended to the end of the output binary.
+    Format: uint32_le(total_size) + META_MAGIC + json_bytes + b'\\x00'
+    total_size counts from the start of the uint32 field to the end of the block.
+    """
+    meta = {
+        'image':     image_name,
+        'timestamp': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'version':   OCI2BIN_VERSION,
+    }
+    if digest:
+        meta['digest'] = digest
+    json_bytes = json.dumps(meta).encode() + b'\x00'
+    total_size = 4 + len(META_MAGIC) + len(json_bytes)
+    return struct.pack('<I', total_size) + META_MAGIC + json_bytes
+
+
+def build_polyglot(loader_path, image_name, output_path, tar_path=None,
+                   digest=None, image_name_for_meta=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
-    docker save.
+    docker save. digest is the content-addressed image digest for the metadata block.
+    image_name_for_meta overrides image_name in the embedded metadata block.
     """
 
     PAGE_SIZE = 4096
@@ -408,9 +433,12 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None):
     # docker load sees these as top-level entries: manifest.json, config, layers.
     polyglot += oci_data
 
-    # 10. Write output
+    # 10. Write output (polyglot + metadata block)
+    meta_image = image_name_for_meta if image_name_for_meta else image_name
+    meta_block = build_meta_block(meta_image, digest)
     with open(output_path, 'wb') as f:
         f.write(polyglot)
+        f.write(meta_block)
 
     os.chmod(output_path, 0o755)
 
@@ -445,6 +473,12 @@ def main():
                         help='Output polyglot file path')
     parser.add_argument('--tar', default=None,
                         help='Path to a pre-saved OCI tar (skips docker save)')
+    parser.add_argument('--image-name', default=None,
+                        help='Image name/tag to embed in metadata block '
+                             '(defaults to --image value)')
+    parser.add_argument('--digest', default=None,
+                        help='Image digest to embed in metadata block '
+                             '(e.g. redis@sha256:abc123...)')
 
     args = parser.parse_args()
 
@@ -456,7 +490,11 @@ def main():
         print(f"Tar not found: {args.tar}", file=sys.stderr)
         sys.exit(1)
 
-    build_polyglot(args.loader, args.image, args.output, tar_path=args.tar)
+    image_name_for_meta = args.image_name if args.image_name else args.image
+    build_polyglot(args.loader, args.image, args.output,
+                   tar_path=args.tar,
+                   digest=args.digest,
+                   image_name_for_meta=image_name_for_meta)
 
 
 if __name__ == '__main__':

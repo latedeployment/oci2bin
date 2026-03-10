@@ -249,17 +249,25 @@ fi
 
 # ── build polyglot ────────────────────────────────────────────────────────
 
+# Build common extra args for metadata embedding
+DIGEST_ARG=()
+[[ -n "${DIGEST:-}" ]] && DIGEST_ARG=(--digest "$DIGEST")
+
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
-        --loader "$LOADER" \
-        --image  "$BUILD_IMAGE_ARG" \
-        --tar    "$BUILD_TAR_ARG" \
-        --output "$OUTPUT"
+        --loader     "$LOADER" \
+        --image      "$BUILD_IMAGE_ARG" \
+        --tar        "$BUILD_TAR_ARG" \
+        --image-name "$IMAGE" \
+        "${DIGEST_ARG[@]}" \
+        --output     "$OUTPUT"
 else
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
-        --loader "$LOADER" \
-        --image  "$IMAGE"  \
-        --output "$OUTPUT"
+        --loader     "$LOADER" \
+        --image      "$IMAGE" \
+        --image-name "$IMAGE" \
+        "${DIGEST_ARG[@]}" \
+        --output     "$OUTPUT"
 fi
 
 # ── populate cache if requested ───────────────────────────────────────────

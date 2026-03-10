@@ -344,6 +344,18 @@ Both `rlim_cur` and `rlim_max` are set to the given value. Failure is non-fatal 
 | `as` | `RLIMIT_AS` — virtual memory in bytes |
 | `fsize` | `RLIMIT_FSIZE` — max file size in bytes |
 
+## Embedded build metadata
+
+Every binary built by oci2bin has a small metadata block appended after the TAR end-of-archive marker. The block does not affect ELF execution (the kernel stops reading at the last PT_LOAD segment) or tar parsing (appended after the `\x00\x00` end-of-archive).
+
+The block contains:
+- Image name and tag
+- Build timestamp (UTC ISO-8601)
+- OCI image digest (if available — from `docker inspect`)
+- oci2bin version string
+
+Use `oci2bin inspect` to display it (see below).
+
 ## Inspecting binaries
 
 Use `oci2bin inspect` to display the metadata embedded in any oci2bin binary without running it:
