@@ -160,6 +160,16 @@ By default containers run in host networking mode — they share the host networ
 
 `--net none` adds `CLONE_NEWNET` to the namespace flags. The container gets its own network stack with only a loopback interface and cannot reach the host network or internet.
 
+## Read-only containers
+
+`--read-only` mounts the rootfs read-only by setting up an overlayfs. The original rootfs becomes the lower layer; writes go to a temporary upper layer that is discarded when the container exits. The on-disk rootfs is never modified.
+
+```bash
+./alpine_latest --read-only /bin/sh -c 'touch /test'   # write fails or goes to overlay
+```
+
+If the kernel does not support overlayfs (e.g. older kernels without `CONFIG_OVERLAY_FS`), a warning is printed and the container runs read-write instead.
+
 ## Testing
 
 ```bash

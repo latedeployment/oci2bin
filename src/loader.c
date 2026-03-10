@@ -49,6 +49,9 @@ struct container_opts
     /* --net host|none  (NULL means host; "none" adds CLONE_NEWNET) */
     char* net;
 
+    /* --read-only  (mount overlay so rootfs is not modified) */
+    int read_only;
+
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
     int   n_env;
@@ -893,6 +896,59 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     /* Set up volume bind mounts BEFORE chroot (host paths still reachable) */
     setup_volumes(rootfs, opts);
 
+    /* --read-only: mount overlayfs so the rootfs is not modified at runtime.
+     * upper/work dirs live in the tmpdir (parent of rootfs). */
+    if (opts->read_only)
+    {
+        /* Derive tmpdir by stripping trailing "/rootfs" suffix */
+        char tmpdir[PATH_MAX];
+        int tmpdir_ok = 0;
+        int tlen = snprintf(tmpdir, sizeof(tmpdir), "%s", rootfs);
+        if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
+        {
+            char* slash = strrchr(tmpdir, '/');
+            if (slash && strcmp(slash, "/rootfs") == 0)
+            {
+                *slash = '\0';
+                tmpdir_ok = 1;
+            }
+            else
+            {
+                /* Fallback: rootfs path has unexpected structure; use parent */
+                tlen = snprintf(tmpdir, sizeof(tmpdir), "%s/..", rootfs);
+                if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
+                {
+                    tmpdir_ok = 1;
+                }
+            }
+        }
+        if (tmpdir_ok)
+        {
+            char upper[PATH_MAX];
+            char work[PATH_MAX];
+            int ulen = snprintf(upper, sizeof(upper), "%s/upper", tmpdir);
+            int wlen = snprintf(work,  sizeof(work),  "%s/work",  tmpdir);
+            if (ulen > 0 && (size_t)ulen < sizeof(upper) &&
+                    wlen > 0 && (size_t)wlen < sizeof(work))
+            {
+                mkdir(upper, 0755);
+                mkdir(work,  0755);
+                char overlay_opts[PATH_MAX * 4];
+                int olen = snprintf(overlay_opts, sizeof(overlay_opts),
+                                    "lowerdir=%s,upperdir=%s,workdir=%s",
+                                    rootfs, upper, work);
+                if (olen > 0 && (size_t)olen < sizeof(overlay_opts))
+                {
+                    if (mount("overlay", rootfs, "overlay", 0, overlay_opts) < 0)
+                    {
+                        fprintf(stderr,
+                                "oci2bin: overlayfs unavailable, running read-write\n");
+                    }
+                }
+            }
+        }
+    }
+
     /* Chroot into rootfs */
     if (chroot(rootfs) < 0)
     {
@@ -1041,6 +1097,7 @@ static void usage(const char* prog)
             "  --entrypoint PATH   Override the image entrypoint\n"
             "  --workdir PATH      Set the working directory inside the container\n"
             "  --net host|none     Network mode: host (default) or none (isolated)\n"
+            "  --read-only         Mount rootfs read-only via overlayfs\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -1140,6 +1197,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->net = argv[i];
+        }
+        else if (strcmp(argv[i], "--read-only") == 0)
+        {
+            opts->read_only = 1;
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
         {
