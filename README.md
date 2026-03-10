@@ -269,6 +269,24 @@ Use `--tmpfs` to mount a fresh in-memory filesystem at any path inside the conta
 
 Paths must be absolute and must not contain `..`. The mount uses `MS_NOSUID|MS_NODEV` flags. Failure is non-fatal. May be repeated.
 
+## Merging image layers
+
+Use `--layer` to overlay additional Docker images on top of the base image. This lets you compose a binary from multiple images — for example, adding a sidecar tool on top of your application image:
+
+```bash
+oci2bin --layer debugtools:latest myapp:latest myapp-debug
+```
+
+Multiple `--layer` flags are applied in order:
+
+```bash
+oci2bin --layer layer1:latest --layer layer2:latest base:latest output
+```
+
+The base image layers come first. Each `--layer` image's layers are appended on top. The image config (Cmd, Entrypoint, Env) from the last `--layer` image overrides the base if non-null.
+
+Requires `docker save` access to each image. Images not already present locally are pulled automatically.
+
 ## Resource limits
 
 Use `--ulimit` to set resource limits via `setrlimit(2)` inside the container:

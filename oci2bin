@@ -15,6 +15,8 @@
 #                         Cross-compilation requires the matching musl cross-
 #                         compiler (aarch64-linux-musl-gcc) to be in PATH.
 #   --cache               Cache the output binary; skip rebuild if already built
+#   --layer IMAGE         Merge additional image layers on top of the base image
+#                         (may be repeated; layers are applied in order)
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -59,6 +61,7 @@ usage() {
 HOST_ARCH="$(uname -m)"
 TARGET_ARCH="$HOST_ARCH"
 USE_CACHE=0
+LAYER_IMAGES=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -70,6 +73,11 @@ while [[ $# -gt 0 ]]; do
         --cache)
             USE_CACHE=1
             shift
+            ;;
+        --layer)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --layer requires an IMAGE argument" >&2; exit 1; }
+            LAYER_IMAGES+=("$2")
+            shift 2
             ;;
         --help|-h)
             usage
@@ -142,12 +150,60 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker pull "$IMAGE"
 fi
 
+# ── merge layers if --layer was given ─────────────────────────────────────
+
+if [[ "${#LAYER_IMAGES[@]}" -gt 0 ]]; then
+    MERGE_TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$MERGE_TMPDIR"' EXIT
+
+    # Save base image
+    BASE_TAR="$MERGE_TMPDIR/base.tar"
+    echo "oci2bin: saving base image $IMAGE..."
+    docker save -o "$BASE_TAR" "$IMAGE"
+
+    MERGE_ARGS=(--base "$BASE_TAR")
+
+    # Save each --layer image
+    idx=0
+    for layer_img in "${LAYER_IMAGES[@]}"; do
+        if ! docker image inspect "$layer_img" >/dev/null 2>&1; then
+            echo "oci2bin: pulling layer image $layer_img..."
+            docker pull "$layer_img"
+        fi
+        layer_tar="$MERGE_TMPDIR/layer${idx}.tar"
+        echo "oci2bin: saving layer image $layer_img..."
+        docker save -o "$layer_tar" "$layer_img"
+        MERGE_ARGS+=(--layer "$layer_tar")
+        idx=$((idx + 1))
+    done
+
+    MERGED_TAR="$MERGE_TMPDIR/merged.tar"
+    python3 "$OCI2BIN_HOME/scripts/merge_layers.py" \
+        "${MERGE_ARGS[@]}" --output "$MERGED_TAR"
+
+    # Build polyglot from merged tar (pass via stdin workaround: use temp image name)
+    # build_polyglot.py accepts --tar directly via docker save output path
+    BUILD_IMAGE_ARG="$IMAGE"
+    BUILD_TAR_ARG="$MERGED_TAR"
+else
+    BUILD_IMAGE_ARG="$IMAGE"
+    BUILD_TAR_ARG=""
+fi
+
 # ── build polyglot ────────────────────────────────────────────────────────
 
-python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
-    --loader "$LOADER" \
-    --image  "$IMAGE"  \
-    --output "$OUTPUT"
+if [[ -n "$BUILD_TAR_ARG" ]]; then
+    python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
+        --loader "$LOADER" \
+        --image  "$BUILD_IMAGE_ARG" \
+        --tar    "$BUILD_TAR_ARG" \
+        --output "$OUTPUT"
+else
+    python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
+        --loader "$LOADER" \
+        --image  "$IMAGE"  \
+        --output "$OUTPUT"
+fi
 
 # ── populate cache if requested ───────────────────────────────────────────
 

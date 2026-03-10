@@ -258,8 +258,12 @@ def get_oci_tar(image_name, output_path):
         sys.exit(1)
 
 
-def build_polyglot(loader_path, image_name, output_path):
-    """Build the TAR+ELF polyglot file."""
+def build_polyglot(loader_path, image_name, output_path, tar_path=None):
+    """Build the TAR+ELF polyglot file.
+
+    If tar_path is given, use it as the pre-saved OCI tar instead of running
+    docker save.
+    """
 
     PAGE_SIZE = 4096
     TAR_BLOCK = 512
@@ -279,12 +283,16 @@ def build_polyglot(loader_path, image_name, output_path):
     loader_size = len(loader_raw)
 
     # 2. Get the OCI tar data
-    with tempfile.TemporaryDirectory() as tmpdir:
-        oci_tar_path = os.path.join(tmpdir, 'image.tar')
-        get_oci_tar(image_name, oci_tar_path)
-
-        with open(oci_tar_path, 'rb') as f:
+    if tar_path is not None:
+        with open(tar_path, 'rb') as f:
             oci_data = f.read()
+    else:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            oci_tar_path = os.path.join(tmpdir, 'image.tar')
+            get_oci_tar(image_name, oci_tar_path)
+
+            with open(oci_tar_path, 'rb') as f:
+                oci_data = f.read()
 
     oci_size = len(oci_data)
 
@@ -435,6 +443,8 @@ def main():
                         help='Docker image name (e.g., alpine:latest)')
     parser.add_argument('--output', default='oci2bin.img',
                         help='Output polyglot file path')
+    parser.add_argument('--tar', default=None,
+                        help='Path to a pre-saved OCI tar (skips docker save)')
 
     args = parser.parse_args()
 
@@ -442,7 +452,11 @@ def main():
         print(f"Loader not found: {args.loader}", file=sys.stderr)
         sys.exit(1)
 
-    build_polyglot(args.loader, args.image, args.output)
+    if args.tar is not None and not os.path.isfile(args.tar):
+        print(f"Tar not found: {args.tar}", file=sys.stderr)
+        sys.exit(1)
+
+    build_polyglot(args.loader, args.image, args.output, tar_path=args.tar)
 
 
 if __name__ == '__main__':
