@@ -33,6 +33,8 @@
 #   --no-seccomp          Disable the default seccomp syscall filter
 #   --user UID[:GID]      Run as this numeric UID (and optional GID)
 #   --hostname NAME       Set the hostname inside the container
+#   --cap-drop CAP        Drop a Linux capability (or 'all' to drop all)
+#   --cap-add CAP         Add an ambient capability (use after --cap-drop all)
 #   --env-file FILE       Load KEY=VALUE pairs from FILE (additive with -e)
 #   --tmpfs PATH          Mount a fresh tmpfs at PATH inside the container
 #   --ulimit TYPE=N       Set resource limit (nofile, nproc, cpu, as, fsize)

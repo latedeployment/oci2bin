@@ -91,6 +91,11 @@ struct container_opts
     gid_t run_gid;
     int   has_user;   /* 1 if --user was given */
 
+    /* --cap-drop / --cap-add  (capability management) */
+    int      cap_drop_all;     /* 1 if --cap-drop all was given */
+    uint64_t cap_drop_mask;    /* bitmask of individual caps to drop */
+    uint64_t cap_add_mask;     /* bitmask of caps to add (ambient) */
+
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
     int   n_env;
@@ -1014,6 +1019,222 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
     }
 }
 
+/* ── capability management ───────────────────────────────────────────────── */
+
+/*
+ * Inline definitions for capset(2) to avoid depending on libcap headers.
+ * These match the kernel ABI defined in linux/capability.h.
+ */
+#define _LINUX_CAPABILITY_VERSION_3  0x20080522
+#define _LINUX_CAPABILITY_U32S_3     2
+
+struct cap_header
+{
+    uint32_t version;
+    int      pid;
+};
+
+struct cap_data
+{
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+};
+
+/*
+ * Map a capability name (case-insensitive, with or without "CAP_" prefix)
+ * to its number (0-40). Returns -1 if unknown.
+ */
+static int cap_name_to_num(const char* name)
+{
+    /* normalise: skip "cap_" or "CAP_" prefix */
+    const char* n = name;
+    if ((n[0] == 'c' || n[0] == 'C') &&
+            (n[1] == 'a' || n[1] == 'A') &&
+            (n[2] == 'p' || n[2] == 'P') &&
+            n[3] == '_')
+    {
+        n += 4;
+    }
+    /* lowercase comparison via tolower-equivalent inline */
+#define STREQI(a, b) (strcasecmp((a), (b)) == 0)
+    if (STREQI(n, "chown"))
+    {
+        return 0;
+    }
+    if (STREQI(n, "dac_override"))
+    {
+        return 1;
+    }
+    if (STREQI(n, "dac_read_search"))
+    {
+        return 2;
+    }
+    if (STREQI(n, "fowner"))
+    {
+        return 3;
+    }
+    if (STREQI(n, "fsetid"))
+    {
+        return 4;
+    }
+    if (STREQI(n, "kill"))
+    {
+        return 5;
+    }
+    if (STREQI(n, "setgid"))
+    {
+        return 6;
+    }
+    if (STREQI(n, "setuid"))
+    {
+        return 7;
+    }
+    if (STREQI(n, "setpcap"))
+    {
+        return 8;
+    }
+    if (STREQI(n, "net_bind_service"))
+    {
+        return 10;
+    }
+    if (STREQI(n, "net_raw"))
+    {
+        return 13;
+    }
+    if (STREQI(n, "sys_chroot"))
+    {
+        return 18;
+    }
+    if (STREQI(n, "mknod"))
+    {
+        return 27;
+    }
+    if (STREQI(n, "audit_write"))
+    {
+        return 29;
+    }
+    if (STREQI(n, "setfcap"))
+    {
+        return 31;
+    }
+    if (STREQI(n, "net_admin"))
+    {
+        return 12;
+    }
+    if (STREQI(n, "sys_admin"))
+    {
+        return 21;
+    }
+    if (STREQI(n, "sys_ptrace"))
+    {
+        return 19;
+    }
+    if (STREQI(n, "sys_module"))
+    {
+        return 16;
+    }
+    if (STREQI(n, "ipc_lock"))
+    {
+        return 14;
+    }
+#undef STREQI
+    return -1;
+}
+
+/*
+ * Apply capability bounding set drops and ambient cap raises.
+ * Called after chroot/chdir and before seccomp.
+ */
+static void apply_capabilities(const struct container_opts* opts)
+{
+    int cap;
+
+    if (opts->cap_drop_all)
+    {
+        /*
+         * When --cap-drop all is combined with --cap-add, we must set up
+         * permitted+inheritable and raise ambient BEFORE dropping from the
+         * bounding set.  PR_CAP_AMBIENT_RAISE requires the cap to still be
+         * in the bounding set at the time of the call; if we drop the bounding
+         * set first, the ambient raise will always fail with EPERM.
+         *
+         * Order:
+         *   1. capset: put add_mask into permitted+inheritable
+         *   2. PR_CAP_AMBIENT_RAISE for each cap in add_mask
+         *   3. PR_CAPBSET_DROP for every cap NOT in add_mask
+         */
+        if (opts->cap_add_mask)
+        {
+            /* Step 1: set permitted+inheritable so ambient raise can succeed */
+            struct cap_header hdr;
+            struct cap_data   data[2];
+            memset(&hdr,  0, sizeof(hdr));
+            memset(data,  0, sizeof(data));
+            hdr.version = _LINUX_CAPABILITY_VERSION_3;
+            hdr.pid     = 0;
+            data[0].permitted   = (uint32_t)(opts->cap_add_mask & 0xFFFFFFFF);
+            data[0].inheritable = (uint32_t)(opts->cap_add_mask & 0xFFFFFFFF);
+            data[1].permitted   = (uint32_t)(opts->cap_add_mask >> 32);
+            data[1].inheritable = (uint32_t)(opts->cap_add_mask >> 32);
+            if (syscall(SYS_capset, &hdr, data) < 0)
+            {
+                fprintf(stderr, "oci2bin: capset for --cap-add: %s (non-fatal)\n",
+                        strerror(errno));
+            }
+            /* Step 2: raise ambient caps (bounding set still intact here) */
+            for (cap = 0; cap <= 40; cap++)
+            {
+                if (!((opts->cap_add_mask >> cap) & 1))
+                {
+                    continue;
+                }
+                if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE,
+                          (unsigned long)cap, 0, 0) < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: PR_CAP_AMBIENT_RAISE %d: %s (non-fatal)\n",
+                            cap, strerror(errno));
+                }
+            }
+        }
+        /* Step 3: drop all bounding-set caps except those being re-added */
+        for (cap = 0; cap <= 40; cap++)
+        {
+            if ((opts->cap_add_mask >> cap) & 1)
+            {
+                continue; /* keep in bounding set — ambient needs it */
+            }
+            if (prctl(PR_CAPBSET_DROP, (unsigned long)cap, 0, 0, 0) < 0)
+            {
+                if (errno != EINVAL) /* EINVAL = cap doesn't exist on this kernel */
+                {
+                    fprintf(stderr,
+                            "oci2bin: PR_CAPBSET_DROP %d: %s (non-fatal)\n",
+                            cap, strerror(errno));
+                }
+            }
+        }
+    }
+    else if (opts->cap_drop_mask)
+    {
+        /* Drop only specified caps from the bounding set */
+        for (cap = 0; cap <= 40; cap++)
+        {
+            if (!((opts->cap_drop_mask >> cap) & 1))
+            {
+                continue;
+            }
+            if (prctl(PR_CAPBSET_DROP, (unsigned long)cap, 0, 0, 0) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: PR_CAPBSET_DROP %d: %s (non-fatal)\n",
+                        cap, strerror(errno));
+            }
+        }
+    }
+}
+
 /* ── seccomp ─────────────────────────────────────────────────────────────── */
 
 /*
@@ -1594,6 +1815,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Apply capability drops/adds before seccomp locks things down */
+    if (opts->cap_drop_all || opts->cap_drop_mask || opts->cap_add_mask)
+    {
+        apply_capabilities(opts);
+    }
+
     /* Apply seccomp filter just before exec (all setup is complete) */
     if (!opts->no_seccomp)
     {
@@ -1744,6 +1971,8 @@ static void usage(const char* prog)
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
             "  --hostname NAME     Set the hostname inside the container\n"
+            "  --cap-drop CAP      Drop a capability (or 'all' to drop all)\n"
+            "  --cap-add CAP       Add an ambient capability (use after --cap-drop all)\n"
             "  --env-file FILE     Load KEY=VALUE pairs from FILE\n"
             "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
             "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
@@ -1994,6 +2223,49 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-seccomp") == 0)
         {
             opts->no_seccomp = 1;
+        }
+        else if (strcmp(argv[i], "--cap-drop") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --cap-drop requires a CAP argument\n");
+                return -1;
+            }
+            i++;
+            if (strcasecmp(argv[i], "all") == 0)
+            {
+                opts->cap_drop_all = 1;
+            }
+            else
+            {
+                int cn = cap_name_to_num(argv[i]);
+                if (cn < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --cap-drop: unknown capability '%s'\n",
+                            argv[i]);
+                    return -1;
+                }
+                opts->cap_drop_mask |= (uint64_t)1 << cn;
+            }
+        }
+        else if (strcmp(argv[i], "--cap-add") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --cap-add requires a CAP argument\n");
+                return -1;
+            }
+            i++;
+            int cn = cap_name_to_num(argv[i]);
+            if (cn < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --cap-add: unknown capability '%s'\n",
+                        argv[i]);
+                return -1;
+            }
+            opts->cap_add_mask |= (uint64_t)1 << cn;
         }
         else if (strcmp(argv[i], "--hostname") == 0)
         {

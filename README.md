@@ -322,6 +322,25 @@ Can be combined with `--layer`:
 oci2bin --strip --layer extra:latest base:latest output
 ```
 
+## Capabilities
+
+Use `--cap-drop` and `--cap-add` to manage Linux capabilities inside the container:
+
+```bash
+# Drop all capabilities (maximum restriction)
+./my-app --cap-drop all
+
+# Drop all, but keep net_bind_service (bind to ports < 1024)
+./my-app --cap-drop all --cap-add net_bind_service
+
+# Drop individual capabilities
+./my-app --cap-drop net_raw --cap-drop sys_ptrace
+```
+
+Capability names are case-insensitive and the `CAP_` prefix is optional (`net_raw` and `CAP_NET_RAW` are equivalent). Supported names: `chown`, `dac_override`, `dac_read_search`, `fowner`, `fsetid`, `kill`, `setgid`, `setuid`, `setpcap`, `net_bind_service`, `net_raw`, `net_admin`, `sys_chroot`, `sys_admin`, `sys_ptrace`, `sys_module`, `mknod`, `audit_write`, `setfcap`, `ipc_lock`.
+
+`--cap-drop all` uses `PR_CAPBSET_DROP` to remove all capabilities from the bounding set (caps 0–40). `--cap-add` then raises the specified capabilities as ambient capabilities so they survive `exec`. Capability operations are non-fatal; failures print a warning and continue.
+
 ## Resource limits
 
 Use `--ulimit` to set resource limits via `setrlimit(2)` inside the container:
