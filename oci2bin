@@ -17,6 +17,7 @@
 #   --cache               Cache the output binary; skip rebuild if already built
 #   --layer IMAGE         Merge additional image layers on top of the base image
 #                         (may be repeated; layers are applied in order)
+#   --strip               Remove docs/man/locale/cache from the image before packaging
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -62,6 +63,7 @@ HOST_ARCH="$(uname -m)"
 TARGET_ARCH="$HOST_ARCH"
 USE_CACHE=0
 LAYER_IMAGES=()
+DO_STRIP=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -78,6 +80,10 @@ while [[ $# -gt 0 ]]; do
             [[ $# -lt 2 ]] && { echo "oci2bin: --layer requires an IMAGE argument" >&2; exit 1; }
             LAYER_IMAGES+=("$2")
             shift 2
+            ;;
+        --strip)
+            DO_STRIP=1
+            shift
             ;;
         --help|-h)
             usage
@@ -188,6 +194,26 @@ if [[ "${#LAYER_IMAGES[@]}" -gt 0 ]]; then
 else
     BUILD_IMAGE_ARG="$IMAGE"
     BUILD_TAR_ARG=""
+fi
+
+# ── strip if requested ────────────────────────────────────────────────────
+
+if [[ "$DO_STRIP" -eq 1 ]]; then
+    # Need a tar to strip — save now if not already saved by --layer logic
+    if [[ -z "$BUILD_TAR_ARG" ]]; then
+        STRIP_TMPDIR="$(mktemp -d)"
+        trap 'rm -rf "$STRIP_TMPDIR"' EXIT
+        BASE_TAR_FOR_STRIP="$STRIP_TMPDIR/base.tar"
+        echo "oci2bin: saving $IMAGE for stripping..."
+        docker save -o "$BASE_TAR_FOR_STRIP" "$IMAGE"
+        BUILD_TAR_ARG="$BASE_TAR_FOR_STRIP"
+    fi
+    STRIPPED_TAR="${BUILD_TAR_ARG%.tar}_stripped.tar"
+    echo "oci2bin: stripping docs/man/locale from image..."
+    python3 "$OCI2BIN_HOME/scripts/strip_image.py" \
+        --input  "$BUILD_TAR_ARG" \
+        --output "$STRIPPED_TAR"
+    BUILD_TAR_ARG="$STRIPPED_TAR"
 fi
 
 # ── build polyglot ────────────────────────────────────────────────────────

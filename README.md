@@ -287,6 +287,31 @@ The base image layers come first. Each `--layer` image's layers are appended on 
 
 Requires `docker save` access to each image. Images not already present locally are pulled automatically.
 
+## Stripping images
+
+Use `--strip` to remove documentation, man pages, locale data, and apt caches from the image before packaging:
+
+```bash
+oci2bin --strip ubuntu:22.04 my-ubuntu
+```
+
+The following path prefixes are removed from every layer:
+
+- `usr/share/doc/`
+- `usr/share/man/`
+- `usr/share/info/`
+- `usr/share/locale/`
+- `usr/share/i18n/`
+- `var/cache/apt/`
+- `var/lib/apt/lists/`
+- `tmp/`
+
+Can be combined with `--layer`:
+
+```bash
+oci2bin --strip --layer extra:latest base:latest output
+```
+
 ## Resource limits
 
 Use `--ulimit` to set resource limits via `setrlimit(2)` inside the container:
