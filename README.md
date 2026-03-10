@@ -414,6 +414,28 @@ The block contains:
 
 Use `oci2bin inspect` to display it (see below).
 
+## Injecting files at build time
+
+Use `--add-file` and `--add-dir` to inject host files or directories into the image at build time, without needing a separate Docker layer or a volume mount at runtime:
+
+```bash
+# Inject a single config file
+oci2bin --add-file ./myapp.conf:/etc/myapp/myapp.conf myapp:latest
+
+# Inject a CA certificate bundle
+oci2bin --add-file /etc/ssl/certs/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt base:latest
+
+# Inject an entire directory
+oci2bin --add-dir ./config:/etc/myapp myapp:latest
+
+# Combine both
+oci2bin --add-file ./secret.pem:/run/secrets/key.pem \
+        --add-dir  ./migrations:/app/migrations \
+        myapp:latest
+```
+
+The files are added as a new layer on top of the existing image layers. The layer is created at build time from the host filesystem and embedded directly in the output binary — no runtime mounts needed.
+
 ## Inspecting binaries
 
 Use `oci2bin inspect` to display the metadata embedded in any oci2bin binary without running it:

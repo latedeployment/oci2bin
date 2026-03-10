@@ -19,6 +19,10 @@
 #   --layer IMAGE         Merge additional image layers on top of the base image
 #                         (may be repeated; layers are applied in order)
 #   --strip               Remove docs/man/locale/cache from the image before packaging
+#   --add-file HOST:CONTAINER
+#                         Inject a host file into the image at build time (repeatable)
+#   --add-dir  HOST:CONTAINER
+#                         Inject a host directory recursively (repeatable)
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -82,6 +86,8 @@ TARGET_ARCH="$HOST_ARCH"
 USE_CACHE=0
 LAYER_IMAGES=()
 DO_STRIP=0
+ADD_FILE_ARGS=()
+ADD_DIR_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -102,6 +108,16 @@ while [[ $# -gt 0 ]]; do
         --strip)
             DO_STRIP=1
             shift
+            ;;
+        --add-file)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --add-file requires HOST:CONTAINER" >&2; exit 1; }
+            ADD_FILE_ARGS+=("$2")
+            shift 2
+            ;;
+        --add-dir)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --add-dir requires HOST:CONTAINER" >&2; exit 1; }
+            ADD_DIR_ARGS+=("$2")
+            shift 2
             ;;
         --help|-h)
             usage
@@ -251,6 +267,32 @@ if [[ "$DO_STRIP" -eq 1 ]]; then
         --input  "$BUILD_TAR_ARG" \
         --output "$STRIPPED_TAR"
     BUILD_TAR_ARG="$STRIPPED_TAR"
+fi
+
+# ── inject --add-file / --add-dir if requested ────────────────────────────
+
+if [[ "${#ADD_FILE_ARGS[@]}" -gt 0 || "${#ADD_DIR_ARGS[@]}" -gt 0 ]]; then
+    # Need a tar to inject into — save now if not already saved
+    if [[ -z "$BUILD_TAR_ARG" ]]; then
+        INJECT_TMPDIR="$(mktemp -d)"
+        trap 'rm -rf "$INJECT_TMPDIR"' EXIT
+        BASE_TAR_FOR_INJECT="$INJECT_TMPDIR/base.tar"
+        echo "oci2bin: saving $IMAGE for file injection..."
+        docker save -o "$BASE_TAR_FOR_INJECT" "$IMAGE"
+        BUILD_TAR_ARG="$BASE_TAR_FOR_INJECT"
+    fi
+    INJECTED_TAR="${BUILD_TAR_ARG%.tar}_injected.tar"
+
+    INJECT_ARGS=()
+    for f in "${ADD_FILE_ARGS[@]}"; do INJECT_ARGS+=(--file "$f"); done
+    for d in "${ADD_DIR_ARGS[@]}";  do INJECT_ARGS+=(--dir  "$d"); done
+
+    echo "oci2bin: injecting files/dirs into image..."
+    python3 "$OCI2BIN_HOME/scripts/add_files.py" \
+        --input  "$BUILD_TAR_ARG" \
+        --output "$INJECTED_TAR" \
+        "${INJECT_ARGS[@]}"
+    BUILD_TAR_ARG="$INJECTED_TAR"
 fi
 
 # ── build polyglot ────────────────────────────────────────────────────────
