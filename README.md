@@ -13,6 +13,8 @@ The output file is also a valid tar archive accepted by `docker load`:
 docker load < alpine_latest
 ```
 
+See [How it works](#how-it-works).
+
 ## Table of contents
 
 - [Getting started](#getting-started)
