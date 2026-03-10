@@ -31,13 +31,14 @@ install: build/loader
 	install -d $(PREFIX)/bin
 	install -d $(PREFIX)/share/oci2bin/scripts
 	install -d $(PREFIX)/share/oci2bin/build
-	install -m 755 polydocker $(PREFIX)/bin/oci2bin
+	install -d $(PREFIX)/share/oci2bin/src
+	install -m 755 oci2bin $(PREFIX)/bin/oci2bin
 	install -m 644 scripts/build_polyglot.py $(PREFIX)/share/oci2bin/scripts/
 	install -m 644 src/loader.c $(PREFIX)/share/oci2bin/src/
 	install -m 755 build/loader $(PREFIX)/share/oci2bin/build/
 	sed -i 's|OCI2BIN_HOME:-\$$SCRIPT_DIR|OCI2BIN_HOME:-$(PREFIX)/share/oci2bin|' \
 		$(PREFIX)/bin/oci2bin
-	@echo "Installed. Run: polydocker <image>"
+	@echo "Installed. Run: oci2bin <image>"
 
 uninstall:
 	rm -f $(PREFIX)/bin/oci2bin
