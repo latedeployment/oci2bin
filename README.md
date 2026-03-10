@@ -45,6 +45,17 @@ After cloning the repository, run `oci2bin` with an image name. The loader is co
 ./oci2bin nginx:1.25 my-nginx  # explicit output name
 ```
 
+### Caching builds
+
+`--cache` stores the output binary in `~/.cache/oci2bin/<image>/output` so repeated builds of the same image are instant:
+
+```bash
+./oci2bin --cache alpine:latest   # builds and caches
+./oci2bin --cache alpine:latest   # returns cached binary immediately
+```
+
+The cache key is derived from the image name (`:` and `/` replaced with `_`). To rebuild, delete the cache entry: `rm -rf ~/.cache/oci2bin/alpine_latest`.
+
 ## Running containers
 
 By default, the binary executes the image's configured entrypoint — equivalent to `docker run <image>`:
