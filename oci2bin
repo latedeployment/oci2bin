@@ -18,6 +18,9 @@
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
+#   --secret HOST_FILE[:CONTAINER_PATH]
+#                         Bind mount a host file read-only into the container;
+#                         defaults to /run/secrets/<basename> (may be repeated)
 #   --entrypoint PATH     Override the image entrypoint
 #   --workdir PATH        Set the working directory inside the container
 #   --net host|none       Network mode: host (default) or none (isolated)

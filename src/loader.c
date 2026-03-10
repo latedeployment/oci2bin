@@ -25,11 +25,12 @@ static volatile unsigned long OCI_DATA_SIZE   = 0xCAFEBABEDEADBEEFUL;
 static volatile unsigned long OCI_PATCHED     = 0xAAAAAAAAAAAAAAAAUL;
 
 /* Max layers / volumes / exec args we support */
-#define MAX_LAYERS  128
-#define MAX_VOLUMES  32
-#define MAX_ARGS     64
-#define MAX_ENV      64
-#define BUF_SIZE   65536
+#define MAX_LAYERS   128
+#define MAX_VOLUMES   32
+#define MAX_SECRETS   32
+#define MAX_ARGS      64
+#define MAX_ENV       64
+#define BUF_SIZE    65536
 
 /* ── runtime options parsed from argv ───────────────────────────────────── */
 
@@ -39,6 +40,11 @@ struct container_opts
     char* vol_host[MAX_VOLUMES];
     char* vol_ctr[MAX_VOLUMES];
     int   n_vols;
+
+    /* --secret HOST_FILE[:CONTAINER_PATH]  (read-only file mounts) */
+    char* secret_host[MAX_SECRETS];
+    char* secret_ctr[MAX_SECRETS];    /* NULL → /run/secrets/<basename> */
+    int   n_secrets;
 
     /* --entrypoint /path  (overrides OCI Entrypoint) */
     char* entrypoint;
@@ -823,6 +829,158 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
     }
 }
 
+/*
+ * Bind-mount secret files (read-only) into the container rootfs.
+ * Each secret is a single file; if no container path is given,
+ * it lands at /run/secrets/<basename>.  Called pre-chroot.
+ */
+static void setup_secrets(const char* rootfs, struct container_opts *opts)
+{
+    if (opts->n_secrets == 0)
+    {
+        return;
+    }
+
+    /* Ensure /run/secrets exists in the rootfs */
+    char run_secrets[PATH_MAX];
+    if (snprintf(run_secrets, sizeof(run_secrets), "%s/run/secrets", rootfs)
+            >= (int)sizeof(run_secrets))
+    {
+        fprintf(stderr, "oci2bin: rootfs path too long for /run/secrets\n");
+        return;
+    }
+    /* mkdir /run first in case it doesn't exist */
+    char run_dir[PATH_MAX];
+    if (snprintf(run_dir, sizeof(run_dir), "%s/run",
+                 rootfs) >= (int)sizeof(run_dir))
+    {
+        fprintf(stderr, "oci2bin: rootfs path too long for /run\n");
+        return;
+    }
+    mkdir(run_dir, 0755);   /* EEXIST is expected and fine */
+    mkdir(run_secrets, 0700); /* EEXIST is expected and fine */
+
+    for (int i = 0; i < opts->n_secrets; i++)
+    {
+        const char* src  = opts->secret_host[i];
+        const char* ctr  = opts->secret_ctr[i]; /* may be NULL */
+
+        /* Validate src is absolute and has no '..' */
+        if (src[0] != '/')
+        {
+            fprintf(stderr, "oci2bin: --secret host path must be absolute: %s\n", src);
+            continue;
+        }
+        if (strstr(src, "..") != NULL)
+        {
+            fprintf(stderr, "oci2bin: --secret host path must not contain '..': %s\n",
+                    src);
+            continue;
+        }
+
+        /* Derive container path */
+        char ctr_buf[PATH_MAX];
+        if (ctr)
+        {
+            if (ctr[0] != '/')
+            {
+                fprintf(stderr,
+                        "oci2bin: --secret container path must be absolute: %s\n", ctr);
+                continue;
+            }
+            if (strstr(ctr, "..") != NULL)
+            {
+                fprintf(stderr,
+                        "oci2bin: --secret container path must not contain '..': %s\n",
+                        ctr);
+                continue;
+            }
+        }
+        else
+        {
+            /* Default: /run/secrets/<basename of src> */
+            const char* base = strrchr(src, '/');
+            base = base ? base + 1 : src;
+            if (base[0] == '\0')
+            {
+                fprintf(stderr, "oci2bin: --secret cannot derive basename from: %s\n",
+                        src);
+                continue;
+            }
+            int n = snprintf(ctr_buf, sizeof(ctr_buf), "/run/secrets/%s", base);
+            if (n < 0 || (size_t)n >= sizeof(ctr_buf))
+            {
+                fprintf(stderr, "oci2bin: --secret container path too long for: %s\n",
+                        src);
+                continue;
+            }
+            ctr = ctr_buf;
+        }
+
+        /* Build full destination path inside rootfs */
+        char dst[PATH_MAX];
+        int dlen = snprintf(dst, sizeof(dst), "%s%s", rootfs, ctr);
+        if (dlen < 0 || (size_t)dlen >= sizeof(dst))
+        {
+            fprintf(stderr, "oci2bin: --secret destination path too long: %s%s\n",
+                    rootfs, ctr);
+            continue;
+        }
+
+        /* Create parent directory if needed */
+        char par[PATH_MAX];
+        int plen = snprintf(par, sizeof(par), "%s", dst);
+        if (plen > 0 && (size_t)plen < sizeof(par))
+        {
+            char* slash = strrchr(par, '/');
+            if (slash && slash != par)
+            {
+                *slash = '\0';
+                mkdir(par, 0755);
+            }
+        }
+
+        /* Create an empty target file so bind-mount has something to attach to.
+         * O_CREAT|O_EXCL is atomic: no stat() pre-check needed or wanted. */
+        {
+            int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0000);
+            if (fd >= 0)
+            {
+                close(fd);
+            }
+            /* EEXIST is fine: file already present, bind-mount will attach to it */
+        }
+
+        /* Bind-mount the secret file read-only */
+        if (mount(src, dst, NULL, MS_BIND, NULL) < 0)
+        {
+            fprintf(stderr, "oci2bin: secret bind mount %s -> %s failed: %s\n",
+                    src, ctr, strerror(errno));
+            continue;
+        }
+        /* Re-mount read-only with no-exec/no-suid/no-dev.
+         * MS_BIND alone does not enforce read-only; a second mount(2) call is
+         * required.  If this step fails the secret is left writable, so we
+         * must unmount and skip rather than continue with a writable mount. */
+        if (mount(NULL, dst, NULL,
+                  MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV,
+                  NULL) < 0)
+        {
+            fprintf(stderr, "oci2bin: secret remount read-only %s failed: %s\n",
+                    ctr, strerror(errno));
+            /* Undo the writable bind-mount rather than leave it accessible */
+            if (umount2(dst, MNT_DETACH) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: warning: could not unmount writable secret %s: %s\n",
+                        dst, strerror(errno));
+            }
+            continue;
+        }
+        fprintf(stderr, "oci2bin: secret %s -> %s (read-only)\n", src, ctr);
+    }
+}
+
 static int container_main(const char* rootfs, struct container_opts *opts)
 {
     /* Read entrypoint/cmd config written by extract_oci_rootfs() */
@@ -895,6 +1053,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
 
     /* Set up volume bind mounts BEFORE chroot (host paths still reachable) */
     setup_volumes(rootfs, opts);
+    setup_secrets(rootfs, opts);
 
     /* --read-only: mount overlayfs so the rootfs is not modified at runtime.
      * upper/work dirs live in the tmpdir (parent of rootfs). */
@@ -1092,6 +1251,9 @@ static void usage(const char* prog)
             "Options:\n"
             "  -v HOST:CONTAINER   Bind mount a host path into the container\n"
             "                      (may be repeated)\n"
+            "  --secret HOST_FILE[:CONTAINER_PATH]\n"
+            "                      Bind mount a host file read-only; defaults to\n"
+            "                      /run/secrets/<basename> (may be repeated)\n"
             "  -e KEY=VALUE        Set an environment variable inside the container\n"
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
@@ -1144,6 +1306,35 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             opts->vol_host[opts->n_vols] = spec;
             opts->vol_ctr[opts->n_vols]  = colon + 1;
             opts->n_vols++;
+        }
+        else if (strcmp(argv[i], "--secret") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --secret requires a HOST_FILE[:CONTAINER_PATH] argument\n");
+                return -1;
+            }
+            if (opts->n_secrets >= MAX_SECRETS)
+            {
+                fprintf(stderr, "oci2bin: too many --secret flags (max %d)\n", MAX_SECRETS);
+                return -1;
+            }
+            i++;
+            char* spec   = argv[i];
+            char* colon  = strchr(spec, ':');
+            opts->secret_host[opts->n_secrets] = spec;
+            if (colon)
+            {
+                *colon = '\0';
+                opts->secret_ctr[opts->n_secrets] = colon + 1;
+            }
+            else
+            {
+                opts->secret_ctr[opts->n_secrets] =
+                    NULL; /* default to /run/secrets/<basename> */
+            }
+            opts->n_secrets++;
         }
         else if (strcmp(argv[i], "-e") == 0)
         {

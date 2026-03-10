@@ -120,6 +120,18 @@ When the command following `--entrypoint` begins with a `-`, use `--` to termina
   /bin/sh -c 'cp /input/file /output/'
 ```
 
+### Secrets
+
+`--secret HOST_FILE[:CONTAINER_PATH]` bind-mounts a single host file into the container read-only. If no container path is given, the file lands at `/run/secrets/<basename>`. The mount is enforced read-only with `MS_NOEXEC|MS_NOSUID|MS_NODEV`.
+
+```bash
+./my-app --secret ~/.config/api_key           # → /run/secrets/api_key
+./my-app --secret /etc/ssl/cert.pem:/certs/ca.pem
+./my-app --secret /run/secrets/db_pass --secret /run/secrets/jwt_key
+```
+
+If the remount read-only step fails the secret is not mounted at all, so container processes can never write to a host secret file.
+
 ### End of options
 
 `--` terminates option parsing. Arguments following it are passed to the container as-is, which is useful when the command begins with a `-`:
