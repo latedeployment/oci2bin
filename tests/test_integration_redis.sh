@@ -18,7 +18,8 @@ echo "TAP version 13"
 
 WORKDIR="$(mktemp -d)"
 BIN="$WORKDIR/redis_test"
-REDIS_PORT=16379   # use non-standard port to avoid conflicts
+# Pick a random free port in the ephemeral range to avoid conflicts
+REDIS_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
 REDIS_PID=""
 
 cleanup() {

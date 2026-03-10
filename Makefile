@@ -106,7 +106,7 @@ test-python:
 	@echo "=== Polyglot structure tests ==="
 	python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
 
-test-integration: test-integration-redis test-integration-nginx
+test-integration: test-integration-redis test-integration-nginx polyglot
 	@echo "=== Runtime integration tests ==="
 	@bash $(TESTS_DIR)/test_runtime.sh
 	@echo "=== Build integration tests ==="

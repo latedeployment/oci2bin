@@ -70,16 +70,16 @@ echo "1..$TAP_COUNT"
 
 if [[ ! -f "$IMG" ]]; then
     for i in $(seq 1 $TAP_COUNT); do
-        echo "not ok $i - SKIP: $IMG not found"
+        echo "ok $i # SKIP $IMG not found"
     done
-    exit 1
+    exit 0
 fi
 
 if [[ ! -x "$IMG" ]]; then
     for i in $(seq 1 $TAP_COUNT); do
-        echo "not ok $i - SKIP: $IMG not executable"
+        echo "ok $i # SKIP $IMG not executable"
     done
-    exit 1
+    exit 0
 fi
 
 # ── Test 1: Arg passthrough — simple echo ─────────────────────────────────
