@@ -414,6 +414,22 @@ The block contains:
 
 Use `oci2bin inspect` to display it (see below).
 
+## Using OCI image layout (no Docker daemon)
+
+Use `--oci-dir` to build from an OCI image layout directory instead of pulling via Docker. This lets you use tools like `skopeo`, `crane`, or `buildah` to fetch images without a running Docker daemon:
+
+```bash
+# Copy image to OCI layout using skopeo
+skopeo copy docker://redis:7-alpine oci:./redis-oci:latest
+
+# Build oci2bin binary from the layout directory
+oci2bin --oci-dir ./redis-oci redis:7-alpine redis_7-alpine
+```
+
+With `--oci-dir`, the `IMAGE` argument is optional and used only for the output filename default and embedded metadata. The Docker daemon is not required.
+
+The `--oci-dir` flag is compatible with `--add-file`, `--add-dir`, `--strip`, and `--layer` (though `--layer` still requires Docker for the additional layer images).
+
 ## Injecting files at build time
 
 Use `--add-file` and `--add-dir` to inject host files or directories into the image at build time, without needing a separate Docker layer or a volume mount at runtime:

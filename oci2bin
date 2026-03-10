@@ -23,6 +23,8 @@
 #                         Inject a host file into the image at build time (repeatable)
 #   --add-dir  HOST:CONTAINER
 #                         Inject a host directory recursively (repeatable)
+#   --oci-dir DIR         Use an OCI image layout directory instead of docker save
+#                         (skips docker pull/save; IMAGE arg used only for naming)
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -88,6 +90,7 @@ LAYER_IMAGES=()
 DO_STRIP=0
 ADD_FILE_ARGS=()
 ADD_DIR_ARGS=()
+OCI_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -117,6 +120,11 @@ while [[ $# -gt 0 ]]; do
         --add-dir)
             [[ $# -lt 2 ]] && { echo "oci2bin: --add-dir requires HOST:CONTAINER" >&2; exit 1; }
             ADD_DIR_ARGS+=("$2")
+            shift 2
+            ;;
+        --oci-dir)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --oci-dir requires a DIR argument" >&2; exit 1; }
+            OCI_DIR="$2"
             shift 2
             ;;
         --help|-h)
@@ -170,6 +178,26 @@ if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
     $CC_CROSS $CFLAGS_CROSS -static -O2 -s -o "$LOADER" "$SRC"
 fi
 
+# ── OCI image layout: convert to docker-save tar, skip docker entirely ────
+
+if [[ -n "$OCI_DIR" ]]; then
+    if [[ ! -d "$OCI_DIR" ]]; then
+        echo "oci2bin: --oci-dir: directory not found: $OCI_DIR" >&2
+        exit 1
+    fi
+    OCI_TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$OCI_TMPDIR"' EXIT
+    OCI_TAR="$OCI_TMPDIR/oci_image.tar"
+    echo "oci2bin: converting OCI image layout from $OCI_DIR..."
+    python3 "$OCI2BIN_HOME/scripts/oci_layout_to_tar.py" \
+        --oci-dir "$OCI_DIR" \
+        --output  "$OCI_TAR" \
+        ${IMAGE:+--tag "$IMAGE"}
+    BUILD_TAR_ARG="$OCI_TAR"
+    BUILD_IMAGE_ARG="${IMAGE:-local/image:latest}"
+    # Jump straight to add-files/build steps — no docker pull/digest needed
+else
+
 # ── pull image if not local ───────────────────────────────────────────────
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -207,7 +235,9 @@ if [[ "$USE_CACHE" -eq 1 && -n "$DIGEST_SHORT" ]]; then
         chmod +x "$OUTPUT"
         exit 0
     fi
-fi
+fi  # end of non-oci-dir docker path
+
+fi  # close: if [[ -n "$OCI_DIR" ]]; then ... else ... fi
 
 # ── merge layers if --layer was given ─────────────────────────────────────
 
@@ -245,8 +275,9 @@ if [[ "${#LAYER_IMAGES[@]}" -gt 0 ]]; then
     BUILD_IMAGE_ARG="$IMAGE"
     BUILD_TAR_ARG="$MERGED_TAR"
 else
-    BUILD_IMAGE_ARG="$IMAGE"
-    BUILD_TAR_ARG=""
+    # Only set defaults if not already set by --oci-dir
+    BUILD_IMAGE_ARG="${BUILD_IMAGE_ARG:-$IMAGE}"
+    BUILD_TAR_ARG="${BUILD_TAR_ARG:-}"
 fi
 
 # ── strip if requested ────────────────────────────────────────────────────
