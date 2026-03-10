@@ -7,9 +7,9 @@ License:        MIT
 URL:            https://github.com/latedeployment/oci2bin
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz
 
-ExclusiveArch:  x86_64
+ExclusiveArch:  x86_64 aarch64
 
-BuildRequires:  musl-gcc musl-libc-static
+BuildRequires:  gcc glibc-static
 Requires:       python3 docker
 
 %description
@@ -28,7 +28,12 @@ make install PREFIX=%{buildroot}/usr
 
 %files
 /usr/bin/oci2bin
-/usr/share/oci2bin/build/loader
+%ifarch x86_64
+/usr/share/oci2bin/build/loader-x86_64
+%endif
+%ifarch aarch64
+/usr/share/oci2bin/build/loader-aarch64
+%endif
 /usr/share/oci2bin/scripts/build_polyglot.py
 /usr/share/oci2bin/src/loader.c
 

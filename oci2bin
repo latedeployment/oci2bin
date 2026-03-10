@@ -2,7 +2,7 @@
 # oci2bin — package a Docker image as a self-contained ELF+tar polyglot
 #
 # Usage:
-#   oci2bin <image[:tag]> [output]
+#   oci2bin [--arch ARCH] <image[:tag]> [output]
 #
 # The output file runs as a rootless container AND can be imported with
 # docker load. It accepts the same runtime flags as the embedded loader:
@@ -10,13 +10,19 @@
 #   ./output [OPTIONS] [-- CMD [ARGS...]]
 #   ./output [OPTIONS] CMD [ARGS...]
 #
+# Build options:
+#   --arch ARCH           Target architecture: x86_64 (default) or aarch64
+#                         Cross-compilation requires the matching musl cross-
+#                         compiler (aarch64-linux-musl-gcc) to be in PATH.
+#
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
 #   --entrypoint PATH     Override the image entrypoint
 #   --                    End of options; remaining args are CMD
 #
 # Examples:
-#   oci2bin alpine:latest               # -> alpine_latest
+#   oci2bin alpine:latest               # -> alpine_latest (host arch)
+#   oci2bin --arch aarch64 alpine:latest # -> alpine_latest (aarch64 binary)
 #   oci2bin ubuntu:22.04 my-ubuntu      # -> my-ubuntu (explicit name)
 #
 #   ./alpine_latest                     # run default shell
@@ -34,18 +40,28 @@ usage() {
     exit 1
 }
 
-# ── dependency checks ─────────────────────────────────────────────────────
-
-need() {
-    command -v "$1" >/dev/null 2>&1 || { echo "oci2bin: '$1' not found in PATH" >&2; exit 1; }
-}
-need musl-gcc
-need python3
-need docker
-
 # ── argument parsing ──────────────────────────────────────────────────────
 
-if [[ $# -lt 1 || "$1" == "--help" || "$1" == "-h" ]]; then
+HOST_ARCH="$(uname -m)"
+TARGET_ARCH="$HOST_ARCH"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --arch)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --arch requires an argument" >&2; exit 1; }
+            TARGET_ARCH="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ $# -lt 1 ]]; then
     usage
 fi
 
@@ -53,15 +69,38 @@ IMAGE="$1"
 # Derive output name from image: "nginx:1.25" -> "nginx_1.25"
 OUTPUT="${2:-${IMAGE//[:\/]/_}}"
 
+# ── architecture / compiler selection ─────────────────────────────────────
+
+if [[ "$TARGET_ARCH" == "$HOST_ARCH" ]]; then
+    CC_CROSS="gcc"
+    CFLAGS_CROSS=""
+elif [[ "$TARGET_ARCH" == "aarch64" && "$HOST_ARCH" == "x86_64" ]]; then
+    CC_CROSS="aarch64-linux-gnu-gcc"
+    AARCH64_SYSROOT="${AARCH64_SYSROOT:-/usr/aarch64-redhat-linux/sys-root/fc43}"
+    CFLAGS_CROSS="--sysroot=$AARCH64_SYSROOT -isystem $AARCH64_SYSROOT/usr/include"
+else
+    echo "oci2bin: cross-compilation from $HOST_ARCH to $TARGET_ARCH is not supported" >&2
+    exit 1
+fi
+
+# ── dependency checks ─────────────────────────────────────────────────────
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || { echo "oci2bin: '$1' not found in PATH" >&2; exit 1; }
+}
+need "$CC_CROSS"
+need python3
+need docker
+
 # ── build loader if needed ────────────────────────────────────────────────
 
-LOADER="$OCI2BIN_HOME/build/loader"
+LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
 SRC="$OCI2BIN_HOME/src/loader.c"
 
 if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
-    echo "oci2bin: building loader..."
+    echo "oci2bin: building loader for $TARGET_ARCH..."
     mkdir -p "$OCI2BIN_HOME/build"
-    musl-gcc -static -O2 -s -o "$LOADER" "$SRC"
+    $CC_CROSS $CFLAGS_CROSS -static -O2 -s -o "$LOADER" "$SRC"
 fi
 
 # ── pull image if not local ───────────────────────────────────────────────

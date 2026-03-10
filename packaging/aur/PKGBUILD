@@ -3,11 +3,10 @@ pkgname=oci2bin
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Convert OCI/Docker images into self-contained ELF executables"
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url="https://github.com/latedeployment/oci2bin"
 license=('MIT')
 depends=('python' 'docker')
-makedepends=('musl')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
