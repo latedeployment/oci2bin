@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <ftw.h>
 #include <unistd.h>
 
 /*
@@ -993,6 +994,30 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
     return 0;
 }
 
+/* ── tmpdir cleanup ──────────────────────────────────────────────────────── */
+
+/*
+ * Recursive deletion via nftw — no fork() required.
+ * Used instead of "rm -rf" to avoid forking after CLONE_NEWPID, which would
+ * fail with ENOMEM because the child PID namespace is already destroyed.
+ */
+static int rm_entry(const char* path, const struct stat* sb,
+                    int typeflag, struct FTW* ftwbuf)
+{
+    (void)sb;
+    (void)ftwbuf;
+    if (typeflag == FTW_DP)
+    {
+        return rmdir(path);
+    }
+    return unlink(path);
+}
+
+static void rm_rf_dir(const char* path)
+{
+    nftw(path, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char* argv[])
@@ -1081,15 +1106,15 @@ int main(int argc, char* argv[])
     int status;
     waitpid(child, &status, 0);
 
-    /* Cleanup: best effort — remove the whole tmpdir.
+    /* Cleanup: remove the whole tmpdir without forking.
      * rootfs = tmpdir + "/rootfs"; strip the last component to get tmpdir.
-     * Use execvp directly (no shell) to avoid any injection risk. */
+     * Cannot use fork() here: after CLONE_NEWPID the child PID namespace is
+     * destroyed when the container exits, so fork() returns ENOMEM. */
     char* last_slash = strrchr(rootfs, '/');
     if (last_slash)
     {
         *last_slash = '\0'; /* rootfs now points to tmpdir */
-        char* rm_argv[] = {"rm", "-rf", rootfs, NULL};
-        run_cmd(rm_argv);
+        rm_rf_dir(rootfs);
     }
 
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
