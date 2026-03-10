@@ -1067,6 +1067,21 @@ static void apply_seccomp_filter(void)
 #ifdef __NR_pivot_root
                 BPF_BLOCK(__NR_pivot_root),
 #endif
+#ifdef __NR_ptrace
+                BPF_BLOCK(__NR_ptrace),
+#endif
+#ifdef __NR_process_vm_readv
+                BPF_BLOCK(__NR_process_vm_readv),
+#endif
+#ifdef __NR_process_vm_writev
+                BPF_BLOCK(__NR_process_vm_writev),
+#endif
+#ifdef __NR_init_module
+                BPF_BLOCK(__NR_init_module),
+#endif
+#ifdef __NR_finit_module
+                BPF_BLOCK(__NR_finit_module),
+#endif
 
             /* 4. Default: allow */
                 BPF_STMT(BPF_RET | BPF_K, SC_ALLOW),
@@ -1500,12 +1515,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         apply_seccomp_filter();
     }
 
-    /* Exec the entrypoint */
+    /* Exec the entrypoint — execvp searches PATH so relative names work */
     fprintf(stderr, "oci2bin: exec %s\n", exec_args[0]);
-    execv(exec_args[0], exec_args);
+    execvp(exec_args[0], exec_args);
 
     /* If exec failed, try /bin/sh as fallback */
-    perror("execv");
+    perror("execvp");
     fprintf(stderr, "oci2bin: falling back to /bin/sh\n");
     execlp("/bin/sh", "sh", NULL);
     perror("execlp /bin/sh");

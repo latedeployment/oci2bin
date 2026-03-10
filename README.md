@@ -208,6 +208,9 @@ Containers run with a default seccomp-BPF filter that blocks syscalls with no le
 | `userfaultfd` | Exploited in kernel escapes |
 | `nfsservctl` | NFS server (irrelevant in containers) |
 | `pivot_root` | Namespace escape vector |
+| `ptrace` | Process tracing / container escape |
+| `process_vm_readv`, `process_vm_writev` | Cross-process memory access |
+| `init_module`, `finit_module` | Kernel module loading |
 
 The filter also sets `PR_SET_NO_NEW_PRIVS` so the container process cannot gain new privileges via setuid or capabilities.
 
@@ -220,14 +223,18 @@ To disable the filter (e.g. for debugging or privileged workloads):
 ## Testing
 
 ```bash
-make test-unit        # unit tests only, no Docker required (~5s)
-make test             # full suite, requires Docker and a built image
-make test-c           # C unit tests (TAP, x86_64)
-make test-python      # Python unit tests
-make test-integration # runtime and build integration tests
+make test-unit               # unit tests only, no Docker required (~5s)
+make test                    # full suite, requires Docker and a built image
+make test-c                  # C unit tests (TAP, x86_64)
+make test-python             # Python unit tests
+make test-integration        # all integration tests (runtime, build, Redis, nginx)
+make test-integration-redis  # Redis PING/SET/GET smoke test
+make test-integration-nginx  # nginx HTTP 200 smoke test
 ```
 
 The suite covers the polyglot builder, loader internals, structural invariants of the output file, and all runtime features: volume mounts, entrypoint override, argument passthrough, exit code forwarding, and execution without Docker.
+
+The Redis test builds `redis:7-alpine`, starts a server on a non-standard port, and verifies `PING`, `SET`, and `GET` via the Redis wire protocol. The nginx test builds `nginx:alpine`, starts a server with a minimal config, and verifies HTTP 200 via curl.
 
 ### aarch64 unit tests
 
