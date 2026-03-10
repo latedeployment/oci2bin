@@ -18,6 +18,7 @@ See below [How it works](#how-it-works).
 ## Table of contents
 
 - [Getting started](#getting-started)
+  - [Installation](#installation)
 - [Building binaries](#building-binaries)
   - [Cross-architecture builds](#cross-architecture-builds)
   - [Injecting files at build time](#injecting-files-at-build-time)
@@ -78,6 +79,19 @@ sudo zypper install gcc glibc-devel-static
 # NixOS / nix-shell
 nix-shell -p gcc python3 docker
 ```
+
+### Installation
+
+Clone the repository and build the loader:
+
+```bash
+git clone https://github.com/latedeployment/oci2bin
+cd oci2bin
+make          # compiles the loader into build/
+make install  # installs oci2bin to /usr/local/bin (PREFIX=/usr/local)
+```
+
+`PREFIX` can be overridden: `make install PREFIX=~/.local`. After `make install`, `oci2bin` is on your PATH. Alternatively, run it directly from the repository root without installing.
 
 After cloning the repository, run `oci2bin` with an image name. The loader is compiled on first use; the image is pulled automatically if not already present locally.
 
