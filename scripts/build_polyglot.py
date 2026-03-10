@@ -53,7 +53,7 @@ SUPPORTED_MACHINES = {
 VADDR_BASE = 0x400000
 
 
-def build_elf64_header(entry, phoff, phnum, e_machine):
+def build_elf64_header(entry, phoff, phnum, e_machine=EM_X86_64):
     """Build a 64-byte ELF64 header."""
     e_ident = (
         ELF_MAGIC +
