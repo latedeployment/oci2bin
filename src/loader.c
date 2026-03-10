@@ -101,6 +101,12 @@ struct container_opts
     char* device_ctr[MAX_VOLUMES];   /* container paths (NULL = same as host) */
     int   n_devices;
 
+    /* --init  (run a zombie-reaping init as PID 1) */
+    int use_init;
+
+    /* --detach / -d  (fork to background, print child PID) */
+    int detach;
+
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
     int   n_env;
@@ -1240,6 +1246,110 @@ static void apply_capabilities(const struct container_opts* opts)
     }
 }
 
+/* ── init reaper ─────────────────────────────────────────────────────────── */
+
+/*
+ * Global child PID used by the init signal forwarding handler.
+ * Set before installing signal handlers; only written once.
+ */
+static volatile pid_t g_init_child_pid = 0;
+
+static void init_forward_signal(int sig)
+{
+    if (g_init_child_pid > 0)
+    {
+        kill(g_init_child_pid, sig);
+    }
+}
+
+/*
+ * run_as_init: fork the entrypoint as a child, then loop reaping all zombies.
+ * Returns the child's exit code, or 1 on fork failure.
+ * Must be called AFTER seccomp/capability setup (both apply to parent+child).
+ * The --user UID drop is applied only in the child.
+ */
+static int run_as_init(char** exec_args,
+                       const struct container_opts* opts)
+{
+    pid_t child = fork();
+    if (child < 0)
+    {
+        perror("oci2bin: --init fork");
+        return 1;
+    }
+
+    if (child == 0)
+    {
+        /* Child: apply UID/GID drop if requested, then exec */
+        if (opts->has_user)
+        {
+            if (setgroups(0, NULL) < 0
+                    || setgid(opts->run_gid) < 0
+                    || setuid(opts->run_uid) < 0)
+            {
+                perror("oci2bin: --init setuid/setgid");
+                _exit(1);
+            }
+        }
+        execvp(exec_args[0], exec_args);
+        perror("execvp");
+        _exit(127);
+    }
+
+    /* Parent: install signal forwarders then reap zombies */
+    g_init_child_pid = child;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = init_forward_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags   = SA_RESTART;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGUSR2, &sa, NULL);
+
+    int child_status = 0;
+    for (;;)
+    {
+        int   status = 0;
+        pid_t reaped = waitpid(-1, &status, 0);
+        if (reaped < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;    /* signal interrupted — restart */
+            }
+            if (errno == ECHILD)
+            {
+                break;    /* no more children */
+            }
+            break;
+        }
+        if (reaped == child)
+        {
+            child_status = status;
+            /* Drain remaining zombies then stop */
+            while (waitpid(-1, NULL, WNOHANG) > 0)
+            {
+            }
+            break;
+        }
+        /* else: reaped an orphaned grandchild — continue */
+    }
+
+    if (WIFEXITED(child_status))
+    {
+        return WEXITSTATUS(child_status);
+    }
+    if (WIFSIGNALED(child_status))
+    {
+        return 128 + WTERMSIG(child_status);
+    }
+    return 1;
+}
+
 /* ── seccomp ─────────────────────────────────────────────────────────────── */
 
 /*
@@ -1846,6 +1956,51 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Apply capability drops/adds before seccomp/fork (applies to all paths) */
+    if (opts->cap_drop_all || opts->cap_drop_mask || opts->cap_add_mask)
+    {
+        apply_capabilities(opts);
+    }
+
+    /* Apply seccomp filter (must be before fork so child inherits it) */
+    if (!opts->no_seccomp)
+    {
+        apply_seccomp_filter();
+    }
+
+    /* --detach: fork to background, print child PID, parent exits */
+    if (opts->detach)
+    {
+        pid_t bg = fork();
+        if (bg < 0)
+        {
+            perror("oci2bin: --detach fork");
+            return 1;
+        }
+        if (bg > 0)
+        {
+            /* Parent: print child PID and exit cleanly */
+            printf("%d\n", (int)bg);
+            fflush(stdout);
+            _exit(0);
+        }
+        /* Child: detach from terminal */
+        setsid();
+        int null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd >= 0)
+        {
+            dup2(null_fd, STDIN_FILENO);
+            close(null_fd);
+        }
+    }
+
+    /* --init: run a zombie-reaping init loop; UID drop happens inside */
+    if (opts->use_init)
+    {
+        int rc = run_as_init(exec_args, opts);
+        return rc;
+    }
+
     /* Drop to requested UID/GID if --user was given (fatal if it fails) */
     if (opts->has_user)
     {
@@ -1866,18 +2021,6 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                     (int)opts->run_uid, strerror(errno));
             return 1;
         }
-    }
-
-    /* Apply capability drops/adds before seccomp locks things down */
-    if (opts->cap_drop_all || opts->cap_drop_mask || opts->cap_add_mask)
-    {
-        apply_capabilities(opts);
-    }
-
-    /* Apply seccomp filter just before exec (all setup is complete) */
-    if (!opts->no_seccomp)
-    {
-        apply_seccomp_filter();
     }
 
     /* Exec the entrypoint — execvp searches PATH so relative names work */
@@ -2029,6 +2172,8 @@ static void usage(const char* prog)
             "  --cap-add CAP       Add an ambient capability (use after --cap-drop all)\n"
             "  --device /dev/PATH[:CONTAINER_PATH]\n"
             "                      Expose a host device inside the container\n"
+            "  --init              Run a zombie-reaping init as PID 1\n"
+            "  --detach, -d        Run container in background; print PID to stdout\n"
             "  --env-file FILE     Load KEY=VALUE pairs from FILE\n"
             "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
             "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
@@ -2319,6 +2464,15 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-seccomp") == 0)
         {
             opts->no_seccomp = 1;
+        }
+        else if (strcmp(argv[i], "--init") == 0)
+        {
+            opts->use_init = 1;
+        }
+        else if (strcmp(argv[i], "--detach") == 0
+                 || strcmp(argv[i], "-d") == 0)
+        {
+            opts->detach = 1;
         }
         else if (strcmp(argv[i], "--cap-drop") == 0)
         {

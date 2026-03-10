@@ -37,6 +37,8 @@
 #   --cap-add CAP         Add an ambient capability (use after --cap-drop all)
 #   --device /dev/PATH[:CONTAINER_PATH]
 #                         Expose a host device inside the container
+#   --init                Run a zombie-reaping init as PID 1
+#   --detach, -d          Run container in background; print PID to stdout
 #   --env-file FILE       Load KEY=VALUE pairs from FILE (additive with -e)
 #   --tmpfs PATH          Mount a fresh tmpfs at PATH inside the container
 #   --ulimit TYPE=N       Set resource limit (nofile, nproc, cpu, as, fsize)

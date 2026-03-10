@@ -357,6 +357,29 @@ Capability names are case-insensitive and the `CAP_` prefix is optional (`net_ra
 
 `--cap-drop all` uses `PR_CAPBSET_DROP` to remove all capabilities from the bounding set (caps 0–40). `--cap-add` then raises the specified capabilities as ambient capabilities so they survive `exec`. Capability operations are non-fatal; failures print a warning and continue.
 
+## Init process and zombie reaping
+
+By default the container process runs directly as PID 1. If it spawns children that exit before it does, those children become zombies because no one reaps them. Use `--init` to run a tiny reaper as PID 1:
+
+```bash
+./my-app --init
+```
+
+With `--init`, oci2bin forks the entrypoint as a child and the parent loops calling `waitpid(-1, ...)` to reap any zombie. SIGTERM, SIGINT, SIGHUP, SIGUSR1, and SIGUSR2 are forwarded to the child. When the main child exits, remaining zombies are drained and the exit code is returned (128+signal for signal deaths).
+
+## Running in background
+
+Use `--detach` (or `-d`) to run the container in the background:
+
+```bash
+PID=$(./redis --detach)
+echo "Redis running as PID $PID"
+sleep 1
+kill "$PID"
+```
+
+The parent prints the child PID to stdout and exits immediately. The child calls `setsid()` to detach from the terminal. Combine with `--init` for a fully-managed background service.
+
 ## Resource limits
 
 Use `--ulimit` to set resource limits via `setrlimit(2)` inside the container:
