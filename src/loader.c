@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <ftw.h>
@@ -837,8 +838,46 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         perror("mount /proc (non-fatal)");
     }
 
-    /* Mount /dev minimally */
+    /* Mount /tmp as fresh tmpfs so container cannot see host /tmp */
+    mkdir("/tmp", 0777);
+    if (mount("tmpfs", "/tmp", "tmpfs",
+              MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=1777") < 0)
+    {
+        perror("mount /tmp tmpfs (non-fatal)");
+    }
+
+    /* Mount /dev and create essential device nodes via mknod.
+     * We cannot bind-mount host /dev in a rootless user namespace,
+     * so we create the nodes manually after entering the namespace. */
     mkdir("/dev", 0755);
+    if (mount("tmpfs", "/dev", "tmpfs",
+              MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
+    {
+        perror("mount /dev tmpfs (non-fatal)");
+    }
+    else
+    {
+        /* c 1 3 */ if (mknod("/dev/null",    S_IFCHR | 0666, makedev(1, 3)) < 0)
+        {
+            perror("mknod /dev/null (non-fatal)");
+        }
+        /* c 1 5 */ if (mknod("/dev/zero",    S_IFCHR | 0666, makedev(1, 5)) < 0)
+        {
+            perror("mknod /dev/zero (non-fatal)");
+        }
+        /* c 1 8 */ if (mknod("/dev/random",  S_IFCHR | 0666, makedev(1, 8)) < 0)
+        {
+            perror("mknod /dev/random (non-fatal)");
+        }
+        /* c 1 9 */ if (mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9)) < 0)
+        {
+            perror("mknod /dev/urandom (non-fatal)");
+        }
+        /* c 5 0 */ if (mknod("/dev/tty",     S_IFCHR | 0620, makedev(5, 0)) < 0)
+        {
+            perror("mknod /dev/tty (non-fatal)");
+        }
+    }
 
     /* Set hostname */
     sethostname("oci2bin", 7);
