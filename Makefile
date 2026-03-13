@@ -22,12 +22,31 @@ TESTS_DIR          = tests
 TEST_C_BIN         = build/test_c_units
 TEST_C_BIN_AARCH64 = build/test_c_units-aarch64
 
+MAKEINFO  ?= $(or $(shell command -v texi2any 2>/dev/null),\
+               $(shell command -v makeinfo 2>/dev/null),\
+               makeinfo)
+MAN_DIR    = doc
+INFO_DIR   = doc
+
 .PHONY: all clean polyglot loader loader-x86_64 loader-aarch64 loader-all \
-        install uninstall test test-unit test-unit-aarch64 \
+        doc install uninstall test test-unit test-unit-aarch64 \
         test-integration test-integration-redis test-integration-nginx \
         test-c test-c-aarch64 test-python
 
 all: polyglot
+
+# ── Documentation ─────────────────────────────────────────────────────────────
+
+# Build the GNU info file from the Texinfo source.
+# Requires: makeinfo (texinfo package).
+doc: $(INFO_DIR)/oci2bin.info
+
+$(INFO_DIR)/oci2bin.info: $(INFO_DIR)/oci2bin.texi
+	@if command -v $(MAKEINFO) >/dev/null 2>&1; then \
+	  $(MAKEINFO) --no-split -o $@ $<; \
+	else \
+	  echo "warning: makeinfo/texi2any not found; install the 'texinfo' package to build oci2bin.info"; \
+	fi
 
 loader: build/loader-$(ARCH)
 
@@ -67,14 +86,26 @@ install: build/loader-$(ARCH)
 	[ -f build/loader-aarch64 ] && install -m 755 build/loader-aarch64 $(PREFIX)/share/oci2bin/build/ || true
 	sed -i 's|OCI2BIN_HOME:-\$$SCRIPT_DIR|OCI2BIN_HOME:-$(PREFIX)/share/oci2bin|' \
 		$(PREFIX)/bin/oci2bin
+	install -d $(PREFIX)/share/man/man1
+	install -m 644 $(MAN_DIR)/oci2bin.1 $(PREFIX)/share/man/man1/oci2bin.1
+	if [ -f $(INFO_DIR)/oci2bin.info ]; then \
+	  install -d $(PREFIX)/share/info; \
+	  install -m 644 $(INFO_DIR)/oci2bin.info $(PREFIX)/share/info/oci2bin.info; \
+	  install-info --dir-file=$(PREFIX)/share/info/dir $(PREFIX)/share/info/oci2bin.info 2>/dev/null || true; \
+	fi
 	@echo "Installed. Run: oci2bin <image>"
 
 uninstall:
 	rm -f $(PREFIX)/bin/oci2bin
 	rm -rf $(PREFIX)/share/oci2bin
+	rm -f $(PREFIX)/share/man/man1/oci2bin.1
+	-install-info --delete --dir-file=$(PREFIX)/share/info/dir \
+	  $(PREFIX)/share/info/oci2bin.info 2>/dev/null || true
+	rm -f $(PREFIX)/share/info/oci2bin.info
 
 clean:
 	rm -rf build $(OUTPUT)
+	rm -f $(INFO_DIR)/oci2bin.info
 
 # ── Test targets ──────────────────────────────────────────────────────────────
 

@@ -9,7 +9,7 @@ Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz
 
 ExclusiveArch:  x86_64 aarch64
 
-BuildRequires:  gcc glibc-static
+BuildRequires:  gcc glibc-static texinfo
 Requires:       python3 docker
 
 %description
@@ -22,6 +22,7 @@ without a daemon, and without any installation on the target.
 
 %build
 make loader
+make doc
 
 %install
 make install PREFIX=%{buildroot}/usr
@@ -36,6 +37,8 @@ make install PREFIX=%{buildroot}/usr
 %endif
 /usr/share/oci2bin/scripts/build_polyglot.py
 /usr/share/oci2bin/src/loader.c
+%{_mandir}/man1/oci2bin.1*
+%{_infodir}/oci2bin.info*
 
 %changelog
 * Tue Mar 10 2026 latedeployment - 0.1.0-1

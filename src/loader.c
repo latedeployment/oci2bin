@@ -59,8 +59,14 @@ struct container_opts
     /* --workdir /path  (overrides OCI WorkingDir) */
     char* workdir;
 
-    /* --net host|none  (NULL means host; "none" adds CLONE_NEWNET) */
+    /* --net host|none|container:<PID>
+     * NULL/"host" = host network; "none" = isolated; container:<PID> = join */
     char* net;
+    pid_t net_join_pid; /* >0: join this PID's network namespace */
+
+    /* --ipc host|container:<PID>
+     * host = share host IPC (default); container:<PID> = join that IPC ns */
+    pid_t ipc_join_pid; /* >0: join this PID's IPC namespace */
 
     /* --read-only  (mount overlay so rootfs is not modified) */
     int read_only;
@@ -2162,7 +2168,12 @@ static void usage(const char* prog)
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
             "  --workdir PATH      Set the working directory inside the container\n"
-            "  --net host|none     Network mode: host (default) or none (isolated)\n"
+            "  --net host|none|container:<PID>\n"
+            "                      Network: host (default), none (isolated),\n"
+            "                      or join the network namespace of PID\n"
+            "  --ipc host|container:<PID>\n"
+            "                      IPC namespace: host (default, shares SysV IPC),\n"
+            "                      or join the IPC namespace of PID\n"
             "  --read-only         Mount rootfs read-only via overlayfs\n"
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
@@ -2442,16 +2453,73 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         {
             if (i + 1 >= argc)
             {
-                fprintf(stderr, "oci2bin: --net requires host or none\n");
+                fprintf(stderr,
+                        "oci2bin: --net requires host, none, or"
+                        " container:<PID>\n");
                 return -1;
             }
             i++;
-            if (strcmp(argv[i], "host") != 0 && strcmp(argv[i], "none") != 0)
+            if (strcmp(argv[i], "host") == 0 || strcmp(argv[i], "none") == 0)
             {
-                fprintf(stderr, "oci2bin: --net must be host or none\n");
+                opts->net = argv[i];
+            }
+            else if (strncmp(argv[i], "container:", 10) == 0)
+            {
+                char* endptr;
+                errno = 0;
+                long pid = strtol(argv[i] + 10, &endptr, 10);
+                if (*endptr != '\0' || errno == ERANGE ||
+                        pid <= 0 || pid > INT_MAX)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --net container:<PID>:"
+                            " invalid PID\n");
+                    return -1;
+                }
+                opts->net_join_pid = (pid_t)pid;
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: --net must be host, none, or"
+                        " container:<PID>\n");
                 return -1;
             }
-            opts->net = argv[i];
+        }
+        else if (strcmp(argv[i], "--ipc") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --ipc requires host or container:<PID>\n");
+                return -1;
+            }
+            i++;
+            if (strcmp(argv[i], "host") == 0)
+            {
+                /* explicit host — already the default, no-op */
+            }
+            else if (strncmp(argv[i], "container:", 10) == 0)
+            {
+                char* endptr;
+                errno = 0;
+                long pid = strtol(argv[i] + 10, &endptr, 10);
+                if (*endptr != '\0' || errno == ERANGE ||
+                        pid <= 0 || pid > INT_MAX)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --ipc container:<PID>:"
+                            " invalid PID\n");
+                    return -1;
+                }
+                opts->ipc_join_pid = (pid_t)pid;
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: --ipc must be host or container:<PID>\n");
+                return -1;
+            }
         }
         else if (strcmp(argv[i], "--read-only") == 0)
         {
@@ -2763,7 +2831,71 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    /* 9. Enter mount + PID + UTS namespaces; optionally network namespace */
+    /* 9. Join shared namespaces (--net container:<PID>, --ipc container:<PID>).
+     * Must happen after CLONE_NEWUSER so we have CAP_SYS_ADMIN in our user
+     * namespace; must happen before unshare() so we don't create new
+     * namespaces for the ones we are joining instead. */
+    if (opts.net_join_pid > 0)
+    {
+        char ns_path[PATH_MAX];
+        int n = snprintf(ns_path, sizeof(ns_path),
+                         "/proc/%d/ns/net", (int)opts.net_join_pid);
+        if (n < 0 || n >= (int)sizeof(ns_path))
+        {
+            fprintf(stderr, "oci2bin: net ns path truncated\n");
+            return 1;
+        }
+        int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+        {
+            perror("oci2bin: open net namespace");
+            return 1;
+        }
+        if (setns(fd, CLONE_NEWNET) < 0)
+        {
+            perror("oci2bin: setns(CLONE_NEWNET)");
+            fprintf(stderr,
+                    "oci2bin: joining another container's network namespace\n"
+                    "oci2bin: requires the target to share the same user"
+                    " namespace owner, or root privileges\n");
+            close(fd);
+            return 1;
+        }
+        close(fd);
+    }
+
+    if (opts.ipc_join_pid > 0)
+    {
+        char ns_path[PATH_MAX];
+        int n = snprintf(ns_path, sizeof(ns_path),
+                         "/proc/%d/ns/ipc", (int)opts.ipc_join_pid);
+        if (n < 0 || n >= (int)sizeof(ns_path))
+        {
+            fprintf(stderr, "oci2bin: ipc ns path truncated\n");
+            return 1;
+        }
+        int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+        {
+            perror("oci2bin: open ipc namespace");
+            return 1;
+        }
+        if (setns(fd, CLONE_NEWIPC) < 0)
+        {
+            perror("oci2bin: setns(CLONE_NEWIPC)");
+            fprintf(stderr,
+                    "oci2bin: joining another container's IPC namespace\n"
+                    "oci2bin: requires the target to share the same user"
+                    " namespace owner, or root privileges\n");
+            close(fd);
+            return 1;
+        }
+        close(fd);
+    }
+
+    /* 10. Enter mount + PID + UTS namespaces; optionally network namespace.
+     * When --net container:<PID> was used, setns() already joined the target
+     * network namespace above — do not create a new one here. */
     {
         int ns_flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS;
         if (opts.net && strcmp(opts.net, "none") == 0)
@@ -2777,7 +2909,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    /* 10. Fork for PID namespace (child becomes PID 1) */
+    /* 11. Fork for PID namespace (child becomes PID 1) */
     pid_t child = fork();
     if (child < 0)
     {

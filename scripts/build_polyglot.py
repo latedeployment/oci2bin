@@ -271,7 +271,7 @@ def build_meta_block(image_name, digest=None):
     """
     meta = {
         'image':     image_name,
-        'timestamp': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'timestamp': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'version':   OCI2BIN_VERSION,
     }
     if digest:

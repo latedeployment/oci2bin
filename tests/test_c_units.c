@@ -321,6 +321,91 @@ static void test_parse_opts(void)
         ASSERT_INT_EQ(opts.n_extra, 1, "parse_opts: combined n_extra=1");
         ASSERT_STR_EQ(opts.extra_args[0], "arg1", "parse_opts: combined extra_args[0]");
     }
+
+    /* --net container:<PID> valid */
+    {
+        char arg[] = "container:1234";
+        char *argv[] = {"prog", "--net", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --net container:1234 returns 0");
+        ASSERT_INT_EQ((int)opts.net_join_pid, 1234,
+                      "parse_opts: --net container:1234 sets net_join_pid");
+    }
+
+    /* --net container: with invalid PID (non-numeric) */
+    {
+        char arg[] = "container:abc";
+        char *argv[] = {"prog", "--net", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --net container:abc returns -1");
+    }
+
+    /* --net container: with zero PID */
+    {
+        char arg[] = "container:0";
+        char *argv[] = {"prog", "--net", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --net container:0 returns -1");
+    }
+
+    /* --net container: with negative PID */
+    {
+        char arg[] = "container:-5";
+        char *argv[] = {"prog", "--net", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --net container:-5 returns -1");
+    }
+
+    /* --ipc host (explicit, no-op) */
+    {
+        char arg[] = "host";
+        char *argv[] = {"prog", "--ipc", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --ipc host returns 0");
+        ASSERT_INT_EQ((int)opts.ipc_join_pid, 0,
+                      "parse_opts: --ipc host leaves ipc_join_pid=0");
+    }
+
+    /* --ipc container:<PID> valid */
+    {
+        char arg[] = "container:5678";
+        char *argv[] = {"prog", "--ipc", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --ipc container:5678 returns 0");
+        ASSERT_INT_EQ((int)opts.ipc_join_pid, 5678,
+                      "parse_opts: --ipc container:5678 sets ipc_join_pid");
+    }
+
+    /* --ipc with invalid mode */
+    {
+        char arg[] = "none";
+        char *argv[] = {"prog", "--ipc", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --ipc none returns -1");
+    }
+
+    /* --ipc container: with invalid PID */
+    {
+        char arg[] = "container:xyz";
+        char *argv[] = {"prog", "--ipc", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --ipc container:xyz returns -1");
+    }
+
+    /* --ipc missing argument */
+    {
+        char *argv[] = {"prog", "--ipc", NULL};
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --ipc missing arg returns -1");
+    }
+
+    /* --net with unknown mode */
+    {
+        char arg[] = "bridge";
+        char *argv[] = {"prog", "--net", arg, NULL};
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --net bridge returns -1");
+    }
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */

@@ -1,0 +1,636 @@
+.\" Man page for oci2bin
+.\" Generate HTML: groff -man -Thtml doc/oci2bin.1
+.\" Generate PDF:  groff -man -Tpdf  doc/oci2bin.1 > oci2bin.pdf
+.TH OCI2BIN 1 "2026-03-12" "oci2bin 0.1.0" "User Commands"
+.
+.SH NAME
+oci2bin \- convert Docker/OCI images into self-contained rootless container executables
+.
+.SH SYNOPSIS
+.SS Building
+.SY oci2bin
+.OP \-\-arch ARCH
+.OP \-\-cache
+.OP \-\-layer IMAGE
+.OP \-\-strip
+.OP \-\-add\-file HOST:CONTAINER
+.OP \-\-add\-dir HOST:CONTAINER
+.OP \-\-oci\-dir DIR
+.I IMAGE\c
+.RI [: TAG ]
+.RI [ OUTPUT ]
+.YS
+.PP
+.SY oci2bin
+.I SUBCOMMAND
+.RI [ ARGS ]
+.YS
+.
+.SS Running the generated binary
+.SY ./OUTPUT
+.OP \-v HOST:CONTAINER
+.OP \-e KEY=VALUE
+.OP \-\-net host|none|container:\fIPID\fR
+.OP \-\-ipc host|container:\fIPID\fR
+.OP \-\-entrypoint PATH
+.OP \-\-workdir PATH
+.OP \-\-user UID\fR[:\fIGID\fR]
+.OP \-\-hostname NAME
+.OP \-\-secret HOST_FILE\fR[:\fICONTAINER_PATH\fR]
+.OP \-\-env\-file FILE
+.OP \-\-tmpfs PATH
+.OP \-\-device /dev/HOST\fR[:\fICONTAINER\fR]
+.OP \-\-read\-only
+.OP \-\-init
+.OP \-\-detach
+.OP \-\-ssh\-agent
+.OP \-\-cap\-drop CAP
+.OP \-\-cap\-add CAP
+.OP \-\-ulimit TYPE=N
+.OP \-\-no\-seccomp
+.OP \-\-
+.RI [ CMD " [" ARGS ]]
+.YS
+.
+.SH DESCRIPTION
+.B oci2bin
+converts any Docker or OCI image into a single, self-contained ELF64 executable.
+The output file is also a valid POSIX tar archive accepted by
+.BR "docker load" ,
+making it a polyglot binary.
+.PP
+The generated binary requires only
+.BR tar (1)
+on the target machine \(em no Docker daemon, no runtime, no installation.
+It runs the container rootlessly using Linux user namespaces.
+.PP
+The container process appears as UID\~0 inside the container; on the host it runs
+as the invoking user with no elevated privileges.
+.
+.SH BUILD OPTIONS
+These options are passed to the
+.B oci2bin
+CLI wrapper at build time.
+.
+.TP
+.BI \-\-arch " ARCH"
+Build a binary for
+.I ARCH
+(either
+.B x86_64
+or
+.BR aarch64 ).
+When building for a foreign architecture from x86_64, the
+.B aarch64\-linux\-gnu\-gcc
+cross-compiler is required.
+The sysroot defaults to
+.IR /usr/aarch64\-redhat\-linux/sys\-root/fc43 ;
+override with the
+.B AARCH64_SYSROOT
+environment variable.
+.
+.TP
+.B \-\-cache
+Cache the output in
+.IR ~/.cache/oci2bin/<image>_<digest>/output .
+Repeated builds of the same image are instant.
+The cache key includes the first 12 hex characters of the image's sha256 digest
+so tag updates are detected automatically.
+.
+.TP
+.BI \-\-layer " IMAGE"
+Overlay additional image layers on top of the base image.
+Layers are applied in order; the image config
+.RI ( Cmd ", " Entrypoint ", " Env )
+from the last
+.B \-\-layer
+argument overrides the base if non-null.
+May be repeated.
+.
+.TP
+.B \-\-strip
+Remove documentation, man pages, locale data, and package caches before
+packaging.
+Affected paths:
+.IR usr/share/doc/ ,
+.IR usr/share/man/ ,
+.IR usr/share/info/ ,
+.IR usr/share/locale/ ,
+.IR usr/share/i18n/ ,
+.IR var/cache/apt/ ,
+.IR var/lib/apt/lists/ ,
+.IR tmp/ .
+.
+.TP
+.BI \-\-add\-file " HOST:CONTAINER"
+Inject a file from
+.I HOST
+into the image at
+.I CONTAINER
+path at build time.
+The file is embedded as an extra layer on top of the image layers.
+May be repeated.
+.
+.TP
+.BI \-\-add\-dir " HOST:CONTAINER"
+Inject a directory from
+.I HOST
+into the image at
+.I CONTAINER
+path at build time.
+May be repeated.
+.
+.TP
+.BI \-\-oci\-dir " DIR"
+Build from an OCI image layout directory instead of pulling via Docker.
+Compatible with images produced by
+.BR skopeo (1),
+.BR crane (1),
+and
+.BR buildah (1).
+.
+.SH RUNTIME OPTIONS
+These options are passed to the generated binary at run time.
+.
+.SS Volume mounts
+.TP
+.BI \-v " HOST:CONTAINER"
+Bind-mount
+.I HOST
+path into the container at
+.IR CONTAINER .
+The container path must be absolute and must not contain
+.BR .. .
+May be repeated (up to 32).
+.
+.TP
+.BI \-\-secret " HOST_FILE\fR[:\fICONTAINER_PATH\fR]"
+Bind-mount a single host file into the container read-only.
+If
+.I CONTAINER_PATH
+is omitted, the file lands at
+.IR /run/secrets/<basename> .
+Enforced with
+.BR MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV .
+May be repeated.
+.
+.TP
+.BI \-\-tmpfs " PATH"
+Mount a fresh in-memory filesystem at
+.I PATH
+inside the container.
+.I PATH
+must be absolute and must not contain
+.BR .. .
+Useful for writable scratch space when
+.B \-\-read\-only
+is active.
+May be repeated.
+.
+.TP
+.BI \-\-device " /dev/HOST\fR[:\fICONTAINER\fR]"
+Expose a host device node inside the container.
+.I HOST
+must start with
+.IR /dev/ .
+.I CONTAINER
+defaults to
+.I HOST
+if omitted.
+.BR mknod (2)
+is attempted first; on failure a bind mount is used.
+May be repeated.
+.
+.SS Process and environment
+.TP
+.BI \-e " KEY=VALUE"
+Set an environment variable inside the container.
+.I KEY
+must not be empty.
+.TP
+.BI \-e " KEY"
+Pass
+.I KEY
+from the host environment.
+If the variable is not set on the host, a warning is printed and it is skipped.
+May be repeated (up to 64).
+.
+.TP
+.BI \-\-env\-file " FILE"
+Load
+.I KEY=VALUE
+pairs from
+.IR FILE .
+Blank lines and lines beginning with
+.B #
+are ignored.
+May be repeated; processed before
+.B \-e
+flags.
+.
+.TP
+.BI \-\-entrypoint " PATH"
+Override the image's OCI entrypoint.
+.
+.TP
+.BI \-\-workdir " PATH"
+Set the working directory inside the container.
+Overrides the image's
+.BR WorkingDir .
+Defaults to
+.B /
+if neither is set.
+.
+.TP
+.BI \-\-user " UID\fR[:\fIGID\fR]"
+Run the container process as numeric
+.I UID
+(and optional
+.IR GID ).
+Both values must be integers \(<=\~65534.
+.
+.TP
+.BI \-\-hostname " NAME"
+Set the hostname inside the UTS namespace.
+Defaults to
+.BR oci2bin .
+.
+.TP
+.BI \-\-ulimit " TYPE=N"
+Set a resource limit via
+.BR setrlimit (2).
+Both soft and hard limits are set to
+.IR N .
+Supported types:
+.BR nofile ,
+.BR nproc ,
+.BR cpu ,
+.BR as ,
+.BR fsize .
+May be repeated.
+.
+.TP
+.B \-\-init
+Run a zombie-reaping init as PID\~1.
+The entrypoint is forked as a child; the parent loop reaps zombies.
+.BR SIGTERM ,
+.BR SIGINT ,
+.BR SIGHUP ,
+.BR SIGUSR1 ,
+and
+.B SIGUSR2
+are forwarded to the child.
+.
+.TP
+.BR \-\-detach ", " \-d
+Fork the container to the background, print the child PID to stdout, and exit.
+Calls
+.BR setsid (2)
+and redirects stdin from
+.IR /dev/null .
+.
+.TP
+.B \-\-ssh\-agent
+Forward the host
+.B SSH_AUTH_SOCK
+Unix socket into the container at
+.IR /run/ssh-agent.sock .
+Sets
+.B SSH_AUTH_SOCK
+inside the container.
+Skipped silently if
+.B SSH_AUTH_SOCK
+is unset or points to a non-socket.
+.
+.TP
+.B \-\-
+End of option parsing.
+Remaining arguments are treated as the command and its arguments.
+.
+.SS Networking and IPC namespaces
+.TP
+.B \-\-net host
+Share the host network stack (default).
+.
+.TP
+.B \-\-net none
+Create an isolated network namespace with only a loopback interface.
+.
+.TP
+.BI \-\-net " container:" PID
+Join the network namespace of the process with PID
+.IR PID .
+The container shares all network interfaces, routing tables, and port bindings
+with that process.
+.I PID
+must be a positive integer.
+.
+.TP
+.B \-\-ipc host
+Share the host IPC namespace (default).
+.
+.TP
+.BI \-\-ipc " container:" PID
+Join the IPC namespace of the process with PID
+.IR PID ,
+sharing SysV semaphores, message queues, and
+.BR shmget (2)
+shared memory segments.
+.
+.SS Isolation
+.TP
+.B \-\-read\-only
+Mount the rootfs read-only via overlayfs.
+Writes go to a temporary upper layer discarded on exit.
+Falls back to read-write with a warning if overlayfs is unavailable.
+.
+.TP
+.BI \-\-cap\-drop " CAP"
+Drop capability
+.I CAP
+from the bounding and effective sets.
+Pass
+.B all
+to drop all capabilities.
+.I CAP
+is case-insensitive; the
+.B CAP_
+prefix is optional.
+May be repeated.
+.
+.TP
+.BI \-\-cap\-add " CAP"
+Add capability
+.I CAP
+as an ambient capability so it survives
+.BR exec (2).
+Use after
+.B \-\-cap\-drop all
+to selectively restore capabilities.
+.
+.TP
+.B \-\-no\-seccomp
+Disable the default seccomp-BPF syscall filter.
+The filter blocks: kexec_load, reboot, syslog, perf_event_open, bpf,
+add_key, request_key, keyctl, userfaultfd, pivot_root, ptrace,
+process_vm_readv, process_vm_writev, init_module, finit_module.
+.B PR_SET_NO_NEW_PRIVS
+is always set regardless of this flag.
+.
+.SH SUBCOMMANDS
+.TP
+.B oci2bin inspect \fIBINARY\fR
+Display OCI metadata embedded in
+.IR BINARY :
+image name, architecture, layer count, entrypoint, command, environment,
+working directory, build digest, and build timestamp.
+.
+.TP
+.B oci2bin list \fR[\fB\-\-json\fR]
+List all cached binaries with image name, digest, size, and build date.
+.B \-\-json
+emits machine-readable JSON.
+.
+.TP
+.B oci2bin prune \fR[\fB\-\-dry\-run\fR]
+Remove outdated cache entries, keeping only the most recently built binary
+for each image name.
+.B \-\-dry\-run
+shows what would be deleted without deleting.
+.
+.TP
+.B oci2bin diff \fIOLD\fR \fINEW\fR
+Compare the filesystem contents of two oci2bin binaries.
+Output lines are prefixed with
+.BR + " (added), " \- " (removed), or " M " (modified)."
+Exits 0 if identical, 1 if there are differences.
+.
+.SH NAMESPACE SHARING
+Two containers can share network or IPC namespaces using the
+.B container:
+.I PID
+form of
+.B \-\-net
+and
+.BR \-\-ipc .
+This enables sidecar patterns and inter-container IPC without a shared daemon.
+.PP
+.B What is shared:
+.TS
+l l .
+\fB\-\-net container:\fIPID\fR	Network interfaces, routing table, port bindings
+\fB\-\-ipc container:\fIPID\fR	SysV semaphores, message queues, shmget/shmat memory
+.TE
+.PP
+POSIX shared memory
+.RB ( shm_open ,
+.IR /dev/shm )
+lives in the mount namespace and is not shared automatically.
+Use
+.B \-v /dev/shm:/dev/shm
+to share the host
+.IR /dev/shm ,
+or
+.BI "\-v /proc/" PID "/root/dev/shm:/dev/shm"
+to share another container's
+.IR /dev/shm .
+.PP
+Joining another container's namespace requires that both were started by a
+process with matching user namespace ownership, or that the joining process
+has root privileges.
+If
+.BR setns (2)
+fails, a descriptive error is printed and the container exits.
+.
+.SH ENVIRONMENT
+.TP
+.B SSH_AUTH_SOCK
+Path to the SSH agent socket forwarded when
+.B \-\-ssh\-agent
+is given.
+.TP
+.B AARCH64_SYSROOT
+Override the sysroot used by the aarch64 cross-compiler.
+Default:
+.IR /usr/aarch64\-redhat\-linux/sys\-root/fc43 .
+.TP
+.B OCI2BIN_HOME
+Override the directory where shared resources
+.RI ( build_polyglot.py ,
+pre-built loader binaries) are found.
+Set automatically by
+.B make install
+to
+.IR PREFIX/share/oci2bin .
+.
+.SH FILES
+.TP
+.I ~/.cache/oci2bin/
+Per-image build cache used by
+.BR \-\-cache .
+Each entry is a directory named
+.IB image_digest /
+containing the output binary.
+.TP
+.I /proc/self/exe
+The loader reads its own OCI data by opening this path at runtime.
+.TP
+.I PREFIX/share/oci2bin/
+Shared resources installed by
+.BR "make install" :
+.RS
+.TP
+.I build/loader\-x86_64
+Pre-compiled static loader for x86_64.
+.TP
+.I build/loader\-aarch64
+Pre-compiled static loader for aarch64.
+.TP
+.I scripts/build_polyglot.py
+Polyglot builder script.
+.TP
+.I src/loader.c
+Loader source code.
+.RE
+.
+.SH EXIT STATUS
+The exit status of the container process is propagated to the caller.
+If the container process was killed by a signal, the exit status is 1.
+If a fatal setup error occurs before exec, the exit status is 1.
+.
+.SH EXAMPLES
+.SS Build examples
+.EX
+# Build from Docker Hub
+oci2bin alpine:latest
+
+# Explicit output name
+oci2bin nginx:1.25 my\-nginx
+
+# Cross-compile for aarch64
+oci2bin \-\-arch aarch64 alpine:latest
+
+# Build and cache
+oci2bin \-\-cache redis:7\-alpine
+
+# Strip documentation to reduce size
+oci2bin \-\-strip ubuntu:22.04 my\-ubuntu
+
+# Inject a config file at build time
+oci2bin \-\-add\-file ./myapp.conf:/etc/myapp.conf myapp:latest
+
+# Overlay debug tools onto a production image
+oci2bin \-\-layer debugtools:latest myapp:latest myapp\-debug
+
+# Build without Docker, from an OCI layout directory
+skopeo copy docker://redis:7\-alpine oci:\&./redis\-oci:latest
+oci2bin \-\-oci\-dir \&./redis\-oci redis:7\-alpine
+.EE
+.
+.SS Runtime examples
+.EX
+# Run default entrypoint
+\&./alpine_latest
+
+# Override command
+\&./alpine_latest /bin/ls /etc
+
+# Terminate option parsing before a flag-like command
+\&./alpine_latest \-\- \-v
+
+# Volume mount
+\&./alpine_latest \-v /data:/data /bin/ls /data
+
+# Set environment variables
+\&./alpine_latest \-e DEBUG=1 \-e HOME=/app /bin/sh
+
+# Load environment from file
+\&./my\-app \-\-env\-file /etc/myapp.env
+
+# Read-only rootfs with writable scratch space
+\&./my\-app \-\-read\-only \-\-tmpfs /tmp \-\-tmpfs /var/cache
+
+# Run as non-root UID
+\&./my\-app \-\-user 1000:1000
+
+# Drop all capabilities, add back net_bind_service
+\&./my\-app \-\-cap\-drop all \-\-cap\-add net_bind_service
+
+# Isolated network namespace
+\&./my\-app \-\-net none
+
+# Share network namespace with another container (sidecar pattern)
+\&./main\-app \-\-net none \-\-detach
+\&./sidecar \-\-net container:$!
+
+# Share IPC namespace
+\&./service \-\-ipc container:$MAIN_PID
+
+# Run in background, capture PID
+PID=$(./redis \-\-detach)
+kill "$PID"
+
+# Init process for zombie reaping
+\&./my\-app \-\-init
+.EE
+.
+.SH HOW IT WORKS
+The output file is a polyglot: simultaneously a valid ELF64 executable and a
+valid POSIX tar archive.
+.PP
+The ELF magic bytes (0x7f\~E\~L\~F) appear at offset\~0; the ustar magic appears
+at offset\~257.
+The 64-byte ELF header is embedded inside the tar header's 100-byte filename
+field so both formats coexist without conflict.
+.PP
+At runtime the loader:
+.IP 1. 4
+Opens itself via
+.I /proc/self/exe
+and reads the embedded OCI tar from the patched offset.
+.IP 2. 4
+Extracts image layers into a temporary rootfs under
+.IR /tmp .
+.IP 3. 4
+Patches
+.I /etc/passwd
+and
+.I /etc/group
+for single-UID namespace compatibility.
+.IP 4. 4
+Enters a user namespace (host UID mapped to container UID\~0).
+.IP 5. 4
+Enters mount, PID, and UTS namespaces; optionally joins or creates a network
+namespace and joins an IPC namespace.
+.IP 6. 4
+Applies volume bind mounts, then
+.BR chroot (2)s
+into the rootfs.
+.IP 7. 4
+.BR exec (2)s
+the entrypoint.
+.
+.SH SEE ALSO
+.BR docker (1),
+.BR skopeo (1),
+.BR unshare (1),
+.BR nsenter (1),
+.BR chroot (8),
+.BR setns (2),
+.BR seccomp (2),
+.BR capabilities (7),
+.BR namespaces (7),
+.BR user_namespaces (7)
+.PP
+Full documentation:
+.BR "info oci2bin"
+.PP
+Source and issue tracker:
+.UR https://github.com/latedeployment/oci2bin
+.UE
+.
+.SH AUTHORS
+The oci2bin project.
+.
+.SH LICENSE
+MIT License.

@@ -341,6 +341,39 @@ By default, containers share the host network stack. Use `--net none` for a full
 
 The container process runs as root inside a user namespace. The host UID is mapped to UID 0 — no real privilege is granted on the host. `/etc/resolv.conf` from the host is copied into the rootfs so DNS resolution works.
 
+### Sharing namespaces between containers
+
+Two containers can share the same network or IPC namespace using `--net container:<PID>` and `--ipc container:<PID>`. This is useful for sidecar patterns (e.g. a proxy sharing network with a service) or for processes that communicate via SysV shared memory or message queues.
+
+```bash
+# Start the main container and capture its PID
+./myapp --net none --detach
+MAIN_PID=$!
+
+# Start a sidecar that joins the same network namespace
+./sidecar --net container:$MAIN_PID
+
+# Share the IPC namespace (SysV semaphores, message queues, shared memory)
+./sidecar --ipc container:$MAIN_PID
+```
+
+Both flags can be combined:
+
+```bash
+./sidecar --net container:$MAIN_PID --ipc container:$MAIN_PID
+```
+
+**Scope of sharing:**
+
+| Flag | What is shared |
+|------|---------------|
+| `--net container:<PID>` | Network interfaces, routing table, port bindings |
+| `--ipc container:<PID>` | SysV semaphores, message queues, SysV shared memory (`shmget`/`shmat`) |
+
+POSIX shared memory (`shm_open`, `/dev/shm`) lives in the mount namespace and is not shared automatically. To share it, bind-mount the host's `/dev/shm` into both containers with `-v /dev/shm:/dev/shm`, or pass the target container's `/dev/shm` via `-v /proc/<PID>/root/dev/shm:/dev/shm`.
+
+**Privilege note:** Joining a network or IPC namespace created by another container requires that both containers were started by a process with matching user namespace ownership, or that the joining process has root privileges. If the `setns()` call fails, a clear error is printed.
+
 ### Read-only containers
 
 `--read-only` mounts the rootfs read-only via overlayfs. Writes go to a temporary upper layer discarded on exit. The on-disk rootfs is never modified.

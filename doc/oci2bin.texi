@@ -1,0 +1,866 @@
+\input texinfo
+@c %**start of header
+@setfilename oci2bin.info
+@settitle oci2bin Manual
+@documentencoding UTF-8
+@c %**end of header
+
+@copying
+This manual is for oci2bin (version 0.1.0).
+
+Copyright @copyright{} 2026 latedeployment.
+
+@quotation
+Permission is granted to copy, distribute and/or modify this document
+under the terms of the MIT License.
+@end quotation
+@end copying
+
+@dircategory Containers
+@direntry
+* oci2bin: (oci2bin).   Convert OCI images to self-contained executables.
+@end direntry
+
+@titlepage
+@title oci2bin Manual
+@subtitle Convert Docker/OCI images into self-contained rootless container executables
+@subtitle Version 0.1.0
+@author The oci2bin project
+@page
+@vskip 0pt plus 1filll
+@insertcopying
+@end titlepage
+
+@contents
+
+@ifnottex
+@node Top
+@top oci2bin
+
+@insertcopying
+
+@menu
+* Overview::                    What oci2bin does
+* Getting Started::             Installation and first steps
+* Building Binaries::           Build options and image customisation
+* Running Containers::          Runtime options reference
+* Namespace Sharing::           Sharing network and IPC between containers
+* Isolation and Security::      Networking, capabilities, seccomp
+* Process Management::          Init, detach, signals
+* Subcommands::                 inspect, list, prune, diff
+* How It Works::                Polyglot format, loader internals
+* Environment Variables::       Variables read by oci2bin
+* Files::                       Paths used at runtime and build time
+* Index::                       Concept and option index
+@end menu
+@end ifnottex
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Overview
+@chapter Overview
+
+@cindex overview
+@cindex polyglot binary
+
+@command{oci2bin} converts any Docker or OCI image into a single,
+self-contained ELF64 executable.  The output requires only @command{tar}
+on the target machine—no Docker daemon, no container runtime, no
+installation.
+
+The output file is also a valid POSIX tar archive accepted by
+@command{docker load}, making it a polyglot binary (@pxref{How It
+Works}).
+
+@example
+oci2bin alpine:latest      # produces ./alpine_latest
+./alpine_latest            # runs the container
+docker load < alpine_latest
+@end example
+
+Containers run rootlessly using Linux user namespaces.  The process
+appears as UID@tie{}0 inside the container; on the host it runs as the
+invoking user with no elevated privileges.
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Getting Started
+@chapter Getting Started
+
+@cindex installation
+@cindex dependencies
+
+@section Build Dependencies
+
+@table @asis
+@item Arch Linux
+@code{sudo pacman -S gcc python3 docker}
+@item Fedora
+@code{sudo dnf install gcc glibc-static python3 docker}
+@item Debian / Ubuntu
+@code{sudo apt install gcc libc6-dev python3 docker.io}
+@item openSUSE Tumbleweed
+@code{sudo zypper install gcc glibc-devel-static python3 docker}
+@item NixOS / nix-shell
+@code{nix-shell -p gcc python3 docker}
+@end table
+
+@section Installation
+
+@example
+git clone https://github.com/latedeployment/oci2bin
+cd oci2bin
+make          # compile the loader into build/
+make install  # install to /usr/local (override with PREFIX=~/.local)
+@end example
+
+After installation @command{oci2bin} is on your @env{PATH}.  To use it
+without installing, run it directly from the repository root.
+
+@section Quick Start
+
+@example
+oci2bin alpine:latest        # output: ./alpine_latest
+./alpine_latest               # run default entrypoint
+./alpine_latest /bin/ls /etc  # override command
+oci2bin nginx:1.25 my-nginx  # explicit output name
+@end example
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Building Binaries
+@chapter Building Binaries
+
+@menu
+* Cross-Architecture Builds::
+* Injecting Files at Build Time::
+* Merging Image Layers::
+* Stripping Images::
+* OCI Image Layout::
+* Caching::
+* Digest Pinning::
+@end menu
+
+@node Cross-Architecture Builds
+@section Cross-Architecture Builds
+
+@cindex aarch64
+@cindex cross compilation
+@opindex --arch
+
+Build for a foreign architecture with @option{--arch}:
+
+@example
+# Install cross-compiler (Fedora)
+sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
+
+oci2bin --arch aarch64 alpine:latest
+@end example
+
+The sysroot defaults to @file{/usr/aarch64-redhat-linux/sys-root/fc43}.
+Override with the @env{AARCH64_SYSROOT} environment variable.
+
+Supported values for @option{--arch}: @code{x86_64}, @code{aarch64}.
+
+@node Injecting Files at Build Time
+@section Injecting Files at Build Time
+
+@opindex --add-file
+@opindex --add-dir
+
+Use @option{--add-file HOST:CONTAINER} and @option{--add-dir
+HOST:CONTAINER} to embed files or directories into the image at build
+time, without needing a volume mount at runtime:
+
+@example
+oci2bin --add-file ./myapp.conf:/etc/myapp/myapp.conf myapp:latest
+oci2bin --add-file /etc/ssl/certs/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt base:latest
+oci2bin --add-dir ./config:/etc/myapp myapp:latest
+@end example
+
+Files are added as a new layer on top of the existing image layers.
+Both flags may be repeated.
+
+@node Merging Image Layers
+@section Merging Image Layers
+
+@opindex --layer
+
+Use @option{--layer IMAGE} to overlay additional images on top of the
+base:
+
+@example
+oci2bin --layer debugtools:latest myapp:latest myapp-debug
+@end example
+
+Layers are applied in order.  The image config (@code{Cmd},
+@code{Entrypoint}, @code{Env}) from the last @option{--layer} argument
+overrides the base if non-null.  May be repeated.
+
+@node Stripping Images
+@section Stripping Images
+
+@opindex --strip
+
+@option{--strip} removes documentation, man pages, locale data, and
+package caches before packaging:
+
+@example
+oci2bin --strip ubuntu:22.04 my-ubuntu
+@end example
+
+Removed path prefixes: @file{usr/share/doc/}, @file{usr/share/man/},
+@file{usr/share/info/}, @file{usr/share/locale/},
+@file{usr/share/i18n/}, @file{var/cache/apt/},
+@file{var/lib/apt/lists/}, @file{tmp/}.
+
+@node OCI Image Layout
+@section Using OCI Image Layout
+
+@opindex --oci-dir
+@cindex skopeo
+@cindex crane
+
+Use @option{--oci-dir DIR} to build from an OCI image layout directory
+instead of pulling via Docker.  Compatible with @command{skopeo},
+@command{crane}, @command{buildah}, and other OCI-compliant tools:
+
+@example
+skopeo copy docker://redis:7-alpine oci:./redis-oci:latest
+oci2bin --oci-dir ./redis-oci redis:7-alpine redis_7-alpine
+@end example
+
+The @var{IMAGE} argument is optional when @option{--oci-dir} is given
+and is used only for the output filename default and embedded metadata.
+
+@node Caching
+@section Caching
+
+@opindex --cache
+@cindex cache
+
+@option{--cache} stores the output binary in
+@file{~/.cache/oci2bin/@var{image}_@var{digest}/output} so that
+repeated builds of the same image are instant:
+
+@example
+oci2bin --cache alpine:latest   # builds and caches
+oci2bin --cache alpine:latest   # returns cached binary immediately
+@end example
+
+The cache key includes the first 12 hex characters of the image's
+sha256 digest, so tag updates produce a fresh cache entry.
+
+Use the @code{list} and @code{prune} subcommands to manage the cache
+(@pxref{Subcommands}).
+
+@node Digest Pinning
+@section Reproducible Builds and Digest Pinning
+
+After pulling, oci2bin prints the content-addressed digest to stderr:
+
+@example
+oci2bin: image digest: redis@@sha256:abc123...
+@end example
+
+When @option{--cache} is active, the cache key includes the digest so
+that @code{redis:latest} updates produce a fresh cache entry rather than
+reusing a stale binary.
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Running Containers
+@chapter Running Containers
+
+By default the binary executes the image's configured entrypoint,
+equivalent to @command{docker run @var{IMAGE}}.  Arguments after the
+binary name replace the default command:
+
+@example
+./alpine_latest                          # default entrypoint
+./alpine_latest /bin/ls /etc             # override CMD
+./alpine_latest /bin/sh -c 'uname -a'
+./alpine_latest -- -v                    # '--' ends option parsing
+@end example
+
+@menu
+* Volume Mounts::
+* Secrets::
+* Environment Variables::         (runtime)
+* Entrypoint and WorkingDir::
+* User and Hostname::
+* Resource Limits::
+* SSH Agent Forwarding::
+* Extra tmpfs Mounts::
+* Exposing Host Devices::
+* Exit Codes::
+@end menu
+
+@node Volume Mounts
+@section Volume Mounts
+
+@opindex -v
+
+@option{-v HOST:CONTAINER} bind-mounts a host path into the container.
+The mount point is created inside the container if it does not exist.
+The container path must be absolute and must not contain @code{..}.
+May be repeated (up to 32).
+
+@example
+./alpine_latest -v /data:/data /bin/ls /data
+./alpine_latest -v /data/input:/input -v /data/output:/output \
+  /bin/sh -c 'cp /input/file /output/'
+@end example
+
+@node Secrets
+@section Secrets
+
+@opindex --secret
+
+@option{--secret HOST_FILE[:CONTAINER_PATH]} bind-mounts a single host
+file into the container read-only.  If @var{CONTAINER_PATH} is omitted,
+the file lands at @file{/run/secrets/@var{basename}}.  Enforced with
+@code{MS_RDONLY|MS_NOEXEC|MS_NOSUID|MS_NODEV}.  May be repeated.
+
+@example
+./my-app --secret ~/.config/api_key           # -> /run/secrets/api_key
+./my-app --secret /etc/ssl/cert.pem:/certs/ca.pem
+@end example
+
+@node Environment Variables
+@section Environment Variables
+
+@opindex -e
+@opindex --env-file
+
+@option{-e KEY=VALUE} sets a variable inside the container.
+@option{-e KEY} (no @code{=}) passes a variable from the host; if it is
+not set on the host, a warning is printed and it is skipped.
+
+@option{--env-file FILE} loads @code{KEY=VALUE} pairs from a file.
+Blank lines and @code{#} comments are ignored.  @option{--env-file} and
+@option{-e} are additive; files are processed before @option{-e} flags.
+
+@example
+./alpine_latest -e DEBUG=1 /bin/sh -c 'echo $DEBUG'
+./my-app --env-file /etc/myapp.env -e OVERRIDE=1
+@end example
+
+@node Entrypoint and WorkingDir
+@section Entrypoint and Working Directory
+
+@opindex --entrypoint
+@opindex --workdir
+
+@option{--entrypoint PATH} overrides the image's OCI entrypoint.
+
+@option{--workdir PATH} sets the working directory inside the container,
+overriding the image's @code{WorkingDir}.  Defaults to @file{/} if
+neither is set.
+
+@example
+./alpine_latest --entrypoint /bin/sh -c 'echo hello'
+./my-app --workdir /app
+@end example
+
+@node User and Hostname
+@section User and Hostname
+
+@opindex --user
+@opindex --hostname
+
+@option{--user UID[:GID]} runs the container process as the given
+numeric UID and optional GID.  Both values must be integers
+@leq{}@tie{}65534.  @code{setgroups}, @code{setgid}, and @code{setuid}
+are called; if any fail the container exits immediately.
+
+@option{--hostname NAME} sets the hostname inside the UTS namespace.
+Defaults to @code{oci2bin}.
+
+@example
+./my-app --user 1000:1000
+./my-app --hostname mycontainer
+@end example
+
+@node Resource Limits
+@section Resource Limits
+
+@opindex --ulimit
+@cindex ulimit
+@cindex setrlimit
+
+@option{--ulimit TYPE=N} sets resource limits via @code{setrlimit(2)}.
+Both soft and hard limits are set to @var{N}.  May be repeated.
+
+@multitable @columnfractions .2 .8
+@headitem Type @tab Meaning
+@item @code{nofile} @tab Maximum number of open file descriptors
+@item @code{nproc}  @tab Maximum number of processes
+@item @code{cpu}    @tab CPU time limit (seconds)
+@item @code{as}     @tab Maximum virtual memory (bytes)
+@item @code{fsize}  @tab Maximum file size (bytes)
+@end multitable
+
+@example
+./my-app --ulimit nofile=1024 --ulimit nproc=64
+./my-app --ulimit as=536870912     # 512 MiB virtual memory
+@end example
+
+@node SSH Agent Forwarding
+@section SSH Agent Forwarding
+
+@opindex --ssh-agent
+@cindex SSH agent
+
+@option{--ssh-agent} forwards the host @env{SSH_AUTH_SOCK} Unix socket
+into the container at @file{/run/ssh-agent.sock} and sets
+@env{SSH_AUTH_SOCK} accordingly.  The socket is bind-mounted read-only.
+If @env{SSH_AUTH_SOCK} is unset or points to a non-socket, a warning is
+printed and the container runs without agent forwarding.
+
+@example
+./my-app --ssh-agent /bin/sh -c 'ssh git@@github.com'
+@end example
+
+@node Extra tmpfs Mounts
+@section Extra tmpfs Mounts
+
+@opindex --tmpfs
+
+@option{--tmpfs PATH} mounts a fresh in-memory filesystem at @var{PATH}
+inside the container.  Useful for writable scratch space when
+@option{--read-only} is active.  @var{PATH} must be absolute and must
+not contain @code{..}.  May be repeated.
+
+@example
+./my-app --read-only --tmpfs /tmp --tmpfs /var/cache
+@end example
+
+@node Exposing Host Devices
+@section Exposing Host Devices
+
+@opindex --device
+
+@option{--device /dev/HOST[:CONTAINER]} exposes a host device node
+inside the container.  The host path must start with @file{/dev/}.  The
+container path defaults to the host path if omitted.  @code{mknod(2)}
+is attempted first; on failure a bind mount is used.  May be repeated.
+
+@example
+./my-app --device /dev/nvidia0         # GPU passthrough
+./my-app --device /dev/ttyUSB0         # serial port
+./my-app --device /dev/snd:/dev/snd    # audio
+@end example
+
+@node Exit Codes
+@section Exit Codes
+
+The container process exit status is forwarded to the caller.
+
+@example
+./alpine_latest /bin/sh -c 'exit 42'
+echo $?   # prints 42
+@end example
+
+If the container process was killed by a signal, the exit status is 1.
+Fatal setup errors (namespace creation, extraction failure) also exit
+with status 1.
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Namespace Sharing
+@chapter Sharing Namespaces Between Containers
+
+@cindex namespace sharing
+@cindex sidecar
+@cindex IPC
+@cindex network namespace
+@opindex --net container
+@opindex --ipc container
+
+Two containers can share the same network or IPC namespace.  This
+enables sidecar patterns (e.g.@: a proxy sharing network with a
+service) and inter-container IPC without a shared daemon.
+
+@section Sharing the Network Namespace
+
+@option{--net container:@var{PID}} joins the network namespace of the
+process with PID @var{PID}.  The container shares all network
+interfaces, routing tables, and port bindings with that process.
+
+@example
+# Start the main container detached, capture its PID
+./myapp --net none --detach
+MAIN_PID=$!
+
+# Sidecar joins the same network namespace
+./sidecar --net container:$MAIN_PID
+@end example
+
+@section Sharing the IPC Namespace
+
+@option{--ipc container:@var{PID}} joins the IPC namespace of the
+process with PID @var{PID}.  Shared resources include:
+
+@itemize
+@item SysV semaphores (@code{semget}/@code{semop})
+@item SysV message queues (@code{msgget}/@code{msgsnd}/@code{msgrcv})
+@item SysV shared memory (@code{shmget}/@code{shmat})
+@end itemize
+
+@example
+./service --ipc container:$MAIN_PID
+@end example
+
+@section Combining Both Flags
+
+@example
+./sidecar --net container:$MAIN_PID --ipc container:$MAIN_PID
+@end example
+
+@section POSIX Shared Memory
+
+POSIX shared memory (@code{shm_open}, @file{/dev/shm}) lives in the
+mount namespace and is not shared by @option{--ipc container:@var{PID}}.
+To share it, bind-mount the same @file{/dev/shm} path into both
+containers:
+
+@example
+./myapp    -v /dev/shm:/dev/shm
+./sidecar  -v /dev/shm:/dev/shm
+@end example
+
+Or share the other container's @file{/dev/shm} directly:
+
+@example
+./sidecar -v /proc/$MAIN_PID/root/dev/shm:/dev/shm
+@end example
+
+@section Privilege Note
+
+Joining a network or IPC namespace created by another container requires
+that both containers were started by a process with matching user
+namespace ownership, or that the joining process has root privileges.
+If @code{setns(2)} fails, a descriptive error is printed and the
+container exits.
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Isolation and Security
+@chapter Isolation and Security
+
+@menu
+* Networking Modes::
+* Read-Only Rootfs::
+* Capabilities::
+* Seccomp Filter::
+* User Namespace::
+@end menu
+
+@node Networking Modes
+@section Networking Modes
+
+@opindex --net
+
+@table @option
+@item --net host
+Share the host network stack (default).
+@item --net none
+Create an isolated network namespace with only a loopback interface.
+@item --net container:@var{PID}
+Join the network namespace of process @var{PID}.
+@end table
+
+@node Read-Only Rootfs
+@section Read-Only Rootfs
+
+@opindex --read-only
+@cindex overlayfs
+
+@option{--read-only} mounts the rootfs read-only via overlayfs.  Writes
+go to a temporary upper layer discarded on exit; the on-disk rootfs is
+never modified.  Falls back to read-write with a warning if overlayfs is
+unavailable.
+
+@example
+./my-app --read-only
+./my-app --read-only --tmpfs /tmp --tmpfs /var/run
+@end example
+
+@node Capabilities
+@section Capabilities
+
+@opindex --cap-drop
+@opindex --cap-add
+@cindex capabilities
+
+@option{--cap-drop CAP} drops a capability from the bounding and
+effective sets.  Pass @code{all} to drop every capability.
+@option{--cap-add CAP} raises a capability as ambient so it survives
+@code{exec(2)}.  Both are case-insensitive and the @code{CAP_} prefix is
+optional.
+
+@example
+./my-app --cap-drop all
+./my-app --cap-drop all --cap-add net_bind_service
+./my-app --cap-drop net_raw --cap-drop sys_ptrace
+@end example
+
+@node Seccomp Filter
+@section Seccomp Filter
+
+@opindex --no-seccomp
+@cindex seccomp
+
+A default seccomp-BPF filter blocks syscalls with no legitimate use
+inside a container:
+
+@multitable @columnfractions .35 .65
+@headitem Blocked syscall @tab Reason
+@item @code{kexec_load}, @code{kexec_file_load} @tab Load a new kernel
+@item @code{reboot} @tab Reboot the host
+@item @code{syslog} @tab Kernel ring buffer access
+@item @code{perf_event_open} @tab Used in kernel exploit chains
+@item @code{bpf} @tab Load arbitrary BPF programs
+@item @code{add_key}, @code{request_key}, @code{keyctl} @tab Kernel keyring manipulation
+@item @code{userfaultfd} @tab Exploited in kernel escapes
+@item @code{pivot_root} @tab Namespace escape vector
+@item @code{ptrace} @tab Container escape
+@item @code{process_vm_readv}, @code{process_vm_writev} @tab Cross-process memory access
+@item @code{init_module}, @code{finit_module} @tab Kernel module loading
+@end multitable
+
+@code{PR_SET_NO_NEW_PRIVS} is always set.  To disable the filter:
+
+@example
+./my-app --no-seccomp
+@end example
+
+@node User Namespace
+@section User Namespace
+
+The loader always creates a user namespace (CLONE_NEWUSER) and maps the
+host UID to UID@tie{}0 inside the container.  This makes the process
+appear as root inside the container without granting real host
+privileges.
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Process Management
+@chapter Process Management
+
+@menu
+* Init Process::
+* Background Detach::
+@end menu
+
+@node Init Process
+@section Init Process and Zombie Reaping
+
+@opindex --init
+@cindex zombie reaping
+@cindex PID 1
+
+@option{--init} runs a tiny zombie-reaping init as PID@tie{}1.  The
+entrypoint is forked as a child; the parent loops reaping zombies.
+@code{SIGTERM}, @code{SIGINT}, @code{SIGHUP}, @code{SIGUSR1}, and
+@code{SIGUSR2} are forwarded to the child.  When the main child exits,
+remaining zombies are drained and the exit status is returned.
+
+@example
+./my-app --init
+./my-app --init --detach   # fully-managed background service
+@end example
+
+@node Background Detach
+@section Running in Background
+
+@opindex --detach
+
+@option{--detach} (or @option{-d}) forks the container to the
+background, prints the child PID to stdout, and exits.  The child calls
+@code{setsid(2)} to detach from the terminal and redirects stdin from
+@file{/dev/null}.
+
+@example
+PID=$(./redis --detach)
+echo "Redis running as PID $PID"
+sleep 1
+kill "$PID"
+@end example
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Subcommands
+@chapter Subcommands
+
+@menu
+* inspect::
+* list::
+* prune::
+* diff::
+@end menu
+
+@node inspect
+@section inspect
+
+@example
+oci2bin inspect @var{BINARY}
+@end example
+
+Display OCI metadata embedded in @var{BINARY}: image name,
+architecture, layer count, entrypoint, command, environment, working
+directory, build digest, and build timestamp.
+
+@node list
+@section list
+
+@example
+oci2bin list [--json]
+@end example
+
+List all cached binaries with image name, digest, size, and build date.
+@option{--json} emits machine-readable JSON.
+
+@node prune
+@section prune
+
+@example
+oci2bin prune [--dry-run]
+@end example
+
+Remove outdated cache entries, keeping only the most recently built
+binary for each image name.  @option{--dry-run} shows what would be
+deleted without deleting.
+
+@node diff
+@section diff
+
+@example
+oci2bin diff @var{OLD} @var{NEW}
+@end example
+
+Compare the filesystem contents of two oci2bin binaries.  Output lines
+are prefixed with @code{+} (added), @code{-} (removed), or @code{M}
+(modified).  Exits with status@tie{}0 if identical, or 1 if there are
+differences.
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node How It Works
+@chapter How It Works
+
+@cindex polyglot
+@cindex ELF
+@cindex tar archive
+
+The output file is a polyglot: simultaneously a valid ELF64 executable
+and a valid POSIX tar archive.
+
+@example
+Byte   0-3:   7f 45 4c 46   ELF magic  (kernel identifies as executable)
+Byte 257-262: 75 73 74 61   ustar\0    (tar identifies as archive)
+@end example
+
+The 64-byte ELF header fits within the tar header's 100-byte filename
+field.  When executed, the kernel processes the ELF; when passed to
+@command{tar} or @command{docker load}, the tar structure is read.
+
+@section File Layout
+
+@example
+[0-63]       ELF64 header  (embedded in the tar filename field)
+[64-511]     Remaining tar header fields (ustar magic at byte 257)
+[512-4095]   NUL padding   (page-aligns the loader for mmap)
+[4096-~75K]  Loader binary (statically linked, gcc -static -O2 -s)
+[~75K-end]   OCI image tar (manifest.json, config, layer tarballs)
+@end example
+
+@section Runtime Sequence
+
+@enumerate
+@item
+Open @file{/proc/self/exe} and read the embedded OCI tar from the
+patched offset.
+@item
+Extract image layers into a temporary rootfs under @file{/tmp} using
+@command{tar --no-same-permissions --no-same-owner}.
+@item
+Patch @file{/etc/passwd} and @file{/etc/group} for single-UID namespace
+compatibility (all UIDs/GIDs set to@tie{}0, except 65534).
+@item
+Enter a user namespace (@code{CLONE_NEWUSER}); map host UID to
+container UID@tie{}0.
+@item
+Optionally join a shared network or IPC namespace via @code{setns(2)}.
+@item
+Enter mount, PID, and UTS namespaces.
+@item
+Apply volume bind mounts; optionally set up overlayfs.
+@item
+@code{chroot(2)} into the rootfs; mount @file{/proc}, @file{/tmp},
+@file{/dev}.
+@item
+Apply seccomp filter, capabilities, UID drop.
+@item
+@code{exec(2)} the entrypoint.
+@end enumerate
+
+@section Security Properties
+
+@itemize
+@item
+The process is unprivileged on the host; @code{CLONE_NEWUSER} does not
+confer real root.
+@item
+Layer and config paths from the OCI manifest are validated against path
+traversal.
+@item
+Volume container paths must be absolute and must not contain @code{..}.
+@item
+Tar extraction uses @option{--no-same-permissions --no-same-owner} to
+prevent setuid bit restoration.
+@item
+Temporary directories are created with @code{mkdtemp} (mode
+@code{0700}).
+@end itemize
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Environment Variables
+@chapter Environment Variables
+
+@table @env
+@item SSH_AUTH_SOCK
+Path to the SSH agent socket forwarded when @option{--ssh-agent} is
+given.
+@item AARCH64_SYSROOT
+Override the sysroot used by the aarch64 cross-compiler.  Default:
+@file{/usr/aarch64-redhat-linux/sys-root/fc43}.
+@item OCI2BIN_HOME
+Override the directory where shared resources are found
+(@file{build_polyglot.py}, pre-built loader binaries).  Set
+automatically by @command{make install} to
+@file{@var{PREFIX}/share/oci2bin}.
+@end table
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Files
+@chapter Files
+
+@table @file
+@item ~/.cache/oci2bin/
+Per-image build cache used by @option{--cache}.  Each entry is a
+directory named @file{@var{image}_@var{digest}/} containing the output
+binary.
+@item /proc/self/exe
+The loader opens this path to read its embedded OCI data at runtime.
+@item @var{PREFIX}/bin/oci2bin
+The CLI wrapper script installed by @command{make install}.
+@item @var{PREFIX}/share/oci2bin/build/loader-x86_64
+Pre-compiled static loader for x86_64.
+@item @var{PREFIX}/share/oci2bin/build/loader-aarch64
+Pre-compiled static loader for aarch64.
+@item @var{PREFIX}/share/oci2bin/scripts/build_polyglot.py
+Polyglot builder script.
+@item @var{PREFIX}/share/oci2bin/src/loader.c
+Loader source code.
+@end table
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Index
+@unnumbered Index
+
+@printindex cp
+
+@bye
