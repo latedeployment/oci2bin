@@ -2,6 +2,55 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.5.0] - 2026-03-13
+
+### Added
+
+- **`--memory SIZE` / `--cpus FLOAT` / `--pids-limit N`** — hard resource
+  limits via Linux cgroup v2. Creates `/sys/fs/cgroup/oci2bin-<pid>/`, writes
+  `memory.max`, `cpu.max` (`QUOTA 100000` format), and `pids.max`, then moves
+  the process into the leaf cgroup. `unshare(CLONE_NEWCGROUP)` hides the host
+  hierarchy. Graceful degradation if cgroup v2 is unavailable. Supports `k`,
+  `m`, `g` suffixes for `--memory`; bounds-checked before suffix multiply to
+  prevent integer overflow.
+- **`oci2bin sign --key KEY.pem --in BINARY [--out BINARY]`** — sign a binary
+  with an ECDSA P-256 key. Appends a `OCI2BIN_SIG` magic block (keyid,
+  DER-encoded signature, total-length trailer) after the OCI tar.
+- **`oci2bin verify --key PUB.pem --in BINARY`** — verify the signature;
+  exits 0 (valid), 1 (not signed), or 2 (invalid). Implemented in
+  `scripts/sign_binary.py` (stdlib + `openssl pkeyutl`).
+- **`--verify-key PATH`** — loader-side verification: checks the binary's
+  signature before any rootfs extraction. Aborts immediately on failure, before
+  writing a single byte to disk.
+- **`--net slirp` / `--net pasta` / `--net slirp:HOST:CTR`** — full outbound
+  TCP/UDP networking inside an isolated network namespace without root. Forks a
+  `slirp4netns` or `pasta` helper after `unshare(CLONE_NEWNET)`, syncs via a
+  pipe, and reaps the helper on container exit. Port-forward syntax
+  `slirp:HOST_PORT:CTR_PORT` supported (up to 16 forwards).
+- **`oci2bin pod run [--net shared] [--ipc shared] BINARY [BINARY ...]`** —
+  daemon-free multi-container pods. Creates a pause process via `unshare` to
+  hold shared namespaces; starts each binary with
+  `--net container:<pause_pid>` / `--ipc container:<pause_pid>`. Monitors
+  lifecycle: non-zero exit SIGTERMs siblings; reports worst exit code.
+  SIGTERM/SIGINT forwarded to all children.
+- **`--overlay-persist DIR`** — keep the overlayfs upper layer between runs.
+  Uses `DIR/upper` and `DIR/work` instead of a tmpdir; state accumulates
+  across invocations. Verifies upper and work are on the same filesystem.
+  The immutable extracted rootfs is never modified.
+- **`--config PATH`** — load runtime options from a `key=value` text file.
+  Lines `key=value` become `--key value`; bare `key` lines become `--key`
+  boolean flags. Config file sets defaults; real argv overrides. Implemented
+  via `build_merged_argv()`: pre-scans for `--config`, reads the file, builds
+  a single merged argv, calls `parse_opts` exactly once — no recursive calls,
+  no pointer-aliasing hazards.
+
+### Fixed
+
+- `--memory` parsing: bounds check now happens **before** the suffix multiply
+  (`val *= 1024^N`) to prevent signed integer overflow / silent limit bypass.
+
+---
+
 ## [0.4.0] - 2026-03-10
 
 ### Added
