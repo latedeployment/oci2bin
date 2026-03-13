@@ -347,6 +347,84 @@ echo $?   # 42
 
 ---
 
+## VM isolation (--vm)
+
+`--vm` runs the container inside a hardware-isolated microVM instead of a Linux
+namespace. The OCI rootfs becomes the VM's root filesystem; the container
+process runs as PID 1 via a minimal in-binary init.
+
+### Prerequisites
+
+Two backends are supported:
+
+| Backend | When to use | Extra requirements |
+|---|---|---|
+| **libkrun** (default when compiled with `LIBKRUN=1`) | macOS (HVF) or Linux (KVM); no kernel binary needed | `libkrun-dev` at build time |
+| **cloud-hypervisor** | Linux (KVM); full VM control | `cloud-hypervisor` in `$PATH`, embedded kernel (see below) |
+
+`--vm` requires `/dev/kvm` on Linux. On macOS, libkrun uses the Hypervisor
+framework (HVF) — no KVM is needed.
+
+### Building with libkrun
+
+```bash
+make LIBKRUN=1          # links libkrun; no kernel binary needed
+```
+
+Requires the `libkrun` and `libkrun-dev` packages (available on Fedora, Ubuntu,
+and from [containers/libkrun](https://github.com/containers/libkrun)).
+
+### Building the kernel (cloud-hypervisor path)
+
+```bash
+make kernel             # downloads Linux 6.1, builds vmlinux (~10 min first time)
+oci2bin alpine myapp --kernel build/vmlinux   # embeds kernel in polyglot
+```
+
+The embedded kernel adds ~10 MB to the binary. The initramfs is built at
+runtime from the extracted rootfs if not pre-embedded.
+
+### Usage
+
+```bash
+# Basic: run command inside microVM
+./myapp --vm /bin/echo hello
+
+# Custom resources
+./myapp --vm --memory 512m --cpus 2 /bin/sh
+
+# Persistent state across runs (ext2 data disk, cloud-hypervisor path)
+./myapp --vm --overlay-persist ./state /bin/sh
+
+# Volume mount via virtiofs (cloud-hypervisor) or mapped volume (libkrun)
+./myapp --vm -v $(pwd):/work /bin/sh
+
+# Explicit VMM selection
+./myapp --vmm cloud-hypervisor /bin/echo hello
+./myapp --vmm /opt/bin/cloud-hypervisor /bin/echo hello
+```
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--vm` | Enable microVM isolation |
+| `--vmm PATH` | VMM binary or name (`cloud-hypervisor`; default is libkrun if available) |
+| `--memory SIZE` | VM RAM (e.g. `256m`, `1g`; default 256 MiB) |
+| `--cpus N` | Number of vCPUs (default 1) |
+| `--overlay-persist DIR` | Persist a 1 GiB ext2 data disk in `DIR/oci2bin-data.ext2` |
+| `-v HOST:CTR` | Mount host directory inside the VM |
+
+### Notes
+
+- The binary itself becomes the VM's `/init`. When the kernel starts, it detects
+  `OCI2BIN_VM_INIT=1` in the cmdline and runs `vm_init_main()` instead of the
+  host extraction path.
+- Volume mounts use **virtiofs** (cloud-hypervisor) or libkrun mapped volumes.
+  `virtiofsd` must be in `$PATH` for the cloud-hypervisor path.
+- `--overlay-persist` in VM mode creates a separate ext2 block device. It does
+  not use overlayfs (that is the namespace-mode behaviour).
+
 ## Isolation and security
 
 ### Networking
