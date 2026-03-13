@@ -20,9 +20,11 @@ Layout:
 
 import argparse
 import datetime
+import gzip
 import io
 import json
 import os
+import stat as stat_module
 import struct
 import subprocess
 import sys
@@ -220,29 +222,166 @@ def parse_loader_elf(loader_path):
 
 # ── Marker patching ──────────────────────────────────────────────────────────
 
-OFFSET_MARKER = struct.pack('<Q', 0xDEADBEEFCAFEBABE)
-SIZE_MARKER = struct.pack('<Q', 0xCAFEBABEDEADBEEF)
+OFFSET_MARKER  = struct.pack('<Q', 0xDEADBEEFCAFEBABE)
+SIZE_MARKER    = struct.pack('<Q', 0xCAFEBABEDEADBEEF)
 PATCHED_MARKER = struct.pack('<Q', 0xAAAAAAAAAAAAAAAA)
 
+# VM blob markers — chosen so no two adjacent markers produce an OCI marker
+# as a cross-boundary substring. Do NOT use DEAD/BEEF/CAFE/BABE byte patterns.
+KERNEL_OFFSET_MARKER     = struct.pack('<Q', 0x7E57AB1E7E57AB1E)
+KERNEL_SIZE_MARKER       = struct.pack('<Q', 0xB00BB00BB00BB00B)
+INITRAMFS_OFFSET_MARKER  = struct.pack('<Q', 0xC0FFEE00C0FFEE00)
+INITRAMFS_SIZE_MARKER    = struct.pack('<Q', 0xFACEB00CFACEB00C)
 
-def patch_markers(data, oci_offset, oci_size):
+
+def patch_markers(data, oci_offset, oci_size,
+                  kernel_offset=None, kernel_size=None,
+                  initramfs_offset=None, initramfs_size=None):
     """
-    Find and replace the OCI_DATA_OFFSET and OCI_DATA_SIZE markers
-    in the loader's loadable segment data.
+    Find and replace the OCI_DATA_OFFSET and OCI_DATA_SIZE markers in the
+    loader binary.  Optionally also patch KERNEL and INITRAMFS markers when
+    those blobs are appended to the polyglot.
     """
-    offset_packed = struct.pack('<Q', oci_offset)
-    size_packed = struct.pack('<Q', oci_size)
-    patched_flag = struct.pack('<Q', 1)
+    patched = data.replace(OFFSET_MARKER,  struct.pack('<Q', oci_offset))
+    patched = patched.replace(SIZE_MARKER, struct.pack('<Q', oci_size))
+    patched = patched.replace(PATCHED_MARKER, struct.pack('<Q', 1))
+
     n_off = data.count(OFFSET_MARKER)
-    n_sz = data.count(SIZE_MARKER)
-    n_pf = data.count(PATCHED_MARKER)
-    patched = data.replace(OFFSET_MARKER, offset_packed)
-    patched = patched.replace(SIZE_MARKER, size_packed)
-    patched = patched.replace(PATCHED_MARKER, patched_flag)
-    print(f"  Patched: offset({n_off}x) size({n_sz}x) flag({n_pf}x)", file=sys.stderr)
+    n_sz  = data.count(SIZE_MARKER)
+    print(f"  Patched OCI: offset({n_off}x) size({n_sz}x)", file=sys.stderr)
     if n_off == 0 or n_sz == 0:
-        print("WARNING: markers not found in loader binary!", file=sys.stderr)
+        print("WARNING: OCI markers not found in loader binary!", file=sys.stderr)
+
+    if kernel_offset is not None:
+        n = patched.count(KERNEL_OFFSET_MARKER)
+        patched = patched.replace(KERNEL_OFFSET_MARKER, struct.pack('<Q', kernel_offset))
+        print(f"  Patched KERNEL_OFFSET({n}x) = 0x{kernel_offset:x}", file=sys.stderr)
+    if kernel_size is not None:
+        n = patched.count(KERNEL_SIZE_MARKER)
+        patched = patched.replace(KERNEL_SIZE_MARKER, struct.pack('<Q', kernel_size))
+        print(f"  Patched KERNEL_SIZE({n}x)   = 0x{kernel_size:x}", file=sys.stderr)
+    if initramfs_offset is not None:
+        n = patched.count(INITRAMFS_OFFSET_MARKER)
+        patched = patched.replace(INITRAMFS_OFFSET_MARKER, struct.pack('<Q', initramfs_offset))
+        print(f"  Patched INITRAMFS_OFFSET({n}x) = 0x{initramfs_offset:x}", file=sys.stderr)
+    if initramfs_size is not None:
+        n = patched.count(INITRAMFS_SIZE_MARKER)
+        patched = patched.replace(INITRAMFS_SIZE_MARKER, struct.pack('<Q', initramfs_size))
+        print(f"  Patched INITRAMFS_SIZE({n}x)   = 0x{initramfs_size:x}", file=sys.stderr)
+
     return patched
+
+
+# ── cpio initramfs builder ────────────────────────────────────────────────────
+
+def _cpio_newc_header(ino, mode, uid, gid, nlink, mtime, filesize,
+                      devmajor, devminor, rdevmajor, rdevminor, namesize):
+    """Build a 110-byte cpio newc (070701) header."""
+    return (
+        b"070701"
+        + format(ino,       '08x').encode()
+        + format(mode,      '08x').encode()
+        + format(uid,       '08x').encode()
+        + format(gid,       '08x').encode()
+        + format(nlink,     '08x').encode()
+        + format(mtime,     '08x').encode()
+        + format(filesize,  '08x').encode()
+        + format(devmajor,  '08x').encode()
+        + format(devminor,  '08x').encode()
+        + format(rdevmajor, '08x').encode()
+        + format(rdevminor, '08x').encode()
+        + format(namesize,  '08x').encode()
+        + b"00000000"  # check field — always zero for newc
+    )
+
+
+def _cpio_pad4(n):
+    """Return number of NUL bytes needed to pad n to a 4-byte boundary."""
+    return (4 - (n % 4)) % 4
+
+
+def build_initramfs(rootfs_dir, out_path):
+    """
+    Build a gzip-compressed cpio newc archive from rootfs_dir.
+    Pure Python, stdlib only.  Security properties:
+    - Strips setuid and setgid bits (mode & 0o1777, then OR file type back in).
+    - Normalizes uid/gid to 0 (root) in the guest.
+    - Follows no symlinks during the walk (followlinks=False).
+    """
+    buf = io.BytesIO()
+    rootfs_dir = os.path.realpath(rootfs_dir)
+    ino_counter = [1]
+
+    def write_entry(name_bytes, st, data=b''):
+        ino = ino_counter[0]
+        ino_counter[0] += 1
+        # Keep the file type bits; strip setuid/setgid from permission bits.
+        type_bits = stat_module.S_IFMT(st.st_mode)
+        perm_bits = st.st_mode & 0o1777
+        mode = type_bits | perm_bits
+        uid = 0
+        gid = 0
+        nlink = max(1, st.st_nlink)
+        mtime = max(0, int(st.st_mtime))
+        filesize = len(data)
+        devmajor = 3
+        devminor = 1
+        rdevmajor = 0
+        rdevminor = 0
+        if stat_module.S_ISCHR(st.st_mode) or stat_module.S_ISBLK(st.st_mode):
+            rdevmajor = os.major(st.st_rdev)
+            rdevminor = os.minor(st.st_rdev)
+        name_with_null = name_bytes + b'\x00'
+        namesize = len(name_with_null)
+        hdr = _cpio_newc_header(ino, mode, uid, gid, nlink, mtime, filesize,
+                                devmajor, devminor, rdevmajor, rdevminor, namesize)
+        buf.write(hdr)
+        buf.write(name_with_null)
+        buf.write(b'\x00' * _cpio_pad4(len(hdr) + namesize))
+        if data:
+            buf.write(data)
+            buf.write(b'\x00' * _cpio_pad4(filesize))
+
+    # Root directory "." entry
+    write_entry(b'.', os.lstat(rootfs_dir))
+
+    # Walk the tree — no symlink following
+    for dirpath, dirs, files in os.walk(rootfs_dir, followlinks=False):
+        dirs.sort()
+        files.sort()
+        for name in dirs + files:
+            full = os.path.join(dirpath, name)
+            rel  = os.path.relpath(full, rootfs_dir)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if stat_module.S_ISREG(st.st_mode):
+                try:
+                    with open(full, 'rb') as fh:
+                        file_data = fh.read()
+                except OSError:
+                    file_data = b''
+                write_entry(rel.encode(), st, file_data)
+            elif stat_module.S_ISLNK(st.st_mode):
+                try:
+                    target = os.readlink(full).encode()
+                except OSError:
+                    target = b''
+                write_entry(rel.encode(), st, target)
+            else:
+                # Directory, device, FIFO, socket — no data
+                write_entry(rel.encode(), st)
+
+    # TRAILER!!! entry
+    trailer_name = b'TRAILER!!!\x00'
+    hdr = _cpio_newc_header(0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, len(trailer_name))
+    buf.write(hdr)
+    buf.write(trailer_name)
+    buf.write(b'\x00' * _cpio_pad4(len(hdr) + len(trailer_name)))
+
+    with open(out_path, 'wb') as f:
+        f.write(gzip.compress(buf.getvalue(), compresslevel=6))
 
 
 # ── Main polyglot construction ───────────────────────────────────────────────
@@ -282,7 +421,8 @@ def build_meta_block(image_name, digest=None):
 
 
 def build_polyglot(loader_path, image_name, output_path, tar_path=None,
-                   digest=None, image_name_for_meta=None):
+                   digest=None, image_name_for_meta=None,
+                   kernel_path=None, initramfs_path=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -349,8 +489,46 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     # The loader reads the OCI region as a standalone tar.
     oci_data_file_offset = TAR_BLOCK + tar_entry1_padded
 
+    # 4. Load optional VM blobs (kernel, initramfs)
+    kernel_data = b''
+    if kernel_path:
+        with open(kernel_path, 'rb') as f:
+            kernel_data = f.read()
+        print(f"  Kernel: {kernel_path} ({len(kernel_data) // 1024} KB)", file=sys.stderr)
+
+    initramfs_data = b''
+    if initramfs_path:
+        with open(initramfs_path, 'rb') as f:
+            initramfs_data = f.read()
+        print(f"  Initramfs: {initramfs_path} ({len(initramfs_data) // 1024} KB)", file=sys.stderr)
+
+    # Pre-compute VM blob offsets (after OCI tar, aligned to 4096)
+    PAGE_ALIGN = 4096
+    kernel_file_offset = None
+    initramfs_file_offset = None
+
+    if kernel_data:
+        # offset after OCI tar, aligned to PAGE_ALIGN
+        base = oci_data_file_offset + oci_size
+        pad = (PAGE_ALIGN - (base % PAGE_ALIGN)) % PAGE_ALIGN
+        kernel_file_offset = base + pad
+
+    if initramfs_data:
+        if kernel_file_offset is not None:
+            base = kernel_file_offset + len(kernel_data)
+        else:
+            base = oci_data_file_offset + oci_size
+        pad = (PAGE_ALIGN - (base % PAGE_ALIGN)) % PAGE_ALIGN
+        initramfs_file_offset = base + pad
+
     # 4. Patch the OCI offset/size markers in the loader binary
-    patched_loader = patch_markers(loader_raw, oci_data_file_offset, oci_size)
+    patched_loader = patch_markers(
+        loader_raw, oci_data_file_offset, oci_size,
+        kernel_offset=kernel_file_offset,
+        kernel_size=len(kernel_data) if kernel_data else None,
+        initramfs_offset=initramfs_file_offset,
+        initramfs_size=len(initramfs_data) if initramfs_data else None,
+    )
 
     # 5. Patch program headers in the loader binary.
     # Loader binary will be at file offset PAGE_SIZE in the polyglot.
@@ -433,6 +611,22 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     # docker load sees these as top-level entries: manifest.json, config, layers.
     polyglot += oci_data
 
+    # Append kernel blob (page-aligned) if provided
+    if kernel_data:
+        pad = (PAGE_ALIGN - (len(polyglot) % PAGE_ALIGN)) % PAGE_ALIGN
+        polyglot += b'\x00' * pad
+        assert len(polyglot) == kernel_file_offset, \
+            f"kernel offset mismatch: {len(polyglot)} != {kernel_file_offset}"
+        polyglot += kernel_data
+
+    # Append initramfs blob (page-aligned) if provided
+    if initramfs_data:
+        pad = (PAGE_ALIGN - (len(polyglot) % PAGE_ALIGN)) % PAGE_ALIGN
+        polyglot += b'\x00' * pad
+        assert len(polyglot) == initramfs_file_offset, \
+            f"initramfs offset mismatch: {len(polyglot)} != {initramfs_file_offset}"
+        polyglot += initramfs_data
+
     # 10. Write output (polyglot + metadata block)
     meta_image = image_name_for_meta if image_name_for_meta else image_name
     meta_block = build_meta_block(meta_image, digest)
@@ -465,9 +659,9 @@ def main():
     parser = argparse.ArgumentParser(
         description='Build a TAR+ELF polyglot container image',
     )
-    parser.add_argument('--loader', required=True,
+    parser.add_argument('--loader', required=False, default=None,
                         help='Path to the compiled loader ELF binary')
-    parser.add_argument('--image', required=True,
+    parser.add_argument('--image', required=False, default=None,
                         help='Docker image name (e.g., alpine:latest)')
     parser.add_argument('--output', default='oci2bin.img',
                         help='Output polyglot file path')
@@ -479,8 +673,32 @@ def main():
     parser.add_argument('--digest', default=None,
                         help='Image digest to embed in metadata block '
                              '(e.g. redis@sha256:abc123...)')
+    parser.add_argument('--kernel', default=None,
+                        help='Path to vmlinux blob to embed (cloud-hypervisor path)')
+    parser.add_argument('--initramfs', default=None,
+                        help='Path to pre-built initramfs cpio.gz to embed')
+    parser.add_argument('--initramfs-only', nargs=2, metavar=('ROOTFSDIR', 'OUTPATH'),
+                        help='Build only a cpio.gz initramfs from ROOTFSDIR into OUTPATH and exit')
 
     args = parser.parse_args()
+
+    # --initramfs-only: standalone cpio build, no polyglot needed
+    if args.initramfs_only:
+        rootfs_dir, out_path = args.initramfs_only
+        if not os.path.isdir(rootfs_dir):
+            print(f"initramfs-only: ROOTFSDIR not found: {rootfs_dir}", file=sys.stderr)
+            sys.exit(1)
+        build_initramfs(rootfs_dir, out_path)
+        print(f"Initramfs written to: {out_path} "
+              f"({os.path.getsize(out_path) // 1024} KB)", file=sys.stderr)
+        sys.exit(0)
+
+    if not args.loader:
+        print("error: --loader is required (unless --initramfs-only is used)", file=sys.stderr)
+        sys.exit(1)
+    if not args.image and not args.tar:
+        print("error: --image or --tar is required", file=sys.stderr)
+        sys.exit(1)
 
     if not os.path.isfile(args.loader):
         print(f"Loader not found: {args.loader}", file=sys.stderr)
@@ -490,11 +708,21 @@ def main():
         print(f"Tar not found: {args.tar}", file=sys.stderr)
         sys.exit(1)
 
-    image_name_for_meta = args.image_name if args.image_name else args.image
-    build_polyglot(args.loader, args.image, args.output,
+    if args.kernel is not None and not os.path.isfile(args.kernel):
+        print(f"Kernel not found: {args.kernel}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.initramfs is not None and not os.path.isfile(args.initramfs):
+        print(f"Initramfs not found: {args.initramfs}", file=sys.stderr)
+        sys.exit(1)
+
+    image_name_for_meta = args.image_name if args.image_name else (args.image or 'unknown')
+    build_polyglot(args.loader, args.image or '', args.output,
                    tar_path=args.tar,
                    digest=args.digest,
-                   image_name_for_meta=image_name_for_meta)
+                   image_name_for_meta=image_name_for_meta,
+                   kernel_path=args.kernel,
+                   initramfs_path=args.initramfs)
 
 
 if __name__ == '__main__':
