@@ -28,10 +28,17 @@ MAKEINFO  ?= $(or $(shell command -v texi2any 2>/dev/null),\
 MAN_DIR    = doc
 INFO_DIR   = doc
 
+LIBKRUN ?= 0
+
+# Kernel download / build (cloud-hypervisor path only)
+KERNEL_VERSION = 6.1.102
+VMLINUX_OUT    = build/vmlinux
+
 .PHONY: all clean polyglot loader loader-x86_64 loader-aarch64 loader-all \
-        doc install uninstall test test-unit test-unit-aarch64 \
-        test-integration test-integration-redis test-integration-nginx \
-        test-c test-c-aarch64 test-python
+        loader-libkrun kernel doc install uninstall test test-unit \
+        test-unit-aarch64 test-integration test-integration-redis \
+        test-integration-nginx test-c test-c-aarch64 test-python \
+        test-vm-unit test-vm
 
 all: polyglot
 
@@ -55,6 +62,25 @@ loader-x86_64: build/loader-x86_64
 loader-aarch64: build/loader-aarch64
 
 loader-all: build/loader-x86_64 build/loader-aarch64
+
+# libkrun-enabled loader: links -lkrun, NOT static (libkrun is a dynamic lib)
+loader-libkrun: build/loader-libkrun-$(ARCH)
+
+build/loader-libkrun-x86_64: src/loader.c
+	@mkdir -p build
+	$(CC_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN -o $@ $< -lkrun
+	@echo "Loader/libkrun (x86_64): $$(ls -lh $@ | awk '{print $$5}')"
+
+build/loader-libkrun-aarch64: src/loader.c
+	@mkdir -p build
+	$(CC_AARCH64) $(CFLAGS_AARCH64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN -o $@ $< -lkrun
+	@echo "Loader/libkrun (aarch64): $$(ls -lh $@ | awk '{print $$5}')"
+
+# Kernel fetch / build (cloud-hypervisor path only)
+kernel: $(VMLINUX_OUT)
+
+$(VMLINUX_OUT): kernel/microvm.config scripts/fetch_kernel.sh
+	bash scripts/fetch_kernel.sh $(KERNEL_VERSION) kernel/microvm.config $@
 
 build/loader-x86_64: src/loader.c
 	@mkdir -p build
@@ -111,7 +137,7 @@ clean:
 
 test: test-unit test-integration
 
-test-unit: test-c test-python
+test-unit: test-c test-python test-vm-unit
 
 test-unit-aarch64: test-c-aarch64 test-python
 
@@ -136,6 +162,16 @@ test-python:
 	python3 -m unittest discover -s tests -p 'test_build.py' -v
 	@echo "=== Polyglot structure tests ==="
 	python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
+
+test-vm-unit:
+	@echo "=== VM unit tests ==="
+	python3 -m unittest tests.test_vm_unit -v
+
+test-vm: test-vm-unit
+	@if [ ! -e /dev/kvm ]; then \
+	    echo "SKIP: /dev/kvm not available"; exit 0; \
+	fi
+	bash tests/test_vm_integration.sh
 
 test-integration: test-integration-redis test-integration-nginx polyglot
 	@echo "=== Runtime integration tests ==="
