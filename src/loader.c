@@ -31,6 +31,13 @@ static volatile unsigned long OCI_DATA_OFFSET = 0xDEADBEEFCAFEBABEUL;
 static volatile unsigned long OCI_DATA_SIZE   = 0xCAFEBABEDEADBEEFUL;
 static volatile unsigned long OCI_PATCHED     = 0xAAAAAAAAAAAAAAAAUL;
 
+/* VM blob markers — patched by build_polyglot.py --kernel / --initramfs.
+ * Sentinels match build_polyglot.py KERNEL_OFFSET_MARKER etc. (little-endian). */
+static volatile unsigned long KERNEL_DATA_OFFSET    = 0x7E57AB1E7E57AB1EUL;
+static volatile unsigned long KERNEL_DATA_SIZE      = 0xB00BB00BB00BB00BUL;
+static volatile unsigned long INITRAMFS_DATA_OFFSET = 0xC0FFEE00C0FFEE00UL;
+static volatile unsigned long INITRAMFS_DATA_SIZE   = 0xFACEB00CFACEB00CUL;
+
 /* Max layers / volumes / exec args we support */
 #define MAX_LAYERS   128
 #define MAX_VOLUMES   32
@@ -137,6 +144,10 @@ struct container_opts
     /* extra args after flags (overrides OCI Cmd) */
     char** extra_args;
     int    n_extra;
+
+    /* --vm / --vmm VMM  (microVM isolation) */
+    int   use_vm;   /* 1 if --vm was given */
+    char* vmm;      /* "cloud-hypervisor" | path; NULL = default */
 };
 
 /* ── tiny JSON helpers (just enough to parse manifest.json and config) ─── */
@@ -2282,6 +2293,9 @@ static void usage(const char* prog)
             "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
             "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
             "  --config PATH       Load options from a key=value config file\n"
+            "  --vm               run container inside a microVM (requires KVM or HVF)\n"
+            "  --vmm VMM          VMM backend: cloud-hypervisor, or path to binary\n"
+            "                     (default: cloud-hypervisor; libkrun if compiled with LIBKRUN=1)\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -2912,6 +2926,19 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                  || strcmp(argv[i], "-d") == 0)
         {
             opts->detach = 1;
+        }
+        else if (strcmp(argv[i], "--vm") == 0)
+        {
+            opts->use_vm = 1;
+        }
+        else if (strcmp(argv[i], "--vmm") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --vmm requires a VMM argument\n");
+                return -1;
+            }
+            opts->vmm = argv[++i];
         }
         else if (strcmp(argv[i], "--memory") == 0)
         {
@@ -3568,6 +3595,246 @@ static void rm_rf_dir(const char* path)
     nftw(path, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
 }
 
+/* ── VM backend ──────────────────────────────────────────────────────────── */
+
+/*
+ * extract_vm_blob: read SIZE bytes from /proc/self/exe at OFFSET, write to
+ * OUT_PATH.  Returns 0 on success, -1 on error.
+ * Security checks: rejects sentinel offsets, sizes > 64 MiB, and
+ * offset+size overflow.
+ */
+static int extract_vm_blob(unsigned long offset, unsigned long size,
+                           const char* out_path)
+{
+    /* Reject sentinel values (unpatched binary) */
+    if (offset == 0x7E57AB1E7E57AB1EUL || offset == 0xC0FFEE00C0FFEE00UL)
+    {
+        fprintf(stderr, "oci2bin: VM blob not embedded (sentinel offset)\n");
+        return -1;
+    }
+    /* Reject unreasonably large blobs (> 64 MiB) */
+    if (size == 0 || size > 67108864UL)
+    {
+        fprintf(stderr, "oci2bin: VM blob size out of range: %lu\n", size);
+        return -1;
+    }
+    /* Reject offset+size overflow */
+    if (offset + size < offset)
+    {
+        fprintf(stderr, "oci2bin: VM blob offset+size overflow\n");
+        return -1;
+    }
+
+    int in_fd = open("/proc/self/exe", O_RDONLY);
+    if (in_fd < 0)
+    {
+        perror("open /proc/self/exe");
+        return -1;
+    }
+    if (lseek(in_fd, (off_t)offset, SEEK_SET) < 0)
+    {
+        perror("lseek VM blob");
+        close(in_fd);
+        return -1;
+    }
+
+    int out_fd = open(out_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (out_fd < 0)
+    {
+        perror("open VM blob output");
+        close(in_fd);
+        return -1;
+    }
+
+    char buf[65536];
+    unsigned long remaining = size;
+    while (remaining > 0)
+    {
+        size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        ssize_t n = read(in_fd, buf, to_read);
+        if (n <= 0)
+        {
+            fprintf(stderr, "oci2bin: read VM blob: short read at offset %lu\n",
+                    size - remaining);
+            close(in_fd);
+            close(out_fd);
+            return -1;
+        }
+        if (write(out_fd, buf, (size_t)n) != n)
+        {
+            perror("write VM blob");
+            close(in_fd);
+            close(out_fd);
+            return -1;
+        }
+        remaining -= (unsigned long)n;
+    }
+    close(in_fd);
+    if (close(out_fd) < 0)
+    {
+        perror("close VM blob output");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * run_as_vm_ch: launch cloud-hypervisor with kernel + initramfs embedded in
+ * this binary.  Calls execvp — does not return on success.
+ */
+static int run_as_vm_ch(const char* tmpdir, struct container_opts* opts)
+{
+    /* Check kernel is embedded */
+    if (KERNEL_DATA_OFFSET == 0x7E57AB1E7E57AB1EUL)
+    {
+        fprintf(stderr,
+                "oci2bin: --vm: no kernel embedded; "
+                "rebuild with build_polyglot.py --kernel vmlinux\n"
+                "  or build with: make LIBKRUN=1 (no kernel needed)\n");
+        return 1;
+    }
+
+    /* Extract kernel blob */
+    char kernel_path[PATH_MAX];
+    int n = snprintf(kernel_path, sizeof(kernel_path), "%s/vmlinux", tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(kernel_path))
+    {
+        fprintf(stderr, "oci2bin: kernel path truncated\n");
+        return 1;
+    }
+    if (extract_vm_blob(KERNEL_DATA_OFFSET, KERNEL_DATA_SIZE, kernel_path) < 0)
+    {
+        return 1;
+    }
+
+    /* Extract or build initramfs */
+    char initramfs_path[PATH_MAX];
+    n = snprintf(initramfs_path, sizeof(initramfs_path),
+                 "%s/rootfs.cpio.gz", tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(initramfs_path))
+    {
+        fprintf(stderr, "oci2bin: initramfs path truncated\n");
+        return 1;
+    }
+
+    if (INITRAMFS_DATA_OFFSET != 0xC0FFEE00C0FFEE00UL)
+    {
+        /* Pre-embedded initramfs: just write the blob */
+        if (extract_vm_blob(INITRAMFS_DATA_OFFSET, INITRAMFS_DATA_SIZE,
+                            initramfs_path) < 0)
+        {
+            return 1;
+        }
+    }
+    else
+    {
+        /* Build initramfs at runtime from the extracted rootfs */
+        char rootfs_dir[PATH_MAX];
+        n = snprintf(rootfs_dir, sizeof(rootfs_dir), "%s/rootfs", tmpdir);
+        if (n < 0 || (size_t)n >= sizeof(rootfs_dir))
+        {
+            fprintf(stderr, "oci2bin: rootfs path truncated\n");
+            return 1;
+        }
+        /* build_polyglot.py --initramfs-only ROOTFSDIR OUTPATH */
+        char* args[] =
+        {
+            "python3",
+            "/usr/share/oci2bin/scripts/build_polyglot.py",
+            "--initramfs-only",
+            rootfs_dir,
+            initramfs_path,
+            NULL
+        };
+        pid_t pid = fork();
+        if (pid < 0)
+        {
+            perror("fork initramfs build");
+            return 1;
+        }
+        if (pid == 0)
+        {
+            execvp("python3", args);
+            perror("execvp python3 build_polyglot.py");
+            _exit(1);
+        }
+        int wstatus;
+        if (waitpid(pid, &wstatus, 0) < 0)
+        {
+            perror("waitpid initramfs build");
+            return 1;
+        }
+        if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0)
+        {
+            fprintf(stderr, "oci2bin: initramfs build failed\n");
+            return 1;
+        }
+    }
+
+    /* Build cpu/memory strings */
+    char cpus_str[32];
+    int vcpus = (opts->cg_cpu_quota > 0) ? (int)opts->cg_cpu_quota : 1;
+    n = snprintf(cpus_str, sizeof(cpus_str), "boot=%d", vcpus);
+    if (n < 0 || (size_t)n >= sizeof(cpus_str))
+    {
+        fprintf(stderr, "oci2bin: cpus string truncated\n");
+        return 1;
+    }
+
+    char mem_str[32];
+    unsigned long mem_mb =
+        (opts->cg_memory_bytes > 0) ? (unsigned long)(opts->cg_memory_bytes >> 20) :
+        256;
+    n = snprintf(mem_str, sizeof(mem_str), "size=%luM", mem_mb);
+    if (n < 0 || (size_t)n >= sizeof(mem_str))
+    {
+        fprintf(stderr, "oci2bin: memory string truncated\n");
+        return 1;
+    }
+
+    /* Build cmdline string */
+    char cmdline[512];
+    n = snprintf(cmdline, sizeof(cmdline),
+                 "console=ttyS0 reboot=k panic=1 pci=off");
+    if (n < 0 || (size_t)n >= sizeof(cmdline))
+    {
+        fprintf(stderr, "oci2bin: cmdline truncated\n");
+        return 1;
+    }
+
+    /* Build argv for cloud-hypervisor */
+    const char* vmm_bin = opts->vmm ? opts->vmm : "cloud-hypervisor";
+    const char* argv[64];
+    int ai = 0;
+
+#define CH_ARG(x) do { \
+    if (ai >= 62) { \
+        fprintf(stderr, "oci2bin: too many cloud-hypervisor args\n"); \
+        return 1; \
+    } \
+    argv[ai++] = (x); \
+} while (0)
+
+    CH_ARG(vmm_bin);
+    CH_ARG("--kernel");
+    CH_ARG(kernel_path);
+    CH_ARG("--initramfs");
+    CH_ARG(initramfs_path);
+    CH_ARG("--cmdline");
+    CH_ARG(cmdline);
+    CH_ARG("--cpus");
+    CH_ARG(cpus_str);
+    CH_ARG("--memory");
+    CH_ARG(mem_str);
+
+    argv[ai] = NULL;
+#undef CH_ARG
+
+    execvp(vmm_bin, (char* const*)argv);
+    perror("execvp cloud-hypervisor");
+    return 1;
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char* argv[])
@@ -3611,6 +3878,28 @@ int main(int argc, char* argv[])
                 "oci2bin: OCI data markers not patched!\n"
                 "This binary must be built with the polyglot builder.\n");
         return 1;
+    }
+
+    /* 3b. VM dispatch: if --vm was given, enter microVM path before extraction */
+    if (opts.use_vm)
+    {
+        /* We need a tmpdir for kernel/initramfs blobs */
+        char vm_tmpdir[] = "/tmp/oci2bin-vm-XXXXXX";
+        if (mkdtemp(vm_tmpdir) == NULL)
+        {
+            perror("mkdtemp VM tmpdir");
+            return 1;
+        }
+#ifdef USE_LIBKRUN
+        if (!opts.vmm || strcmp(opts.vmm, "libkrun") == 0)
+        {
+            /* libkrun path implemented in Phase 4 */
+            fprintf(stderr,
+                    "oci2bin: libkrun path not yet implemented in this build\n");
+            return 1;
+        }
+#endif
+        return run_as_vm_ch(vm_tmpdir, &opts);
     }
 
     /* 3a. Verify binary signature before any extraction */
