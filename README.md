@@ -317,6 +317,25 @@ The socket is bind-mounted read-only. If `SSH_AUTH_SOCK` is unset or points to a
 
 Both `rlim_cur` and `rlim_max` are set to the given value. Failure is non-fatal.
 
+### Resource limits (cgroup v2)
+
+`--memory`, `--cpus`, and `--pids-limit` enforce hard limits across the entire
+container process tree using Linux cgroup v2. Unlike `--ulimit`, these limits
+apply to all forked children as well.
+
+```bash
+./my-app --memory 512m           # hard memory limit (k/m/g suffix)
+./my-app --cpus 0.5              # 50% of one CPU core
+./my-app --pids-limit 100        # max 100 PIDs in the container
+./my-app --memory 1g --cpus 2 --pids-limit 256
+```
+
+Requires cgroup v2 (`/sys/fs/cgroup/cgroup.controllers` must exist). If cgroup
+v2 is unavailable, a warning is printed and the container runs unconstrained.
+The loader creates `/sys/fs/cgroup/oci2bin-<pid>/`, moves itself in, sets the
+limits, then calls `unshare(CLONE_NEWCGROUP)` so the container only sees its
+own cgroup subtree. The cgroup dir is removed on exit.
+
 ### Exit codes
 
 The container process exit code is forwarded to the calling shell:
@@ -340,6 +359,25 @@ By default, containers share the host network stack. Use `--net none` for a full
 ```
 
 The container process runs as root inside a user namespace. The host UID is mapped to UID 0 — no real privilege is granted on the host. `/etc/resolv.conf` from the host is copied into the rootfs so DNS resolution works.
+
+#### Userspace networking with slirp4netns or pasta
+
+`--net slirp` and `--net pasta` give the container a fully isolated network
+namespace with real outbound TCP/UDP without requiring root. This uses
+[slirp4netns](https://github.com/rootless-containers/slirp4netns) or
+[pasta](https://passt.top/passt/) respectively.
+
+```bash
+./myapp --net slirp             # outbound internet via slirp4netns
+./myapp --net pasta             # outbound internet via pasta (faster, IPv6)
+./myapp --net slirp:8080:80     # slirp + port-forward host:8080 → ctr:80
+```
+
+`slirp4netns` or `pasta` must be installed (`dnf install slirp4netns` /
+`apt install slirp4netns` or `dnf install passt`). The loader forks the
+network helper after `unshare(CLONE_NEWNET)`, sends it a ready signal, and
+waits for it to configure the `tap0` interface. On container exit the helper
+is sent `SIGTERM`.
 
 ### Sharing namespaces between containers
 
@@ -374,6 +412,29 @@ POSIX shared memory (`shm_open`, `/dev/shm`) lives in the mount namespace and is
 
 **Privilege note:** Joining a network or IPC namespace created by another container requires that both containers were started by a process with matching user namespace ownership, or that the joining process has root privileges. If the `setns()` call fails, a clear error is printed.
 
+### Pod mode (multi-container)
+
+`oci2bin pod run` starts multiple binaries sharing network and IPC namespaces —
+a pod primitive without any orchestrator.
+
+```bash
+oci2bin pod run \
+    --net shared \
+    --ipc shared \
+    ./envoy \
+    ./myapp \
+    ./fluentbit
+```
+
+The command:
+1. Creates a lightweight "pause" process via `unshare` to hold the shared namespaces
+2. Starts each binary with `--net container:<pause_pid>` and/or `--ipc container:<pause_pid>`
+3. If any binary exits with a non-zero status, sends `SIGTERM` to the others
+4. Reports the worst non-zero exit code seen
+
+SIGTERM and SIGINT are forwarded to all children. Use with `--detach` in the
+individual binaries for fully background pods.
+
 ### Read-only containers
 
 `--read-only` mounts the rootfs read-only via overlayfs. Writes go to a temporary upper layer discarded on exit. The on-disk rootfs is never modified.
@@ -383,6 +444,25 @@ POSIX shared memory (`shm_open`, `/dev/shm`) lives in the mount namespace and is
 ```
 
 If overlayfs is not available, a warning is printed and the container runs read-write.
+
+### Persistent state (--overlay-persist)
+
+`--overlay-persist DIR` keeps the overlay upper layer between runs. Instead of
+discarding writes on exit, changes accumulate in `DIR/upper`. On the next run
+the same upper layer is used as a starting point.
+
+```bash
+./myapp --overlay-persist /var/lib/myapp/state   # first run — changes saved
+./myapp --overlay-persist /var/lib/myapp/state   # second run — state preserved
+```
+
+Use cases:
+- CLI tools that accumulate config (`~/.config`, shell history)
+- Dev environments with installed packages that persist
+- Staged rollouts: inspect `DIR/upper` before promoting as the new base
+
+`DIR/upper` and `DIR/work` must be on the same filesystem. The immutable base
+(extracted OCI rootfs) is never modified.
 
 ### Capabilities
 
@@ -459,6 +539,31 @@ Only numeric UIDs/GIDs are accepted. Values must be ≤ 65534. If any of `setgro
 
 The host path must start with `/dev/`. The container path defaults to the same path if omitted. oci2bin first attempts `mknod` with the host device's `st_rdev`; if that fails it falls back to a bind mount. Failure is non-fatal. May be repeated.
 
+### Config file (--config)
+
+All runtime options can be loaded from a simple `key=value` text file with
+`--config PATH`. This avoids long command lines and allows per-application
+defaults.
+
+```ini
+# /etc/myapp/oci2bin.conf
+memory=512m
+cpus=0.5
+pids-limit=100
+net=none
+read-only
+user=1000
+```
+
+```bash
+./myapp --config /etc/myapp/oci2bin.conf
+./myapp --config /etc/myapp/oci2bin.conf --memory 1g   # override file values
+```
+
+Lines starting with `#` or blank lines are ignored. A line `key=value` becomes
+`--key value`. A line with no `=` (like `read-only`) becomes a boolean `--key`
+flag. Nested `--config` is not allowed.
+
 ---
 
 ## Process management
@@ -485,6 +590,40 @@ kill "$PID"
 ```
 
 The child calls `setsid()` to detach from the terminal and redirects stdin from `/dev/null`. Combine with `--init` for a fully-managed background service.
+
+---
+
+## Binary signing
+
+oci2bin binaries can be signed with an ECDSA key. The signature block is
+appended after the OCI tar and verified before any extraction occurs.
+
+### Signing
+
+```bash
+# Generate a key pair
+openssl ecparam -name prime256v1 -genkey -noout -out signing.key
+openssl ec -in signing.key -pubout -out signing.pub
+
+# Sign a binary (in-place or to a new file)
+oci2bin sign --key signing.key --in ./redis_7-alpine
+oci2bin sign --key signing.key --in ./redis_7-alpine --out ./redis_7-alpine.signed
+```
+
+### Verifying
+
+```bash
+# Verify before running
+oci2bin verify --key signing.pub --in ./redis_7-alpine
+echo $?   # 0 = OK, 1 = not signed, 2 = invalid
+
+# Loader-side verification: abort before any write if signature is wrong
+./redis_7-alpine --verify-key /etc/oci2bin/trusted.pub
+```
+
+`--verify-key` checks the signature at startup, before any rootfs extraction.
+If verification fails the process exits immediately without writing a single byte
+to disk.
 
 ---
 

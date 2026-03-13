@@ -4,6 +4,9 @@
 # Usage:
 #   oci2bin [--arch ARCH] <image[:tag]> [output]
 #   oci2bin inspect <binary>
+#   oci2bin sign   --key KEY.pem  --in BINARY [--out BINARY]
+#   oci2bin verify --key PUB.pem  --in BINARY
+#   oci2bin pod run [--net shared] [--ipc shared] BINARY [BINARY ...]
 #   oci2bin list [--json]
 #   oci2bin prune [--dry-run]
 #   oci2bin diff <binary1> <binary2>
@@ -36,8 +39,11 @@
 #                         defaults to /run/secrets/<basename> (may be repeated)
 #   --entrypoint PATH     Override the image entrypoint
 #   --workdir PATH        Set the working directory inside the container
-#   --net host|none       Network mode: host (default) or none (isolated)
+#   --net host|none|slirp|pasta|slirp:H:C
+#                         Network: host (default), none (isolated),
+#                         slirp (slirp4netns), pasta, or slirp with port forward
 #   --read-only           Mount rootfs read-only via overlayfs
+#   --overlay-persist DIR Persist overlay upper layer to DIR (state survives restarts)
 #   --ssh-agent           Forward host SSH_AUTH_SOCK into the container
 #   --no-seccomp          Disable the default seccomp syscall filter
 #   --user UID[:GID]      Run as this numeric UID (and optional GID)
@@ -48,9 +54,14 @@
 #                         Expose a host device inside the container
 #   --init                Run a zombie-reaping init as PID 1
 #   --detach, -d          Run container in background; print PID to stdout
+#   --memory SIZE         Limit memory (e.g. 512m, 2g) via cgroup v2
+#   --cpus FLOAT          Limit CPU fraction (e.g. 0.5) via cgroup v2
+#   --pids-limit N        Limit total PIDs via cgroup v2
+#   --verify-key PATH     Verify signature before extraction (abort if invalid)
 #   --env-file FILE       Load KEY=VALUE pairs from FILE (additive with -e)
 #   --tmpfs PATH          Mount a fresh tmpfs at PATH inside the container
 #   --ulimit TYPE=N       Set resource limit (nofile, nproc, cpu, as, fsize)
+#   --config PATH         Load options from a key=value config file
 #   --                    End of options; remaining args are CMD
 #
 # Cache subcommands:
@@ -91,6 +102,20 @@ if [[ "${1:-}" == "inspect" ]]; then
         exit 1
     fi
     exec python3 "$OCI2BIN_HOME/scripts/inspect_image.py" "$@"
+fi
+
+# ── sign subcommand ───────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "sign" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" sign "$@"
+fi
+
+# ── verify subcommand ─────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "verify" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" verify "$@"
 fi
 
 # ── list subcommand ───────────────────────────────────────────────────────
@@ -256,6 +281,116 @@ if [[ "${1:-}" == "diff" ]]; then
         exit 1
     fi
     exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" "$1" "$2"
+fi
+
+# ── pod subcommand ────────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "pod" ]]; then
+    shift
+    if [[ "${1:-}" != "run" ]]; then
+        echo "Usage: oci2bin pod run [--net shared] [--ipc shared] BINARY [BINARY ...]" >&2
+        exit 1
+    fi
+    shift  # consume "run"
+
+    POD_NET_SHARED=0
+    POD_IPC_SHARED=0
+    POD_BINARIES=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --net)
+                [[ "${2:-}" == "shared" ]] || { echo "oci2bin pod: --net only supports 'shared'" >&2; exit 1; }
+                POD_NET_SHARED=1; shift 2 ;;
+            --ipc)
+                [[ "${2:-}" == "shared" ]] || { echo "oci2bin pod: --ipc only supports 'shared'" >&2; exit 1; }
+                POD_IPC_SHARED=1; shift 2 ;;
+            -*)
+                echo "oci2bin pod: unknown option: $1" >&2; exit 1 ;;
+            *)
+                POD_BINARIES+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ ${#POD_BINARIES[@]} -eq 0 ]]; then
+        echo "oci2bin pod run: at least one BINARY is required" >&2
+        exit 1
+    fi
+
+    for b in "${POD_BINARIES[@]}"; do
+        [[ -x "$b" ]] || { echo "oci2bin pod: $b is not executable" >&2; exit 1; }
+    done
+
+    # Create a pause process to hold the shared namespaces
+    PAUSE_PID_FILE="$(mktemp)"
+    PAUSE_NET_FLAG=""
+    PAUSE_IPC_FLAG=""
+    [[ $POD_NET_SHARED -eq 1 ]] && PAUSE_NET_FLAG="--net"
+    [[ $POD_IPC_SHARED -eq 1 ]] && PAUSE_IPC_FLAG="--ipc"
+    # shellcheck disable=SC2086
+    unshare $PAUSE_NET_FLAG $PAUSE_IPC_FLAG -- sh -c "echo \$\$ > \"$PAUSE_PID_FILE\"; exec sleep infinity" &
+    PAUSE_BG=$!
+    # Give unshare a moment to start
+    sleep 0.1
+    PAUSE_PID=$(cat "$PAUSE_PID_FILE")
+    rm -f "$PAUSE_PID_FILE"
+
+    echo "oci2bin pod: pause PID=$PAUSE_PID" >&2
+
+    # Start each binary joining the pause process's namespaces
+    CHILD_PIDS=()
+    WORST_EXIT=0
+
+    for b in "${POD_BINARIES[@]}"; do
+        CHILD_FLAGS=()
+        [[ $POD_NET_SHARED -eq 1 ]] && CHILD_FLAGS+=("--net" "container:$PAUSE_PID")
+        [[ $POD_IPC_SHARED -eq 1 ]] && CHILD_FLAGS+=("--ipc" "container:$PAUSE_PID")
+        "$b" "${CHILD_FLAGS[@]}" &
+        cid=$!
+        CHILD_PIDS+=("$cid")
+        echo "oci2bin pod: started $b (PID=$cid)" >&2
+    done
+
+    # Forward SIGTERM/SIGINT to all children
+    _pod_signal() {
+        local sig="$1"
+        for cpid in "${CHILD_PIDS[@]}"; do
+            kill "-$sig" "$cpid" 2>/dev/null || true
+        done
+    }
+    trap '_pod_signal TERM' TERM
+    trap '_pod_signal INT' INT
+
+    # Monitor: wait for any child to exit; if non-zero, SIGTERM others
+    REMAINING=("${CHILD_PIDS[@]}")
+    while [[ ${#REMAINING[@]} -gt 0 ]]; do
+        NEW_REMAINING=()
+        for cpid in "${REMAINING[@]}"; do
+            if ! kill -0 "$cpid" 2>/dev/null; then
+                wait "$cpid" 2>/dev/null; ec=$?
+                echo "oci2bin pod: PID=$cpid exited with code $ec" >&2
+                if [[ $ec -ne 0 && $ec -gt $WORST_EXIT ]]; then
+                    WORST_EXIT=$ec
+                fi
+                if [[ $ec -ne 0 ]]; then
+                    # Non-zero exit: SIGTERM all others
+                    for other in "${REMAINING[@]}"; do
+                        [[ "$other" != "$cpid" ]] && kill -TERM "$other" 2>/dev/null || true
+                    done
+                fi
+            else
+                NEW_REMAINING+=("$cpid")
+            fi
+        done
+        REMAINING=("${NEW_REMAINING[@]}")
+        [[ ${#REMAINING[@]} -gt 0 ]] && sleep 0.2
+    done
+
+    # Cleanup pause process
+    kill "$PAUSE_BG" 2>/dev/null || true
+    wait "$PAUSE_BG" 2>/dev/null || true
+
+    exit "$WORST_EXIT"
 fi
 
 # ── argument parsing ──────────────────────────────────────────────────────

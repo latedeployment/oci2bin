@@ -178,6 +178,7 @@ static void test_parse_opts(void)
     /* No args */
     {
         char *argv[] = {"prog", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(1, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: no args returns 0");
         ASSERT_INT_EQ(opts.n_vols, 0, "parse_opts: no args n_vols=0");
@@ -189,6 +190,7 @@ static void test_parse_opts(void)
     {
         char spec[] = "/host:/ctr";
         char *argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: -v returns 0");
         ASSERT_INT_EQ(opts.n_vols, 1, "parse_opts: -v n_vols=1");
@@ -201,6 +203,7 @@ static void test_parse_opts(void)
         char s1[] = "/a:/b";
         char s2[] = "/c:/d";
         char *argv[] = {"prog", "-v", s1, "-v", s2, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(5, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: two -v returns 0");
         ASSERT_INT_EQ(opts.n_vols, 2, "parse_opts: two -v n_vols=2");
@@ -209,6 +212,7 @@ static void test_parse_opts(void)
     /* --entrypoint */
     {
         char *argv[] = {"prog", "--entrypoint", "/bin/bash", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: --entrypoint returns 0");
         ASSERT_STR_EQ(opts.entrypoint, "/bin/bash", "parse_opts: --entrypoint value");
@@ -217,6 +221,7 @@ static void test_parse_opts(void)
     /* CMD positional args */
     {
         char *argv[] = {"prog", "/bin/ls", "-la", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: positional args returns 0");
         ASSERT_INT_EQ(opts.n_extra, 2, "parse_opts: positional n_extra=2");
@@ -226,6 +231,7 @@ static void test_parse_opts(void)
     /* -- separator */
     {
         char *argv[] = {"prog", "--", "/bin/echo", "hello", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(4, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: -- separator returns 0");
         ASSERT_INT_EQ(opts.n_extra, 2, "parse_opts: -- n_extra=2");
@@ -235,6 +241,7 @@ static void test_parse_opts(void)
     /* -v missing arg */
     {
         char *argv[] = {"prog", "-v", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(2, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: -v missing arg returns -1");
     }
@@ -243,6 +250,7 @@ static void test_parse_opts(void)
     {
         char spec[] = "nocolon";
         char *argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: -v without colon returns -1");
     }
@@ -250,6 +258,7 @@ static void test_parse_opts(void)
     /* Unknown flag */
     {
         char *argv[] = {"prog", "--unknown", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(2, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: unknown flag returns -1");
     }
@@ -257,6 +266,7 @@ static void test_parse_opts(void)
     /* --entrypoint missing arg */
     {
         char *argv[] = {"prog", "--entrypoint", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(2, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --entrypoint missing arg returns -1");
     }
@@ -265,6 +275,7 @@ static void test_parse_opts(void)
     {
         char env1[] = "FOO=bar";
         char *argv[] = {"prog", "-e", env1, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: -e returns 0");
         ASSERT_INT_EQ(opts.n_env, 1, "parse_opts: -e n_env=1");
@@ -276,6 +287,7 @@ static void test_parse_opts(void)
         char e1[] = "A=1";
         char e2[] = "B=2";
         char *argv[] = {"prog", "-e", e1, "-e", e2, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(5, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: two -e returns 0");
         ASSERT_INT_EQ(opts.n_env, 2, "parse_opts: two -e n_env=2");
@@ -284,6 +296,7 @@ static void test_parse_opts(void)
     /* -e missing arg */
     {
         char *argv[] = {"prog", "-e", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(2, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: -e missing arg returns -1");
     }
@@ -303,6 +316,7 @@ static void test_parse_opts(void)
     {
         char bad[] = "=value";
         char *argv[] = {"prog", "-e", bad, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: -e with empty key returns -1");
     }
@@ -312,6 +326,7 @@ static void test_parse_opts(void)
         char spec[] = "/data:/mnt";
         char env[] = "DEBUG=1";
         char *argv[] = {"prog", "-v", spec, "-e", env, "--entrypoint", "/bin/sh", "arg1", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(8, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: combined returns 0");
         ASSERT_INT_EQ(opts.n_vols, 1, "parse_opts: combined n_vols=1");
@@ -326,6 +341,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "container:1234";
         char *argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: --net container:1234 returns 0");
         ASSERT_INT_EQ((int)opts.net_join_pid, 1234,
@@ -336,6 +352,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "container:abc";
         char *argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --net container:abc returns -1");
     }
@@ -344,6 +361,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "container:0";
         char *argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --net container:0 returns -1");
     }
@@ -352,6 +370,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "container:-5";
         char *argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --net container:-5 returns -1");
     }
@@ -360,6 +379,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "host";
         char *argv[] = {"prog", "--ipc", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: --ipc host returns 0");
         ASSERT_INT_EQ((int)opts.ipc_join_pid, 0,
@@ -370,6 +390,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "container:5678";
         char *argv[] = {"prog", "--ipc", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, 0, "parse_opts: --ipc container:5678 returns 0");
         ASSERT_INT_EQ((int)opts.ipc_join_pid, 5678,
@@ -380,6 +401,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "none";
         char *argv[] = {"prog", "--ipc", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --ipc none returns -1");
     }
@@ -388,6 +410,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "container:xyz";
         char *argv[] = {"prog", "--ipc", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --ipc container:xyz returns -1");
     }
@@ -395,6 +418,7 @@ static void test_parse_opts(void)
     /* --ipc missing argument */
     {
         char *argv[] = {"prog", "--ipc", NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(2, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --ipc missing arg returns -1");
     }
@@ -403,6 +427,7 @@ static void test_parse_opts(void)
     {
         char arg[] = "bridge";
         char *argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --net bridge returns -1");
     }

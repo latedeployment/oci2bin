@@ -59,10 +59,16 @@ struct container_opts
     /* --workdir /path  (overrides OCI WorkingDir) */
     char* workdir;
 
-    /* --net host|none|container:<PID>
-     * NULL/"host" = host network; "none" = isolated; container:<PID> = join */
+    /* --net host|none|container:<PID>|slirp|pasta|slirp:H:C
+     * NULL/"host" = host network; "none" = isolated; container:<PID> = join
+     * "slirp" = userspace TCP/UDP via slirp4netns
+     * "pasta" = userspace TCP/UDP via pasta
+     * "slirp:HOST_PORT:CTR_PORT" = slirp with port forward */
     char* net;
     pid_t net_join_pid; /* >0: join this PID's network namespace */
+    /* port-forwards for slirp mode: "HOST_PORT:CTR_PORT" strings */
+    char* net_portfwd[16];
+    int   n_portfwd;
 
     /* --ipc host|container:<PID>
      * host = share host IPC (default); container:<PID> = join that IPC ns */
@@ -70,6 +76,9 @@ struct container_opts
 
     /* --read-only  (mount overlay so rootfs is not modified) */
     int read_only;
+
+    /* --overlay-persist DIR  (persist overlay upper layer across runs) */
+    char* overlay_persist;
 
     /* --ssh-agent  (forward host SSH_AUTH_SOCK into the container) */
     int ssh_agent;
@@ -112,6 +121,14 @@ struct container_opts
 
     /* --detach / -d  (fork to background, print child PID) */
     int detach;
+
+    /* --verify-key PATH  (verify binary signature before execution) */
+    char* verify_key;
+
+    /* --memory MEM, --cpus FLOAT, --pids-limit N  (cgroup v2 limits) */
+    long long cg_memory_bytes; /* 0 = unset */
+    long      cg_cpu_quota;    /* 0 = unset; cpu.max quota in 100000 period */
+    long      cg_pids;         /* 0 = unset */
 
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
     char* env_vars[MAX_ENV];
@@ -1694,54 +1711,115 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* --read-only: mount overlayfs so the rootfs is not modified at runtime.
-     * upper/work dirs live in the tmpdir (parent of rootfs). */
-    if (opts->read_only)
+    /* --read-only / --overlay-persist: mount overlayfs.
+     * For --read-only:       upper/work live in a tmpdir (discarded on exit).
+     * For --overlay-persist: upper/work live in the user-specified dir (kept). */
+    if (opts->read_only || opts->overlay_persist)
     {
-        /* Derive tmpdir by stripping trailing "/rootfs" suffix */
-        char tmpdir[PATH_MAX];
-        int tmpdir_ok = 0;
-        int tlen = snprintf(tmpdir, sizeof(tmpdir), "%s", rootfs);
-        if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
+        char upper[PATH_MAX];
+        char work[PATH_MAX];
+        int upper_ok = 0;
+
+        if (opts->overlay_persist)
         {
-            char* slash = strrchr(tmpdir, '/');
-            if (slash && strcmp(slash, "/rootfs") == 0)
+            /* --overlay-persist DIR: use DIR/upper and DIR/work */
+            int ulen = snprintf(upper, sizeof(upper),
+                                "%s/upper", opts->overlay_persist);
+            int wlen = snprintf(work,  sizeof(work),
+                                "%s/work",  opts->overlay_persist);
+            if (ulen < 0 || (size_t)ulen >= sizeof(upper))
             {
-                *slash = '\0';
-                tmpdir_ok = 1;
+                fprintf(stderr,
+                        "oci2bin: --overlay-persist: upper path"
+                        " truncated\n");
+            }
+            else if (wlen < 0 || (size_t)wlen >= sizeof(work))
+            {
+                fprintf(stderr,
+                        "oci2bin: --overlay-persist: work path"
+                        " truncated\n");
             }
             else
             {
-                /* Fallback: rootfs path has unexpected structure; use parent */
-                tlen = snprintf(tmpdir, sizeof(tmpdir), "%s/..", rootfs);
-                if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
+                /* Create DIR, DIR/upper, DIR/work if needed */
+                mkdir(opts->overlay_persist, 0755);
+                mkdir(upper, 0755);
+                mkdir(work,  0755);
+                /* Verify upper and work are on the same filesystem */
+                struct stat su, sw;
+                if (stat(upper, &su) < 0 || stat(work, &sw) < 0)
                 {
-                    tmpdir_ok = 1;
+                    fprintf(stderr,
+                            "oci2bin: --overlay-persist: stat"
+                            " failed\n");
+                }
+                else if (su.st_dev != sw.st_dev)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --overlay-persist:"
+                            " upper and work must be on the"
+                            " same filesystem\n");
+                }
+                else
+                {
+                    upper_ok = 1;
                 }
             }
         }
-        if (tmpdir_ok)
+        else
         {
-            char upper[PATH_MAX];
-            char work[PATH_MAX];
-            int ulen = snprintf(upper, sizeof(upper), "%s/upper", tmpdir);
-            int wlen = snprintf(work,  sizeof(work),  "%s/work",  tmpdir);
-            if (ulen > 0 && (size_t)ulen < sizeof(upper) &&
-                    wlen > 0 && (size_t)wlen < sizeof(work))
+            /* --read-only: derive tmpdir by stripping "/rootfs" suffix */
+            char tmpdir[PATH_MAX];
+            int tmpdir_ok = 0;
+            int tlen = snprintf(tmpdir, sizeof(tmpdir), "%s", rootfs);
+            if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
             {
-                mkdir(upper, 0755);
-                mkdir(work,  0755);
-                char overlay_opts[PATH_MAX * 4];
-                int olen = snprintf(overlay_opts, sizeof(overlay_opts),
-                                    "lowerdir=%s,upperdir=%s,workdir=%s",
-                                    rootfs, upper, work);
-                if (olen > 0 && (size_t)olen < sizeof(overlay_opts))
+                char* slash = strrchr(tmpdir, '/');
+                if (slash && strcmp(slash, "/rootfs") == 0)
                 {
-                    if (mount("overlay", rootfs, "overlay", 0, overlay_opts) < 0)
+                    *slash = '\0';
+                    tmpdir_ok = 1;
+                }
+                else
+                {
+                    tlen = snprintf(tmpdir, sizeof(tmpdir),
+                                    "%s/..", rootfs);
+                    if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
                     {
-                        fprintf(stderr,
-                                "oci2bin: overlayfs unavailable, running read-write\n");
+                        tmpdir_ok = 1;
                     }
+                }
+            }
+            if (tmpdir_ok)
+            {
+                int ulen = snprintf(upper, sizeof(upper),
+                                    "%s/upper", tmpdir);
+                int wlen = snprintf(work,  sizeof(work),
+                                    "%s/work",  tmpdir);
+                if (ulen > 0 && (size_t)ulen < sizeof(upper) &&
+                        wlen > 0 && (size_t)wlen < sizeof(work))
+                {
+                    mkdir(upper, 0755);
+                    mkdir(work,  0755);
+                    upper_ok = 1;
+                }
+            }
+        }
+
+        if (upper_ok)
+        {
+            char overlay_opts[PATH_MAX * 4];
+            int olen = snprintf(overlay_opts, sizeof(overlay_opts),
+                                "lowerdir=%s,upperdir=%s,workdir=%s",
+                                rootfs, upper, work);
+            if (olen > 0 && (size_t)olen < sizeof(overlay_opts))
+            {
+                if (mount("overlay", rootfs, "overlay", 0,
+                          overlay_opts) < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: overlayfs unavailable,"
+                            " running read-write\n");
                 }
             }
         }
@@ -2168,13 +2246,20 @@ static void usage(const char* prog)
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
             "  --workdir PATH      Set the working directory inside the container\n"
-            "  --net host|none|container:<PID>\n"
+            "  --net host|none|slirp|pasta|slirp:H:C|container:<PID>\n"
             "                      Network: host (default), none (isolated),\n"
+            "                      slirp (userspace via slirp4netns),\n"
+            "                      pasta (userspace via pasta),\n"
+            "                      slirp:HOST_PORT:CTR_PORT (with port"
+            " forward),\n"
             "                      or join the network namespace of PID\n"
             "  --ipc host|container:<PID>\n"
             "                      IPC namespace: host (default, shares SysV IPC),\n"
             "                      or join the IPC namespace of PID\n"
             "  --read-only         Mount rootfs read-only via overlayfs\n"
+            "  --overlay-persist DIR\n"
+            "                      Persist the overlay upper layer to DIR;\n"
+            "                      state accumulates across runs\n"
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
@@ -2185,9 +2270,18 @@ static void usage(const char* prog)
             "                      Expose a host device inside the container\n"
             "  --init              Run a zombie-reaping init as PID 1\n"
             "  --detach, -d        Run container in background; print PID to stdout\n"
+            "  --memory SIZE       Limit container memory (e.g. 512m, 2g) via"
+            " cgroup v2\n"
+            "  --cpus FLOAT        Limit container CPU (e.g. 0.5 = 50%%)"
+            " via cgroup v2\n"
+            "  --pids-limit N      Limit number of PIDs inside the container"
+            " via cgroup v2\n"
+            "  --verify-key PATH   Verify binary signature before extraction;"
+            " abort if invalid\n"
             "  --env-file FILE     Load KEY=VALUE pairs from FILE\n"
             "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
             "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
+            "  --config PATH       Load options from a key=value config file\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -2199,9 +2293,237 @@ static void usage(const char* prog)
             prog, prog, prog, prog, prog, prog, prog);
 }
 
+/*
+ * Pre-scan argv for --config PATH.  Read the config file and return a
+ * merged argv: argv[0], then config-file options (as defaults), then the
+ * original argv[1..] with --config / PATH pairs stripped out.
+ *
+ * This means real argv flags override config file values (config file sets
+ * defaults).  parse_opts is then called exactly once with the merged argv,
+ * which consists entirely of strings that either come from the original argv
+ * (permanent) or were heap-allocated here and stored in *out_extra (also
+ * permanent for the process lifetime — they are freed on error but kept on
+ * success, which is fine because we exec shortly after).
+ *
+ * Returns a heap-allocated argv array (NULL-terminated) on success.
+ * Returns NULL on error (error message already printed).
+ * *out_argc is set to the new argc.
+ * *out_heap_strings is set to a NULL-terminated list of strings to free
+ *   on error only; on success the caller must NOT free them.
+ */
+static char** build_merged_argv(int argc, char* argv[], int* out_argc,
+                                char*** out_heap_strings)
+{
+    /* First pass: find --config PATH pairs and validate the path */
+    const char* config_path = NULL;
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--config") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --config requires PATH argument\n");
+                return NULL;
+            }
+            if (config_path)
+            {
+                fprintf(stderr,
+                        "oci2bin: --config may only be specified"
+                        " once\n");
+                return NULL;
+            }
+            config_path = argv[i + 1];
+            if (strstr(config_path, ".."))
+            {
+                fprintf(stderr,
+                        "oci2bin: --config: path must not"
+                        " contain '..'\n");
+                return NULL;
+            }
+            i++; /* skip PATH */
+        }
+    }
+
+    /* If no --config, return original argv unchanged */
+    if (!config_path)
+    {
+        *out_argc         = argc;
+        *out_heap_strings = NULL;
+        return argv;
+    }
+
+    /* Read config file into a temporary heap-string array.
+     * Each line "key=value" → two strings: "--key", "value"
+     * Each line "key"       → one string:  "--key"
+     * Max 128 pairs (256 tokens) from the config file. */
+    char** cfg = malloc(257 * sizeof(char*));
+    if (!cfg)
+    {
+        return NULL;
+    }
+    int cfg_n = 0;
+
+    FILE* f = fopen(config_path, "r");
+    if (!f)
+    {
+        fprintf(stderr, "oci2bin: --config: cannot open '%s': %s\n",
+                config_path, strerror(errno));
+        free(cfg);
+        return NULL;
+    }
+
+    char line[4096];
+    int  ok = 1;
+    while (ok && fgets(line, (int)sizeof(line), f))
+    {
+        size_t len = strlen(line);
+        while (len > 0 &&
+                (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                 line[len - 1] == ' '  || line[len - 1] == '\t'))
+        {
+            line[--len] = '\0';
+        }
+        if (len == 0 || line[0] == '#')
+        {
+            continue;
+        }
+
+        if (len > 4092)
+        {
+            fprintf(stderr,
+                    "oci2bin: --config: line too long in '%s'\n",
+                    config_path);
+            ok = 0;
+            break;
+        }
+
+        char* eq = strchr(line, '=');
+        if (eq)
+        {
+            size_t key_len = (size_t)(eq - line);
+            if (cfg_n + 2 > 256)
+            {
+                fprintf(stderr,
+                        "oci2bin: --config: too many entries"
+                        " in '%s'\n", config_path);
+                ok = 0;
+                break;
+            }
+            char* flag = malloc(key_len + 3);
+            char* val  = strdup(eq + 1);
+            if (!flag || !val)
+            {
+                free(flag);
+                free(val);
+                ok = 0;
+                break;
+            }
+            flag[0] = '-';
+            flag[1] = '-';
+            memcpy(flag + 2, line, key_len);
+            flag[key_len + 2] = '\0';
+            cfg[cfg_n++] = flag;
+            cfg[cfg_n++] = val;
+        }
+        else
+        {
+            if (cfg_n + 1 > 256)
+            {
+                fprintf(stderr,
+                        "oci2bin: --config: too many entries"
+                        " in '%s'\n", config_path);
+                ok = 0;
+                break;
+            }
+            char* flag = malloc(len + 3);
+            if (!flag)
+            {
+                ok = 0;
+                break;
+            }
+            flag[0] = '-';
+            flag[1] = '-';
+            memcpy(flag + 2, line, len + 1);
+            cfg[cfg_n++] = flag;
+        }
+    }
+    fclose(f);
+
+    if (!ok)
+    {
+        for (int j = 0; j < cfg_n; j++)
+        {
+            free(cfg[j]);
+        }
+        free(cfg);
+        return NULL;
+    }
+    cfg[cfg_n] = NULL;
+
+    /* Build merged argv:
+     *   [0]           = argv[0]
+     *   [1..cfg_n]    = config-file options (defaults)
+     *   [cfg_n+1..]   = original argv[1..] minus --config/PATH pairs
+     */
+    int real_n = 0; /* count of real argv entries after stripping --config */
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--config") == 0)
+        {
+            i++; /* skip PATH too */
+        }
+        else
+        {
+            real_n++;
+        }
+    }
+
+    int    merged_argc = 1 + cfg_n + real_n;
+    char** merged      = malloc((size_t)(merged_argc + 1) * sizeof(char*));
+    if (!merged)
+    {
+        for (int j = 0; j < cfg_n; j++)
+        {
+            free(cfg[j]);
+        }
+        free(cfg);
+        return NULL;
+    }
+
+    int mi     = 0;
+    merged[mi++] = argv[0];
+    for (int j = 0; j < cfg_n; j++)
+    {
+        merged[mi++] = cfg[j];
+    }
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--config") == 0)
+        {
+            i++;
+        }
+        else
+        {
+            merged[mi++] = argv[i];
+        }
+    }
+    merged[mi] = NULL;
+
+    *out_argc         = merged_argc;
+    *out_heap_strings = cfg; /* caller must NOT free on success */
+    free(cfg);               /* free the indirection array; strings live in merged */
+    *out_heap_strings = NULL;
+
+    /* The cfg[] strings are now referenced from merged[] directly.
+     * They are heap-allocated and persist for the process lifetime —
+     * the same lifetime as argv[] itself.  We exec shortly after. */
+    return merged;
+}
+
 static int parse_opts(int argc, char* argv[], struct container_opts *opts)
 {
-    memset(opts, 0, sizeof(*opts));
+    /* Caller is responsible for zeroing opts before the first call. */
     int i = 1;
     for (; i < argc; i++)
     {
@@ -2478,11 +2800,41 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 }
                 opts->net_join_pid = (pid_t)pid;
             }
+            else if (strcmp(argv[i], "pasta") == 0)
+            {
+                opts->net = argv[i]; /* "pasta" */
+            }
+            else if (strcmp(argv[i], "slirp") == 0)
+            {
+                opts->net = argv[i]; /* "slirp" */
+            }
+            else if (strncmp(argv[i], "slirp:", 6) == 0)
+            {
+                /* slirp:HOST_PORT:CTR_PORT */
+                char* portspec = argv[i] + 6;
+                char* colon = strchr(portspec, ':');
+                if (!colon || colon == portspec || colon[1] == '\0')
+                {
+                    fprintf(stderr,
+                            "oci2bin: --net slirp:HOST:CTR:"
+                            " invalid port forward spec\n");
+                    return -1;
+                }
+                if (opts->n_portfwd >= 16)
+                {
+                    fprintf(stderr,
+                            "oci2bin: too many port forwards"
+                            " (max 16)\n");
+                    return -1;
+                }
+                opts->net_portfwd[opts->n_portfwd++] = portspec;
+                opts->net = "slirp";
+            }
             else
             {
                 fprintf(stderr,
-                        "oci2bin: --net must be host, none, or"
-                        " container:<PID>\n");
+                        "oci2bin: --net must be host, none, slirp,"
+                        " pasta, slirp:H:C, or container:<PID>\n");
                 return -1;
             }
         }
@@ -2525,6 +2877,25 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         {
             opts->read_only = 1;
         }
+        else if (strcmp(argv[i], "--overlay-persist") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --overlay-persist requires DIR"
+                        " argument\n");
+                return -1;
+            }
+            i++;
+            if (strstr(argv[i], ".."))
+            {
+                fprintf(stderr,
+                        "oci2bin: --overlay-persist: path must not"
+                        " contain '..'\n");
+                return -1;
+            }
+            opts->overlay_persist = argv[i];
+        }
         else if (strcmp(argv[i], "--ssh-agent") == 0)
         {
             opts->ssh_agent = 1;
@@ -2541,6 +2912,149 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                  || strcmp(argv[i], "-d") == 0)
         {
             opts->detach = 1;
+        }
+        else if (strcmp(argv[i], "--memory") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --memory requires SIZE argument\n");
+                return -1;
+            }
+            i++;
+            char* spec = argv[i];
+            char* endp = NULL;
+            errno = 0;
+            long long val = strtoll(spec, &endp, 10);
+            if (endp == spec || val <= 0 || errno == ERANGE)
+            {
+                fprintf(stderr,
+                        "oci2bin: --memory: invalid size '%s'\n", spec);
+                return -1;
+            }
+            /* Parse optional suffix; check bounds BEFORE multiplying to
+             * prevent signed integer overflow (UB) that would silently
+             * bypass the 256 GiB cap check done after the multiplication. */
+            if (*endp == 'k' || *endp == 'K')
+            {
+                if (val > 256LL * 1024LL * 1024LL * 1024LL / 1024LL)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --memory: value exceeds 256 GiB\n");
+                    return -1;
+                }
+                val *= 1024LL;
+                endp++;
+            }
+            else if (*endp == 'm' || *endp == 'M')
+            {
+                if (val > 256LL * 1024LL * 1024LL * 1024LL
+                        / (1024LL * 1024LL))
+                {
+                    fprintf(stderr,
+                            "oci2bin: --memory: value exceeds 256 GiB\n");
+                    return -1;
+                }
+                val *= 1024LL * 1024LL;
+                endp++;
+            }
+            else if (*endp == 'g' || *endp == 'G')
+            {
+                if (val > 256LL)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --memory: value exceeds 256 GiB\n");
+                    return -1;
+                }
+                val *= 1024LL * 1024LL * 1024LL;
+                endp++;
+            }
+            if (*endp != '\0')
+            {
+                fprintf(stderr,
+                        "oci2bin: --memory: invalid suffix in '%s'\n", spec);
+                return -1;
+            }
+            /* Reject > 256 GiB (no-suffix path) */
+            if (val > 256LL * 1024LL * 1024LL * 1024LL)
+            {
+                fprintf(stderr,
+                        "oci2bin: --memory: value exceeds 256 GiB\n");
+                return -1;
+            }
+            opts->cg_memory_bytes = val;
+        }
+        else if (strcmp(argv[i], "--cpus") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --cpus requires FLOAT argument\n");
+                return -1;
+            }
+            i++;
+            char* endp = NULL;
+            double cpus = strtod(argv[i], &endp);
+            if (endp == argv[i] || *endp != '\0' || cpus <= 0.0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --cpus: invalid value '%s'\n", argv[i]);
+                return -1;
+            }
+            if (cpus > 1024.0)
+            {
+                fprintf(stderr, "oci2bin: --cpus: value exceeds 1024\n");
+                return -1;
+            }
+            /* Convert to quota: round(cpus * 100000) */
+            long quota = (long)(cpus * 100000.0 + 0.5);
+            if (quota < 1)
+            {
+                quota = 1;
+            }
+            opts->cg_cpu_quota = quota;
+        }
+        else if (strcmp(argv[i], "--pids-limit") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --pids-limit requires N argument\n");
+                return -1;
+            }
+            i++;
+            char* endp = NULL;
+            long pids = strtol(argv[i], &endp, 10);
+            if (endp == argv[i] || *endp != '\0' || pids <= 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --pids-limit: invalid value '%s'\n",
+                        argv[i]);
+                return -1;
+            }
+            if (pids > 65536)
+            {
+                fprintf(stderr,
+                        "oci2bin: --pids-limit: value exceeds 65536\n");
+                return -1;
+            }
+            opts->cg_pids = pids;
+        }
+        else if (strcmp(argv[i], "--verify-key") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --verify-key requires PATH argument\n");
+                return -1;
+            }
+            i++;
+            if (strstr(argv[i], ".."))
+            {
+                fprintf(stderr,
+                        "oci2bin: --verify-key: key path must not"
+                        " contain '..'\n");
+                return -1;
+            }
+            opts->verify_key = argv[i];
         }
         else if (strcmp(argv[i], "--cap-drop") == 0)
         {
@@ -2743,6 +3257,293 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
     return 0;
 }
 
+/* ── binary signature verification ──────────────────────────────────────── */
+
+/*
+ * Verify the binary signature by delegating to sign_binary.py via execvp.
+ * Never uses a shell. Returns 0 on success, -1 on failure.
+ * Aborts the process on invalid signature.
+ */
+static int verify_signature(const char* key_path)
+{
+    /* Resolve SCRIPTS_DIR relative to /proc/self/exe */
+    char self_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    if (len < 0)
+    {
+        perror("oci2bin: --verify-key: readlink /proc/self/exe");
+        return -1;
+    }
+    self_path[len] = '\0';
+
+    /* scripts dir = dirname(self_path) + "/../scripts" resolved via dirname */
+    char scripts_dir[PATH_MAX];
+    char* slash = strrchr(self_path, '/');
+    if (!slash)
+    {
+        fprintf(stderr,
+                "oci2bin: --verify-key: cannot determine script dir\n");
+        return -1;
+    }
+    size_t dir_len = (size_t)(slash - self_path);
+    /* Build: <dir>/../scripts/sign_binary.py */
+    int n = snprintf(scripts_dir, sizeof(scripts_dir),
+                     "%.*s/../scripts/sign_binary.py",
+                     (int)dir_len, self_path);
+    if (n < 0 || n >= (int)sizeof(scripts_dir))
+    {
+        fprintf(stderr,
+                "oci2bin: --verify-key: scripts path truncated\n");
+        return -1;
+    }
+
+    /* Validate key_path: must not contain '..' */
+    if (strstr(key_path, ".."))
+    {
+        fprintf(stderr,
+                "oci2bin: --verify-key: key path must not contain "
+                "'..'\n");
+        return -1;
+    }
+
+    /* execvp: python3 sign_binary.py verify --key KEY --in /proc/self/exe */
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("oci2bin: --verify-key: fork");
+        return -1;
+    }
+    if (pid == 0)
+    {
+        char* args[] =
+        {
+            "python3",
+            scripts_dir,
+            "verify",
+            "--key", (char*)key_path,
+            "--in", self_path,
+            NULL
+        };
+        execvp("python3", args);
+        perror("oci2bin: execvp python3");
+        _exit(127);
+    }
+    int status;
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        perror("oci2bin: --verify-key: waitpid");
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: signature verification failed — "
+                "aborting before extraction\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* ── cgroup v2 resource limits ───────────────────────────────────────────── */
+
+/*
+ * Write NUL-terminated string to a cgroup file.
+ * Returns 0 on success, -1 on failure (prints warning).
+ */
+static int cg_write(const char* path, const char* value)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        fprintf(stderr, "oci2bin: cgroup: open %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    ssize_t n = write(fd, value, strlen(value));
+    int saved = errno;
+    close(fd);
+    if (n < 0)
+    {
+        fprintf(stderr, "oci2bin: cgroup: write %s (%s): %s\n",
+                path, value, strerror(saved));
+        return -1;
+    }
+    return 0;
+}
+
+static char g_cgroup_dir[PATH_MAX]; /* global so atexit can clean up */
+
+static void cleanup_cgroup(void)
+{
+    if (g_cgroup_dir[0])
+    {
+        rmdir(g_cgroup_dir);
+        g_cgroup_dir[0] = '\0';
+    }
+}
+
+/*
+ * Set up a cgroup v2 leaf for this process.  Called before unshare().
+ * On failure: prints a warning and returns 0 (non-fatal).
+ * Returns 1 if a cgroup namespace unshare should be done, 0 otherwise.
+ */
+static int setup_cgroup(const struct container_opts* opts)
+{
+    if (!opts->cg_memory_bytes && !opts->cg_cpu_quota && !opts->cg_pids)
+    {
+        return 0;
+    }
+
+    /* Verify cgroup v2 is mounted */
+    struct stat st;
+    if (stat("/sys/fs/cgroup/cgroup.controllers", &st) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: cgroup v2 not available"
+                " (/sys/fs/cgroup/cgroup.controllers missing);"
+                " resource limits disabled\n");
+        return 0;
+    }
+
+    /* Create leaf: /sys/fs/cgroup/oci2bin-<pid> */
+    int n = snprintf(g_cgroup_dir, sizeof(g_cgroup_dir),
+                     "/sys/fs/cgroup/oci2bin-%d", (int)getpid());
+    if (n < 0 || n >= (int)sizeof(g_cgroup_dir))
+    {
+        fprintf(stderr, "oci2bin: cgroup dir path truncated\n");
+        return 0;
+    }
+
+    if (mkdir(g_cgroup_dir, 0755) < 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "oci2bin: cgroup mkdir %s: %s\n",
+                g_cgroup_dir, strerror(errno));
+        return 0;
+    }
+
+    /* Enable controllers in the root cgroup's subtree_control */
+    {
+        char ctrl_path[PATH_MAX];
+        n = snprintf(ctrl_path, sizeof(ctrl_path),
+                     "/sys/fs/cgroup/cgroup.subtree_control");
+        if (n < 0 || n >= (int)sizeof(ctrl_path))
+        {
+            fprintf(stderr, "oci2bin: subtree_control path truncated\n");
+        }
+        else
+        {
+            /* Ignore failures — controllers may already be enabled */
+            cg_write(ctrl_path, "+memory +cpu +pids");
+        }
+    }
+
+    /* memory.max */
+    if (opts->cg_memory_bytes > 0)
+    {
+        char path[PATH_MAX];
+        n = snprintf(path, sizeof(path), "%s/memory.max", g_cgroup_dir);
+        if (n < 0 || n >= (int)sizeof(path))
+        {
+            fprintf(stderr, "oci2bin: cgroup memory.max path truncated\n");
+        }
+        else
+        {
+            char val[32];
+            int vn = snprintf(val, sizeof(val), "%lld\n",
+                              opts->cg_memory_bytes);
+            if (vn < 0 || vn >= (int)sizeof(val))
+            {
+                fprintf(stderr,
+                        "oci2bin: memory value out of range\n");
+            }
+            else
+            {
+                cg_write(path, val);
+            }
+        }
+    }
+
+    /* cpu.max — format: "QUOTA PERIOD\n" */
+    if (opts->cg_cpu_quota > 0)
+    {
+        char path[PATH_MAX];
+        n = snprintf(path, sizeof(path), "%s/cpu.max", g_cgroup_dir);
+        if (n < 0 || n >= (int)sizeof(path))
+        {
+            fprintf(stderr, "oci2bin: cgroup cpu.max path truncated\n");
+        }
+        else
+        {
+            char val[64];
+            int vn = snprintf(val, sizeof(val), "%ld 100000\n",
+                              opts->cg_cpu_quota);
+            if (vn < 0 || vn >= (int)sizeof(val))
+            {
+                fprintf(stderr, "oci2bin: cpu quota value out of range\n");
+            }
+            else
+            {
+                cg_write(path, val);
+            }
+        }
+    }
+
+    /* pids.max */
+    if (opts->cg_pids > 0)
+    {
+        char path[PATH_MAX];
+        n = snprintf(path, sizeof(path), "%s/pids.max", g_cgroup_dir);
+        if (n < 0 || n >= (int)sizeof(path))
+        {
+            fprintf(stderr, "oci2bin: cgroup pids.max path truncated\n");
+        }
+        else
+        {
+            char val[32];
+            int vn = snprintf(val, sizeof(val), "%ld\n", opts->cg_pids);
+            if (vn < 0 || vn >= (int)sizeof(val))
+            {
+                fprintf(stderr, "oci2bin: pids value out of range\n");
+            }
+            else
+            {
+                cg_write(path, val);
+            }
+        }
+    }
+
+    /* Move ourselves into the leaf cgroup */
+    {
+        char path[PATH_MAX];
+        n = snprintf(path, sizeof(path), "%s/cgroup.procs", g_cgroup_dir);
+        if (n < 0 || n >= (int)sizeof(path))
+        {
+            fprintf(stderr, "oci2bin: cgroup.procs path truncated\n");
+            rmdir(g_cgroup_dir);
+            g_cgroup_dir[0] = '\0';
+            return 0;
+        }
+        char pid_str[16];
+        int pn = snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());
+        if (pn < 0 || pn >= (int)sizeof(pid_str))
+        {
+            fprintf(stderr, "oci2bin: pid string truncated\n");
+            rmdir(g_cgroup_dir);
+            g_cgroup_dir[0] = '\0';
+            return 0;
+        }
+        if (cg_write(path, pid_str) < 0)
+        {
+            rmdir(g_cgroup_dir);
+            g_cgroup_dir[0] = '\0';
+            return 0;
+        }
+    }
+
+    atexit(cleanup_cgroup);
+    return 1; /* caller should unshare(CLONE_NEWCGROUP) */
+}
+
 /* ── tmpdir cleanup ──────────────────────────────────────────────────────── */
 
 /*
@@ -2781,9 +3582,21 @@ int main(int argc, char* argv[])
     }
     self_path[len] = '\0';
 
-    /* 2. Parse command-line options */
+    /* 2. Parse command-line options.
+     * build_merged_argv pre-scans for --config PATH and, if found, reads
+     * the config file and prepends its options as defaults.  parse_opts is
+     * then called exactly once on the merged argv. */
+    int    merged_argc = 0;
+    char** unused_heap = NULL;
+    char** merged_argv = build_merged_argv(argc, argv,
+                                           &merged_argc, &unused_heap);
+    if (!merged_argv)
+    {
+        return 1;
+    }
     struct container_opts opts;
-    if (parse_opts(argc, argv, &opts) < 0)
+    memset(&opts, 0, sizeof(opts));
+    if (parse_opts(merged_argc, merged_argv, &opts) < 0)
     {
         return 1;
     }
@@ -2798,6 +3611,15 @@ int main(int argc, char* argv[])
                 "oci2bin: OCI data markers not patched!\n"
                 "This binary must be built with the polyglot builder.\n");
         return 1;
+    }
+
+    /* 3a. Verify binary signature before any extraction */
+    if (opts.verify_key)
+    {
+        if (verify_signature(opts.verify_key) < 0)
+        {
+            return 1;
+        }
     }
 
     /* 4. Extract OCI image into rootfs */
@@ -2816,6 +3638,9 @@ int main(int argc, char* argv[])
     /* 6. Capture real UID/GID before entering user namespace */
     uid_t real_uid = getuid();
     gid_t real_gid = getgid();
+
+    /* 6a. Set up cgroup v2 resource limits (before unshare, uses host cgroupfs) */
+    int cg_did_setup = setup_cgroup(&opts);
 
     /* 7. Enter user namespace first (needed before we can map UIDs) */
     if (unshare(CLONE_NEWUSER) < 0)
@@ -2893,20 +3718,131 @@ int main(int argc, char* argv[])
         close(fd);
     }
 
-    /* 10. Enter mount + PID + UTS namespaces; optionally network namespace.
+    /* 10. Enter mount + PID + UTS namespaces; optionally network/cgroup ns.
      * When --net container:<PID> was used, setns() already joined the target
      * network namespace above — do not create a new one here. */
     {
         int ns_flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS;
-        if (opts.net && strcmp(opts.net, "none") == 0)
+        if (opts.net &&
+                (strcmp(opts.net, "none") == 0 ||
+                 strcmp(opts.net, "slirp") == 0 ||
+                 strcmp(opts.net, "pasta") == 0))
         {
             ns_flags |= CLONE_NEWNET;
+        }
+        if (cg_did_setup)
+        {
+            ns_flags |= CLONE_NEWCGROUP;
         }
         if (unshare(ns_flags) < 0)
         {
             perror("unshare(NEWNS|NEWPID|NEWUTS)");
             return 1;
         }
+    }
+
+    /* 10b. For slirp/pasta modes: fork a net helper AFTER CLONE_NEWNET.
+     * The net helper will exec slirp4netns or pasta, targeting our new
+     * network namespace via /proc/<pid>/ns/net. */
+    pid_t net_helper_pid = -1;
+    if (opts.net &&
+            (strcmp(opts.net, "slirp") == 0 || strcmp(opts.net, "pasta") == 0))
+    {
+        int sync_pipe[2];
+        if (pipe(sync_pipe) < 0)
+        {
+            perror("oci2bin: slirp: pipe");
+            return 1;
+        }
+        pid_t cur_pid = getpid();
+        net_helper_pid = fork();
+        if (net_helper_pid < 0)
+        {
+            perror("oci2bin: slirp: fork net helper");
+            close(sync_pipe[0]);
+            close(sync_pipe[1]);
+            return 1;
+        }
+        if (net_helper_pid == 0)
+        {
+            /* Net helper child: wait for a byte on the pipe, then exec
+             * slirp4netns/pasta targeting the container's net namespace */
+            close(sync_pipe[1]);
+            char ready;
+            (void)read(sync_pipe[0], &ready, 1);
+            close(sync_pipe[0]);
+
+            char pid_str[16];
+            int psn = snprintf(pid_str, sizeof(pid_str),
+                               "%d", (int)cur_pid);
+            if (psn < 0 || psn >= (int)sizeof(pid_str))
+            {
+                _exit(1);
+            }
+
+            if (strcmp(opts.net, "slirp") == 0)
+            {
+                /* Build argv for slirp4netns */
+                const char* slirp_args[64];
+                int ai = 0;
+                slirp_args[ai++] = "slirp4netns";
+                slirp_args[ai++] = "--configure";
+                slirp_args[ai++] = "--mtu=65520";
+                slirp_args[ai++] = "--disable-host-loopback";
+                slirp_args[ai++] = "-6";
+                /* Add port-forwards */
+                char pf_bufs[16][32];
+                for (int pi = 0; pi < opts.n_portfwd && ai + 2 < 60; pi++)
+                {
+                    int bn = snprintf(pf_bufs[pi], sizeof(pf_bufs[pi]),
+                                      ":%s",
+                                      opts.net_portfwd[pi]);
+                    if (bn < 0 || bn >= (int)sizeof(pf_bufs[pi]))
+                    {
+                        continue;
+                    }
+                    slirp_args[ai++] = "-p";
+                    slirp_args[ai++] = pf_bufs[pi];
+                }
+                slirp_args[ai++] = pid_str;
+                slirp_args[ai++] = "tap0";
+                slirp_args[ai]   = NULL;
+
+                /* Try /usr/bin then /usr/local/bin */
+                execvp("slirp4netns", (char* const*)slirp_args);
+                /* If PATH lookup fails, try explicit paths */
+                execv("/usr/bin/slirp4netns", (char* const*)slirp_args);
+                execv("/usr/local/bin/slirp4netns",
+                      (char* const*)slirp_args);
+                fprintf(stderr, "oci2bin: slirp4netns not found in PATH,"
+                                " /usr/bin, or /usr/local/bin\n");
+                _exit(127);
+            }
+            else
+            {
+                /* pasta */
+                char* pasta_args[] =
+                {
+                    "pasta",
+                    "--config-net",
+                    pid_str,
+                    NULL
+                };
+                execvp("pasta", pasta_args);
+                execv("/usr/bin/pasta", pasta_args);
+                execv("/usr/local/bin/pasta", pasta_args);
+                fprintf(stderr, "oci2bin: pasta not found in PATH,"
+                                " /usr/bin, or /usr/local/bin\n");
+                _exit(127);
+            }
+        }
+        /* Parent: signal net helper that it can proceed */
+        close(sync_pipe[0]);
+        if (write(sync_pipe[1], "1", 1) < 0)
+        {
+            perror("oci2bin: slirp: write sync pipe");
+        }
+        close(sync_pipe[1]);
     }
 
     /* 11. Fork for PID namespace (child becomes PID 1) */
@@ -2925,6 +3861,13 @@ int main(int argc, char* argv[])
     /* Parent: wait for container to exit */
     int status;
     waitpid(child, &status, 0);
+    /* Reap net helper if it was started */
+    if (net_helper_pid > 0)
+    {
+        kill(net_helper_pid, SIGTERM);
+        int helper_status;
+        waitpid(net_helper_pid, &helper_status, 0);
+    }
 
     /* Cleanup: remove the whole tmpdir without forking.
      * rootfs = tmpdir + "/rootfs"; strip the last component to get tmpdir.
