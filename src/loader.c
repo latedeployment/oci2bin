@@ -564,6 +564,86 @@ static int write_file(const char* path, const char* data, size_t len)
 }
 
 /*
+ * Resolve a username to numeric UID:GID using rootfs/etc/passwd.
+ * Stores "uid:gid" in out (at least 32 bytes).  Returns 0 on success.
+ * If the spec is already numeric (or "uid:gid"), it is copied as-is.
+ */
+static int resolve_user_in_rootfs(const char* rootfs, const char* spec,
+                                  char* out, size_t outsz)
+{
+    if (!spec || !spec[0])
+    {
+        return -1;
+    }
+    /* Already numeric — copy as-is */
+    if (spec[0] >= '0' && spec[0] <= '9')
+    {
+        if (snprintf(out, outsz, "%s", spec) >= (int)outsz)
+        {
+            return -1;
+        }
+        return 0;
+    }
+    char passwd_path[PATH_MAX];
+    if (snprintf(passwd_path, sizeof(passwd_path), "%s/etc/passwd",
+                 rootfs) >= (int)sizeof(passwd_path))
+    {
+        return -1;
+    }
+    FILE* f = fopen(passwd_path, "r");
+    if (!f)
+    {
+        return -1;
+    }
+    char line[1024];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f))
+    {
+        /* name:x:uid:gid:gecos:home:shell */
+        char* f1 = line;
+        char* f2 = strchr(f1, ':');
+        if (!f2)
+        {
+            continue;
+        }
+        *f2++ = '\0';
+        char* f3 = strchr(f2, ':');
+        if (!f3)
+        {
+            continue;
+        }
+        *f3++ = '\0';
+        char* f4 = strchr(f3, ':');
+        if (!f4)
+        {
+            continue;
+        }
+        *f4++ = '\0';
+        if (strcmp(f1, spec) == 0)
+        {
+            long uid_val = atol(f3);
+            long gid_val = atol(f4);
+            /* Reject out-of-range values from crafted /etc/passwd */
+            if (uid_val < 0 || uid_val > 65534 ||
+                    gid_val < 0 || gid_val > 65534)
+            {
+                fclose(f);
+                return -1;
+            }
+            if (snprintf(out, outsz, "%ld:%ld", uid_val, gid_val)
+                    >= (int)outsz)
+            {
+                fclose(f);
+                return -1;
+            }
+            found = 1;
+        }
+    }
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+/*
  * Copy the host /etc/resolv.conf into rootfs/etc/resolv.conf.
  * Prefers /run/systemd/resolve/resolv.conf (real upstream nameservers)
  * over /etc/resolv.conf which may contain 127.0.0.53 (systemd-resolved
@@ -602,6 +682,7 @@ struct oci_config
     char* cmd_json;        /* "Cmd" array or NULL */
     char* env_json;        /* "Env" array or NULL */
     char* workdir;         /* "WorkingDir" string or NULL */
+    char* user;            /* "User" string or NULL */
 };
 
 /*
@@ -628,6 +709,7 @@ static int read_oci_config(const char* rootfs, struct oci_config* out)
     out->cmd_json        = json_get_array(cfg, "Cmd");
     out->env_json        = json_get_array(cfg, "Env");
     out->workdir         = json_get_string(cfg, "WorkingDir");
+    out->user            = json_get_string(cfg, "User");
     free(cfg);
     return 0;
 }
@@ -638,6 +720,7 @@ static void free_oci_config(struct oci_config* c)
     free(c->cmd_json);
     free(c->env_json);
     free(c->workdir);
+    free(c->user);
     memset(c, 0, sizeof(*c));
 }
 
@@ -944,6 +1027,7 @@ static char* extract_oci_rootfs(const char* self_path)
         char* entrypoint = json_get_array(config, "Entrypoint");
         char* env_json   = json_get_array(config, "Env");
         char* workdir    = json_get_string(config, "WorkingDir");
+        char* img_user   = json_get_string(config, "User");
 
         char info_path[PATH_MAX];
         if (snprintf(info_path, sizeof(info_path), "%s/.oci2bin_config", rootfs)
@@ -954,7 +1038,7 @@ static char* extract_oci_rootfs(const char* self_path)
             char*  info_buf = calloc(1, bufsz);
             if (info_buf)
             {
-                /* JSON-escape WorkingDir to prevent injection into the config */
+                /* JSON-escape WorkingDir and User to prevent injection */
                 char workdir_escaped[PATH_MAX * 2];
                 const char* wdir_safe = NULL;
                 if (workdir)
@@ -964,17 +1048,40 @@ static char* extract_oci_rootfs(const char* self_path)
                     {
                         wdir_safe = workdir_escaped;
                     }
-                    /* If escaping fails (path absurdly long), omit WorkingDir */
+                }
+                /* Resolve username to numeric uid:gid now, before
+                 * patch_rootfs_ids() rewrites /etc/passwd to uid=0 */
+                char user_resolved[64] = {0};
+                char user_escaped[512];
+                const char* user_safe = NULL;
+                if (img_user && img_user[0])
+                {
+                    const char* user_src = img_user;
+                    if (resolve_user_in_rootfs(rootfs, img_user,
+                                               user_resolved,
+                                               sizeof(user_resolved)) == 0)
+                    {
+                        user_src = user_resolved;
+                    }
+                    if (json_escape_string(user_src, user_escaped,
+                                           sizeof(user_escaped)) == 0)
+                    {
+                        user_safe = user_escaped;
+                    }
                 }
                 int n = snprintf(info_buf, bufsz,
                                  "{\"Cmd\":%s,\"Entrypoint\":%s,"
-                                 "\"Env\":%s,\"WorkingDir\":%s%s%s}",
+                                 "\"Env\":%s,\"WorkingDir\":%s%s%s,"
+                                 "\"User\":%s%s%s}",
                                  cmd        ? cmd        : "null",
                                  entrypoint ? entrypoint : "null",
                                  env_json   ? env_json   : "null",
                                  wdir_safe  ? "\""       : "null",
                                  wdir_safe  ? wdir_safe  : "",
-                                 wdir_safe  ? "\""       : "");
+                                 wdir_safe  ? "\""       : "",
+                                 user_safe  ? "\""       : "null",
+                                 user_safe  ? user_safe  : "",
+                                 user_safe  ? "\""       : "");
                 if (n > 0 && (size_t)n < bufsz)
                 {
                     write_file(info_path, info_buf, strlen(info_buf));
@@ -987,6 +1094,7 @@ static char* extract_oci_rootfs(const char* self_path)
         free(entrypoint);
         free(env_json);
         free(workdir);
+        free(img_user);
         free(config);
     }
 
@@ -2053,6 +2161,166 @@ done:
 
 /* ── end PTY relay ──────────────────────────────────────────────────────── */
 
+/*
+ * Resolve an OCI "User" spec into uid/gid.  Called after chroot so
+ * /etc/passwd and /etc/group refer to the container's files.
+ *
+ * Formats: "user" | "uid" | "user:group" | "uid:gid" | "uid:group" | "user:gid"
+ * Returns 0 on success, -1 if the spec cannot be resolved.
+ */
+static int resolve_user(const char* spec, uid_t* out_uid, gid_t* out_gid)
+{
+    if (!spec || !spec[0])
+    {
+        return -1;
+    }
+    char buf[256];
+    int sn = snprintf(buf, sizeof(buf), "%s", spec);
+    if (sn < 0 || (size_t)sn >= sizeof(buf))
+    {
+        return -1;
+    }
+
+    char* colon      = strchr(buf, ':');
+    char* group_part = NULL;
+    if (colon)
+    {
+        *colon     = '\0';
+        group_part = colon + 1;
+    }
+
+    uid_t uid = 0;
+    gid_t gid = 0;
+
+    /* Resolve user part: numeric UID or name lookup in /etc/passwd */
+    if (buf[0] >= '0' && buf[0] <= '9')
+    {
+        long v = atol(buf);
+        if (v < 0 || v > 65534)
+        {
+            return -1;
+        }
+        uid = (uid_t)v;
+        /* numeric UID with no group spec → gid defaults to 0 */
+    }
+    else
+    {
+        /* Name lookup */
+        int found = 0;
+        FILE* f   = fopen("/etc/passwd", "r");
+        if (f)
+        {
+            char line[1024];
+            while (!found && fgets(line, sizeof(line), f))
+            {
+                /* name:x:uid:gid:gecos:home:shell */
+                char* f1 = line;
+                char* f2 = strchr(f1, ':');
+                if (!f2)
+                {
+                    continue;
+                }
+                *f2++ = '\0';
+                char* f3 = strchr(f2, ':');
+                if (!f3)
+                {
+                    continue;
+                }
+                *f3++ = '\0';
+                char* f4 = strchr(f3, ':');
+                if (!f4)
+                {
+                    continue;
+                }
+                *f4++ = '\0';
+                if (strcmp(f1, buf) == 0)
+                {
+                    long u = atol(f3);
+                    long g = atol(f4);
+                    if (u < 0 || u > 65534 || g < 0 || g > 65534)
+                    {
+                        fclose(f);
+                        return -1;
+                    }
+                    uid   = (uid_t)u;
+                    gid   = (gid_t)g;
+                    found = 1;
+                }
+            }
+            fclose(f);
+        }
+        if (!found)
+        {
+            return -1;
+        }
+    }
+
+    /* Resolve group part if given: numeric GID or name lookup in /etc/group */
+    if (group_part)
+    {
+        if (group_part[0] >= '0' && group_part[0] <= '9')
+        {
+            long v = atol(group_part);
+            if (v < 0 || v > 65534)
+            {
+                return -1;
+            }
+            gid = (gid_t)v;
+        }
+        else
+        {
+            int found = 0;
+            FILE* f   = fopen("/etc/group", "r");
+            if (f)
+            {
+                char line[1024];
+                while (!found && fgets(line, sizeof(line), f))
+                {
+                    /* name:x:gid:members */
+                    char* f1 = line;
+                    char* f2 = strchr(f1, ':');
+                    if (!f2)
+                    {
+                        continue;
+                    }
+                    *f2++ = '\0';
+                    char* f3 = strchr(f2, ':');
+                    if (!f3)
+                    {
+                        continue;
+                    }
+                    *f3++ = '\0';
+                    char* f4 = strchr(f3, ':');
+                    if (f4)
+                    {
+                        *f4 = '\0';
+                    }
+                    if (strcmp(f1, group_part) == 0)
+                    {
+                        long g = atol(f3);
+                        if (g < 0 || g > 65534)
+                        {
+                            fclose(f);
+                            return -1;
+                        }
+                        gid   = (gid_t)g;
+                        found = 1;
+                    }
+                }
+                fclose(f);
+            }
+            if (!found)
+            {
+                return -1;
+            }
+        }
+    }
+
+    *out_uid = uid;
+    *out_gid = gid;
+    return 0;
+}
+
 static int container_main(const char* rootfs, struct container_opts *opts)
 {
     debug_log("container_main.begin", "rootfs=%s", rootfs);
@@ -2074,10 +2342,17 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* Save image Env and WorkingDir — applied after chroot.
-     * Transfer ownership from oci_cfg so free_oci_config won't free them. */
+    /* Save image Env, WorkingDir and User — applied after chroot.
+     * Transfer ownership from oci_cfg so free_oci_config won't free them.
+     * User is copied to a stack buffer to survive subsequent heap activity. */
     char* image_env_json = oci_cfg.env_json;
     char* image_workdir  = oci_cfg.workdir;
+    char  image_user_buf[256] = {0};
+    if (oci_cfg.user && oci_cfg.user[0])
+    {
+        snprintf(image_user_buf, sizeof(image_user_buf), "%s", oci_cfg.user);
+    }
+    char* image_user = image_user_buf;
     oci_cfg.env_json = NULL;
     oci_cfg.workdir  = NULL;
     free_oci_config(&oci_cfg);
@@ -2655,25 +2930,50 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         return rc;
     }
 
-    /* Drop to requested UID/GID if --user was given (fatal if it fails) */
+    /* Drop to requested UID/GID.  --user overrides the image User field. */
+    uid_t drop_uid = 0;
+    gid_t drop_gid = 0;
+    int   do_drop  = 0;
+
     if (opts->has_user)
     {
-        if (setgroups(0, NULL) < 0)
+        drop_uid = opts->run_uid;
+        drop_gid = opts->run_gid;
+        do_drop  = 1;
+    }
+    else if (image_user && image_user[0])
+    {
+        if (resolve_user(image_user, &drop_uid, &drop_gid) == 0 &&
+                (drop_uid != 0 || drop_gid != 0))
         {
-            fprintf(stderr, "oci2bin: setgroups failed: %s\n", strerror(errno));
-            return 1;
+            do_drop = 1;
+            debug_log("container.user", "spec=%s uid=%d gid=%d",
+                      image_user, (int)drop_uid, (int)drop_gid);
         }
-        if (setgid(opts->run_gid) < 0)
+        else
         {
-            fprintf(stderr, "oci2bin: setgid(%d) failed: %s\n",
-                    (int)opts->run_gid, strerror(errno));
-            return 1;
+            fprintf(stderr,
+                    "oci2bin: warning: could not resolve image User \"%s\"\n",
+                    image_user);
         }
-        if (setuid(opts->run_uid) < 0)
+    }
+
+    if (do_drop)
+    {
+        /* setgroups may be denied in a user namespace (EPERM) — non-fatal */
+        setgroups(0, NULL);
+        /* In a user namespace only UID/GID 0 is mapped; setgid/setuid
+         * for other IDs fails with EINVAL.  Treat as non-fatal so the
+         * container still runs as the mapped uid=0. */
+        if (setgid(drop_gid) < 0)
         {
-            fprintf(stderr, "oci2bin: setuid(%d) failed: %s\n",
-                    (int)opts->run_uid, strerror(errno));
-            return 1;
+            debug_log("container.setgid_skip", "gid=%d err=%s",
+                      (int)drop_gid, strerror(errno));
+        }
+        if (setuid(drop_uid) < 0)
+        {
+            debug_log("container.setuid_skip", "uid=%d err=%s",
+                      (int)drop_uid, strerror(errno));
         }
     }
 

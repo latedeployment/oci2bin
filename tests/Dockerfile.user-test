@@ -1,0 +1,7 @@
+FROM alpine:latest
+RUN adduser -D -u 1001 testuser && \
+    addgroup -g 1002 testgroup && \
+    adduser testuser testgroup
+USER testuser
+WORKDIR /home/testuser
+CMD ["/bin/sh", "-c", "echo uid=$(id -u) gid=$(id -g)"]
