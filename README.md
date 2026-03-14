@@ -357,10 +357,10 @@ process runs as PID 1 via a minimal in-binary init.
 
 Two backends are supported:
 
-| Backend | When to use | Extra requirements |
-|---|---|---|
-| **libkrun** (default when compiled with `LIBKRUN=1`) | macOS (HVF) or Linux (KVM); no kernel binary needed | `libkrun-dev` at build time |
-| **cloud-hypervisor** | Linux (KVM); full VM control | `cloud-hypervisor` in `$PATH`, embedded kernel (see below) |
+| Backend | When to use | Kernel required? | Extra requirements |
+|---|---|---|---|
+| **libkrun** (default when available) | macOS (HVF) or Linux (KVM) | **No** — libkrun bundles its own kernel internally | `libkrun-dev` at build time |
+| **cloud-hypervisor** | Linux (KVM); full VM control | **Yes** — you must embed a vmlinux (see below) | `cloud-hypervisor` in `$PATH`, embedded kernel |
 
 `--vm` requires `/dev/kvm` on Linux. On macOS, libkrun uses the Hypervisor
 framework (HVF) — no KVM is needed.
@@ -368,13 +368,21 @@ framework (HVF) — no KVM is needed.
 ### Building with libkrun
 
 ```bash
-make LIBKRUN=1          # links libkrun; no kernel binary needed
+make loader-libkrun     # builds build/loader-libkrun-$(ARCH)
+oci2bin alpine myapp    # auto-detects libkrun loader if present
 ```
 
 Requires the `libkrun` and `libkrun-dev` packages (available on Fedora, Ubuntu,
 and from [containers/libkrun](https://github.com/containers/libkrun)).
 
-### Building the kernel (cloud-hypervisor path)
+libkrun is an in-process microVM library that includes its own guest kernel, so
+the output binary does not need a separate kernel blob embedded. Just pass
+`--vm` at runtime and it works.
+
+### Building the kernel (cloud-hypervisor only)
+
+The cloud-hypervisor backend requires an external Linux kernel embedded in the
+binary. This is **not needed for libkrun**.
 
 ```bash
 make kernel             # downloads Linux 6.1, builds vmlinux (~10 min first time)
@@ -383,6 +391,17 @@ oci2bin alpine myapp --kernel build/vmlinux   # embeds kernel in polyglot
 
 The embedded kernel adds ~10 MB to the binary. The initramfs is built at
 runtime from the extracted rootfs if not pre-embedded.
+
+### Custom VM defaults
+
+Override the default vCPU count (1) and memory (256 MiB) at build time:
+
+```bash
+make VM_CPUS=4 VM_MEM_MB=512             # Makefile
+VM_CPUS=4 VM_MEM_MB=512 oci2bin alpine myapp  # oci2bin wrapper
+```
+
+These defaults apply when `--cpus` or `--memory` are not passed at runtime.
 
 ### Usage
 
