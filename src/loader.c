@@ -96,6 +96,7 @@ struct container_opts
 
     /* --no-seccomp  (disable the default seccomp filter) */
     int no_seccomp;
+    int no_host_dev; /* --no-host-dev: skip bind-mounting host /dev nodes */
 
     /* --hostname NAME  (override the UTS hostname) */
     char* hostname;
@@ -1867,9 +1868,9 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         perror("mount /tmp tmpfs (non-fatal)");
     }
 
-    /* Mount /dev and create essential device nodes via mknod.
-     * We cannot bind-mount host /dev in a rootless user namespace,
-     * so we create the nodes manually after entering the namespace. */
+    /* Mount tmpfs on /dev then bind-mount essential devices from the host.
+     * mknod is not available in rootless user namespaces, but bind-mounting
+     * existing host device nodes requires no special privileges. */
     mkdir("/dev", 0755);
     if (mount("tmpfs", "/dev", "tmpfs",
               MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
@@ -1878,25 +1879,28 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     }
     else
     {
-        /* c 1 3 */ if (mknod("/dev/null",    S_IFCHR | 0666, makedev(1, 3)) < 0)
+        if (!opts->no_host_dev)
         {
-            perror("mknod /dev/null (non-fatal)");
-        }
-        /* c 1 5 */ if (mknod("/dev/zero",    S_IFCHR | 0666, makedev(1, 5)) < 0)
-        {
-            perror("mknod /dev/zero (non-fatal)");
-        }
-        /* c 1 8 */ if (mknod("/dev/random",  S_IFCHR | 0666, makedev(1, 8)) < 0)
-        {
-            perror("mknod /dev/random (non-fatal)");
-        }
-        /* c 1 9 */ if (mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9)) < 0)
-        {
-            perror("mknod /dev/urandom (non-fatal)");
-        }
-        /* c 5 0 */ if (mknod("/dev/tty",     S_IFCHR | 0620, makedev(5, 0)) < 0)
-        {
-            perror("mknod /dev/tty (non-fatal)");
+            static const char* const DEV_NODES[] =
+            {
+                "/dev/null", "/dev/zero", "/dev/random",
+                "/dev/urandom", "/dev/tty", NULL,
+            };
+            for (int di = 0; DEV_NODES[di]; di++)
+            {
+                int fd = open(DEV_NODES[di], O_CREAT | O_WRONLY, 0666);
+                if (fd >= 0)
+                {
+                    close(fd);
+                }
+                if (mount(DEV_NODES[di], DEV_NODES[di], NULL,
+                          MS_BIND, NULL) < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: bind-mount %s (non-fatal): %s\n",
+                            DEV_NODES[di], strerror(errno));
+                }
+            }
         }
     }
 
@@ -2277,6 +2281,8 @@ static void usage(const char* prog)
             "                      state accumulates across runs\n"
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
+            "  --no-host-dev       Skip bind-mounting host /dev nodes (null, zero, "
+            "random, tty)\n"
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
             "  --hostname NAME     Set the hostname inside the container\n"
             "  --cap-drop CAP      Drop a capability (or 'all' to drop all)\n"
@@ -2921,6 +2927,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-seccomp") == 0)
         {
             opts->no_seccomp = 1;
+        }
+        else if (strcmp(argv[i], "--no-host-dev") == 0)
+        {
+            opts->no_host_dev = 1;
         }
         else if (strcmp(argv[i], "--init") == 0)
         {
