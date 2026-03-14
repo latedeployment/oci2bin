@@ -171,6 +171,18 @@ static void test_json_parse_string_array(void)
     free(out_esc[0]);
 }
 
+static void test_path_has_dotdot_component(void)
+{
+    ASSERT(path_has_dotdot_component("/safe/../path"),
+           "path_has_dotdot_component: detects parent component");
+    ASSERT(path_has_dotdot_component("../relative"),
+           "path_has_dotdot_component: detects leading parent component");
+    ASSERT(!path_has_dotdot_component("/safe/..hidden/path"),
+           "path_has_dotdot_component: ignores non-component '..' substring");
+    ASSERT(!path_has_dotdot_component("/safe/path"),
+           "path_has_dotdot_component: accepts clean path");
+}
+
 static void test_parse_opts(void)
 {
     struct container_opts opts;
@@ -440,6 +452,17 @@ static void test_parse_opts(void)
         int r = parse_opts(3, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --net bridge returns -1");
     }
+
+    /* --tmpfs path with ".." inside a component should be allowed */
+    {
+        char arg[] = "/safe/..cache";
+        char *argv[] = {"prog", "--tmpfs", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --tmpfs allows '..' inside component name");
+        ASSERT_STR_EQ(opts.tmpfs_mounts[0], "/safe/..cache",
+                      "parse_opts: --tmpfs preserves clean component name");
+    }
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
@@ -452,6 +475,7 @@ int main(void)
     test_json_get_string();
     test_json_get_array();
     test_json_parse_string_array();
+    test_path_has_dotdot_component();
     test_parse_opts();
 
     printf("1..%d\n", tap_test_num);
