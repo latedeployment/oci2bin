@@ -70,6 +70,7 @@ static const char* safe_str(const char* s)
     return s ? s : "(null)";
 }
 
+__attribute__((format(printf, 2, 3)))
 static void debug_log(const char* event, const char* fmt, ...)
 {
     if (!g_debug)
@@ -1141,6 +1142,13 @@ static int setup_uid_map(uid_t real_uid, gid_t real_gid)
  */
 static void patch_rootfs_ids(const char* rootfs)
 {
+    /* Reject rootfs paths that would overflow any of the paths built below.
+     * "/etc/apt/apt.conf.d" is the longest suffix (19 chars + NUL = 20). */
+    if (strlen(rootfs) + 20 > PATH_MAX)
+    {
+        return;
+    }
+
     /* ── /etc/passwd ── remap all uid:gid fields to 0:0 ── */
     char passwd_path[PATH_MAX];
     snprintf(passwd_path, sizeof(passwd_path), "%s/etc/passwd", rootfs);
@@ -1271,7 +1279,8 @@ static void patch_rootfs_ids(const char* rootfs)
 
     /* ── apt sandbox ── belt-and-suspenders for Debian/Ubuntu images ── */
     char apt_conf_dir[PATH_MAX];
-    snprintf(apt_conf_dir, sizeof(apt_conf_dir), "%s/etc/apt/apt.conf.d", rootfs);
+    snprintf(apt_conf_dir, sizeof(apt_conf_dir), "%s/etc/apt/apt.conf.d",
+             rootfs);
     struct stat st;
     if (stat(apt_conf_dir, &st) == 0 && S_ISDIR(st.st_mode))
     {

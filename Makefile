@@ -1,4 +1,5 @@
 CC_X86_64  = gcc
+CC_CLANG  ?= clang
 # Use native gcc on aarch64 host; cross-compiler when targeting aarch64 from x86_64
 ifeq ($(shell uname -m),aarch64)
 CC_AARCH64       = gcc
@@ -56,7 +57,7 @@ VMLINUX_OUT    = build/vmlinux
         test-unit-aarch64 test-integration test-integration-redis \
         test-integration-nginx test-integration-services \
         test-c test-c-aarch64 test-python \
-        test-vm-unit test-vm
+        test-vm-unit test-vm lint-clang
 
 all: polyglot
 
@@ -154,6 +155,27 @@ clean:
 
 clean-all: clean
 	rm -rf build
+
+# ── Clang lint ─────────────────────────────────────────────────────────────────
+# Compile src/loader.c with clang and an extended warning set to catch issues
+# that GCC's diagnostics miss.  Output is discarded (-o /dev/null); any warning
+# is treated as an error so CI fails loudly.
+CLANG_LINT_FLAGS = -static -O2 -Wall -Wextra -Werror \
+                   -Wno-unused-parameter \
+                   -Wcast-align \
+                   -Wshadow \
+                   -Wstrict-prototypes \
+                   -Wmissing-prototypes \
+                   -Wnull-dereference \
+                   -Wformat=2 \
+                   -Wformat-nonliteral \
+                   -Wimplicit-fallthrough \
+                   -Wlogical-op-parentheses
+
+lint-clang:
+	@echo "=== clang lint ($(CC_CLANG)) ==="
+	$(CC_CLANG) $(CLANG_LINT_FLAGS) $(VM_DEFS) -o /dev/null src/loader.c
+	@echo "clang lint: OK"
 
 # ── Test targets ──────────────────────────────────────────────────────────────
 
