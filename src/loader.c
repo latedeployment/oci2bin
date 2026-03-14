@@ -459,6 +459,21 @@ static int json_escape_string(const char* src, char* dst, size_t dstsz)
 
 /* ── file helpers ────────────────────────────────────────────────────────── */
 
+static int path_has_dotdot_component(const char* path);
+static int path_is_absolute_and_clean(const char* path);
+static ssize_t read_all_fd(int fd, char* buf, size_t len);
+static int write_all_fd(int fd, const char* data, size_t len);
+static int parent_dir_path(const char* path, char* out, size_t out_sz);
+static int mkdir_p_secure(const char* path, mode_t leaf_mode, const char* what);
+static int ensure_path_not_symlink(const char* path, const char* what);
+static int ensure_bind_mount_target(const char* src, const char* dst,
+                                    const char* what);
+static int parse_id_value(const char* text, long max_value, long* out);
+static int lookup_passwd_user(const char* passwd_path, const char* name,
+                              uid_t* out_uid, gid_t* out_gid);
+static int lookup_group_name(const char* group_path, const char* name,
+                             gid_t* out_gid);
+
 /*
  * Create a runtime tmpdir in OCI2BIN_TMPDIR, TMPDIR, /tmp, or /var/tmp.
  * Returns 0 on success, -1 on failure.
@@ -481,7 +496,7 @@ static int make_runtime_tmpdir(char* out, size_t out_sz, const char* prefix)
         {
             continue;
         }
-        if (strstr(base, ".."))
+        if (path_has_dotdot_component(base))
         {
             continue;
         }
@@ -512,6 +527,386 @@ static int path_join_suffix(char* out, size_t out_sz,
     return 0;
 }
 
+static int path_has_dotdot_component(const char* path)
+{
+    if (!path)
+    {
+        return 0;
+    }
+
+    const char* p = path;
+    while (*p)
+    {
+        while (*p == '/')
+        {
+            p++;
+        }
+
+        const char* start = p;
+        while (*p && *p != '/')
+        {
+            p++;
+        }
+        if ((size_t)(p - start) == 2 &&
+                start[0] == '.' &&
+                start[1] == '.')
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int path_is_absolute_and_clean(const char* path)
+{
+    return path && path[0] == '/' && !path_has_dotdot_component(path);
+}
+
+static ssize_t read_all_fd(int fd, char* buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        ssize_t n = read(fd, buf + off, len - off);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        off += (size_t)n;
+    }
+    return (ssize_t)off;
+}
+
+static int write_all_fd(int fd, const char* data, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        ssize_t n = write(fd, data + off, len - off);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int parent_dir_path(const char* path, char* out, size_t out_sz)
+{
+    int n = snprintf(out, out_sz, "%s", path);
+    if (n < 0 || (size_t)n >= out_sz)
+    {
+        return -1;
+    }
+
+    char* slash = strrchr(out, '/');
+    if (!slash)
+    {
+        return -1;
+    }
+    if (slash == out)
+    {
+        slash[1] = '\0';
+        return 0;
+    }
+    *slash = '\0';
+    return 0;
+}
+
+static int mkdir_p_secure(const char* path, mode_t leaf_mode, const char* what)
+{
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(tmp))
+    {
+        fprintf(stderr, "oci2bin: %s path too long: %s\n", what, path);
+        return -1;
+    }
+
+    for (char* p = tmp + 1;; p++)
+    {
+        if (*p != '/' && *p != '\0')
+        {
+            continue;
+        }
+
+        char saved = *p;
+        *p = '\0';
+
+        struct stat st;
+        if (lstat(tmp, &st) == 0)
+        {
+            if (S_ISLNK(st.st_mode))
+            {
+                fprintf(stderr,
+                        "oci2bin: %s path contains symlink component: %s\n",
+                        what, tmp);
+                return -1;
+            }
+            if (!S_ISDIR(st.st_mode))
+            {
+                fprintf(stderr,
+                        "oci2bin: %s path component is not a directory: %s\n",
+                        what, tmp);
+                return -1;
+            }
+        }
+        else if (errno == ENOENT)
+        {
+            mode_t mode = (saved == '\0') ? leaf_mode : 0755;
+            if (mkdir(tmp, mode) < 0 && errno != EEXIST)
+            {
+                fprintf(stderr, "oci2bin: mkdir %s: %s\n",
+                        tmp, strerror(errno));
+                return -1;
+            }
+        }
+        else
+        {
+            fprintf(stderr, "oci2bin: lstat %s: %s\n",
+                    tmp, strerror(errno));
+            return -1;
+        }
+
+        if (saved == '\0')
+        {
+            break;
+        }
+        *p = saved;
+    }
+
+    return 0;
+}
+
+static int ensure_path_not_symlink(const char* path, const char* what)
+{
+    struct stat st;
+    if (lstat(path, &st) < 0)
+    {
+        if (errno == ENOENT)
+        {
+            return 0;
+        }
+        fprintf(stderr, "oci2bin: lstat %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (S_ISLNK(st.st_mode))
+    {
+        fprintf(stderr, "oci2bin: %s target must not be a symlink: %s\n",
+                what, path);
+        return -1;
+    }
+    return 0;
+}
+
+static int ensure_bind_mount_target(const char* src, const char* dst,
+                                    const char* what)
+{
+    struct stat src_st;
+    if (stat(src, &src_st) < 0)
+    {
+        fprintf(stderr, "oci2bin: stat %s: %s\n", src, strerror(errno));
+        return -1;
+    }
+
+    char parent[PATH_MAX];
+    if (parent_dir_path(dst, parent, sizeof(parent)) < 0)
+    {
+        fprintf(stderr, "oci2bin: %s destination path too long: %s\n",
+                what, dst);
+        return -1;
+    }
+    if (mkdir_p_secure(parent, 0755, what) < 0)
+    {
+        return -1;
+    }
+
+    struct stat dst_st;
+    if (lstat(dst, &dst_st) == 0)
+    {
+        if (S_ISLNK(dst_st.st_mode))
+        {
+            fprintf(stderr,
+                    "oci2bin: %s destination must not be a symlink: %s\n",
+                    what, dst);
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT)
+    {
+        fprintf(stderr, "oci2bin: lstat %s: %s\n", dst, strerror(errno));
+        return -1;
+    }
+
+    if (S_ISDIR(src_st.st_mode))
+    {
+        if (mkdir(dst, 0755) < 0 && errno != EEXIST)
+        {
+            fprintf(stderr, "oci2bin: mkdir %s: %s\n",
+                    dst, strerror(errno));
+            return -1;
+        }
+        return ensure_path_not_symlink(dst, what);
+    }
+
+    int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                  src_st.st_mode & 0777 ? (src_st.st_mode & 0777) : 0600);
+    if (fd < 0)
+    {
+        fprintf(stderr, "oci2bin: create %s: %s\n", dst, strerror(errno));
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int parse_id_value(const char* text, long max_value, long* out)
+{
+    if (!text || !text[0])
+    {
+        return -1;
+    }
+
+    char* endp = NULL;
+    errno = 0;
+    long value = strtol(text, &endp, 10);
+    if (endp == text || *endp != '\0' || errno == ERANGE ||
+            value < 0 || value > max_value)
+    {
+        return -1;
+    }
+
+    *out = value;
+    return 0;
+}
+
+static int lookup_passwd_user(const char* passwd_path, const char* name,
+                              uid_t* out_uid, gid_t* out_gid)
+{
+    FILE* f = fopen(passwd_path, "r");
+    if (!f)
+    {
+        return -1;
+    }
+
+    char line[1024];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f))
+    {
+        char* user = line;
+        char* passwd = strchr(user, ':');
+        if (!passwd)
+        {
+            continue;
+        }
+        *passwd++ = '\0';
+
+        char* uid_field = strchr(passwd, ':');
+        if (!uid_field)
+        {
+            continue;
+        }
+        *uid_field++ = '\0';
+
+        char* gid_field = strchr(uid_field, ':');
+        if (!gid_field)
+        {
+            continue;
+        }
+        *gid_field++ = '\0';
+
+        char* tail = strchr(gid_field, ':');
+        if (!tail)
+        {
+            continue;
+        }
+        *tail = '\0';
+
+        if (strcmp(user, name) == 0)
+        {
+            long uid_val = 0;
+            long gid_val = 0;
+            if (parse_id_value(uid_field, 65534, &uid_val) < 0 ||
+                    parse_id_value(gid_field, 65534, &gid_val) < 0)
+            {
+                fclose(f);
+                return -1;
+            }
+            *out_uid = (uid_t)uid_val;
+            *out_gid = (gid_t)gid_val;
+            found = 1;
+        }
+    }
+
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+static int lookup_group_name(const char* group_path, const char* name,
+                             gid_t* out_gid)
+{
+    FILE* f = fopen(group_path, "r");
+    if (!f)
+    {
+        return -1;
+    }
+
+    char line[1024];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f))
+    {
+        char* group = line;
+        char* passwd = strchr(group, ':');
+        if (!passwd)
+        {
+            continue;
+        }
+        *passwd++ = '\0';
+
+        char* gid_field = strchr(passwd, ':');
+        if (!gid_field)
+        {
+            continue;
+        }
+        *gid_field++ = '\0';
+
+        char* members = strchr(gid_field, ':');
+        if (members)
+        {
+            *members = '\0';
+        }
+
+        if (strcmp(group, name) == 0)
+        {
+            long gid_val = 0;
+            if (parse_id_value(gid_field, 65534, &gid_val) < 0)
+            {
+                fclose(f);
+                return -1;
+            }
+            *out_gid = (gid_t)gid_val;
+            found = 1;
+        }
+    }
+
+    fclose(f);
+    return found ? 0 : -1;
+}
+
 static char* read_file(const char* path, size_t* out_size)
 {
     int fd = open(path, O_RDONLY);
@@ -537,7 +932,7 @@ static char* read_file(const char* path, size_t* out_size)
         close(fd);
         return NULL;
     }
-    ssize_t n = read(fd, buf, st.st_size);
+    ssize_t n = read_all_fd(fd, buf, (size_t)st.st_size);
     close(fd);
     if (n < 0)
     {
@@ -559,9 +954,9 @@ static int write_file(const char* path, const char* data, size_t len)
     {
         return -1;
     }
-    ssize_t written = write(fd, data, len);
+    int rc = write_all_fd(fd, data, len);
     close(fd);
-    return (written == (ssize_t)len) ? 0 : -1;
+    return rc;
 }
 
 /*
@@ -591,57 +986,14 @@ static int resolve_user_in_rootfs(const char* rootfs, const char* spec,
     {
         return -1;
     }
-    FILE* f = fopen(passwd_path, "r");
-    if (!f)
+    uid_t uid = 0;
+    gid_t gid = 0;
+    if (lookup_passwd_user(passwd_path, spec, &uid, &gid) < 0)
     {
         return -1;
     }
-    char line[1024];
-    int found = 0;
-    while (!found && fgets(line, sizeof(line), f))
-    {
-        /* name:x:uid:gid:gecos:home:shell */
-        char* f1 = line;
-        char* f2 = strchr(f1, ':');
-        if (!f2)
-        {
-            continue;
-        }
-        *f2++ = '\0';
-        char* f3 = strchr(f2, ':');
-        if (!f3)
-        {
-            continue;
-        }
-        *f3++ = '\0';
-        char* f4 = strchr(f3, ':');
-        if (!f4)
-        {
-            continue;
-        }
-        *f4++ = '\0';
-        if (strcmp(f1, spec) == 0)
-        {
-            long uid_val = atol(f3);
-            long gid_val = atol(f4);
-            /* Reject out-of-range values from crafted /etc/passwd */
-            if (uid_val < 0 || uid_val > 65534 ||
-                    gid_val < 0 || gid_val > 65534)
-            {
-                fclose(f);
-                return -1;
-            }
-            if (snprintf(out, outsz, "%ld:%ld", uid_val, gid_val)
-                    >= (int)outsz)
-            {
-                fclose(f);
-                return -1;
-            }
-            found = 1;
-        }
-    }
-    fclose(f);
-    return found ? 0 : -1;
+    return snprintf(out, outsz, "%u:%u",
+                    (unsigned)uid, (unsigned)gid) < (int)outsz ? 0 : -1;
 }
 
 /*
@@ -785,9 +1137,9 @@ static int write_proc(const char* path, const char* data, size_t len)
     {
         return -1;
     }
-    ssize_t written = write(fd, data, len);
+    int rc = write_all_fd(fd, data, len);
     close(fd);
-    return (written == (ssize_t)len) ? 0 : -1;
+    return rc;
 }
 
 /* Run a command, wait for it. Returns exit status. */
@@ -970,7 +1322,7 @@ static char* extract_oci_rootfs(const char* self_path)
     for (int i = 0; i < nlayers; i++)
     {
         /* Reject any layer path that tries to traverse out of oci_dir */
-        if (strstr(layers[i], "..") != NULL || layers[i][0] == '/')
+        if (path_has_dotdot_component(layers[i]) || layers[i][0] == '/')
         {
             fprintf(stderr, "oci2bin: rejecting dangerous layer path: %s\n", layers[i]);
             free(layers[i]);
@@ -999,7 +1351,8 @@ static char* extract_oci_rootfs(const char* self_path)
 
     /* 6. Read the image config to get Cmd/Entrypoint */
     /* Reject config paths that could traverse outside oci_dir */
-    if (strstr(config_path_rel, "..") != NULL || config_path_rel[0] == '/')
+    if (path_has_dotdot_component(config_path_rel) ||
+            config_path_rel[0] == '/')
     {
         fprintf(stderr, "oci2bin: rejecting dangerous config path: %s\n",
                 config_path_rel);
@@ -1382,16 +1735,19 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
 {
     for (int i = 0; i < opts->n_vols; i++)
     {
+        const char* host_path = opts->vol_host[i];
         const char* ctr_path = opts->vol_ctr[i];
         /* Container path must be absolute and must not contain '..' components */
-        if (ctr_path[0] != '/')
+        if (!path_is_absolute_and_clean(host_path))
         {
-            fprintf(stderr, "oci2bin: -v container path must be absolute: %s\n", ctr_path);
+            fprintf(stderr, "oci2bin: -v host path must be absolute and clean: %s\n",
+                    host_path);
             continue;
         }
-        if (strstr(ctr_path, "..") != NULL)
+        if (!path_is_absolute_and_clean(ctr_path))
         {
-            fprintf(stderr, "oci2bin: -v container path must not contain '..': %s\n",
+            fprintf(stderr,
+                    "oci2bin: -v container path must be absolute and clean: %s\n",
                     ctr_path);
             continue;
         }
@@ -1404,23 +1760,21 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
             continue;
         }
 
-        /* Create mount point if it doesn't exist */
-        struct stat st;
-        if (stat(dst, &st) != 0)
+        if (ensure_bind_mount_target(host_path, dst, "-v") < 0)
         {
-            mkdir(dst, 0755);
+            continue;
         }
 
         /* Bind mount: host path → container path (pre-chroot, both accessible) */
-        if (mount(opts->vol_host[i], dst, NULL, MS_BIND | MS_REC, NULL) < 0)
+        if (mount(host_path, dst, NULL, MS_BIND | MS_REC, NULL) < 0)
         {
             fprintf(stderr, "oci2bin: bind mount %s -> %s failed: %s\n",
-                    opts->vol_host[i], opts->vol_ctr[i], strerror(errno));
+                    host_path, opts->vol_ctr[i], strerror(errno));
         }
         else
         {
             fprintf(stderr, "oci2bin: mounted %s -> %s\n",
-                    opts->vol_host[i], opts->vol_ctr[i]);
+                    host_path, opts->vol_ctr[i]);
         }
     }
 }
@@ -1437,7 +1791,6 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         return;
     }
 
-    /* Ensure /run/secrets exists in the rootfs */
     char run_secrets[PATH_MAX];
     if (snprintf(run_secrets, sizeof(run_secrets), "%s/run/secrets", rootfs)
             >= (int)sizeof(run_secrets))
@@ -1453,8 +1806,11 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         fprintf(stderr, "oci2bin: rootfs path too long for /run\n");
         return;
     }
-    mkdir(run_dir, 0755);   /* EEXIST is expected and fine */
-    mkdir(run_secrets, 0700); /* EEXIST is expected and fine */
+    if (mkdir_p_secure(run_dir, 0755, "--secret") < 0 ||
+            mkdir_p_secure(run_secrets, 0700, "--secret") < 0)
+    {
+        return;
+    }
 
     for (int i = 0; i < opts->n_secrets; i++)
     {
@@ -1462,14 +1818,10 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         const char* ctr  = opts->secret_ctr[i]; /* may be NULL */
 
         /* Validate src is absolute and has no '..' */
-        if (src[0] != '/')
+        if (!path_is_absolute_and_clean(src))
         {
-            fprintf(stderr, "oci2bin: --secret host path must be absolute: %s\n", src);
-            continue;
-        }
-        if (strstr(src, "..") != NULL)
-        {
-            fprintf(stderr, "oci2bin: --secret host path must not contain '..': %s\n",
+            fprintf(stderr,
+                    "oci2bin: --secret host path must be absolute and clean: %s\n",
                     src);
             continue;
         }
@@ -1478,16 +1830,10 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         char ctr_buf[PATH_MAX];
         if (ctr)
         {
-            if (ctr[0] != '/')
+            if (!path_is_absolute_and_clean(ctr))
             {
                 fprintf(stderr,
-                        "oci2bin: --secret container path must be absolute: %s\n", ctr);
-                continue;
-            }
-            if (strstr(ctr, "..") != NULL)
-            {
-                fprintf(stderr,
-                        "oci2bin: --secret container path must not contain '..': %s\n",
+                        "oci2bin: --secret container path must be absolute and clean: %s\n",
                         ctr);
                 continue;
             }
@@ -1523,28 +1869,9 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
             continue;
         }
 
-        /* Create parent directory if needed */
-        char par[PATH_MAX];
-        int plen = snprintf(par, sizeof(par), "%s", dst);
-        if (plen > 0 && (size_t)plen < sizeof(par))
+        if (ensure_bind_mount_target(src, dst, "--secret") < 0)
         {
-            char* slash = strrchr(par, '/');
-            if (slash && slash != par)
-            {
-                *slash = '\0';
-                mkdir(par, 0755);
-            }
-        }
-
-        /* Create an empty target file so bind-mount has something to attach to.
-         * O_CREAT|O_EXCL is atomic: no stat() pre-check needed or wanted. */
-        {
-            int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0000);
-            if (fd >= 0)
-            {
-                close(fd);
-            }
-            /* EEXIST is fine: file already present, bind-mount will attach to it */
+            continue;
         }
 
         /* Bind-mount the secret file read-only */
@@ -2204,8 +2531,8 @@ static int resolve_user(const char* spec, uid_t* out_uid, gid_t* out_gid)
     /* Resolve user part: numeric UID or name lookup in /etc/passwd */
     if (buf[0] >= '0' && buf[0] <= '9')
     {
-        long v = atol(buf);
-        if (v < 0 || v > 65534)
+        long v = 0;
+        if (parse_id_value(buf, 65534, &v) < 0)
         {
             return -1;
         }
@@ -2214,51 +2541,7 @@ static int resolve_user(const char* spec, uid_t* out_uid, gid_t* out_gid)
     }
     else
     {
-        /* Name lookup */
-        int found = 0;
-        FILE* f   = fopen("/etc/passwd", "r");
-        if (f)
-        {
-            char line[1024];
-            while (!found && fgets(line, sizeof(line), f))
-            {
-                /* name:x:uid:gid:gecos:home:shell */
-                char* f1 = line;
-                char* f2 = strchr(f1, ':');
-                if (!f2)
-                {
-                    continue;
-                }
-                *f2++ = '\0';
-                char* f3 = strchr(f2, ':');
-                if (!f3)
-                {
-                    continue;
-                }
-                *f3++ = '\0';
-                char* f4 = strchr(f3, ':');
-                if (!f4)
-                {
-                    continue;
-                }
-                *f4++ = '\0';
-                if (strcmp(f1, buf) == 0)
-                {
-                    long u = atol(f3);
-                    long g = atol(f4);
-                    if (u < 0 || u > 65534 || g < 0 || g > 65534)
-                    {
-                        fclose(f);
-                        return -1;
-                    }
-                    uid   = (uid_t)u;
-                    gid   = (gid_t)g;
-                    found = 1;
-                }
-            }
-            fclose(f);
-        }
-        if (!found)
+        if (lookup_passwd_user("/etc/passwd", buf, &uid, &gid) < 0)
         {
             return -1;
         }
@@ -2269,8 +2552,8 @@ static int resolve_user(const char* spec, uid_t* out_uid, gid_t* out_gid)
     {
         if (group_part[0] >= '0' && group_part[0] <= '9')
         {
-            long v = atol(group_part);
-            if (v < 0 || v > 65534)
+            long v = 0;
+            if (parse_id_value(group_part, 65534, &v) < 0)
             {
                 return -1;
             }
@@ -2278,47 +2561,7 @@ static int resolve_user(const char* spec, uid_t* out_uid, gid_t* out_gid)
         }
         else
         {
-            int found = 0;
-            FILE* f   = fopen("/etc/group", "r");
-            if (f)
-            {
-                char line[1024];
-                while (!found && fgets(line, sizeof(line), f))
-                {
-                    /* name:x:gid:members */
-                    char* f1 = line;
-                    char* f2 = strchr(f1, ':');
-                    if (!f2)
-                    {
-                        continue;
-                    }
-                    *f2++ = '\0';
-                    char* f3 = strchr(f2, ':');
-                    if (!f3)
-                    {
-                        continue;
-                    }
-                    *f3++ = '\0';
-                    char* f4 = strchr(f3, ':');
-                    if (f4)
-                    {
-                        *f4 = '\0';
-                    }
-                    if (strcmp(f1, group_part) == 0)
-                    {
-                        long g = atol(f3);
-                        if (g < 0 || g > 65534)
-                        {
-                            fclose(f);
-                            return -1;
-                        }
-                        gid   = (gid_t)g;
-                        found = 1;
-                    }
-                }
-                fclose(f);
-            }
-            if (!found)
+            if (lookup_group_name("/etc/group", group_part, &gid) < 0)
             {
                 return -1;
             }
@@ -2391,7 +2634,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         int dlen = snprintf(dev_dir, sizeof(dev_dir), "%s/dev", rootfs);
         if (dlen > 0 && (size_t)dlen < sizeof(dev_dir))
         {
-            mkdir(dev_dir, 0755);
+            if (mkdir_p_secure(dev_dir, 0755, "/dev") < 0)
+            {
+                return 1;
+            }
             if (mount("tmpfs", dev_dir, "tmpfs",
                       MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
             {
@@ -2415,10 +2661,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                         {
                             continue;
                         }
-                        int fd = open(dst, O_CREAT | O_WRONLY, 0666);
-                        if (fd >= 0)
+                        if (ensure_bind_mount_target(HOST_DEVS[di], dst,
+                                                     "/dev") < 0)
                         {
-                            close(fd);
+                            continue;
                         }
                         if (mount(HOST_DEVS[di], dst, NULL,
                                   MS_BIND, NULL) < 0)
@@ -2436,7 +2682,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                                     "%s/dev/pts", rootfs);
                 if (plen > 0 && (size_t)plen < sizeof(pts_dir))
                 {
-                    mkdir(pts_dir, 0755);
+                    if (mkdir_p_secure(pts_dir, 0755, "/dev/pts") < 0)
+                    {
+                        return 1;
+                    }
                 }
                 /* Create /dev/ptmx placeholder for post-chroot bind */
                 char ptmx_path[PATH_MAX];
@@ -2444,10 +2693,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                                     "%s/dev/ptmx", rootfs);
                 if (mlen > 0 && (size_t)mlen < sizeof(ptmx_path))
                 {
-                    int fd = open(ptmx_path, O_CREAT | O_WRONLY, 0666);
-                    if (fd >= 0)
+                    if (ensure_bind_mount_target("/dev/null", ptmx_path,
+                                                 "/dev/ptmx") < 0)
                     {
-                        close(fd);
+                        return 1;
                     }
                 }
             }
@@ -2472,9 +2721,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                     "oci2bin: --ssh-agent: SSH_AUTH_SOCK must be an absolute path: %s\n",
                     sock);
         }
-        else if (strstr(sock, "/../") != NULL ||
-                 (strlen(sock) >= 3 &&
-                  strcmp(sock + strlen(sock) - 3, "/..") == 0))
+        else if (path_has_dotdot_component(sock))
         {
             fprintf(stderr,
                     "oci2bin: --ssh-agent: SSH_AUTH_SOCK must not contain '..': %s\n",
@@ -2512,7 +2759,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                     int dlen = snprintf(sock_dir, sizeof(sock_dir), "%s/run", rootfs);
                     if (dlen > 0 && (size_t)dlen < sizeof(sock_dir))
                     {
-                        mkdir(sock_dir, 0755);
+                        if (mkdir_p_secure(sock_dir, 0755, "--ssh-agent") < 0)
+                        {
+                            ssh_auth_sock_host[0] = '\0';
+                        }
                     }
                     char sock_dst[PATH_MAX];
                     int tlen = snprintf(sock_dst, sizeof(sock_dst),
@@ -2523,25 +2773,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                                 "oci2bin: --ssh-agent: destination path too long\n");
                         ssh_auth_sock_host[0] = '\0';
                     }
-                    else
+                    else if (ssh_auth_sock_host[0] != '\0')
                     {
-                        /* Create empty placeholder file as bind-mount target.
-                         * O_EXCL ensures we abort if the file already exists
-                         * (e.g. a symlink planted by a malicious image layer)
-                         * rather than silently following it. */
-                        int fd = open(sock_dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-                                      0600);
-                        if (fd < 0)
+                        if (ensure_bind_mount_target(ssh_auth_sock_host, sock_dst,
+                                                     "--ssh-agent") < 0)
                         {
-                            fprintf(stderr,
-                                    "oci2bin: --ssh-agent: cannot create socket placeholder"
-                                    " %s: %s\n",
-                                    sock_dst, strerror(errno));
                             ssh_auth_sock_host[0] = '\0';
-                        }
-                        else
-                        {
-                            close(fd);
                         }
                         if (ssh_auth_sock_host[0] != '\0')
                         {
@@ -3064,7 +3301,7 @@ static int load_env_file(const char* path, struct container_opts* opts)
         return -1;
     }
 
-    ssize_t n = read(fd, buf, sz);
+    ssize_t n = read_all_fd(fd, buf, sz);
     close(fd);
     if (n < 0)
     {
@@ -3217,11 +3454,8 @@ static void usage(const char* prog)
  * Returns a heap-allocated argv array (NULL-terminated) on success.
  * Returns NULL on error (error message already printed).
  * *out_argc is set to the new argc.
- * *out_heap_strings is set to a NULL-terminated list of strings to free
- *   on error only; on success the caller must NOT free them.
  */
-static char** build_merged_argv(int argc, char* argv[], int* out_argc,
-                                char*** out_heap_strings)
+static char** build_merged_argv(int argc, char* argv[], int* out_argc)
 {
     /* First pass: find --config PATH pairs and validate the path */
     const char* config_path = NULL;
@@ -3243,7 +3477,7 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc,
                 return NULL;
             }
             config_path = argv[i + 1];
-            if (strstr(config_path, ".."))
+            if (path_has_dotdot_component(config_path))
             {
                 fprintf(stderr,
                         "oci2bin: --config: path must not"
@@ -3258,8 +3492,7 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc,
     if (!config_path)
     {
         debug_log("argv.merge", "config=none argc=%d", argc);
-        *out_argc         = argc;
-        *out_heap_strings = NULL;
+        *out_argc = argc;
         return argv;
     }
     debug_log("argv.merge", "config=%s", config_path);
@@ -3421,10 +3654,8 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc,
     }
     merged[mi] = NULL;
 
-    *out_argc         = merged_argc;
-    *out_heap_strings = cfg; /* caller must NOT free on success */
+    *out_argc = merged_argc;
     free(cfg);               /* free the indirection array; strings live in merged */
-    *out_heap_strings = NULL;
     debug_log("argv.merge", "merged_argc=%d", merged_argc);
 
     /* The cfg[] strings are now referenced from merged[] directly.
@@ -3525,7 +3756,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         "oci2bin: --tmpfs path must be absolute: %s\n", tp);
                 return -1;
             }
-            if (strstr(tp, ".."))
+            if (path_has_dotdot_component(tp))
             {
                 fprintf(stderr,
                         "oci2bin: --tmpfs path must not contain '..': %s\n",
@@ -3799,7 +4030,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             i++;
-            if (strstr(argv[i], ".."))
+            if (path_has_dotdot_component(argv[i]))
             {
                 fprintf(stderr,
                         "oci2bin: --overlay-persist: path must not"
@@ -3981,7 +4212,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             i++;
-            if (strstr(argv[i], ".."))
+            if (path_has_dotdot_component(argv[i]))
             {
                 fprintf(stderr,
                         "oci2bin: --verify-key: key path must not"
@@ -4058,7 +4289,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         spec);
                 return -1;
             }
-            if (strstr(spec, ".."))
+            if (path_has_dotdot_component(spec))
             {
                 fprintf(stderr,
                         "oci2bin: --device path must not contain '..': %s\n",
@@ -4078,7 +4309,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                             ctr);
                     return -1;
                 }
-                if (strstr(ctr, ".."))
+                if (path_has_dotdot_component(ctr))
                 {
                     fprintf(stderr,
                             "oci2bin: --device container path must not"
@@ -4232,7 +4463,7 @@ static int verify_signature(const char* key_path)
     }
 
     /* Validate key_path: must not contain '..' */
-    if (strstr(key_path, ".."))
+    if (path_has_dotdot_component(key_path))
     {
         fprintf(stderr,
                 "oci2bin: --verify-key: key path must not contain "
@@ -4293,10 +4524,10 @@ static int cg_write(const char* path, const char* value)
                 path, strerror(errno));
         return -1;
     }
-    ssize_t n = write(fd, value, strlen(value));
+    int rc = write_all_fd(fd, value, strlen(value));
     int saved = errno;
     close(fd);
-    if (n < 0)
+    if (rc < 0)
     {
         fprintf(stderr, "oci2bin: cgroup: write %s (%s): %s\n",
                 path, value, strerror(saved));
@@ -5447,9 +5678,7 @@ int main(int argc, char* argv[])
      * the config file and prepends its options as defaults.  parse_opts is
      * then called exactly once on the merged argv. */
     int    merged_argc = 0;
-    char** unused_heap = NULL;
-    char** merged_argv = build_merged_argv(argc, argv,
-                                           &merged_argc, &unused_heap);
+    char** merged_argv = build_merged_argv(argc, argv, &merged_argc);
     if (!merged_argv)
     {
         return 1;

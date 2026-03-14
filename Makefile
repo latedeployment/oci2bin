@@ -57,7 +57,8 @@ VMLINUX_OUT    = build/vmlinux
         test-unit-aarch64 test-integration test-integration-redis \
         test-integration-nginx test-integration-services \
         test-c test-c-aarch64 test-python \
-        test-vm-unit test-vm lint-clang
+        test-vm-unit test-vm \
+        lint lint-clang lint-semgrep lint-scan-build
 
 all: polyglot
 
@@ -156,10 +157,26 @@ clean:
 clean-all: clean
 	rm -rf build
 
-# ── Clang lint ─────────────────────────────────────────────────────────────────
-# Compile src/loader.c with clang and an extended warning set to catch issues
-# that GCC's diagnostics miss.  Output is discarded (-o /dev/null); any warning
-# is treated as an error so CI fails loudly.
+# ── Lint targets ───────────────────────────────────────────────────────────────
+
+# Run all linters in sequence.
+lint: lint-clang lint-scan-build lint-semgrep
+
+# clang: compile with an extended warning set; -Werror makes CI fail on any hit.
+# Flags chosen to catch real bugs without false-positive noise:
+#   -Wcast-align          misaligned pointer casts
+#   -Wshadow              local variable shadows outer scope
+#   -Wstrict-prototypes   missing parameter types in K&R style
+#   -Wmissing-prototypes  functions without a prior declaration
+#   -Wnull-dereference    paths that provably deref NULL
+#   -Wformat=2            strict format-string checking
+#   -Wformat-nonliteral   non-literal passed to printf-family
+#   -Wimplicit-fallthrough  missing break/fallthrough annotation
+#   -Wlogical-op-parentheses  ambiguous && / || mixing
+#   -Wunreachable-code    dead code after return/goto/etc
+#   -Wcomma               comma operator (often a typo for ';')
+#   -Wundef               macro used in #if but never defined
+#   -Wduplicate-enum      duplicate enum constant values
 CLANG_LINT_FLAGS = -static -O2 -Wall -Wextra -Werror \
                    -Wno-unused-parameter \
                    -Wcast-align \
@@ -170,12 +187,39 @@ CLANG_LINT_FLAGS = -static -O2 -Wall -Wextra -Werror \
                    -Wformat=2 \
                    -Wformat-nonliteral \
                    -Wimplicit-fallthrough \
-                   -Wlogical-op-parentheses
+                   -Wlogical-op-parentheses \
+                   -Wunreachable-code \
+                   -Wcomma \
+                   -Wundef \
+                   -Wduplicate-enum
 
 lint-clang:
 	@echo "=== clang lint ($(CC_CLANG)) ==="
 	$(CC_CLANG) $(CLANG_LINT_FLAGS) $(VM_DEFS) -o /dev/null src/loader.c
 	@echo "clang lint: OK"
+
+# clang static analyzer: interprocedural analysis for null-deref, memory leaks,
+# use-after-free, and POSIX API misuse.  The DeprecatedOrUnsafeBufferHandling
+# checker is disabled — it flags every snprintf/memcpy as "insecure" because
+# the C11 Annex K *_s variants don't exist in glibc.
+lint-scan-build:
+	@echo "=== clang static analyzer ==="
+	$(CC_CLANG) --analyze \
+	  -Xanalyzer -analyzer-disable-checker \
+	  -Xanalyzer security.insecureAPI.DeprecatedOrUnsafeBufferHandling \
+	  -Xanalyzer -analyzer-output=text \
+	  $(VM_DEFS) -o /dev/null src/loader.c
+	@echo "scan-build: OK"
+
+# semgrep: pattern-based rules covering OWASP top-10 and general C security.
+SEMGREP     ?= semgrep
+SEMGREP_CONFIGS = --config=p/default --config=p/owasp-top-ten \
+                  --config=p/security-audit
+
+lint-semgrep:
+	@echo "=== semgrep ==="
+	$(SEMGREP) $(SEMGREP_CONFIGS) --error src/loader.c
+	@echo "semgrep: OK"
 
 # ── Test targets ──────────────────────────────────────────────────────────────
 
