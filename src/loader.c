@@ -3967,45 +3967,52 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     uint32_t mem_mb =
         (opts->cg_memory_bytes > 0) ?
         (uint32_t)((unsigned long long)opts->cg_memory_bytes >> 20) : 256;
-    if (krun_set_vm_config(ctx, vcpus, mem_mb) != 0)
+    if (krun_set_vm_config((uint32_t)ctx, vcpus, mem_mb) != 0)
     {
         fprintf(stderr, "oci2bin: krun_set_vm_config failed\n");
         goto cleanup;
     }
 
     /* Set rootfs */
-    if (krun_set_root(ctx, rootfs) != 0)
+    if (krun_set_root((uint32_t)ctx, rootfs) != 0)
     {
         fprintf(stderr, "oci2bin: krun_set_root failed\n");
         goto cleanup;
     }
 
-    /* Add volume mounts */
-    for (int vi = 0; vi < opts->n_vols; vi++)
+    /* Add volume mounts via krun_set_mapped_volumes (format: "host:guest") */
+    if (opts->n_vols > 0)
     {
-        /* Validate host path */
-        if (strstr(opts->vol_host[vi], "..") != NULL)
+        char vol_bufs[MAX_VOLUMES][PATH_MAX * 2 + 2];
+        const char* mapped[MAX_VOLUMES + 1];
+        for (int vi = 0; vi < opts->n_vols; vi++)
         {
-            fprintf(stderr,
-                    "oci2bin: -v host path contains ..: %s\n",
-                    opts->vol_host[vi]);
-            goto cleanup;
+            if (strstr(opts->vol_host[vi], "..") != NULL)
+            {
+                fprintf(stderr, "oci2bin: -v host path contains ..: %s\n",
+                        opts->vol_host[vi]);
+                goto cleanup;
+            }
+            if (strstr(opts->vol_ctr[vi], "..") != NULL ||
+                    opts->vol_ctr[vi][0] != '/')
+            {
+                fprintf(stderr, "oci2bin: -v container path invalid: %s\n",
+                        opts->vol_ctr[vi]);
+                goto cleanup;
+            }
+            int vn = snprintf(vol_bufs[vi], sizeof(vol_bufs[vi]),
+                              "%s:%s", opts->vol_host[vi], opts->vol_ctr[vi]);
+            if (vn < 0 || (size_t)vn >= sizeof(vol_bufs[vi]))
+            {
+                fprintf(stderr, "oci2bin: volume path too long\n");
+                goto cleanup;
+            }
+            mapped[vi] = vol_bufs[vi];
         }
-        /* Validate container path */
-        if (strstr(opts->vol_ctr[vi], "..") != NULL ||
-                opts->vol_ctr[vi][0] != '/')
+        mapped[opts->n_vols] = NULL;
+        if (krun_set_mapped_volumes((uint32_t)ctx, mapped) != 0)
         {
-            fprintf(stderr,
-                    "oci2bin: -v container path invalid: %s\n",
-                    opts->vol_ctr[vi]);
-            goto cleanup;
-        }
-        if (krun_add_mapped_volume(ctx, opts->vol_host[vi],
-                                   opts->vol_ctr[vi]) != 0)
-        {
-            fprintf(stderr,
-                    "oci2bin: krun_add_mapped_volume failed for %s\n",
-                    opts->vol_host[vi]);
+            fprintf(stderr, "oci2bin: krun_set_mapped_volumes failed\n");
             goto cleanup;
         }
     }
@@ -4022,7 +4029,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
                         "oci2bin: workdir contains ..: %s\n", wdir);
                 goto cleanup;
             }
-            if (krun_set_workdir(ctx, wdir) != 0)
+            if (krun_set_workdir((uint32_t)ctx, wdir) != 0)
             {
                 fprintf(stderr,
                         "oci2bin: krun_set_workdir failed\n");
@@ -4034,15 +4041,16 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     image_workdir = NULL;
 
     /* Set exec */
-    if (krun_set_exec(ctx, exec_args[0], exec_args + 1,
-                      (char* const*)flat_env) != 0)
+    if (krun_set_exec((uint32_t)ctx, exec_args[0],
+                      (const char* const *)(exec_args + 1),
+                      (const char* const *)flat_env) != 0)
     {
         fprintf(stderr, "oci2bin: krun_set_exec failed\n");
         goto cleanup_ctx;
     }
 
     /* Start VM — does not return on success */
-    if (krun_start_enter(ctx) != 0)
+    if (krun_start_enter((uint32_t)ctx) != 0)
     {
         fprintf(stderr, "oci2bin: krun_start_enter returned unexpectedly\n");
     }

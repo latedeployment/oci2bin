@@ -33,6 +33,8 @@
 #                         (skips docker pull/save; IMAGE arg used only for naming)
 #   --kernel PATH         Embed a vmlinux kernel blob (enables --vm mode)
 #   --initramfs PATH      Embed a pre-built initramfs cpio.gz blob
+#   --libkrun             Force libkrun loader (default: auto-detected)
+#   --no-libkrun          Force static loader even if libkrun is available
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -407,6 +409,12 @@ ADD_DIR_ARGS=()
 OCI_DIR=""
 KERNEL_PATH=""
 INITRAMFS_PATH=""
+# Auto-detect libkrun; --no-libkrun opts out
+if pkg-config --exists libkrun 2>/dev/null || ldconfig -p 2>/dev/null | grep -q libkrun; then
+    USE_LIBKRUN=1
+else
+    USE_LIBKRUN=0
+fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -452,6 +460,14 @@ while [[ $# -gt 0 ]]; do
             [[ $# -lt 2 ]] && { echo "oci2bin: --initramfs requires a PATH argument" >&2; exit 1; }
             INITRAMFS_PATH="$2"
             shift 2
+            ;;
+        --libkrun)
+            USE_LIBKRUN=1
+            shift
+            ;;
+        --no-libkrun)
+            USE_LIBKRUN=0
+            shift
             ;;
         --help|-h)
             usage
@@ -510,13 +526,21 @@ need docker
 
 # ── build loader if needed ────────────────────────────────────────────────
 
-LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
 SRC="$OCI2BIN_HOME/src/loader.c"
-
-if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
-    echo "oci2bin: building loader for $TARGET_ARCH..."
-    mkdir -p "$OCI2BIN_HOME/build"
-    $CC_CROSS $CFLAGS_CROSS -static -O2 -s -o "$LOADER" "$SRC"
+if [[ "$USE_LIBKRUN" -eq 1 ]]; then
+    LOADER="$OCI2BIN_HOME/build/loader-libkrun-$TARGET_ARCH"
+    if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
+        echo "oci2bin: building loader with libkrun for $TARGET_ARCH..."
+        mkdir -p "$OCI2BIN_HOME/build"
+        $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN -o "$LOADER" "$SRC" -lkrun
+    fi
+else
+    LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
+    if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
+        echo "oci2bin: building loader for $TARGET_ARCH..."
+        mkdir -p "$OCI2BIN_HOME/build"
+        $CC_CROSS $CFLAGS_CROSS -static -O2 -s -o "$LOADER" "$SRC"
+    fi
 fi
 
 # ── OCI image layout: convert to docker-save tar, skip docker entirely ────
