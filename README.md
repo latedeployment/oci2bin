@@ -862,6 +862,8 @@ An unprivileged user namespace allows exactly one UID mapping. Container UID 0 m
 | `/etc/group` | All GIDs set to `0` (except `65534`) | Same for GID operations |
 | `/etc/apt/apt.conf.d/99oci2bin` | `APT::Sandbox::User "root";` | Disables the apt sandbox |
 | `/etc/resolv.conf` | Replaced with host resolver content | Symlink target not present in chroot |
+| `/usr/bin/setpriv` | Replaced with no-op shim (skips flags, execs command) | `setpriv --reuid` fails in single-UID namespace |
+| `gosu`, `su-exec` | Replaced with no-op shim (skips user arg, execs command) | Same — user switching is impossible |
 
 **Security properties:**
 

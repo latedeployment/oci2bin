@@ -993,6 +993,79 @@ static void patch_rootfs_ids(const char* rootfs)
         }
     }
 
+    /* ── user-switching wrappers ── replace setpriv/gosu/su-exec with
+     * no-op shims so entrypoints that try to drop privileges don't fail
+     * in the single-UID user namespace (only UID 0 is mapped). */
+    static const char setpriv_shim[] =
+        "#!/bin/sh\n"
+        "# oci2bin shim: in a single-UID namespace, privilege changes\n"
+        "# are impossible.  For -d/--dump, report no capabilities so\n"
+        "# entrypoints that check has_cap skip the priv-drop path.\n"
+        "# For exec mode, strip all flags and run the command directly.\n"
+        "case \"$1\" in -d|--dump) echo 'Capability bounding set:'; exit 0;; esac\n"
+        "while [ $# -gt 0 ]; do\n"
+        "  case \"$1\" in\n"
+        "    --reuid|--regid|--groups|--inh-caps|--ambient-caps|--bounding-set|\\\n"
+        "--securebits|--selinux-label|--apparmor-profile)\n"
+        "      shift 2;;\n"
+        "    --reuid=*|--regid=*|--groups=*|--inh-caps=*|--ambient-caps=*|\\\n"
+        "--bounding-set=*|--securebits=*|--selinux-label=*|--apparmor-profile=*)\n"
+        "      shift;;\n"
+        "    --clear-groups|--keep-groups|--init-groups|--reset-env|--nnp|\\\n"
+        "--no-new-privs)\n"
+        "      shift;;\n"
+        "    --) shift; break;;\n"
+        "    *) break;;\n"
+        "  esac\n"
+        "done\n"
+        "exec \"$@\"\n";
+    static const char gosu_shim[] =
+        "#!/bin/sh\n"
+        "# oci2bin shim: skip user arg, exec the command\n"
+        "shift\n"
+        "exec \"$@\"\n";
+    static const struct
+    {
+        const char* path;
+        const char* script;
+    } shims[] =
+    {
+        {"/usr/bin/setpriv", setpriv_shim},
+        {"/bin/setpriv", setpriv_shim},
+        {"/usr/sbin/gosu", gosu_shim},
+        {"/usr/local/bin/gosu", gosu_shim},
+        {"/sbin/gosu", gosu_shim},
+        {"/usr/local/bin/su-exec", gosu_shim},
+        {"/sbin/su-exec", gosu_shim},
+    };
+
+    for (size_t i = 0; i < sizeof(shims) / sizeof(shims[0]); i++)
+    {
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof(full), "%s%s", rootfs, shims[i].path)
+                >= (int)sizeof(full))
+        {
+            continue;
+        }
+        struct stat sb;
+        if (lstat(full, &sb) == 0)
+        {
+            /* Remove first: the file may be a symlink (e.g. to busybox)
+             * and O_TRUNC would corrupt the shared target. */
+            unlink(full);
+            if (write_file(full, shims[i].script, strlen(shims[i].script))
+                    < 0)
+            {
+                fprintf(stderr, "oci2bin: warning: could not write shim %s: %s\n",
+                        shims[i].path, strerror(errno));
+            }
+            else
+            {
+                chmod(full, 0755);
+            }
+        }
+    }
+
     /* ── /etc/resolv.conf ── copy host resolver into chroot ── */
     install_resolv_conf(rootfs);
 }
@@ -1663,6 +1736,17 @@ static void apply_seccomp_filter(void)
 /* Global master fd used by SIGWINCH handler to forward terminal resize. */
 static volatile int g_pty_master_fd = -1;
 
+/* Global child PID for signal forwarding from PTY parent. */
+static volatile pid_t g_pty_child_pid = 0;
+
+static void pty_forward_signal(int sig)
+{
+    if (g_pty_child_pid > 0)
+    {
+        kill(g_pty_child_pid, sig);
+    }
+}
+
 static void sigwinch_handler(int sig)
 {
     (void)sig;
@@ -1739,8 +1823,37 @@ static void relay_pty(int master_fd, struct termios *saved_termios,
             }
         }
 
-        if ((fds[1].revents & (POLLHUP | POLLERR)) ||
-                (fds[0].revents & (POLLHUP | POLLERR)))
+        /* stdin closed — stop sending to master, but keep draining output */
+        if (fds[0].revents & (POLLHUP | POLLERR))
+        {
+            fds[0].fd = -1;   /* stop polling stdin */
+        }
+
+        /* master closed — drain any final data then exit */
+        if (fds[1].revents & POLLHUP)
+        {
+            /* drain remaining bytes */
+            for (;;)
+            {
+                ssize_t r = read(master_fd, buf, sizeof(buf));
+                if (r <= 0)
+                {
+                    break;
+                }
+                ssize_t w = 0;
+                while (w < r)
+                {
+                    ssize_t ww = write(STDOUT_FILENO, buf + w, r - w);
+                    if (ww < 0)
+                    {
+                        goto done;
+                    }
+                    w += ww;
+                }
+            }
+            break;
+        }
+        if (fds[1].revents & POLLERR)
         {
             break;
         }
@@ -4809,6 +4922,10 @@ int main(int argc, char* argv[])
 
     fprintf(stderr, "oci2bin: rootfs at %s\n", rootfs);
 
+    /* 5. Patch rootfs so privilege-dropping tools work in a single-UID namespace
+     * (container mode) or microVM where real setpriv/chown may fail. */
+    patch_rootfs_ids(rootfs);
+
     /* 4b. VM dispatch: after rootfs extraction so rootfs is available */
     if (opts.use_vm)
     {
@@ -4827,9 +4944,6 @@ int main(int argc, char* argv[])
 #endif
         return run_as_vm_ch(rootfs, vm_tmpdir, &opts);
     }
-
-    /* 5. Patch rootfs so privilege-dropping tools work in a single-UID namespace */
-    patch_rootfs_ids(rootfs);
 
     /* 6. Capture real UID/GID before entering user namespace */
     uid_t real_uid = getuid();
@@ -5130,6 +5244,22 @@ int main(int argc, char* argv[])
     if (opts.pty_slave_fd >= 0)
     {
         close(opts.pty_slave_fd);
+    }
+
+    /* Forward SIGINT/SIGTERM/SIGHUP to the child so that signals from
+     * the host (e.g. kill, systemd stop) reach the container process.
+     * Ctrl-C in the PTY relay goes through the slave line discipline,
+     * but external signals need explicit forwarding. */
+    g_pty_child_pid = child;
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = pty_forward_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags   = SA_RESTART;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
     }
 
     /* Parent: if PTY active, relay until child exits */
