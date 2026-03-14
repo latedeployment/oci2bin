@@ -5,6 +5,14 @@ set -euo pipefail
 
 LOADER="${1:-./alpine_latest}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -z "${TMPDIR:-}" ]; then
+    TMPDIR="$SCRIPT_DIR/build/test-tmp"
+fi
+mkdir -p "$TMPDIR"
+export TMPDIR
+export OCI2BIN_TMPDIR="${OCI2BIN_TMPDIR:-$TMPDIR}"
+
 if [ ! -e /dev/kvm ]; then
     echo "SKIP: /dev/kvm not available"
     exit 0

@@ -218,6 +218,15 @@ static void test_parse_opts(void)
         ASSERT_STR_EQ(opts.entrypoint, "/bin/bash", "parse_opts: --entrypoint value");
     }
 
+    /* --debug */
+    {
+        char *argv[] = {"prog", "--debug", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --debug returns 0");
+        ASSERT_INT_EQ(opts.debug, 1, "parse_opts: --debug sets debug=1");
+    }
+
     /* CMD positional args */
     {
         char *argv[] = {"prog", "/bin/ls", "-la", NULL};

@@ -21,6 +21,8 @@ QEMU_AARCH64 ?= qemu-aarch64-static
 TESTS_DIR          = tests
 TEST_C_BIN         = build/test_c_units
 TEST_C_BIN_AARCH64 = build/test_c_units-aarch64
+TEST_TMPDIR       ?= $(CURDIR)/build/test-tmp
+TEST_ENV           = TMPDIR=$(TEST_TMPDIR) OCI2BIN_TMPDIR=$(TEST_TMPDIR)
 
 MAKEINFO  ?= $(or $(shell command -v texi2any 2>/dev/null),\
                $(shell command -v makeinfo 2>/dev/null),\
@@ -52,7 +54,8 @@ VMLINUX_OUT    = build/vmlinux
 .PHONY: all clean clean-all polyglot loader loader-x86_64 loader-aarch64 loader-all \
         loader-libkrun kernel doc install uninstall test test-unit \
         test-unit-aarch64 test-integration test-integration-redis \
-        test-integration-nginx test-c test-c-aarch64 test-python \
+        test-integration-nginx test-integration-services \
+        test-c test-c-aarch64 test-python \
         test-vm-unit test-vm
 
 all: polyglot
@@ -82,13 +85,13 @@ loader-all: build/loader-x86_64 build/loader-aarch64
 loader-libkrun: build/loader-libkrun-$(ARCH)
 
 build/loader-libkrun-x86_64: src/loader.c
-	@mkdir -p build
-	$(CC_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -lkrun
+	@mkdir -p build $(TEST_TMPDIR)
+	$(TEST_ENV) $(CC_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -lkrun
 	@echo "Loader/libkrun (x86_64): $$(ls -lh $@ | awk '{print $$5}')"
 
 build/loader-libkrun-aarch64: src/loader.c
-	@mkdir -p build
-	$(CC_AARCH64) $(CFLAGS_AARCH64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -lkrun
+	@mkdir -p build $(TEST_TMPDIR)
+	$(TEST_ENV) $(CC_AARCH64) $(CFLAGS_AARCH64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -lkrun
 	@echo "Loader/libkrun (aarch64): $$(ls -lh $@ | awk '{print $$5}')"
 
 # Kernel fetch / build (cloud-hypervisor path only)
@@ -98,17 +101,18 @@ $(VMLINUX_OUT): kernel/microvm.config scripts/fetch_kernel.sh
 	bash scripts/fetch_kernel.sh $(KERNEL_VERSION) kernel/microvm.config $@
 
 build/loader-x86_64: src/loader.c
-	@mkdir -p build
-	$(CC_X86_64) $(CFLAGS) $(VM_DEFS) -o $@ $<
+	@mkdir -p build $(TEST_TMPDIR)
+	$(TEST_ENV) $(CC_X86_64) $(CFLAGS) $(VM_DEFS) -o $@ $<
 	@echo "Loader (x86_64): $$(ls -lh $@ | awk '{print $$5}')"
 
 build/loader-aarch64: src/loader.c
-	@mkdir -p build
-	$(CC_AARCH64) $(CFLAGS_AARCH64) $(CFLAGS) $(VM_DEFS) -o $@ $<
+	@mkdir -p build $(TEST_TMPDIR)
+	$(TEST_ENV) $(CC_AARCH64) $(CFLAGS_AARCH64) $(CFLAGS) $(VM_DEFS) -o $@ $<
 	@echo "Loader (aarch64): $$(ls -lh $@ | awk '{print $$5}')"
 
 polyglot: build/loader-$(ARCH)
-	python3 scripts/build_polyglot.py \
+	@mkdir -p $(TEST_TMPDIR)
+	$(TEST_ENV) python3 scripts/build_polyglot.py \
 		--loader build/loader-$(ARCH) \
 		--image $(IMAGE) \
 		--output $(OUTPUT)
@@ -164,43 +168,53 @@ test-c: $(TEST_C_BIN)
 	@$(TEST_C_BIN)
 
 $(TEST_C_BIN): $(TESTS_DIR)/test_c_units.c src/loader.c
-	@mkdir -p build
-	$(CC) -static -Wno-return-local-addr -o $@ $<
+	@mkdir -p build $(TEST_TMPDIR)
+	$(TEST_ENV) $(CC) -static -Wno-return-local-addr -o $@ $<
 
 test-c-aarch64: $(TEST_C_BIN_AARCH64)
 	@echo "=== C unit tests (aarch64 via $(QEMU_AARCH64)) ==="
 	@$(QEMU_AARCH64) $(TEST_C_BIN_AARCH64)
 
 $(TEST_C_BIN_AARCH64): $(TESTS_DIR)/test_c_units.c src/loader.c
-	@mkdir -p build
-	$(CC_AARCH64) $(CFLAGS_AARCH64) -static -Wno-return-local-addr -o $@ $<
+	@mkdir -p build $(TEST_TMPDIR)
+	$(TEST_ENV) $(CC_AARCH64) $(CFLAGS_AARCH64) -static -Wno-return-local-addr -o $@ $<
 
 test-python:
 	@echo "=== Python unit tests ==="
-	python3 -m unittest discover -s tests -p 'test_build.py' -v
+	@mkdir -p $(TEST_TMPDIR)
+	$(TEST_ENV) python3 -m unittest discover -s tests -p 'test_build.py' -v
 	@echo "=== Polyglot structure tests ==="
-	python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
+	$(TEST_ENV) python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="
-	python3 -m unittest tests.test_vm_unit -v
+	@mkdir -p $(TEST_TMPDIR)
+	$(TEST_ENV) python3 -m unittest tests.test_vm_unit -v
 
 test-vm: test-vm-unit
 	@if [ ! -e /dev/kvm ]; then \
 	    echo "SKIP: /dev/kvm not available"; exit 0; \
 	fi
-	bash tests/test_vm_integration.sh
+	$(TEST_ENV) bash tests/test_vm_integration.sh
 
 test-integration: test-integration-redis test-integration-nginx polyglot
 	@echo "=== Runtime integration tests ==="
-	@bash $(TESTS_DIR)/test_runtime.sh
+	@mkdir -p $(TEST_TMPDIR)
+	@$(TEST_ENV) bash $(TESTS_DIR)/test_runtime.sh
 	@echo "=== Build integration tests ==="
-	python3 -m unittest tests.test_polyglot.TestBuildPolyglotIntegration -v
+	$(TEST_ENV) python3 -m unittest tests.test_polyglot.TestBuildPolyglotIntegration -v
 
 test-integration-redis:
 	@echo "=== Redis integration test ==="
-	@bash $(TESTS_DIR)/test_integration_redis.sh
+	@mkdir -p $(TEST_TMPDIR)
+	@$(TEST_ENV) bash $(TESTS_DIR)/test_integration_redis.sh
 
 test-integration-nginx:
 	@echo "=== nginx integration test ==="
-	@bash $(TESTS_DIR)/test_integration_nginx.sh
+	@mkdir -p $(TEST_TMPDIR)
+	@$(TEST_ENV) bash $(TESTS_DIR)/test_integration_nginx.sh
+
+test-integration-services:
+	@echo "=== Service matrix integration tests (container + VM) ==="
+	@mkdir -p $(TEST_TMPDIR)
+	$(TEST_ENV) python3 -m unittest tests.test_service_matrix -v

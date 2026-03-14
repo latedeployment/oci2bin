@@ -433,6 +433,7 @@ These defaults apply when `--cpus` or `--memory` are not passed at runtime.
 | `--cpus N` | Number of vCPUs (default 1) |
 | `--overlay-persist DIR` | Persist a 1 GiB ext2 data disk in `DIR/oci2bin-data.ext2` |
 | `-v HOST:CTR` | Mount host directory inside the VM |
+| `--debug` | Print verbose runtime diagnostics (execution path, VM config, extracted paths) |
 
 ### Notes
 
@@ -808,7 +809,16 @@ make test-python             # Python unit tests
 make test-integration        # all integration tests (runtime, build, Redis, nginx)
 make test-integration-redis  # Redis PING/SET/GET smoke test
 make test-integration-nginx  # nginx HTTP 200 smoke test
+make test-integration-services  # Redis (container+VM) + 5 service images (container+VM)
 ```
+
+`test-integration-services` validates:
+- `redis:7-alpine` (SET/GET in both container mode and `--vm`)
+- `nginx:alpine`
+- `caddy:2-alpine`
+- `postgres:16-alpine`
+- `memcached:1.6-alpine`
+- `httpd:2.4-alpine`
 
 The aarch64 C unit tests can be cross-compiled and run under qemu without real hardware:
 

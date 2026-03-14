@@ -11,6 +11,14 @@ TAP_TOTAL=3
 tap_n=0
 fail=0
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -z "${TMPDIR:-}" ]]; then
+    TMPDIR="$SCRIPT_DIR/build/test-tmp"
+fi
+mkdir -p "$TMPDIR"
+export TMPDIR
+export OCI2BIN_TMPDIR="${OCI2BIN_TMPDIR:-$TMPDIR}"
+
 tap_ok()  { tap_n=$((tap_n + 1)); echo "ok $tap_n - $*"; }
 tap_fail(){ tap_n=$((tap_n + 1)); echo "not ok $tap_n - $*"; fail=$((fail + 1)); }
 
@@ -34,7 +42,6 @@ trap cleanup EXIT
 
 # ── 1. Build the redis binary ────────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OCI2BIN="${SCRIPT_DIR}/oci2bin"
 
 if ! "$OCI2BIN" redis:7-alpine "$BIN" 2>/dev/null; then

@@ -84,7 +84,8 @@ class TestCpioInitramfs(unittest.TestCase):
                 out_path = out.name
             try:
                 build_polyglot.build_initramfs(rootfs, out_path)
-                raw = gzip.decompress(open(out_path, 'rb').read())
+                with open(out_path, 'rb') as f:
+                    raw = gzip.decompress(f.read())
                 # Scan cpio headers for mode fields containing setuid (04000)
                 pos = 0
                 found_su_setuid = False
@@ -127,7 +128,8 @@ class TestCpioInitramfs(unittest.TestCase):
                 out_path = out.name
             try:
                 build_polyglot.build_initramfs(rootfs, out_path)
-                raw = gzip.decompress(open(out_path, 'rb').read())
+                with open(out_path, 'rb') as f:
+                    raw = gzip.decompress(f.read())
                 pos = 0
                 found_symlink = False
                 S_IFLNK = 0o120000

@@ -66,6 +66,7 @@
 #   --tmpfs PATH          Mount a fresh tmpfs at PATH inside the container
 #   --ulimit TYPE=N       Set resource limit (nofile, nproc, cpu, as, fsize)
 #   --config PATH         Load options from a key=value config file
+#   --debug               Emit verbose runtime debug diagnostics
 #   --                    End of options; remaining args are CMD
 #
 # Cache subcommands:
