@@ -1902,6 +1902,25 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                 }
             }
         }
+
+        /* Mount devpts for TTY/job control support */
+        mkdir("/dev/pts", 0755);
+        if (mount("devpts", "/dev/pts", "devpts",
+                  MS_NOSUID | MS_NOEXEC,
+                  "newinstance,ptmxmode=0666,mode=0620") < 0)
+        {
+            perror("mount devpts (non-fatal)");
+        }
+        /* /dev/ptmx -> pts/ptmx so openpty() finds the right multiplexer */
+        int ptmx_fd = open("/dev/ptmx", O_CREAT | O_WRONLY, 0666);
+        if (ptmx_fd >= 0)
+        {
+            close(ptmx_fd);
+        }
+        if (mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL) < 0)
+        {
+            perror("bind-mount /dev/ptmx (non-fatal)");
+        }
     }
 
     /* Expose --device host devices inside the container */
