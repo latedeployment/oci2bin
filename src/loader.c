@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <ftw.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <grp.h>
@@ -51,6 +52,14 @@ static volatile unsigned long INITRAMFS_DATA_PATCHED = 0x6B6B6B6B6B6B6B6BUL;
 #define MAX_ARGS      64
 #define MAX_ENV       64
 #define BUF_SIZE    65536
+
+/* VM defaults — overridable at build time via -DDEFAULT_VM_CPUS=N etc. */
+#ifndef DEFAULT_VM_CPUS
+#define DEFAULT_VM_CPUS   1
+#endif
+#ifndef DEFAULT_VM_MEM_MB
+#define DEFAULT_VM_MEM_MB 256
+#endif
 
 /* ── runtime options parsed from argv ───────────────────────────────────── */
 
@@ -142,6 +151,7 @@ struct container_opts
     /* --memory MEM, --cpus FLOAT, --pids-limit N  (cgroup v2 limits) */
     long long cg_memory_bytes; /* 0 = unset */
     long      cg_cpu_quota;    /* 0 = unset; cpu.max quota in 100000 period */
+    double    vm_cpus;         /* 0 = unset; raw --cpus value for VM backends */
     long      cg_pids;         /* 0 = unset */
 
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
@@ -155,6 +165,10 @@ struct container_opts
     /* --vm / --vmm VMM  (microVM isolation) */
     int   use_vm;   /* 1 if --vm was given */
     char* vmm;      /* "cloud-hypervisor" | path; NULL = default */
+
+    /* PTY relay: set by run_container() before fork, used by container_main() */
+    int pty_master_fd; /* -1 if no PTY; parent closes slave, uses this for relay */
+    int pty_slave_fd;  /* -1 if no PTY; child sets as controlling terminal */
 };
 
 /* ── tiny JSON helpers (just enough to parse manifest.json and config) ─── */
@@ -395,6 +409,136 @@ static int write_file(const char* path, const char* data, size_t len)
     ssize_t written = write(fd, data, len);
     close(fd);
     return (written == (ssize_t)len) ? 0 : -1;
+}
+
+/*
+ * Copy the host /etc/resolv.conf into rootfs/etc/resolv.conf.
+ * Prefers /run/systemd/resolve/resolv.conf (real upstream nameservers)
+ * over /etc/resolv.conf which may contain 127.0.0.53 (systemd-resolved
+ * stub, unreachable inside VMs).
+ */
+static void install_resolv_conf(const char* rootfs)
+{
+    char dst[PATH_MAX];
+    int n = snprintf(dst, sizeof(dst), "%s/etc/resolv.conf", rootfs);
+    if (n < 0 || (size_t)n >= sizeof(dst))
+    {
+        return;
+    }
+    size_t sz;
+    char* data = read_file("/run/systemd/resolve/resolv.conf", &sz);
+    if (!data)
+    {
+        data = read_file("/etc/resolv.conf", &sz);
+    }
+    if (data)
+    {
+        unlink(dst);
+        write_file(dst, data, sz);
+        free(data);
+    }
+}
+
+/*
+ * Parsed OCI image config.  Populated by read_oci_config() from the
+ * .oci2bin_config JSON written during extraction.  Caller must free
+ * all non-NULL pointers when done.
+ */
+struct oci_config
+{
+    char* entrypoint_json; /* "Entrypoint" array or NULL */
+    char* cmd_json;        /* "Cmd" array or NULL */
+    char* env_json;        /* "Env" array or NULL */
+    char* workdir;         /* "WorkingDir" string or NULL */
+};
+
+/*
+ * Read and parse .oci2bin_config from rootfs (or "/" if rootfs is NULL).
+ * Returns 0 on success, -1 if the config file cannot be read.
+ */
+static int read_oci_config(const char* rootfs, struct oci_config* out)
+{
+    memset(out, 0, sizeof(*out));
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/.oci2bin_config",
+                     rootfs ? rootfs : "");
+    if (n < 0 || (size_t)n >= sizeof(path))
+    {
+        fprintf(stderr, "oci2bin: config path truncated\n");
+        return -1;
+    }
+    char* cfg = read_file(path, NULL);
+    if (!cfg)
+    {
+        return -1;
+    }
+    out->entrypoint_json = json_get_array(cfg, "Entrypoint");
+    out->cmd_json        = json_get_array(cfg, "Cmd");
+    out->env_json        = json_get_array(cfg, "Env");
+    out->workdir         = json_get_string(cfg, "WorkingDir");
+    free(cfg);
+    return 0;
+}
+
+static void free_oci_config(struct oci_config* c)
+{
+    free(c->entrypoint_json);
+    free(c->cmd_json);
+    free(c->env_json);
+    free(c->workdir);
+    memset(c, 0, sizeof(*c));
+}
+
+/*
+ * Build an exec argv from parsed OCI config.
+ *   - If user_entrypoint is non-NULL, it replaces the image Entrypoint.
+ *   - If extra_args/n_extra are provided, they replace the image Cmd.
+ *   - Falls back to /bin/sh if nothing resolves.
+ * Returns the number of args placed in exec_args (null-terminated).
+ */
+static int build_exec_args(const struct oci_config* cfg,
+                           const char* user_entrypoint,
+                           char* const* extra_args, int n_extra,
+                           char* exec_args[], int max_args)
+{
+    int argc = 0;
+
+    /* Entrypoint */
+    if (user_entrypoint)
+    {
+        exec_args[argc++] = (char*)user_entrypoint;
+    }
+    else if (cfg->entrypoint_json &&
+             strcmp(cfg->entrypoint_json, "null") != 0)
+    {
+        argc += json_parse_string_array(cfg->entrypoint_json,
+                                        exec_args + argc,
+                                        max_args - argc);
+    }
+
+    /* Cmd / extra args */
+    if (n_extra > 0)
+    {
+        for (int i = 0; i < n_extra && argc < max_args; i++)
+        {
+            exec_args[argc++] = extra_args[i];
+        }
+    }
+    else if (cfg->cmd_json && strcmp(cfg->cmd_json, "null") != 0)
+    {
+        argc += json_parse_string_array(cfg->cmd_json,
+                                        exec_args + argc,
+                                        max_args - argc);
+    }
+
+    /* Fallback */
+    if (argc == 0)
+    {
+        exec_args[0] = "/bin/sh";
+        argc = 1;
+    }
+    exec_args[argc] = NULL;
+    return argc;
 }
 
 /* Write to /proc files (no O_CREAT, no O_TRUNC) */
@@ -850,18 +994,7 @@ static void patch_rootfs_ids(const char* rootfs)
     }
 
     /* ── /etc/resolv.conf ── copy host resolver into chroot ── */
-    {
-        size_t resolv_sz;
-        char* resolv = read_file("/etc/resolv.conf", &resolv_sz);
-        if (resolv)
-        {
-            char resolv_path[PATH_MAX];
-            snprintf(resolv_path, sizeof(resolv_path), "%s/etc/resolv.conf", rootfs);
-            unlink(resolv_path);
-            write_file(resolv_path, resolv, resolv_sz);
-            free(resolv);
-        }
-    }
+    install_resolv_conf(rootfs);
 }
 
 /*
@@ -1525,79 +1658,211 @@ static void apply_seccomp_filter(void)
     }
 }
 
+/* ── PTY relay for job control ──────────────────────────────────────────── */
+
+/* Global master fd used by SIGWINCH handler to forward terminal resize. */
+static volatile int g_pty_master_fd = -1;
+
+static void sigwinch_handler(int sig)
+{
+    (void)sig;
+    if (g_pty_master_fd < 0)
+    {
+        return;
+    }
+    struct winsize ws;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+    {
+        ioctl(g_pty_master_fd, TIOCSWINSZ, &ws);
+    }
+}
+
+/*
+ * Relay data between the host terminal (stdin/stdout) and the PTY master.
+ * Runs until the slave side closes (child exits) — read() returns EIO or 0.
+ * Restores the saved terminal settings before returning.
+ */
+static void relay_pty(int master_fd, struct termios *saved_termios,
+                      int saved_termios_ok)
+{
+    char buf[4096];
+    struct pollfd fds[2];
+
+    fds[0].fd     = STDIN_FILENO;
+    fds[0].events = POLLIN;
+    fds[1].fd     = master_fd;
+    fds[1].events = POLLIN;
+
+    for (;;)
+    {
+        int n = poll(fds, 2, -1);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+
+        /* stdin → master: user keystrokes into container */
+        if (fds[0].revents & POLLIN)
+        {
+            ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+            if (r <= 0)
+            {
+                break;
+            }
+            if (write(master_fd, buf, r) < 0)
+            {
+                break;
+            }
+        }
+
+        /* master → stdout: container output to user */
+        if (fds[1].revents & POLLIN)
+        {
+            ssize_t r = read(master_fd, buf, sizeof(buf));
+            if (r <= 0)
+            {
+                break;
+            }
+            ssize_t w = 0;
+            while (w < r)
+            {
+                ssize_t ww = write(STDOUT_FILENO, buf + w, r - w);
+                if (ww < 0)
+                {
+                    goto done;
+                }
+                w += ww;
+            }
+        }
+
+        if ((fds[1].revents & (POLLHUP | POLLERR)) ||
+                (fds[0].revents & (POLLHUP | POLLERR)))
+        {
+            break;
+        }
+    }
+done:
+    /* Restore the host terminal before returning so the prompt looks right */
+    if (saved_termios_ok)
+    {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, saved_termios);
+    }
+    g_pty_master_fd = -1;
+    close(master_fd);
+}
+
+/* ── end PTY relay ──────────────────────────────────────────────────────── */
+
 static int container_main(const char* rootfs, struct container_opts *opts)
 {
-    /* Read entrypoint/cmd config written by extract_oci_rootfs() */
-    char config_path[PATH_MAX];
-    snprintf(config_path, sizeof(config_path), "%s/.oci2bin_config", rootfs);
-    char* config = read_file(config_path, NULL);
+    /* Read OCI image config and build exec argv */
+    struct oci_config oci_cfg;
+    read_oci_config(rootfs, &oci_cfg);
 
-    /* Build exec_args: [entrypoint...] [cmd...] */
     char* exec_args[MAX_ARGS + 1];
-    int exec_argc = 0;
+    build_exec_args(&oci_cfg, opts->entrypoint,
+                    opts->extra_args, opts->n_extra,
+                    exec_args, MAX_ARGS);
 
-    /* --- Determine entrypoint --- */
-    if (opts->entrypoint)
-    {
-        /* User supplied --entrypoint: use it as a single string */
-        exec_args[exec_argc++] = opts->entrypoint;
-    }
-    else if (config)
-    {
-        char* ep_json = json_get_array(config, "Entrypoint");
-        if (ep_json && strcmp(ep_json, "null") != 0)
-        {
-            exec_argc += json_parse_string_array(ep_json, exec_args + exec_argc,
-                                                 MAX_ARGS - exec_argc);
-        }
-        free(ep_json);
-    }
-
-    /* --- Determine cmd / extra args --- */
-    if (opts->n_extra > 0)
-    {
-        /* User supplied extra args: they replace OCI Cmd entirely */
-        for (int i = 0; i < opts->n_extra && exec_argc < MAX_ARGS; i++)
-        {
-            exec_args[exec_argc++] = opts->extra_args[i];
-        }
-    }
-    else if (config)
-    {
-        char* cmd_json = json_get_array(config, "Cmd");
-        if (cmd_json && strcmp(cmd_json, "null") != 0)
-        {
-            exec_argc += json_parse_string_array(cmd_json, exec_args + exec_argc,
-                                                 MAX_ARGS - exec_argc);
-        }
-        free(cmd_json);
-    }
-
-    /* Save image Env and WorkingDir before freeing config — applied after chroot */
-    char* image_env_json = NULL;
-    char* image_workdir  = NULL;
-    if (config)
-    {
-        image_env_json = json_get_array(config, "Env");
-        image_workdir  = json_get_string(config, "WorkingDir");
-    }
-
-    free(config);
-
-    /* Fallback: if nothing resolved, run /bin/sh */
-    if (exec_argc == 0)
-    {
-        exec_args[0] = "/bin/sh";
-        exec_argc = 1;
-    }
-    exec_args[exec_argc] = NULL;
+    /* Save image Env and WorkingDir — applied after chroot.
+     * Transfer ownership from oci_cfg so free_oci_config won't free them. */
+    char* image_env_json = oci_cfg.env_json;
+    char* image_workdir  = oci_cfg.workdir;
+    oci_cfg.env_json = NULL;
+    oci_cfg.workdir  = NULL;
+    free_oci_config(&oci_cfg);
 
     /* Remove our temp config file */
-    unlink(config_path);
+    {
+        char config_path[PATH_MAX];
+        int cpn = snprintf(config_path, sizeof(config_path),
+                           "%s/.oci2bin_config", rootfs);
+        if (cpn > 0 && (size_t)cpn < sizeof(config_path))
+        {
+            unlink(config_path);
+        }
+    }
 
     /* Set up volume bind mounts BEFORE chroot (host paths still reachable) */
     setup_volumes(rootfs, opts);
     setup_secrets(rootfs, opts);
+
+    /* Mount tmpfs on rootfs/dev and bind-mount host device nodes.
+     * Must be done before chroot so the host paths are still reachable as
+     * bind-mount sources.  After chroot the paths resolve inside the
+     * container and the bind would silently map an empty tmpfs file to
+     * itself instead of the real host device node. */
+    {
+        char dev_dir[PATH_MAX];
+        int dlen = snprintf(dev_dir, sizeof(dev_dir), "%s/dev", rootfs);
+        if (dlen > 0 && (size_t)dlen < sizeof(dev_dir))
+        {
+            mkdir(dev_dir, 0755);
+            if (mount("tmpfs", dev_dir, "tmpfs",
+                      MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
+            {
+                perror("mount /dev tmpfs (non-fatal)");
+            }
+            else
+            {
+                if (!opts->no_host_dev)
+                {
+                    static const char* const HOST_DEVS[] =
+                    {
+                        "/dev/null", "/dev/zero", "/dev/random",
+                        "/dev/urandom", "/dev/tty", NULL,
+                    };
+                    for (int di = 0; HOST_DEVS[di]; di++)
+                    {
+                        char dst[PATH_MAX];
+                        int plen = snprintf(dst, sizeof(dst), "%s%s",
+                                            rootfs, HOST_DEVS[di]);
+                        if (plen < 0 || (size_t)plen >= sizeof(dst))
+                        {
+                            continue;
+                        }
+                        int fd = open(dst, O_CREAT | O_WRONLY, 0666);
+                        if (fd >= 0)
+                        {
+                            close(fd);
+                        }
+                        if (mount(HOST_DEVS[di], dst, NULL,
+                                  MS_BIND, NULL) < 0)
+                        {
+                            fprintf(stderr,
+                                    "oci2bin: bind-mount %s"
+                                    " (non-fatal): %s\n",
+                                    HOST_DEVS[di], strerror(errno));
+                        }
+                    }
+                }
+                /* Create /dev/pts dir; devpts is mounted after chroot */
+                char pts_dir[PATH_MAX];
+                int plen = snprintf(pts_dir, sizeof(pts_dir),
+                                    "%s/dev/pts", rootfs);
+                if (plen > 0 && (size_t)plen < sizeof(pts_dir))
+                {
+                    mkdir(pts_dir, 0755);
+                }
+                /* Create /dev/ptmx placeholder for post-chroot bind */
+                char ptmx_path[PATH_MAX];
+                int mlen = snprintf(ptmx_path, sizeof(ptmx_path),
+                                    "%s/dev/ptmx", rootfs);
+                if (mlen > 0 && (size_t)mlen < sizeof(ptmx_path))
+                {
+                    int fd = open(ptmx_path, O_CREAT | O_WRONLY, 0666);
+                    if (fd >= 0)
+                    {
+                        close(fd);
+                    }
+                }
+            }
+        }
+    }
 
     /* --ssh-agent: forward host SSH_AUTH_SOCK into the container.
      * The socket is bind-mounted at /run/ssh-agent.sock and SSH_AUTH_SOCK
@@ -1870,59 +2135,18 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         perror("mount /tmp tmpfs (non-fatal)");
     }
 
-    /* Mount tmpfs on /dev then bind-mount essential devices from the host.
-     * mknod is not available in rootless user namespaces, but bind-mounting
-     * existing host device nodes requires no special privileges. */
-    mkdir("/dev", 0755);
-    if (mount("tmpfs", "/dev", "tmpfs",
-              MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
+    /* Mount devpts for TTY/job control support.  /dev is already a tmpfs
+     * with host device nodes bind-mounted (done pre-chroot above). */
+    if (mount("devpts", "/dev/pts", "devpts",
+              MS_NOSUID | MS_NOEXEC,
+              "newinstance,ptmxmode=0666,mode=0620") < 0)
     {
-        perror("mount /dev tmpfs (non-fatal)");
+        perror("mount devpts (non-fatal)");
     }
-    else
+    /* /dev/ptmx -> pts/ptmx so openpty() finds the right multiplexer */
+    if (mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL) < 0)
     {
-        if (!opts->no_host_dev)
-        {
-            static const char* const DEV_NODES[] =
-            {
-                "/dev/null", "/dev/zero", "/dev/random",
-                "/dev/urandom", "/dev/tty", NULL,
-            };
-            for (int di = 0; DEV_NODES[di]; di++)
-            {
-                int fd = open(DEV_NODES[di], O_CREAT | O_WRONLY, 0666);
-                if (fd >= 0)
-                {
-                    close(fd);
-                }
-                if (mount(DEV_NODES[di], DEV_NODES[di], NULL,
-                          MS_BIND, NULL) < 0)
-                {
-                    fprintf(stderr,
-                            "oci2bin: bind-mount %s (non-fatal): %s\n",
-                            DEV_NODES[di], strerror(errno));
-                }
-            }
-        }
-
-        /* Mount devpts for TTY/job control support */
-        mkdir("/dev/pts", 0755);
-        if (mount("devpts", "/dev/pts", "devpts",
-                  MS_NOSUID | MS_NOEXEC,
-                  "newinstance,ptmxmode=0666,mode=0620") < 0)
-        {
-            perror("mount devpts (non-fatal)");
-        }
-        /* /dev/ptmx -> pts/ptmx so openpty() finds the right multiplexer */
-        int ptmx_fd = open("/dev/ptmx", O_CREAT | O_WRONLY, 0666);
-        if (ptmx_fd >= 0)
-        {
-            close(ptmx_fd);
-        }
-        if (mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL) < 0)
-        {
-            perror("bind-mount /dev/ptmx (non-fatal)");
-        }
+        perror("bind-mount /dev/ptmx (non-fatal)");
     }
 
     /* Expose --device host devices inside the container */
@@ -2147,19 +2371,30 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* Acquire controlling terminal so interactive shells get job control.
-     * setsid() makes this process a new session leader (no controlling tty),
-     * then TIOCSCTTY claims stdin (the user's terminal) as our controlling tty. */
-    if (isatty(STDIN_FILENO))
+    /* Set up PTY slave as controlling terminal for job control.
+     * The PTY master/slave pair was allocated before fork() in main().
+     * The child closes the master (parent's end) and claims the slave
+     * via setsid() + TIOCSCTTY so the container shell gets full job control. */
+    if (opts->pty_slave_fd >= 0)
     {
-        setsid();
-        if (ioctl(STDIN_FILENO, TIOCSCTTY, 0) < 0)
+        if (opts->pty_master_fd >= 0)
         {
-            /* non-fatal: shell still works, just without job control */
+            close(opts->pty_master_fd);
+        }
+        setsid();
+        if (ioctl(opts->pty_slave_fd, TIOCSCTTY, 0) == 0)
+        {
+            dup2(opts->pty_slave_fd, STDIN_FILENO);
+            dup2(opts->pty_slave_fd, STDOUT_FILENO);
+            dup2(opts->pty_slave_fd, STDERR_FILENO);
+        }
+        if (opts->pty_slave_fd > STDERR_FILENO)
+        {
+            close(opts->pty_slave_fd);
         }
     }
 
-    /* Exec the entrypoint — execvp searches PATH so relative names work */
+    /* Exec the entrypoint */
     fprintf(stderr, "oci2bin: exec %s\n", exec_args[0]);
     execvp(exec_args[0], exec_args);
 
@@ -3085,6 +3320,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 quota = 1;
             }
             opts->cg_cpu_quota = quota;
+            opts->vm_cpus = cpus;
         }
         else if (strcmp(argv[i], "--pids-limit") == 0)
         {
@@ -3822,50 +4058,18 @@ static int vm_init_main(void)
         free(vm_cmdline);
     }
 
-    /* 3. Read /.oci2bin_config */
-    size_t cfg_size;
-    char* cfg = read_file("/.oci2bin_config", &cfg_size);
-    if (!cfg)
+    /* 3. Read OCI config and build exec argv */
+    struct oci_config oci_cfg;
+    if (read_oci_config("", &oci_cfg) < 0)
     {
         fprintf(stderr, "oci2bin-init: /.oci2bin_config not found\n");
         return 1;
     }
 
-    /* 4. Parse entrypoint + cmd + env + workdir from config */
-    char* entrypoint_json = json_get_array(cfg, "Entrypoint");
-    char* cmd_json        = json_get_array(cfg, "Cmd");
-    char* env_json        = json_get_array(cfg, "Env");
-    char* workdir         = json_get_string(cfg, "WorkingDir");
-    free(cfg);
-
-    /* 5. Build exec argv (entrypoint + cmd) */
     char* exec_args[MAX_ARGS + 1];
-    int exec_argc = 0;
+    build_exec_args(&oci_cfg, NULL, NULL, 0, exec_args, MAX_ARGS);
 
-    if (entrypoint_json && strcmp(entrypoint_json, "null") != 0)
-    {
-        exec_argc += json_parse_string_array(entrypoint_json,
-                                             exec_args + exec_argc,
-                                             MAX_ARGS - exec_argc);
-    }
-    free(entrypoint_json);
-
-    if (cmd_json && strcmp(cmd_json, "null") != 0)
-    {
-        exec_argc += json_parse_string_array(cmd_json,
-                                             exec_args + exec_argc,
-                                             MAX_ARGS - exec_argc);
-    }
-    free(cmd_json);
-
-    if (exec_argc == 0)
-    {
-        exec_args[0] = "/bin/sh";
-        exec_argc    = 1;
-    }
-    exec_args[exec_argc] = NULL;
-
-    /* 6. Build flat env array */
+    /* 4. Build flat env array */
     char* flat_env[MAX_ENV + 1];
     int flat_env_n = 0;
 
@@ -3877,36 +4081,36 @@ static int vm_init_main(void)
 
     char* image_envs[MAX_ENV];
     int n_image_env = 0;
-    if (env_json && strcmp(env_json, "null") != 0)
+    if (oci_cfg.env_json && strcmp(oci_cfg.env_json, "null") != 0)
     {
-        n_image_env = json_parse_string_array(env_json, image_envs, MAX_ENV);
+        n_image_env = json_parse_string_array(oci_cfg.env_json,
+                                              image_envs, MAX_ENV);
         for (int i = 0; i < n_image_env && flat_env_n < MAX_ENV; i++)
         {
             flat_env[flat_env_n++] = image_envs[i];
         }
     }
-    free(env_json);
     flat_env[flat_env_n] = NULL;
 
-    /* 7. chdir to workdir */
-    if (workdir && workdir[0])
+    /* 5. chdir to workdir */
+    if (oci_cfg.workdir && oci_cfg.workdir[0])
     {
-        if (chdir(workdir) < 0)
+        if (chdir(oci_cfg.workdir) < 0)
         {
             perror("chdir workdir"); /* non-fatal */
         }
     }
-    free(workdir);
 
-    /* 8. exec */
+    /* 6. exec */
     execvpe(exec_args[0], exec_args, flat_env);
     perror("oci2bin-init: execvpe");
 
-    /* Free image_envs on failure path */
+    /* Cleanup on failure */
     for (int i = 0; i < n_image_env; i++)
     {
         free(image_envs[i]);
     }
+    free_oci_config(&oci_cfg);
     return 1;
 }
 
@@ -3922,57 +4126,18 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
 {
     (void)tmpdir; /* unused in libkrun path */
 
-    /* Read rootfs config */
-    char config_path[PATH_MAX];
-    int cn = snprintf(config_path, sizeof(config_path),
-                      "%s/.oci2bin_config", rootfs);
-    if (cn < 0 || (size_t)cn >= sizeof(config_path))
+    /* Read OCI config and build exec argv */
+    struct oci_config oci_cfg;
+    if (read_oci_config(rootfs, &oci_cfg) < 0)
     {
-        fprintf(stderr, "oci2bin: config path truncated\n");
+        fprintf(stderr, "oci2bin: cannot read OCI config\n");
         return 1;
     }
-    char* cfg = read_file(config_path, NULL);
 
-    /* Parse entrypoint/cmd/env/workdir */
-    char* entrypoint_json = cfg ? json_get_array(cfg, "Entrypoint") : NULL;
-    char* cmd_json        = cfg ? json_get_array(cfg, "Cmd") : NULL;
-    char* env_json        = cfg ? json_get_array(cfg, "Env") : NULL;
-    char* image_workdir   = cfg ? json_get_string(cfg, "WorkingDir") : NULL;
-    free(cfg);
-
-    /* Build exec argv */
     char* exec_args[MAX_ARGS + 1];
-    int exec_argc = 0;
-
-    if (entrypoint_json && strcmp(entrypoint_json, "null") != 0)
-    {
-        exec_argc += json_parse_string_array(entrypoint_json,
-                                             exec_args + exec_argc,
-                                             MAX_ARGS - exec_argc);
-    }
-    free(entrypoint_json);
-
-    if (opts->n_extra > 0)
-    {
-        for (int i = 0; i < opts->n_extra && exec_argc < MAX_ARGS; i++)
-        {
-            exec_args[exec_argc++] = opts->extra_args[i];
-        }
-    }
-    else if (cmd_json && strcmp(cmd_json, "null") != 0)
-    {
-        exec_argc += json_parse_string_array(cmd_json,
-                                             exec_args + exec_argc,
-                                             MAX_ARGS - exec_argc);
-    }
-    free(cmd_json);
-
-    if (exec_argc == 0)
-    {
-        exec_args[0] = "/bin/sh";
-        exec_argc    = 1;
-    }
-    exec_args[exec_argc] = NULL;
+    build_exec_args(&oci_cfg, opts->entrypoint,
+                    opts->extra_args, opts->n_extra,
+                    exec_args, MAX_ARGS);
 
     /* Build flat env array (image Env + opts->env_vars) */
     char* flat_env[MAX_ENV + 1];
@@ -3980,15 +4145,15 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     char* image_envs[MAX_ENV];
     int n_image_env = 0;
 
-    if (env_json && strcmp(env_json, "null") != 0)
+    if (oci_cfg.env_json && strcmp(oci_cfg.env_json, "null") != 0)
     {
-        n_image_env = json_parse_string_array(env_json, image_envs, MAX_ENV);
+        n_image_env = json_parse_string_array(oci_cfg.env_json,
+                                              image_envs, MAX_ENV);
         for (int i = 0; i < n_image_env && flat_env_n < MAX_ENV; i++)
         {
             flat_env[flat_env_n++] = image_envs[i];
         }
     }
-    free(env_json);
 
     for (int i = 0; i < opts->n_env && flat_env_n < MAX_ENV; i++)
     {
@@ -4005,16 +4170,22 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     }
 
     /* Set VM config */
-    uint8_t vcpus = (opts->cg_cpu_quota > 0 && opts->cg_cpu_quota <= 255) ?
-                    (uint8_t)opts->cg_cpu_quota : 1;
+    uint8_t vcpus = (opts->vm_cpus > 0.0) ?
+                    (uint8_t)(opts->vm_cpus < 255.0 ?
+                              (int)(opts->vm_cpus + 0.5) : 255)
+                    : DEFAULT_VM_CPUS;
     uint32_t mem_mb =
         (opts->cg_memory_bytes > 0) ?
-        (uint32_t)((unsigned long long)opts->cg_memory_bytes >> 20) : 256;
+        (uint32_t)((unsigned long long)opts->cg_memory_bytes >> 20)
+        : DEFAULT_VM_MEM_MB;
     if (krun_set_vm_config((uint32_t)ctx, vcpus, mem_mb) != 0)
     {
         fprintf(stderr, "oci2bin: krun_set_vm_config failed\n");
         goto cleanup;
     }
+
+    /* Ensure VM guest has a usable /etc/resolv.conf (not 127.0.0.53) */
+    install_resolv_conf(rootfs);
 
     /* Set rootfs */
     if (krun_set_root((uint32_t)ctx, rootfs) != 0)
@@ -4063,7 +4234,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     /* Set workdir */
     {
         const char* wdir = opts->workdir ? opts->workdir :
-                           (image_workdir ? image_workdir : NULL);
+                           (oci_cfg.workdir ? oci_cfg.workdir : NULL);
         if (wdir && wdir[0])
         {
             if (strstr(wdir, "..") != NULL)
@@ -4080,8 +4251,6 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
             }
         }
     }
-    free(image_workdir);
-    image_workdir = NULL;
 
     /* Set exec */
     if (krun_set_exec((uint32_t)ctx, exec_args[0],
@@ -4103,7 +4272,7 @@ cleanup_ctx:
     {
         free(image_envs[i]);
     }
-    free(image_workdir);
+    free_oci_config(&oci_cfg);
     return 1;
 
 cleanup:
@@ -4111,7 +4280,7 @@ cleanup:
     {
         free(image_envs[i]);
     }
-    free(image_workdir);
+    free_oci_config(&oci_cfg);
     return 1;
 }
 #endif /* USE_LIBKRUN */
@@ -4124,6 +4293,9 @@ cleanup:
 static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
                         struct container_opts* opts)
 {
+    /* Ensure VM guest has a usable /etc/resolv.conf (not 127.0.0.53) */
+    install_resolv_conf(rootfs);
+
     /* Check kernel is embedded */
     if (KERNEL_DATA_PATCHED != 1)
     {
@@ -4394,7 +4566,8 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
 
     /* Build cpu/memory strings */
     char cpus_str[32];
-    int vcpus = (opts->cg_cpu_quota > 0) ? (int)opts->cg_cpu_quota : 1;
+    int vcpus = (opts->vm_cpus > 0.0) ? (int)(opts->vm_cpus + 0.5)
+                : DEFAULT_VM_CPUS;
     n = snprintf(cpus_str, sizeof(cpus_str), "boot=%d", vcpus);
     if (n < 0 || (size_t)n >= sizeof(cpus_str))
     {
@@ -4405,7 +4578,8 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
     char mem_str[32];
     unsigned long mem_mb =
         (opts->cg_memory_bytes > 0) ?
-        (unsigned long)(opts->cg_memory_bytes >> 20) : 256;
+        (unsigned long)(opts->cg_memory_bytes >> 20)
+        : DEFAULT_VM_MEM_MB;
     n = snprintf(mem_str, sizeof(mem_str), "size=%luM", mem_mb);
     if (n < 0 || (size_t)n >= sizeof(mem_str))
     {
@@ -4867,22 +5041,114 @@ int main(int argc, char* argv[])
         close(sync_pipe[1]);
     }
 
-    /* 11. Fork for PID namespace (child becomes PID 1) */
+    /* 11. Allocate a PTY so the container shell gets job control.
+     * We open /dev/ptmx (the POSIX PTY multiplexer) before fork():
+     *   parent  → master_fd: relays host terminal ↔ container I/O
+     *   child   → slave_fd:  setsid() + TIOCSCTTY → controlling terminal
+     * Only done when stdin is an interactive terminal and not --detach. */
+    opts.pty_master_fd = -1;
+    opts.pty_slave_fd  = -1;
+    struct termios saved_termios;
+    int saved_termios_ok = 0;
+
+    if (!opts.detach && isatty(STDIN_FILENO))
+    {
+        int master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (master_fd >= 0 && grantpt(master_fd) == 0 &&
+                unlockpt(master_fd) == 0)
+        {
+            char* slave_name = ptsname(master_fd);
+            if (slave_name)
+            {
+                int slave_fd = open(slave_name, O_RDWR | O_NOCTTY);
+                if (slave_fd >= 0)
+                {
+                    /* Propagate current terminal size to slave */
+                    struct winsize ws;
+                    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+                    {
+                        ioctl(slave_fd, TIOCSWINSZ, &ws);
+                    }
+                    opts.pty_master_fd = master_fd;
+                    opts.pty_slave_fd  = slave_fd;
+
+                    /* Save terminal state and switch to raw mode */
+                    if (tcgetattr(STDIN_FILENO, &saved_termios) == 0)
+                    {
+                        saved_termios_ok = 1;
+                        struct termios raw = saved_termios;
+                        cfmakeraw(&raw);
+                        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+                    }
+
+                    /* Install SIGWINCH handler to forward resize events */
+                    g_pty_master_fd = master_fd;
+                    struct sigaction sa;
+                    memset(&sa, 0, sizeof(sa));
+                    sa.sa_handler = sigwinch_handler;
+                    sigemptyset(&sa.sa_mask);
+                    sigaction(SIGWINCH, &sa, NULL);
+                }
+                else
+                {
+                    close(master_fd);
+                }
+            }
+            else
+            {
+                close(master_fd);
+            }
+        }
+    }
+
+    /* 12. Fork for PID namespace (child becomes PID 1) */
     pid_t child = fork();
     if (child < 0)
     {
         perror("fork");
+        if (saved_termios_ok)
+        {
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
+        }
         return 1;
     }
 
     if (child == 0)
     {
+        /* Redirect stderr to the PTY slave immediately so all child
+         * diagnostic output goes through the PTY line discipline
+         * (LF→CRLF) and the parent relay, instead of writing directly
+         * to the raw-mode host terminal where \n skips carriage return. */
+        if (opts.pty_slave_fd >= 0)
+        {
+            dup2(opts.pty_slave_fd, STDERR_FILENO);
+        }
         _exit(container_main(rootfs, &opts));
     }
 
-    /* Parent: wait for container to exit */
-    int status;
-    waitpid(child, &status, 0);
+    /* Parent: close slave end — only the child needs it */
+    if (opts.pty_slave_fd >= 0)
+    {
+        close(opts.pty_slave_fd);
+    }
+
+    /* Parent: if PTY active, relay until child exits */
+    int status = 0;
+    if (opts.pty_master_fd >= 0)
+    {
+        relay_pty(opts.pty_master_fd, &saved_termios, saved_termios_ok);
+        /* relay_pty() returned because slave closed; reap child */
+        waitpid(child, &status, 0);
+    }
+    else
+    {
+        waitpid(child, &status, 0);
+        if (saved_termios_ok)
+        {
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
+        }
+    }
+
     /* Reap net helper if it was started */
     if (net_helper_pid > 0)
     {
