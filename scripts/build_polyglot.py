@@ -230,8 +230,10 @@ PATCHED_MARKER = struct.pack('<Q', 0xAAAAAAAAAAAAAAAA)
 # as a cross-boundary substring. Do NOT use DEAD/BEEF/CAFE/BABE byte patterns.
 KERNEL_OFFSET_MARKER     = struct.pack('<Q', 0x7E57AB1E7E57AB1E)
 KERNEL_SIZE_MARKER       = struct.pack('<Q', 0xB00BB00BB00BB00B)
+KERNEL_PATCHED_MARKER    = struct.pack('<Q', 0x5A5A5A5A5A5A5A5A)
 INITRAMFS_OFFSET_MARKER  = struct.pack('<Q', 0xC0FFEE00C0FFEE00)
 INITRAMFS_SIZE_MARKER    = struct.pack('<Q', 0xFACEB00CFACEB00C)
+INITRAMFS_PATCHED_MARKER = struct.pack('<Q', 0x6B6B6B6B6B6B6B6B)
 
 
 def patch_markers(data, oci_offset, oci_size,
@@ -255,19 +257,19 @@ def patch_markers(data, oci_offset, oci_size,
     if kernel_offset is not None:
         n = patched.count(KERNEL_OFFSET_MARKER)
         patched = patched.replace(KERNEL_OFFSET_MARKER, struct.pack('<Q', kernel_offset))
-        print(f"  Patched KERNEL_OFFSET({n}x) = 0x{kernel_offset:x}", file=sys.stderr)
-    if kernel_size is not None:
-        n = patched.count(KERNEL_SIZE_MARKER)
-        patched = patched.replace(KERNEL_SIZE_MARKER, struct.pack('<Q', kernel_size))
-        print(f"  Patched KERNEL_SIZE({n}x)   = 0x{kernel_size:x}", file=sys.stderr)
+        patched = patched.replace(KERNEL_SIZE_MARKER,   struct.pack('<Q', kernel_size))
+        patched = patched.replace(KERNEL_PATCHED_MARKER, struct.pack('<Q', 1))
+        print(f"  Patched KERNEL offset=0x{kernel_offset:x} size=0x{kernel_size:x} ({n}x marker)", file=sys.stderr)
+        if n != 1:
+            print(f"WARNING: expected 1 KERNEL_OFFSET marker, found {n}", file=sys.stderr)
     if initramfs_offset is not None:
         n = patched.count(INITRAMFS_OFFSET_MARKER)
         patched = patched.replace(INITRAMFS_OFFSET_MARKER, struct.pack('<Q', initramfs_offset))
-        print(f"  Patched INITRAMFS_OFFSET({n}x) = 0x{initramfs_offset:x}", file=sys.stderr)
-    if initramfs_size is not None:
-        n = patched.count(INITRAMFS_SIZE_MARKER)
-        patched = patched.replace(INITRAMFS_SIZE_MARKER, struct.pack('<Q', initramfs_size))
-        print(f"  Patched INITRAMFS_SIZE({n}x)   = 0x{initramfs_size:x}", file=sys.stderr)
+        patched = patched.replace(INITRAMFS_SIZE_MARKER,   struct.pack('<Q', initramfs_size))
+        patched = patched.replace(INITRAMFS_PATCHED_MARKER, struct.pack('<Q', 1))
+        print(f"  Patched INITRAMFS offset=0x{initramfs_offset:x} size=0x{initramfs_size:x} ({n}x marker)", file=sys.stderr)
+        if n != 1:
+            print(f"WARNING: expected 1 INITRAMFS_OFFSET marker, found {n}", file=sys.stderr)
 
     return patched
 
@@ -642,6 +644,12 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     print(f"  Loader at file offset: 0x{PAGE_SIZE:x} ({PAGE_SIZE})")
     print(f"  OCI data offset: 0x{oci_data_file_offset:x} ({oci_data_file_offset})")
     print(f"  OCI data size: {oci_size} bytes ({oci_size / 1024 / 1024:.1f} MB)")
+    if kernel_data:
+        print(f"  Kernel offset:  0x{kernel_file_offset:x} ({kernel_file_offset})")
+        print(f"  Kernel size:    {len(kernel_data)} bytes ({len(kernel_data) / 1024 / 1024:.1f} MB)")
+    if initramfs_data:
+        print(f"  Initramfs offset: 0x{initramfs_file_offset:x} ({initramfs_file_offset})")
+        print(f"  Initramfs size:   {len(initramfs_data)} bytes ({len(initramfs_data) / 1024:.1f} KB)")
 
     if polyglot[0:4] != ELF_MAGIC:
         print("ERROR: ELF magic missing at byte 0!", file=sys.stderr)

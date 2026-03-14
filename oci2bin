@@ -31,6 +31,8 @@
 #                         Inject a host directory recursively (repeatable)
 #   --oci-dir DIR         Use an OCI image layout directory instead of docker save
 #                         (skips docker pull/save; IMAGE arg used only for naming)
+#   --kernel PATH         Embed a vmlinux kernel blob (enables --vm mode)
+#   --initramfs PATH      Embed a pre-built initramfs cpio.gz blob
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -89,7 +91,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OCI2BIN_HOME="${OCI2BIN_HOME:-$SCRIPT_DIR}"
 
 usage() {
-    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//'
+    sed -n '/^#!/d; /^#/!q; s/^# \?//p' "$0"
     exit 1
 }
 
@@ -403,6 +405,8 @@ DO_STRIP=0
 ADD_FILE_ARGS=()
 ADD_DIR_ARGS=()
 OCI_DIR=""
+KERNEL_PATH=""
+INITRAMFS_PATH=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -439,6 +443,16 @@ while [[ $# -gt 0 ]]; do
             OCI_DIR="$2"
             shift 2
             ;;
+        --kernel)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --kernel requires a PATH argument" >&2; exit 1; }
+            KERNEL_PATH="$2"
+            shift 2
+            ;;
+        --initramfs)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --initramfs requires a PATH argument" >&2; exit 1; }
+            INITRAMFS_PATH="$2"
+            shift 2
+            ;;
         --help|-h)
             usage
             ;;
@@ -455,6 +469,21 @@ fi
 IMAGE="$1"
 # Derive output name from image: "nginx:1.25" -> "nginx_1.25"
 OUTPUT="${2:-${IMAGE//[:\/]/_}}"
+shift 2 2>/dev/null || shift 1
+
+# Parse any remaining flags that follow the positional args (e.g. --kernel, --initramfs)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --kernel)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --kernel requires a PATH argument" >&2; exit 1; }
+            KERNEL_PATH="$2"; shift 2 ;;
+        --initramfs)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --initramfs requires a PATH argument" >&2; exit 1; }
+            INITRAMFS_PATH="$2"; shift 2 ;;
+        *)
+            echo "oci2bin: unexpected argument: $1" >&2; exit 1 ;;
+    esac
+done
 
 # ── architecture / compiler selection ─────────────────────────────────────
 
@@ -643,6 +672,10 @@ fi
 # Build common extra args for metadata embedding
 DIGEST_ARG=()
 [[ -n "${DIGEST:-}" ]] && DIGEST_ARG=(--digest "$DIGEST")
+KERNEL_ARG=()
+[[ -n "$KERNEL_PATH" ]] && KERNEL_ARG=(--kernel "$KERNEL_PATH")
+INITRAMFS_ARG=()
+[[ -n "$INITRAMFS_PATH" ]] && INITRAMFS_ARG=(--initramfs "$INITRAMFS_PATH")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
@@ -651,6 +684,8 @@ if [[ -n "$BUILD_TAR_ARG" ]]; then
         --tar        "$BUILD_TAR_ARG" \
         --image-name "$IMAGE" \
         "${DIGEST_ARG[@]}" \
+        "${KERNEL_ARG[@]}" \
+        "${INITRAMFS_ARG[@]}" \
         --output     "$OUTPUT"
 else
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
@@ -658,6 +693,8 @@ else
         --image      "$IMAGE" \
         --image-name "$IMAGE" \
         "${DIGEST_ARG[@]}" \
+        "${KERNEL_ARG[@]}" \
+        "${INITRAMFS_ARG[@]}" \
         --output     "$OUTPUT"
 fi
 

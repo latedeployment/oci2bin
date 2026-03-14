@@ -29,12 +29,15 @@ MAN_DIR    = doc
 INFO_DIR   = doc
 
 LIBKRUN ?= 0
+ifeq ($(LIBKRUN),1)
+$(info Building with libkrun support (USE_LIBKRUN))
+endif
 
 # Kernel download / build (cloud-hypervisor path only)
-KERNEL_VERSION = 6.1.102
+KERNEL_VERSION = 6.1.166
 VMLINUX_OUT    = build/vmlinux
 
-.PHONY: all clean polyglot loader loader-x86_64 loader-aarch64 loader-all \
+.PHONY: all clean clean-all polyglot loader loader-x86_64 loader-aarch64 loader-all \
         loader-libkrun kernel doc install uninstall test test-unit \
         test-unit-aarch64 test-integration test-integration-redis \
         test-integration-nginx test-c test-c-aarch64 test-python \
@@ -130,8 +133,11 @@ uninstall:
 	rm -f $(PREFIX)/share/info/oci2bin.info
 
 clean:
-	rm -rf build $(OUTPUT)
+	rm -rf build/loader-* build/test_c_units* build/vmlinux $(OUTPUT)
 	rm -f $(INFO_DIR)/oci2bin.info
+
+clean-all: clean
+	rm -rf build
 
 # ── Test targets ──────────────────────────────────────────────────────────────
 

@@ -183,17 +183,17 @@ class TestMarkerPatching(unittest.TestCase):
     """Tests for VM marker patching in build_polyglot.patch_markers()."""
 
     def test_kernel_markers_patched(self):
-        """KERNEL_OFFSET and KERNEL_SIZE sentinels must be replaced."""
-        # Build fake loader data containing sentinel values
-        sentinel_off  = build_polyglot.KERNEL_OFFSET_MARKER
-        sentinel_size = build_polyglot.KERNEL_SIZE_MARKER
-        # Also include OCI markers so patch_markers doesn't warn
+        """KERNEL_OFFSET, KERNEL_SIZE and KERNEL_PATCHED sentinels must be replaced."""
+        sentinel_off     = build_polyglot.KERNEL_OFFSET_MARKER
+        sentinel_size    = build_polyglot.KERNEL_SIZE_MARKER
+        sentinel_patched = build_polyglot.KERNEL_PATCHED_MARKER
         fake_data = (
             build_polyglot.OFFSET_MARKER +
             build_polyglot.SIZE_MARKER +
             build_polyglot.PATCHED_MARKER +
             sentinel_off +
-            sentinel_size
+            sentinel_size +
+            sentinel_patched
         )
         patched = build_polyglot.patch_markers(
             fake_data, oci_offset=0x1000, oci_size=0x2000,
@@ -201,19 +201,23 @@ class TestMarkerPatching(unittest.TestCase):
         )
         self.assertNotIn(sentinel_off, patched)
         self.assertNotIn(sentinel_size, patched)
+        self.assertNotIn(sentinel_patched, patched)
         self.assertIn(struct.pack('<Q', 0xABCD0000), patched)
         self.assertIn(struct.pack('<Q', 0x500000), patched)
+        self.assertIn(struct.pack('<Q', 1), patched)
 
     def test_initramfs_markers_patched(self):
-        """INITRAMFS_OFFSET and INITRAMFS_SIZE sentinels must be replaced."""
-        sentinel_off  = build_polyglot.INITRAMFS_OFFSET_MARKER
-        sentinel_size = build_polyglot.INITRAMFS_SIZE_MARKER
+        """INITRAMFS_OFFSET, INITRAMFS_SIZE and INITRAMFS_PATCHED sentinels must be replaced."""
+        sentinel_off     = build_polyglot.INITRAMFS_OFFSET_MARKER
+        sentinel_size    = build_polyglot.INITRAMFS_SIZE_MARKER
+        sentinel_patched = build_polyglot.INITRAMFS_PATCHED_MARKER
         fake_data = (
             build_polyglot.OFFSET_MARKER +
             build_polyglot.SIZE_MARKER +
             build_polyglot.PATCHED_MARKER +
             sentinel_off +
-            sentinel_size
+            sentinel_size +
+            sentinel_patched
         )
         patched = build_polyglot.patch_markers(
             fake_data, oci_offset=0x1000, oci_size=0x2000,
@@ -221,8 +225,10 @@ class TestMarkerPatching(unittest.TestCase):
         )
         self.assertNotIn(sentinel_off, patched)
         self.assertNotIn(sentinel_size, patched)
+        self.assertNotIn(sentinel_patched, patched)
         self.assertIn(struct.pack('<Q', 0xDEF00000), patched)
         self.assertIn(struct.pack('<Q', 0x100000), patched)
+        self.assertIn(struct.pack('<Q', 1), patched)
 
     def test_oci_markers_still_patched(self):
         """OCI markers must still be patched when VM markers are present."""

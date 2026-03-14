@@ -32,11 +32,15 @@ static volatile unsigned long OCI_DATA_SIZE   = 0xCAFEBABEDEADBEEFUL;
 static volatile unsigned long OCI_PATCHED     = 0xAAAAAAAAAAAAAAAAUL;
 
 /* VM blob markers — patched by build_polyglot.py --kernel / --initramfs.
- * Sentinels match build_polyglot.py KERNEL_OFFSET_MARKER etc. (little-endian). */
+ * Sentinels match build_polyglot.py KERNEL_OFFSET_MARKER etc. (little-endian).
+ * Use KERNEL_DATA_PATCHED / INITRAMFS_DATA_PATCHED to check presence — never
+ * compare OFFSET/SIZE against sentinel literals in C (embeds extra copies). */
 static volatile unsigned long KERNEL_DATA_OFFSET    = 0x7E57AB1E7E57AB1EUL;
 static volatile unsigned long KERNEL_DATA_SIZE      = 0xB00BB00BB00BB00BUL;
+static volatile unsigned long KERNEL_DATA_PATCHED   = 0x5A5A5A5A5A5A5A5AUL;
 static volatile unsigned long INITRAMFS_DATA_OFFSET = 0xC0FFEE00C0FFEE00UL;
 static volatile unsigned long INITRAMFS_DATA_SIZE   = 0xFACEB00CFACEB00CUL;
+static volatile unsigned long INITRAMFS_DATA_PATCHED = 0x6B6B6B6B6B6B6B6BUL;
 
 /* Max layers / volumes / exec args we support */
 #define MAX_LAYERS   128
@@ -3606,10 +3610,10 @@ static void rm_rf_dir(const char* path)
 static int extract_vm_blob(unsigned long offset, unsigned long size,
                            const char* out_path)
 {
-    /* Reject sentinel values (unpatched binary) */
-    if (offset == 0x7E57AB1E7E57AB1EUL || offset == 0xC0FFEE00C0FFEE00UL)
+    /* Reject zero offset (unpatched binary — caller must check PATCHED flag) */
+    if (offset == 0)
     {
-        fprintf(stderr, "oci2bin: VM blob not embedded (sentinel offset)\n");
+        fprintf(stderr, "oci2bin: VM blob not embedded (zero offset)\n");
         return -1;
     }
     /* Reject unreasonably large blobs (> 64 MiB) */
@@ -4070,11 +4074,11 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
                         struct container_opts* opts)
 {
     /* Check kernel is embedded */
-    if (KERNEL_DATA_OFFSET == 0x7E57AB1E7E57AB1EUL)
+    if (KERNEL_DATA_PATCHED != 1)
     {
         fprintf(stderr,
                 "oci2bin: --vm: no kernel embedded; "
-                "rebuild with build_polyglot.py --kernel vmlinux\n"
+                "rebuild with: oci2bin --kernel build/vmlinux IMAGE OUTPUT\n"
                 "  or build with: make LIBKRUN=1 (no kernel needed)\n");
         return 1;
     }
@@ -4102,7 +4106,7 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         return 1;
     }
 
-    if (INITRAMFS_DATA_OFFSET != 0xC0FFEE00C0FFEE00UL)
+    if (INITRAMFS_DATA_PATCHED == 1)
     {
         /* Pre-embedded initramfs: just write the blob */
         if (extract_vm_blob(INITRAMFS_DATA_OFFSET, INITRAMFS_DATA_SIZE,
@@ -4190,29 +4194,41 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
             }
         }
 
-        /* Try dirname/../../share/oci2bin/scripts/build_polyglot.py */
-        struct stat pystat;
-        n = snprintf(polyglot_py, sizeof(polyglot_py),
-                     "%s/../../share/oci2bin/scripts/build_polyglot.py",
-                     self_dir);
-        if (n < 0 || (size_t)n >= sizeof(polyglot_py) ||
-                stat(polyglot_py, &pystat) != 0)
+        /* Search for build_polyglot.py in order:
+         *  1. dirname(self)/scripts/          (dev / project root)
+         *  2. dirname(self)/../scripts/       (bin/ next to scripts/)
+         *  3. dirname(self)/../../share/oci2bin/scripts/ (installed)
+         *  4. /usr/share/oci2bin/scripts/     (system fallback)
+         */
+        static const char* const PY_SUFFIXES[] =
         {
-            /* Try dirname/../scripts/build_polyglot.py */
+            "/scripts/build_polyglot.py",
+            "/../scripts/build_polyglot.py",
+            "/../../share/oci2bin/scripts/build_polyglot.py",
+            NULL,
+        };
+        struct stat pystat;
+        int found_py = 0;
+        for (int si = 0; PY_SUFFIXES[si]; si++)
+        {
             n = snprintf(polyglot_py, sizeof(polyglot_py),
-                         "%s/../scripts/build_polyglot.py", self_dir);
-            if (n < 0 || (size_t)n >= sizeof(polyglot_py) ||
-                    stat(polyglot_py, &pystat) != 0)
+                         "%s%s", self_dir, PY_SUFFIXES[si]);
+            if (n > 0 && (size_t)n < sizeof(polyglot_py) &&
+                    stat(polyglot_py, &pystat) == 0)
             {
-                /* Fallback to system path */
-                n = snprintf(polyglot_py, sizeof(polyglot_py),
-                             "/usr/share/oci2bin/scripts/build_polyglot.py");
-                if (n < 0 || (size_t)n >= sizeof(polyglot_py))
-                {
-                    fprintf(stderr,
-                            "oci2bin: build_polyglot.py path truncated\n");
-                    return 1;
-                }
+                found_py = 1;
+                break;
+            }
+        }
+        if (!found_py)
+        {
+            n = snprintf(polyglot_py, sizeof(polyglot_py),
+                         "/usr/share/oci2bin/scripts/build_polyglot.py");
+            if (n < 0 || (size_t)n >= sizeof(polyglot_py))
+            {
+                fprintf(stderr,
+                        "oci2bin: build_polyglot.py path truncated\n");
+                return 1;
             }
         }
 
