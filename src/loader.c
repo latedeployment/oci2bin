@@ -15,6 +15,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <ftw.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <grp.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -2142,6 +2144,18 @@ static int container_main(const char* rootfs, struct container_opts *opts)
             fprintf(stderr, "oci2bin: setuid(%d) failed: %s\n",
                     (int)opts->run_uid, strerror(errno));
             return 1;
+        }
+    }
+
+    /* Acquire controlling terminal so interactive shells get job control.
+     * setsid() makes this process a new session leader (no controlling tty),
+     * then TIOCSCTTY claims stdin (the user's terminal) as our controlling tty. */
+    if (isatty(STDIN_FILENO))
+    {
+        setsid();
+        if (ioctl(STDIN_FILENO, TIOCSCTTY, 0) < 0)
+        {
+            /* non-fatal: shell still works, just without job control */
         }
     }
 
