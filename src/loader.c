@@ -1672,11 +1672,35 @@ static void patch_rootfs_ids(const char* rootfs)
         "  esac\n"
         "done\n"
         "exec \"$@\"\n";
+    /* gosu/su-exec shim: we cannot change uid in a single-UID namespace, so
+     * just exec the command.  Two invocation patterns exist:
+     *
+     *   Pattern A: gosu user command [args...]
+     *     → exec command args                (direct, depth=0)
+     *
+     *   Pattern B (redis-style re-entry): gosu user entrypoint.sh command [args...]
+     *     The entrypoint calls "exec gosu user $0 $@", which re-runs itself
+     *     as the same uid=0.  On the second call (depth≥1) we detect >1 arg
+     *     after removing the user, skip the leading script, and exec the
+     *     real command.
+     */
     static const char gosu_shim[] =
         "#!/bin/sh\n"
-        "# oci2bin shim: skip user arg, exec the command\n"
+        "# oci2bin shim: skip user arg, exec the command.\n"
         "shift\n"
+        "if [ \"${OCI2BIN_GOSU_DEPTH:-0}\" -ge 1 ] && [ $# -gt 1 ]; then\n"
+        "  shift\n"
+        "fi\n"
+        "export OCI2BIN_GOSU_DEPTH=$(( ${OCI2BIN_GOSU_DEPTH:-0} + 1 ))\n"
         "exec \"$@\"\n";
+    /* chown shim: virtiofs passes host UIDs through untranslated, so
+     * chown inside a microVM (or single-UID user namespace) always fails
+     * with EPERM.  Replace the binary with a no-op that exits 0. */
+    static const char chown_shim[] =
+        "#!/bin/sh\n"
+        "# oci2bin shim: ownership changes are impossible in a single-UID\n"
+        "# environment; silently succeed so entrypoint scripts continue.\n"
+        "exit 0\n";
     static const struct
     {
         const char* path;
@@ -1684,12 +1708,14 @@ static void patch_rootfs_ids(const char* rootfs)
     } shims[] =
     {
         {"/usr/bin/setpriv", setpriv_shim},
-        {"/bin/setpriv", setpriv_shim},
-        {"/usr/sbin/gosu", gosu_shim},
-        {"/usr/local/bin/gosu", gosu_shim},
-        {"/sbin/gosu", gosu_shim},
+        {"/bin/setpriv",     setpriv_shim},
+        {"/usr/sbin/gosu",       gosu_shim},
+        {"/usr/local/bin/gosu",  gosu_shim},
+        {"/sbin/gosu",           gosu_shim},
         {"/usr/local/bin/su-exec", gosu_shim},
-        {"/sbin/su-exec", gosu_shim},
+        {"/sbin/su-exec",          gosu_shim},
+        {"/bin/chown",       chown_shim},
+        {"/usr/bin/chown",   chown_shim},
     };
 
     for (size_t i = 0; i < sizeof(shims) / sizeof(shims[0]); i++)
