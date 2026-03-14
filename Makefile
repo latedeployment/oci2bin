@@ -33,6 +33,18 @@ ifeq ($(LIBKRUN),1)
 $(info Building with libkrun support (USE_LIBKRUN))
 endif
 
+# VM defaults — override at build time:
+#   make VM_CPUS=4 VM_MEM_MB=512
+VM_CPUS   ?=
+VM_MEM_MB ?=
+VM_DEFS   :=
+ifneq ($(VM_CPUS),)
+VM_DEFS += -DDEFAULT_VM_CPUS=$(VM_CPUS)
+endif
+ifneq ($(VM_MEM_MB),)
+VM_DEFS += -DDEFAULT_VM_MEM_MB=$(VM_MEM_MB)
+endif
+
 # Kernel download / build (cloud-hypervisor path only)
 KERNEL_VERSION = 6.1.166
 VMLINUX_OUT    = build/vmlinux
@@ -71,12 +83,12 @@ loader-libkrun: build/loader-libkrun-$(ARCH)
 
 build/loader-libkrun-x86_64: src/loader.c
 	@mkdir -p build
-	$(CC_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN -o $@ $< -lkrun
+	$(CC_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -lkrun
 	@echo "Loader/libkrun (x86_64): $$(ls -lh $@ | awk '{print $$5}')"
 
 build/loader-libkrun-aarch64: src/loader.c
 	@mkdir -p build
-	$(CC_AARCH64) $(CFLAGS_AARCH64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN -o $@ $< -lkrun
+	$(CC_AARCH64) $(CFLAGS_AARCH64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -lkrun
 	@echo "Loader/libkrun (aarch64): $$(ls -lh $@ | awk '{print $$5}')"
 
 # Kernel fetch / build (cloud-hypervisor path only)
@@ -87,12 +99,12 @@ $(VMLINUX_OUT): kernel/microvm.config scripts/fetch_kernel.sh
 
 build/loader-x86_64: src/loader.c
 	@mkdir -p build
-	$(CC_X86_64) $(CFLAGS) -o $@ $<
+	$(CC_X86_64) $(CFLAGS) $(VM_DEFS) -o $@ $<
 	@echo "Loader (x86_64): $$(ls -lh $@ | awk '{print $$5}')"
 
 build/loader-aarch64: src/loader.c
 	@mkdir -p build
-	$(CC_AARCH64) $(CFLAGS_AARCH64) $(CFLAGS) -o $@ $<
+	$(CC_AARCH64) $(CFLAGS_AARCH64) $(CFLAGS) $(VM_DEFS) -o $@ $<
 	@echo "Loader (aarch64): $$(ls -lh $@ | awk '{print $$5}')"
 
 polyglot: build/loader-$(ARCH)

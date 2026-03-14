@@ -532,14 +532,14 @@ if [[ "$USE_LIBKRUN" -eq 1 ]]; then
     if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
         echo "oci2bin: building loader with libkrun for $TARGET_ARCH..."
         mkdir -p "$OCI2BIN_HOME/build"
-        $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN -o "$LOADER" "$SRC" -lkrun
+        $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC" -lkrun
     fi
 else
     LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
     if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
         echo "oci2bin: building loader for $TARGET_ARCH..."
         mkdir -p "$OCI2BIN_HOME/build"
-        $CC_CROSS $CFLAGS_CROSS -static -O2 -s -o "$LOADER" "$SRC"
+        $CC_CROSS $CFLAGS_CROSS -static -O2 -s ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC"
     fi
 fi
 
