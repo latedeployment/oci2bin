@@ -29,6 +29,7 @@ See below [How it works](#how-it-works).
   - [Reproducible builds and digest pinning](#reproducible-builds-and-digest-pinning)
   - [VM-mode binaries (oci2vm)](#vm-mode-binaries-oci2vm)
   - [Embedding the loader for reconstruction](#embedding-the-loader-for-reconstruction)
+    - [Registry persistence](#registry-persistence)
 - [Running containers](#running-containers)
   - [Overriding the entrypoint](#overriding-the-entrypoint)
   - [Working directory](#working-directory)
@@ -244,6 +245,24 @@ oci2bin --embed-loader-labels --label-chunk-size 4096 redis:7-alpine
 ```
 
 Both approaches store `oci2bin.loader.sha256`, `oci2bin.loader.arch`, and strategy-specific labels in the image config. `oci2bin reconstruct` verifies the sha256 before rebuilding.
+
+#### Registry persistence
+
+Both embedding strategies are designed to survive a full registry round-trip. OCI registries store each layer blob and the image config separately, content-addressed by SHA256. Because the loader layer and the `oci2bin.loader.*` labels are part of the image config and layer list, they are preserved exactly through `docker push` and `docker pull` — there is nothing special for the registry to strip or rewrite.
+
+```bash
+# Build once, push to registry
+oci2bin --embed-loader-layer redis:7-alpine
+docker load < redis_7-alpine
+docker tag redis:7-alpine registry.example.com/redis:7-alpine
+docker push registry.example.com/redis:7-alpine
+
+# Rebuild from registry on any machine — no local .img file needed
+docker pull registry.example.com/redis:7-alpine
+oci2bin reconstruct registry.example.com/redis:7-alpine
+```
+
+The label approach (`--embed-loader-labels`) works the same way — config labels are part of the image manifest that registries store verbatim. The only registry-specific consideration is per-label or total-config size limits; use `--label-chunk-size` to reduce individual label size if your registry enforces one. See [`--embed-loader-layer`](#embedding-the-loader-for-reconstruction), [`--embed-loader-labels`](#embedding-the-loader-for-reconstruction), and [`--label-chunk-size`](#embedding-the-loader-for-reconstruction) for details.
 
 ---
 
