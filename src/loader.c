@@ -604,6 +604,117 @@ static int write_all_fd(int fd, const char* data, size_t len)
     return 0;
 }
 
+/*
+ * Copy exactly nbytes from in_fd to out_fd.
+ * Retries EINTR.  Returns 0 on success, -1 on short read or write error.
+ */
+static int copy_n_bytes(int in_fd, int out_fd, unsigned long nbytes)
+{
+    char buf[65536];
+    unsigned long remaining = nbytes;
+    while (remaining > 0)
+    {
+        size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        ssize_t nr;
+        do
+        {
+            nr = read(in_fd, buf, to_read);
+        }
+        while (nr < 0 && errno == EINTR);
+        if (nr <= 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: copy_n_bytes: premature EOF at offset %lu\n",
+                    nbytes - remaining);
+            return -1;
+        }
+        if (write_all_fd(out_fd, buf, (size_t)nr) < 0)
+        {
+            return -1;
+        }
+        remaining -= (unsigned long)nr;
+    }
+    return 0;
+}
+
+/*
+ * Open a path beneath a directory fd without following symlinks at any
+ * component.  relpath must be relative (no leading '/').
+ * Each intermediate directory component is opened with
+ * O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC.
+ * The final component is opened with (flags|O_NOFOLLOW|O_CLOEXEC) and mode.
+ * Returns fd on success or -1 on error (including ELOOP for any symlink).
+ */
+static int openat_beneath(int rootfs_fd, const char* relpath,
+                          int flags, mode_t mode)
+{
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s", relpath) >= (int)sizeof(buf))
+    {
+        return -1;
+    }
+
+    int cur_fd = dup(rootfs_fd);
+    if (cur_fd < 0)
+    {
+        return -1;
+    }
+
+    char* tok = buf;
+    char* slash;
+    while ((slash = strchr(tok, '/')) != NULL)
+    {
+        *slash = '\0';
+        if (*tok != '\0')
+        {
+            int next = openat(cur_fd, tok,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            close(cur_fd);
+            if (next < 0)
+            {
+                return -1;
+            }
+            cur_fd = next;
+        }
+        tok = slash + 1;
+    }
+
+    /* final component */
+    int fd = openat(cur_fd, tok, flags | O_NOFOLLOW | O_CLOEXEC, mode);
+    close(cur_fd);
+    return fd;
+}
+
+/*
+ * Unlink a path beneath rootfs_fd without following symlinks.
+ * relpath must be relative (no leading '/').
+ */
+static int unlinkat_beneath(int rootfs_fd, const char* relpath, int atflags)
+{
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s", relpath) >= (int)sizeof(buf))
+    {
+        return -1;
+    }
+
+    char* slash = strrchr(buf, '/');
+    if (!slash)
+    {
+        return unlinkat(rootfs_fd, buf, atflags);
+    }
+
+    *slash = '\0';
+    int dir_fd = openat_beneath(rootfs_fd, buf,
+                                O_RDONLY | O_DIRECTORY, 0);
+    if (dir_fd < 0)
+    {
+        return -1;
+    }
+    int rc = unlinkat(dir_fd, slash + 1, atflags);
+    close(dir_fd);
+    return rc;
+}
+
 static int parent_dir_path(const char* path, char* out, size_t out_sz)
 {
     int n = snprintf(out, out_sz, "%s", path);
@@ -1004,24 +1115,34 @@ static int resolve_user_in_rootfs(const char* rootfs, const char* spec,
  */
 static void install_resolv_conf(const char* rootfs)
 {
-    char dst[PATH_MAX];
-    int n = snprintf(dst, sizeof(dst), "%s/etc/resolv.conf", rootfs);
-    if (n < 0 || (size_t)n >= sizeof(dst))
-    {
-        return;
-    }
     size_t sz;
     char* data = read_file("/run/systemd/resolve/resolv.conf", &sz);
     if (!data)
     {
         data = read_file("/etc/resolv.conf", &sz);
     }
-    if (data)
+    if (!data)
     {
-        unlink(dst);
-        write_file(dst, data, sz);
-        free(data);
+        return;
     }
+
+    int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfs_fd < 0)
+    {
+        free(data);
+        return;
+    }
+
+    unlinkat_beneath(rootfs_fd, "etc/resolv.conf", 0);
+    int dst_fd = openat_beneath(rootfs_fd, "etc/resolv.conf",
+                                O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst_fd >= 0)
+    {
+        write_all_fd(dst_fd, data, sz);
+        close(dst_fd);
+    }
+    close(rootfs_fd);
+    free(data);
 }
 
 /*
@@ -1224,32 +1345,16 @@ static char* extract_oci_rootfs(const char* self_path)
         return NULL;
     }
 
-    unsigned long remaining = OCI_DATA_SIZE;
-    char buf[BUF_SIZE];
-    int write_error = 0;
-    while (remaining > 0)
+    if (copy_n_bytes(self_fd, out_fd, OCI_DATA_SIZE) < 0)
     {
-        size_t to_read = remaining < BUF_SIZE ? remaining : BUF_SIZE;
-        ssize_t n = read(self_fd, buf, to_read);
-        if (n <= 0)
-        {
-            break;
-        }
-        ssize_t written = write(out_fd, buf, n);
-        if (written != n)
-        {
-            write_error = 1;
-            break;
-        }
-        remaining -= n;
+        fprintf(stderr,
+                "oci2bin: error extracting embedded OCI data\n");
+        close(self_fd);
+        close(out_fd);
+        return NULL;
     }
     close(self_fd);
     close(out_fd);
-    if (write_error)
-    {
-        fprintf(stderr, "oci2bin: write error extracting OCI data (disk full?)\n");
-        return NULL;
-    }
 
     /* 2. Extract the OCI tar into tmpdir/oci/ */
     char oci_dir[PATH_MAX];
@@ -1502,6 +1607,12 @@ static void patch_rootfs_ids(const char* rootfs)
         return;
     }
 
+    int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfs_fd < 0)
+    {
+        return;
+    }
+
     /* ── /etc/passwd ── remap all uid:gid fields to 0:0 ── */
     char passwd_path[PATH_MAX];
     snprintf(passwd_path, sizeof(passwd_path), "%s/etc/passwd", rootfs);
@@ -1509,7 +1620,9 @@ static void patch_rootfs_ids(const char* rootfs)
     char* passwd = read_file(passwd_path, &passwd_sz);
     if (passwd)
     {
-        FILE *out = fopen(passwd_path, "w");
+        int passwd_fd = openat_beneath(rootfs_fd, "etc/passwd",
+                                       O_WRONLY | O_TRUNC, 0);
+        FILE *out = passwd_fd >= 0 ? fdopen(passwd_fd, "w") : NULL;
         if (out)
         {
             char* line = passwd;
@@ -1576,7 +1689,9 @@ static void patch_rootfs_ids(const char* rootfs)
     char* grp = read_file(group_path, &group_sz);
     if (grp)
     {
-        FILE *out = fopen(group_path, "w");
+        int group_fd = openat_beneath(rootfs_fd, "etc/group",
+                                      O_WRONLY | O_TRUNC, 0);
+        FILE *out = group_fd >= 0 ? fdopen(group_fd, "w") : NULL;
         if (out)
         {
             char* line = grp;
@@ -1631,18 +1746,21 @@ static void patch_rootfs_ids(const char* rootfs)
     }
 
     /* ── apt sandbox ── belt-and-suspenders for Debian/Ubuntu images ── */
-    char apt_conf_dir[PATH_MAX];
-    snprintf(apt_conf_dir, sizeof(apt_conf_dir), "%s/etc/apt/apt.conf.d",
-             rootfs);
-    struct stat st;
-    if (stat(apt_conf_dir, &st) == 0 && S_ISDIR(st.st_mode))
     {
-        char apt_conf[PATH_MAX];
-        if (snprintf(apt_conf, sizeof(apt_conf), "%s/99oci2bin", apt_conf_dir)
-                < (int)sizeof(apt_conf))
+        int apt_fd = openat_beneath(rootfs_fd, "etc/apt/apt.conf.d",
+                                    O_RDONLY | O_DIRECTORY, 0);
+        if (apt_fd >= 0)
         {
-            const char* conf = "APT::Sandbox::User \"root\";\n";
-            write_file(apt_conf, conf, strlen(conf));
+            int conf_fd = openat(apt_fd, "99oci2bin",
+                                 O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW |
+                                 O_CLOEXEC, 0644);
+            if (conf_fd >= 0)
+            {
+                const char* conf = "APT::Sandbox::User \"root\";\n";
+                write_all_fd(conf_fd, conf, strlen(conf));
+                close(conf_fd);
+            }
+            close(apt_fd);
         }
     }
 
@@ -1720,30 +1838,38 @@ static void patch_rootfs_ids(const char* rootfs)
 
     for (size_t i = 0; i < sizeof(shims) / sizeof(shims[0]); i++)
     {
-        char full[PATH_MAX];
-        if (snprintf(full, sizeof(full), "%s%s", rootfs, shims[i].path)
-                >= (int)sizeof(full))
+        /* shims[i].path starts with '/', skip it for openat_beneath */
+        const char* rel = shims[i].path + 1;
+        /* Check existence via openat before attempting replacement */
+        int probe = openat_beneath(rootfs_fd, rel, O_RDONLY, 0);
+        if (probe < 0)
         {
             continue;
         }
-        struct stat sb;
-        if (lstat(full, &sb) == 0)
+        close(probe);
+        /* Remove any existing file/symlink, then write the shim safely */
+        unlinkat_beneath(rootfs_fd, rel, 0);
+        int sfd = openat_beneath(rootfs_fd, rel,
+                                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (sfd < 0)
         {
-            /* Remove first: the file may be a symlink (e.g. to busybox)
-             * and O_TRUNC would corrupt the shared target. */
-            unlink(full);
-            if (write_file(full, shims[i].script, strlen(shims[i].script))
-                    < 0)
-            {
-                fprintf(stderr, "oci2bin: warning: could not write shim %s: %s\n",
-                        shims[i].path, strerror(errno));
-            }
-            else
-            {
-                chmod(full, 0755);
-            }
+            fprintf(stderr, "oci2bin: warning: could not write shim %s: %s\n",
+                    shims[i].path, strerror(errno));
+            continue;
         }
+        if (write_all_fd(sfd, shims[i].script, strlen(shims[i].script)) < 0)
+        {
+            fprintf(stderr, "oci2bin: warning: could not write shim %s: %s\n",
+                    shims[i].path, strerror(errno));
+        }
+        else
+        {
+            fchmod(sfd, 0755);
+        }
+        close(sfd);
     }
+
+    close(rootfs_fd);
 
     /* ── /etc/resolv.conf ── copy host resolver into chroot ── */
     install_resolv_conf(rootfs);
@@ -4502,7 +4628,22 @@ static int verify_signature(const char* key_path)
         return -1;
     }
 
-    /* execvp: python3 sign_binary.py verify --key KEY --in /proc/self/exe */
+    /* Check that the verifier script is not writable by group/world */
+    struct stat vst;
+    if (stat(scripts_dir, &vst) < 0)
+    {
+        fprintf(stderr, "oci2bin: --verify-key: cannot stat verifier script\n");
+        return -1;
+    }
+    if (vst.st_mode & (S_IWGRP | S_IWOTH))
+    {
+        fprintf(stderr,
+                "oci2bin: --verify-key: verifier script is group/world "
+                "writable — refusing to execute\n");
+        return -1;
+    }
+
+    /* execv: /usr/bin/python3 sign_binary.py verify --key KEY --in /proc/self/exe */
     pid_t pid = fork();
     if (pid < 0)
     {
@@ -4513,15 +4654,15 @@ static int verify_signature(const char* key_path)
     {
         char* args[] =
         {
-            "python3",
+            "/usr/bin/python3",
             scripts_dir,
             "verify",
             "--key", (char*)key_path,
             "--in", self_path,
             NULL
         };
-        execvp("python3", args);
-        perror("oci2bin: execvp python3");
+        execv("/usr/bin/python3", args);
+        perror("oci2bin: execv /usr/bin/python3");
         _exit(127);
     }
     int status;
@@ -4815,28 +4956,11 @@ static int extract_vm_blob(unsigned long offset, unsigned long size,
         return -1;
     }
 
-    char buf[65536];
-    unsigned long remaining = size;
-    while (remaining > 0)
+    if (copy_n_bytes(in_fd, out_fd, size) < 0)
     {
-        size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
-        ssize_t n = read(in_fd, buf, to_read);
-        if (n <= 0)
-        {
-            fprintf(stderr, "oci2bin: read VM blob: short read at offset %lu\n",
-                    size - remaining);
-            close(in_fd);
-            close(out_fd);
-            return -1;
-        }
-        if (write(out_fd, buf, (size_t)n) != n)
-        {
-            perror("write VM blob");
-            close(in_fd);
-            close(out_fd);
-            return -1;
-        }
-        remaining -= (unsigned long)n;
+        close(in_fd);
+        close(out_fd);
+        return -1;
     }
     close(in_fd);
     if (close(out_fd) < 0)
@@ -5286,15 +5410,30 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
             }
             char cpbuf[65536];
             ssize_t nr;
-            while ((nr = read(src_fd, cpbuf, sizeof(cpbuf))) > 0)
+            int copy_err = 0;
+            while (1)
             {
-                if (write(dst_fd, cpbuf, (size_t)nr) != nr)
+                do
+                {
+                    nr = read(src_fd, cpbuf, sizeof(cpbuf));
+                }
+                while (nr < 0 && errno == EINTR);
+                if (nr == 0)
+                {
+                    break;
+                }
+                if (nr < 0 || write_all_fd(dst_fd, cpbuf, (size_t)nr) < 0)
                 {
                     perror("write rootfs/init");
-                    close(src_fd);
-                    close(dst_fd);
-                    return 1;
+                    copy_err = 1;
+                    break;
                 }
+            }
+            if (copy_err)
+            {
+                close(src_fd);
+                close(dst_fd);
+                return 1;
             }
             close(src_fd);
             if (close(dst_fd) < 0)
@@ -5712,6 +5851,9 @@ int main(int argc, char* argv[])
     {
         g_debug = 1;
     }
+
+    /* Sanitize PATH before executing any host helpers */
+    setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1);
 
     /* 0. If running as VM init (OCI2BIN_VM_INIT=1), skip all host logic */
     if (getenv("OCI2BIN_VM_INIT"))
