@@ -3,6 +3,7 @@
 #
 # Usage:
 #   oci2bin [--arch ARCH] <image[:tag]> [output]
+#   oci2vm  [--arch ARCH] <image[:tag]> [output]   (VM mode by default)
 #   oci2bin inspect <binary>
 #   oci2bin sign   --key KEY.pem  --in BINARY [--out BINARY]
 #   oci2bin verify --key PUB.pem  --in BINARY
@@ -10,6 +11,7 @@
 #   oci2bin list [--json]
 #   oci2bin prune [--dry-run]
 #   oci2bin diff <binary1> <binary2>
+#   oci2bin reconstruct <image-or-file> [--output PATH] [--no-strip]
 #
 # The output file runs as a rootless container AND can be imported with
 # docker load. It accepts the same runtime flags as the embedded loader:
@@ -35,6 +37,12 @@
 #   --initramfs PATH      Embed a pre-built initramfs cpio.gz blob
 #   --libkrun             Force libkrun loader (default: auto-detected)
 #   --no-libkrun          Force static loader even if libkrun is available
+#   --embed-loader-layer  Embed loader as an extra OCI layer (.oci2bin/loader)
+#                         so the binary can be reconstructed via 'reconstruct'
+#   --embed-loader-labels Embed loader as chunked base64 image config labels
+#                         (no filesystem layer; use when layer pollution matters)
+#   --label-chunk-size N  Binary bytes per label chunk for --embed-loader-labels
+#                         (default: 6144 → ~8 KB base64 per label)
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -73,6 +81,10 @@
 #   list [--json]         List all cached binaries with image name, size, date
 #   prune [--dry-run]     Remove outdated cache entries (keep newest per image)
 #   diff <b1> <b2>        Show filesystem diff between two oci2bin binaries
+#   reconstruct <src>     Rebuild polyglot from an image built with
+#                         --embed-loader-layer or --embed-loader-labels;
+#                         <src> is a Docker image name or a .tar/.img file
+#                         Options: --output PATH, --no-strip
 #
 # Examples:
 #   oci2bin alpine:latest               # -> alpine_latest (host arch)
@@ -87,6 +99,8 @@
 #   oci2bin list                        # show cached binaries
 #   oci2bin prune                       # remove old cache entries
 #   oci2bin diff alpine_latest redis_7  # compare two binaries
+#   oci2bin --embed-loader-layer redis:7-alpine  # embed loader for reconstruction
+#   oci2bin reconstruct redis:7-alpine  # rebuild from Docker image
 
 set -euo pipefail
 
