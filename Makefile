@@ -127,7 +127,9 @@ install: build/loader-$(ARCH)
 	install -d $(PREFIX)/share/oci2bin/build
 	install -d $(PREFIX)/share/oci2bin/src
 	install -m 755 oci2bin $(PREFIX)/bin/oci2bin
+	ln -sf $(PREFIX)/bin/oci2bin $(PREFIX)/bin/oci2vm
 	install -m 644 scripts/build_polyglot.py $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/reconstruct.py $(PREFIX)/share/oci2bin/scripts/
 	install -m 644 src/loader.c $(PREFIX)/share/oci2bin/src/
 	[ -f build/loader-x86_64  ] && install -m 755 build/loader-x86_64  $(PREFIX)/share/oci2bin/build/ || true
 	[ -f build/loader-aarch64 ] && install -m 755 build/loader-aarch64 $(PREFIX)/share/oci2bin/build/ || true
@@ -143,7 +145,7 @@ install: build/loader-$(ARCH)
 	@echo "Installed. Run: oci2bin <image>"
 
 uninstall:
-	rm -f $(PREFIX)/bin/oci2bin
+	rm -f $(PREFIX)/bin/oci2bin $(PREFIX)/bin/oci2vm
 	rm -rf $(PREFIX)/share/oci2bin
 	rm -f $(PREFIX)/share/man/man1/oci2bin.1
 	-install-info --delete --dir-file=$(PREFIX)/share/info/dir \

@@ -855,12 +855,17 @@ Each layer tar records filesystem additions, modifications, and deletions (white
 **File layout:**
 
 ```
-[0-63]       ELF64 header  (embedded in the tar filename field)
-[64-511]     Remaining tar header fields (ustar magic at byte 257)
-[512-4095]   NUL padding   (page-aligns the loader for mmap)
-[4096-~75K]  Loader binary (statically linked)
-[~75K-end]   OCI image tar (manifest.json, config, layer tarballs)
+[0-511]      Tar entry #1 header  (ELF header in filename field, ustar magic at byte 257)
+[512-4095]   Tar entry #1 data: NUL padding  (page-aligns loader for mmap)
+[4096-~75K]  Tar entry #1 data: loader binary  (statically linked)
+[~75K-end]   Tar entries #2+: OCI image tar  (manifest.json, config, layer tarballs)
+             Two 512-byte zero blocks  (tar EOF)
+             OCI2BIN_META block  (image name, digest, version — outside the tar)
 ```
+
+**What `docker load` sees:**
+
+The loader binary is stored as tar entry #1, whose "filename" is the 64-byte ELF header — binary data that Docker does not recognise and silently skips. Entries #2 onwards are the unmodified `docker save` output (`manifest.json`, config blob, layer tarballs), so `docker load` imports exactly the original image. The loader binary is never written into Docker's image store. Any VM blobs (kernel, initramfs) and the metadata block are appended after the tar EOF markers and are completely invisible to Docker.
 
 **At runtime the loader:**
 

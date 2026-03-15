@@ -93,6 +93,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OCI2BIN_HOME="${OCI2BIN_HOME:-$SCRIPT_DIR}"
 
+# ── oci2vm mode ───────────────────────────────────────────────────────────
+# When invoked as "oci2vm" the output binary is named oci2vm_<image> so that
+# the loader's own basename check fires and VM mode is the runtime default.
+_OCI2BIN_BASENAME="$(basename "$0")"
+OCI2VM_MODE=0
+if [[ "$_OCI2BIN_BASENAME" == "oci2vm" ]]; then
+    OCI2VM_MODE=1
+fi
+
 usage() {
     sed -n '/^#!/d; /^#/!q; s/^# \?//p' "$0"
     exit 1
@@ -288,6 +297,13 @@ if [[ "${1:-}" == "diff" ]]; then
     exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" "$1" "$2"
 fi
 
+# ── reconstruct subcommand ───────────────────────────────────────────────
+
+if [[ "${1:-}" == "reconstruct" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/reconstruct.py" "$@"
+fi
+
 # ── pod subcommand ────────────────────────────────────────────────────────
 
 if [[ "${1:-}" == "pod" ]]; then
@@ -410,6 +426,9 @@ ADD_DIR_ARGS=()
 OCI_DIR=""
 KERNEL_PATH=""
 INITRAMFS_PATH=""
+EMBED_LOADER_LAYER=0
+EMBED_LOADER_LABELS=0
+LABEL_CHUNK_SIZE=""
 # Auto-detect libkrun; --no-libkrun opts out
 if pkg-config --exists libkrun 2>/dev/null || ldconfig -p 2>/dev/null | grep -q libkrun; then
     USE_LIBKRUN=1
@@ -470,6 +489,19 @@ while [[ $# -gt 0 ]]; do
             USE_LIBKRUN=0
             shift
             ;;
+        --embed-loader-layer)
+            EMBED_LOADER_LAYER=1
+            shift
+            ;;
+        --embed-loader-labels)
+            EMBED_LOADER_LABELS=1
+            shift
+            ;;
+        --label-chunk-size)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --label-chunk-size requires a BYTES argument" >&2; exit 1; }
+            LABEL_CHUNK_SIZE="$2"
+            shift 2
+            ;;
         --help|-h)
             usage
             ;;
@@ -485,7 +517,12 @@ fi
 
 IMAGE="$1"
 # Derive output name from image: "nginx:1.25" -> "nginx_1.25"
-OUTPUT="${2:-${IMAGE//[:\/]/_}}"
+# In oci2vm mode prefix with "oci2vm_" so the loader's basename check fires.
+if [[ "$OCI2VM_MODE" -eq 1 ]]; then
+    OUTPUT="${2:-oci2vm_${IMAGE//[:\/]/_}}"
+else
+    OUTPUT="${2:-${IMAGE//[:\/]/_}}"
+fi
 shift 2 2>/dev/null || shift 1
 
 # Parse any remaining flags that follow the positional args (e.g. --kernel, --initramfs)
@@ -701,6 +738,10 @@ KERNEL_ARG=()
 [[ -n "$KERNEL_PATH" ]] && KERNEL_ARG=(--kernel "$KERNEL_PATH")
 INITRAMFS_ARG=()
 [[ -n "$INITRAMFS_PATH" ]] && INITRAMFS_ARG=(--initramfs "$INITRAMFS_PATH")
+EMBED_LOADER_ARG=()
+[[ "$EMBED_LOADER_LAYER"  -eq 1 ]] && EMBED_LOADER_ARG=(--embed-loader-layer)
+[[ "$EMBED_LOADER_LABELS" -eq 1 ]] && EMBED_LOADER_ARG=(--embed-loader-labels)
+[[ -n "$LABEL_CHUNK_SIZE" ]] && EMBED_LOADER_ARG+=(--label-chunk-size "$LABEL_CHUNK_SIZE")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
@@ -711,6 +752,7 @@ if [[ -n "$BUILD_TAR_ARG" ]]; then
         "${DIGEST_ARG[@]}" \
         "${KERNEL_ARG[@]}" \
         "${INITRAMFS_ARG[@]}" \
+        "${EMBED_LOADER_ARG[@]}" \
         --output     "$OUTPUT"
 else
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
@@ -720,6 +762,7 @@ else
         "${DIGEST_ARG[@]}" \
         "${KERNEL_ARG[@]}" \
         "${INITRAMFS_ARG[@]}" \
+        "${EMBED_LOADER_ARG[@]}" \
         --output     "$OUTPUT"
 fi
 

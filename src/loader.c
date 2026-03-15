@@ -5674,6 +5674,32 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
     return 1;
 }
 
+/* ── oci2vm mode ─────────────────────────────────────────────────────────── */
+
+/*
+ * When invoked as "oci2vm" (via symlink or renamed binary), prepend "--vm"
+ * to argv so VM mode is the default without the user typing --vm every time.
+ * Returns a new heap-allocated argv (permanent for process lifetime) with
+ * argc incremented, or NULL on allocation failure.
+ */
+static char** inject_vm_flag(int argc, char* argv[], int* out_argc)
+{
+    char** merged = malloc((size_t)(argc + 2) * sizeof(char*));
+    if (!merged)
+    {
+        return NULL;
+    }
+    merged[0] = argv[0];
+    merged[1] = (char*)"--vm";
+    for (int i = 1; i < argc; i++)
+    {
+        merged[i + 1] = argv[i];
+    }
+    merged[argc + 1] = NULL;
+    *out_argc = argc + 1;
+    return merged;
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char* argv[])
@@ -5703,6 +5729,24 @@ int main(int argc, char* argv[])
     }
     self_path[len] = '\0';
     debug_log("main.self", "path=%s", self_path);
+
+    /* 1b. oci2vm mode: if invoked as "oci2vm", prepend --vm to argv so VM
+     * mode is the default without requiring an explicit flag. */
+    {
+        const char* base0 = strrchr(argv[0], '/');
+        base0 = base0 ? base0 + 1 : argv[0];
+        if (strcmp(base0, "oci2vm") == 0)
+        {
+            int vm_argc = 0;
+            char** vm_argv = inject_vm_flag(argc, argv, &vm_argc);
+            if (!vm_argv)
+            {
+                return 1;
+            }
+            argc = vm_argc;
+            argv = vm_argv;
+        }
+    }
 
     /* 2. Parse command-line options.
      * build_merged_argv pre-scans for --config PATH and, if found, reads

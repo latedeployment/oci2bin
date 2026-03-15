@@ -19,8 +19,10 @@ Layout:
 """
 
 import argparse
+import base64
 import datetime
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -422,9 +424,191 @@ def build_meta_block(image_name, digest=None):
     return struct.pack('<I', total_size) + META_MAGIC + json_bytes
 
 
+def _repack_oci_tar(orig_data, replacements, extra_entries):
+    """
+    Rebuild an OCI tar from orig_data, substituting entries in `replacements`
+    (dict of tarinfo.name -> (new_tarinfo, new_data_bytes)) and appending
+    `extra_entries` (list of (tarinfo, data_bytes)).  Returns new tar bytes.
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:') as out_tf:
+        with tarfile.open(fileobj=io.BytesIO(orig_data), mode='r:*') as in_tf:
+            for member in in_tf.getmembers():
+                if member.name in replacements:
+                    new_info, new_data = replacements[member.name]
+                    out_tf.addfile(new_info, io.BytesIO(new_data))
+                else:
+                    fobj = in_tf.extractfile(member)
+                    out_tf.addfile(member, fobj)
+        for info, data in extra_entries:
+            out_tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _make_tar_info(name, size, mode=0o644):
+    info = tarfile.TarInfo(name=name)
+    info.size = size
+    info.mode = mode
+    info.uid = 0
+    info.gid = 0
+    info.mtime = 0
+    return info
+
+
+def _parse_oci_manifest_and_config(oci_data):
+    """
+    Returns (manifest_list, config_path, config_obj, config_raw_bytes).
+    """
+    with tarfile.open(fileobj=io.BytesIO(oci_data), mode='r:*') as tf:
+        manifest_raw = tf.extractfile(tf.getmember('manifest.json')).read()
+        manifest = json.loads(manifest_raw)
+        config_path = manifest[0]['Config']
+        config_raw = tf.extractfile(tf.getmember(config_path)).read()
+        config = json.loads(config_raw)
+    return manifest, config_path, config, config_raw
+
+
+def _rebuild_oci_with_new_config(oci_data, manifest, old_config_path, new_config):
+    """
+    Re-serialize new_config, recompute its sha256, rename the blob, update
+    manifest.json, and return new OCI tar bytes plus the new config path.
+    """
+    new_config_raw = json.dumps(new_config, separators=(',', ':')).encode()
+    new_config_sha = hashlib.sha256(new_config_raw).hexdigest()
+    new_config_path = f'blobs/sha256/{new_config_sha}'
+
+    # Update manifest to point at new config blob
+    manifest[0]['Config'] = new_config_path
+    new_manifest_raw = json.dumps(manifest, separators=(',', ':')).encode()
+
+    new_config_info = _make_tar_info(new_config_path, len(new_config_raw))
+    new_manifest_info = _make_tar_info('manifest.json', len(new_manifest_raw))
+
+    replacements = {
+        old_config_path: (new_config_info, new_config_raw),
+        'manifest.json': (new_manifest_info, new_manifest_raw),
+    }
+    return _repack_oci_tar(oci_data, replacements, []), new_config_path
+
+
+def embed_loader_as_layer(oci_data, loader_bytes, arch):
+    """
+    Inject the loader binary as an extra OCI layer (.oci2bin/loader) and add
+    labels so the image can be reconstructed later.  Returns updated OCI tar
+    bytes.  The loader layer is appended last so it is easy to strip on
+    reconstruct.
+    """
+    loader_sha = hashlib.sha256(loader_bytes).hexdigest()
+
+    # Build the layer tar (uncompressed): one entry ".oci2bin/loader"
+    layer_buf = io.BytesIO()
+    with tarfile.open(fileobj=layer_buf, mode='w:') as lt:
+        # Directory entry first
+        dir_info = _make_tar_info('.oci2bin', 0, mode=0o755)
+        dir_info.type = tarfile.DIRTYPE
+        dir_info.size = 0
+        lt.addfile(dir_info)
+        # Loader binary entry
+        file_info = _make_tar_info('.oci2bin/loader', len(loader_bytes), mode=0o755)
+        lt.addfile(file_info, io.BytesIO(loader_bytes))
+    layer_uncompressed = layer_buf.getvalue()
+    diff_id = hashlib.sha256(layer_uncompressed).hexdigest()
+
+    # Gzip the layer
+    gz_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz_buf, mode='wb', mtime=0) as gz:
+        gz.write(layer_uncompressed)
+    layer_gz = gz_buf.getvalue()
+    layer_gz_sha = hashlib.sha256(layer_gz).hexdigest()
+    layer_path = f'blobs/sha256/{layer_gz_sha}'
+
+    manifest, old_config_path, config, _ = _parse_oci_manifest_and_config(
+        oci_data)
+
+    # Add layer to manifest Layers list
+    manifest[0]['Layers'].append(layer_path)
+
+    # Add diff_id and labels to config
+    config.setdefault('rootfs', {}).setdefault('diff_ids', []).append(
+        f'sha256:{diff_id}')
+    config.setdefault('config', {}).setdefault('Labels', {}  ).update({
+        'oci2bin.loader.path':   '.oci2bin/loader',
+        'oci2bin.loader.arch':   arch,
+        'oci2bin.loader.sha256': loader_sha,
+    })
+
+    new_config_raw = json.dumps(config, separators=(',', ':')).encode()
+    new_config_sha = hashlib.sha256(new_config_raw).hexdigest()
+    new_config_path = f'blobs/sha256/{new_config_sha}'
+    manifest[0]['Config'] = new_config_path
+
+    new_manifest_raw = json.dumps(manifest, separators=(',', ':')).encode()
+
+    # Layer blob needs a directory entry in the tar as well
+    layer_dir_info = _make_tar_info(
+        f'blobs/sha256/{layer_gz_sha[:12]}', 0, mode=0o755)
+    layer_dir_info.type = tarfile.DIRTYPE
+    layer_dir_info.size = 0
+
+    layer_file_info = _make_tar_info(layer_path, len(layer_gz))
+
+    new_config_info = _make_tar_info(new_config_path, len(new_config_raw))
+    new_manifest_info = _make_tar_info('manifest.json', len(new_manifest_raw))
+
+    replacements = {
+        old_config_path: (new_config_info, new_config_raw),
+        'manifest.json': (new_manifest_info, new_manifest_raw),
+    }
+    extra = [
+        (layer_file_info, layer_gz),
+    ]
+    result = _repack_oci_tar(oci_data, replacements, extra)
+    print(f'  Embedded loader as OCI layer: {layer_path[:32]}…', file=sys.stderr)
+    return result
+
+
+# Default chunk size in binary bytes for base64 label embedding (~8 KB base64 per label)
+DEFAULT_LABEL_CHUNK_BYTES = 6144
+
+
+def embed_loader_as_labels(oci_data, loader_bytes, arch,
+                           chunk_bytes=DEFAULT_LABEL_CHUNK_BYTES):
+    """
+    Embed the loader binary as chunked base64 strings in image config Labels.
+    No filesystem layer is added.  Returns updated OCI tar bytes.
+
+    chunk_bytes controls how many binary bytes go into each label before
+    base64 encoding (default 6144 → ~8 KB base64 per label).
+    """
+    if chunk_bytes < 1:
+        raise ValueError(f'chunk_bytes must be >= 1, got {chunk_bytes}')
+    loader_sha = hashlib.sha256(loader_bytes).hexdigest()
+    chunks = []
+    for i in range(0, len(loader_bytes), chunk_bytes):
+        chunks.append(
+            base64.b64encode(loader_bytes[i:i + chunk_bytes]).decode())
+
+    manifest, old_config_path, config, _ = _parse_oci_manifest_and_config(
+        oci_data)
+
+    labels = config.setdefault('config', {}).setdefault('Labels', {})
+    labels['oci2bin.loader.arch'] = arch
+    labels['oci2bin.loader.sha256'] = loader_sha
+    labels['oci2bin.loader.chunks'] = str(len(chunks))
+    for i, chunk in enumerate(chunks):
+        labels[f'oci2bin.loader.{i}'] = chunk
+
+    new_oci, _ = _rebuild_oci_with_new_config(
+        oci_data, manifest, old_config_path, config)
+    print(f'  Embedded loader in {len(chunks)} base64 label chunks', file=sys.stderr)
+    return new_oci
+
+
 def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    digest=None, image_name_for_meta=None,
-                   kernel_path=None, initramfs_path=None):
+                   kernel_path=None, initramfs_path=None,
+                   embed_loader_layer=False, embed_loader_labels=False,
+                   label_chunk_bytes=DEFAULT_LABEL_CHUNK_BYTES):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -460,6 +644,24 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
 
             with open(oci_tar_path, 'rb') as f:
                 oci_data = f.read()
+
+    # 2a. Optionally embed loader binary into the OCI image for reconstruction
+    arch_name = SUPPORTED_MACHINES[loader['e_machine']]
+    if embed_loader_layer and embed_loader_labels:
+        print('error: embed_loader_layer and embed_loader_labels are mutually '
+              'exclusive', file=sys.stderr)
+        sys.exit(1)
+    if embed_loader_layer:
+        with open(loader_path, 'rb') as f:
+            loader_bytes_for_embed = f.read()
+        oci_data = embed_loader_as_layer(oci_data, loader_bytes_for_embed,
+                                         arch_name)
+    elif embed_loader_labels:
+        with open(loader_path, 'rb') as f:
+            loader_bytes_for_embed = f.read()
+        oci_data = embed_loader_as_labels(oci_data, loader_bytes_for_embed,
+                                          arch_name,
+                                          chunk_bytes=label_chunk_bytes)
 
     oci_size = len(oci_data)
 
@@ -687,6 +889,17 @@ def main():
                         help='Path to pre-built initramfs cpio.gz to embed')
     parser.add_argument('--initramfs-only', nargs=2, metavar=('ROOTFSDIR', 'OUTPATH'),
                         help='Build only a cpio.gz initramfs from ROOTFSDIR into OUTPATH and exit')
+    parser.add_argument('--embed-loader-layer', action='store_true', default=False,
+                        help='Embed loader binary as an extra OCI layer (.oci2bin/loader) '
+                             'for later reconstruction via oci2bin reconstruct')
+    parser.add_argument('--embed-loader-labels', action='store_true', default=False,
+                        help='Embed loader binary as chunked base64 labels in image config '
+                             'for later reconstruction via oci2bin reconstruct')
+    parser.add_argument('--label-chunk-size', type=int,
+                        default=DEFAULT_LABEL_CHUNK_BYTES,
+                        metavar='BYTES',
+                        help=f'Binary bytes per base64 label chunk when using '
+                             f'--embed-loader-labels (default: {DEFAULT_LABEL_CHUNK_BYTES})')
 
     args = parser.parse_args()
 
@@ -730,7 +943,10 @@ def main():
                    digest=args.digest,
                    image_name_for_meta=image_name_for_meta,
                    kernel_path=args.kernel,
-                   initramfs_path=args.initramfs)
+                   initramfs_path=args.initramfs,
+                   embed_loader_layer=args.embed_loader_layer,
+                   embed_loader_labels=args.embed_loader_labels,
+                   label_chunk_bytes=args.label_chunk_size)
 
 
 if __name__ == '__main__':
