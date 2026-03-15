@@ -253,6 +253,10 @@ test-python:
 	$(TEST_ENV) python3 -m unittest discover -s tests -p 'test_build.py' -v
 	@echo "=== Polyglot structure tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
+	@echo "=== Embed loader unit tests (no Docker) ==="
+	$(TEST_ENV) python3 -m unittest \
+		tests.test_embed_loader.TestEmbedLoaderLayer \
+		tests.test_embed_loader.TestEmbedLoaderLabels -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

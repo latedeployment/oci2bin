@@ -95,8 +95,13 @@ def extract_loader_from_layer(tar_bytes, labels):
 
     # The loader layer is the last one (appended by embed_loader_as_layer)
     layer_path = layers[-1]
-    loader_bytes = _extract_file_from_layer(tar_bytes, layer_path,
-                                            loader_path.lstrip('./'))
+    try:
+        loader_bytes = _extract_file_from_layer(tar_bytes, layer_path,
+                                                loader_path)
+    except KeyError as exc:
+        raise ValueError(
+            f'Loader file {loader_path!r} not found in layer {layer_path!r}'
+        ) from exc
 
     if expected_sha:
         actual = hashlib.sha256(loader_bytes).hexdigest()
