@@ -27,6 +27,8 @@ See below [How it works](#how-it-works).
   - [Using OCI image layout](#using-oci-image-layout-no-docker-daemon)
   - [Caching builds](#caching-builds)
   - [Reproducible builds and digest pinning](#reproducible-builds-and-digest-pinning)
+  - [VM-mode binaries (oci2vm)](#vm-mode-binaries-oci2vm)
+  - [Embedding the loader for reconstruction](#embedding-the-loader-for-reconstruction)
 - [Running containers](#running-containers)
   - [Overriding the entrypoint](#overriding-the-entrypoint)
   - [Working directory](#working-directory)
@@ -53,6 +55,7 @@ See below [How it works](#how-it-works).
   - [list](#list)
   - [prune](#prune)
   - [diff](#diff)
+  - [reconstruct](#reconstruct)
 - [Testing](#testing)
 - [How it works](#how-it-works)
 - [References](#references)
@@ -200,6 +203,47 @@ oci2bin: image digest: redis@sha256:abc123...
 ```
 
 When `--cache` is active, the cache key includes the digest so that `redis:latest` updates produce a fresh cache entry rather than reusing a stale binary. If the image has no registry origin (locally built), the digest lookup is skipped with a warning and the tag-only key is used.
+
+### VM-mode binaries (oci2vm)
+
+`oci2vm` is a symlink to `oci2bin` that builds binaries which run in VM mode by default — no `--vm` flag needed at runtime. The output is named `oci2vm_<image>` so that the embedded loader detects the invocation name and enables VM mode automatically.
+
+```bash
+oci2vm redis:7-alpine          # -> oci2vm_redis_7-alpine (runs as VM by default)
+./oci2vm_redis_7-alpine        # starts a VM, no --vm required
+./oci2vm_redis_7-alpine --net host redis-server --port 6380
+```
+
+This is equivalent to building with `oci2bin` and always running with `--vm`, but removes the need to remember the flag. You can also rename or symlink any oci2bin binary to a name starting with `oci2vm` to get the same effect.
+
+### Embedding the loader for reconstruction
+
+By default, a polyglot binary is self-sufficient but not self-reconstructing — if you lose the `.img` file you cannot rebuild it from the Docker image alone, because the loader binary is not stored there. The two `--embed-loader-*` flags fix this by persisting the loader inside the Docker image so that `oci2bin reconstruct` can rebuild the polyglot from any Docker image name or saved tar.
+
+**`--embed-loader-layer`** — adds the loader binary as a dedicated OCI layer (`.oci2bin/loader` inside the container filesystem) and records its location in image labels:
+
+```bash
+oci2bin --embed-loader-layer redis:7-alpine
+docker load < redis_7-alpine   # layer is stored in Docker's image store
+oci2bin reconstruct redis:7-alpine --output redis_7-alpine  # rebuilds from Docker
+```
+
+The `.oci2bin/` directory will appear in the container's filesystem (read-only, ~75 KB). This is the recommended option — the binary is self-contained and survives push/pull through any OCI registry.
+
+**`--embed-loader-labels`** — encodes the loader binary as chunked base64 strings in the image config labels. No filesystem layer is added:
+
+```bash
+oci2bin --embed-loader-labels redis:7-alpine
+oci2bin reconstruct redis:7-alpine --output redis_7-alpine
+```
+
+The default chunk size is 6144 binary bytes per label (~8 KB base64 each). Use `--label-chunk-size BYTES` to tune this if your registry enforces per-label or total-config size limits:
+
+```bash
+oci2bin --embed-loader-labels --label-chunk-size 4096 redis:7-alpine
+```
+
+Both approaches store `oci2bin.loader.sha256`, `oci2bin.loader.arch`, and strategy-specific labels in the image config. `oci2bin reconstruct` verifies the sha256 before rebuilding.
 
 ---
 
@@ -796,6 +840,29 @@ M /etc/redis/redis.conf    (512 B -> 768 B)
 ```
 
 Exits with status 0 if the filesystems are identical, or 1 if there are differences.
+
+### reconstruct
+
+Rebuild a polyglot binary from a Docker image that was built with `--embed-loader-layer` or `--embed-loader-labels`. Accepts either a Docker image name (runs `docker save` internally) or a path to an existing tar or `.img` file:
+
+```bash
+# From a Docker image name
+oci2bin reconstruct redis:7-alpine --output redis_7-alpine
+
+# From a saved tar
+oci2bin reconstruct ./backup.tar --output redis_7-alpine
+
+# From an existing polyglot file
+oci2bin reconstruct ./redis_7-alpine.img --output redis_7-alpine_new
+```
+
+By default the loader embedding (layer or labels) is stripped from the OCI data before rebuilding, producing a clean result identical to a fresh `oci2bin` build. Pass `--no-strip` to keep the embedding in the rebuilt binary:
+
+```bash
+oci2bin reconstruct redis:7-alpine --no-strip --output redis_7-alpine
+```
+
+`reconstruct` verifies the loader's SHA256 before rebuilding and exits with a non-zero status if the digest does not match or if no `oci2bin.loader.*` labels are present in the image.
 
 ---
 
