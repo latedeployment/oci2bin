@@ -79,14 +79,15 @@ def _extract_file_from_layer(tar_bytes, layer_path, file_path):
 
 # ── extraction strategies ─────────────────────────────────────────────────────
 
-def extract_loader_from_layer(tar_bytes, labels):
+def extract_loader_from_layer(tar_bytes, labels,
+                              label_prefix='oci2bin.loader'):
     """
     Approach 2.1: pull the loader binary from the embedded OCI layer.
     Returns (loader_bytes, arch).
     """
-    loader_path = labels.get('oci2bin.loader.path', '.oci2bin/loader')
-    arch = labels.get('oci2bin.loader.arch', 'x86_64')
-    expected_sha = labels.get('oci2bin.loader.sha256', '')
+    loader_path = labels.get(f'{label_prefix}.path', '.oci2bin/loader')
+    arch = labels.get(f'{label_prefix}.arch', 'x86_64')
+    expected_sha = labels.get(f'{label_prefix}.sha256', '')
 
     manifest, _, _, _ = _read_oci_tar(tar_bytes)
     layers = manifest[0]['Layers']
@@ -112,22 +113,23 @@ def extract_loader_from_layer(tar_bytes, labels):
     return loader_bytes, arch
 
 
-def extract_loader_from_labels(tar_bytes, labels):
+def extract_loader_from_labels(tar_bytes, labels,
+                               label_prefix='oci2bin.loader'):
     """
     Approach 2.2: reassemble loader from chunked base64 labels.
     Returns (loader_bytes, arch).
     """
-    arch = labels.get('oci2bin.loader.arch', 'x86_64')
-    expected_sha = labels.get('oci2bin.loader.sha256', '')
-    n_chunks_str = labels.get('oci2bin.loader.chunks', '')
+    arch = labels.get(f'{label_prefix}.arch', 'x86_64')
+    expected_sha = labels.get(f'{label_prefix}.sha256', '')
+    n_chunks_str = labels.get(f'{label_prefix}.chunks', '')
 
     if not n_chunks_str:
-        raise ValueError('oci2bin.loader.chunks label missing')
+        raise ValueError(f'{label_prefix}.chunks label missing')
 
     n = int(n_chunks_str)
     parts = []
     for i in range(n):
-        key = f'oci2bin.loader.{i}'
+        key = f'{label_prefix}.{i}'
         if key not in labels:
             raise ValueError(f'Missing label {key!r} (expected {n} chunks)')
         parts.append(base64.b64decode(labels[key]))
@@ -145,7 +147,7 @@ def extract_loader_from_labels(tar_bytes, labels):
 
 # ── strip helpers ─────────────────────────────────────────────────────────────
 
-def strip_loader_layer(tar_bytes):
+def strip_loader_layer(tar_bytes, label_prefix='oci2bin.loader'):
     """Remove the last OCI layer (the loader layer) from the image tar."""
     manifest, config_path, config, _ = _read_oci_tar(tar_bytes)
     layers = manifest[0]['Layers']
@@ -159,10 +161,10 @@ def strip_loader_layer(tar_bytes):
     if diff_ids:
         config.setdefault('rootfs', {})['diff_ids'] = diff_ids[:-1]
 
-    # Remove oci2bin labels
+    # Remove loader labels
     labels = (config.get('config') or {}).get('Labels') or {}
     for key in list(labels.keys()):
-        if key.startswith('oci2bin.loader.'):
+        if key.startswith(f'{label_prefix}.'):
             del labels[key]
 
     new_config_raw = json.dumps(config, separators=(',', ':')).encode()
@@ -198,13 +200,13 @@ def strip_loader_layer(tar_bytes):
     return buf.getvalue()
 
 
-def strip_loader_labels(tar_bytes):
-    """Remove oci2bin.loader.* labels from the image config (label approach)."""
+def strip_loader_labels(tar_bytes, label_prefix='oci2bin.loader'):
+    """Remove <label_prefix>.* labels from the image config (label approach)."""
     manifest, config_path, config, _ = _read_oci_tar(tar_bytes)
 
     labels = (config.get('config') or {}).get('Labels') or {}
     for key in list(labels.keys()):
-        if key.startswith('oci2bin.loader.'):
+        if key.startswith(f'{label_prefix}.'):
             del labels[key]
 
     new_oci, _ = bp._rebuild_oci_with_new_config(
@@ -226,6 +228,11 @@ def main():
     parser.add_argument('--no-strip', action='store_true', default=False,
                         help='Keep the loader embedding in the rebuilt OCI data '
                              '(by default it is stripped for a clean result)')
+    parser.add_argument('--label-prefix', default='oci2bin.loader',
+                        metavar='PREFIX',
+                        help='Label key prefix used when the image was built '
+                             '(default: oci2bin.loader); must match the '
+                             '--label-prefix used with --embed-loader-*')
     args = parser.parse_args()
 
     # ── resolve OCI tar ───────────────────────────────────────────────────────
@@ -258,14 +265,17 @@ def main():
         manifest, config_path, config, _ = _read_oci_tar(tar_bytes)
         labels = _get_labels(config)
 
-        if 'oci2bin.loader.path' in labels:
+        lp = args.label_prefix
+        if f'{lp}.path' in labels:
             strategy = 'layer'
-        elif 'oci2bin.loader.chunks' in labels:
+        elif f'{lp}.chunks' in labels:
             strategy = 'labels'
         else:
-            print('oci2bin reconstruct: no oci2bin.loader.* labels found in '
-                  'image config.\nBuild with --embed-loader-layer or '
-                  '--embed-loader-labels to enable reconstruction.',
+            print(f'oci2bin reconstruct: no {lp}.* labels found in image '
+                  f'config.\nBuild with --embed-loader-layer or '
+                  f'--embed-loader-labels to enable reconstruction.\n'
+                  f'If a custom --label-prefix was used at build time, pass '
+                  f'the same value here.',
                   file=sys.stderr)
             sys.exit(1)
 
@@ -274,11 +284,13 @@ def main():
         if strategy == 'layer':
             print('oci2bin reconstruct: extracting loader from OCI layer ...',
                   file=sys.stderr)
-            loader_bytes, arch = extract_loader_from_layer(tar_bytes, labels)
+            loader_bytes, arch = extract_loader_from_layer(
+                tar_bytes, labels, label_prefix=lp)
         else:
             print('oci2bin reconstruct: reassembling loader from labels ...',
                   file=sys.stderr)
-            loader_bytes, arch = extract_loader_from_labels(tar_bytes, labels)
+            loader_bytes, arch = extract_loader_from_labels(
+                tar_bytes, labels, label_prefix=lp)
 
         print(f'oci2bin reconstruct: loader extracted '
               f'({len(loader_bytes)} bytes, arch={arch})', file=sys.stderr)
@@ -287,9 +299,9 @@ def main():
 
         if not args.no_strip:
             if strategy == 'layer':
-                tar_bytes = strip_loader_layer(tar_bytes)
+                tar_bytes = strip_loader_layer(tar_bytes, label_prefix=lp)
             else:
-                tar_bytes = strip_loader_labels(tar_bytes)
+                tar_bytes = strip_loader_labels(tar_bytes, label_prefix=lp)
 
         # ── write temp files for build_polyglot ───────────────────────────────
 

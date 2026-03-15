@@ -221,7 +221,7 @@ This is equivalent to building with `oci2bin` and always running with `--vm`, bu
 
 By default, a polyglot binary is self-sufficient but not self-reconstructing — if you lose the `.img` file you cannot rebuild it from the Docker image alone, because the loader binary is not stored there. The two `--embed-loader-*` flags fix this by persisting the loader inside the Docker image so that `oci2bin reconstruct` can rebuild the polyglot from any Docker image name or saved tar.
 
-**`--embed-loader-layer`** — adds the loader binary as a dedicated OCI layer (`.oci2bin/loader` inside the container filesystem) and records its location in image labels:
+**`--embed-loader-layer`** — adds the loader binary as a dedicated OCI layer (`<loader-dir>/loader` inside the container filesystem) and records its location in image labels:
 
 ```bash
 oci2bin --embed-loader-layer redis:7-alpine
@@ -229,7 +229,7 @@ docker load < redis_7-alpine   # layer is stored in Docker's image store
 oci2bin reconstruct redis:7-alpine --output redis_7-alpine  # rebuilds from Docker
 ```
 
-The `.oci2bin/` directory will appear in the container's filesystem (read-only, ~75 KB). This is the recommended option — the binary is self-contained and survives push/pull through any OCI registry.
+The directory (default `.oci2bin/`) will appear in the container's filesystem (read-only, ~75 KB). This is the recommended option — the binary is self-contained and survives push/pull through any OCI registry.
 
 **`--embed-loader-labels`** — encodes the loader binary as chunked base64 strings in the image config labels. No filesystem layer is added:
 
@@ -244,11 +244,26 @@ The default chunk size is 6144 binary bytes per label (~8 KB base64 each). Use `
 oci2bin --embed-loader-labels --label-chunk-size 4096 redis:7-alpine
 ```
 
-Both approaches store `oci2bin.loader.sha256`, `oci2bin.loader.arch`, and strategy-specific labels in the image config. `oci2bin reconstruct` verifies the sha256 before rebuilding.
+Both approaches store `<prefix>.sha256`, `<prefix>.arch`, and strategy-specific labels in the image config (prefix defaults to `oci2bin.loader`). `oci2bin reconstruct` verifies the sha256 before rebuilding.
+
+**`--loader-dir DIR`** — overrides the directory inside the container filesystem where the loader binary is placed when using `--embed-loader-layer` (default: `.oci2bin`). Use this to avoid naming conflicts with application directories:
+
+```bash
+oci2bin --embed-loader-layer --loader-dir .myapp-meta redis:7-alpine
+```
+
+**`--label-prefix PREFIX`** — overrides the label key prefix for all embed metadata (default: `oci2bin.loader`). Use this when the default prefix conflicts with existing image labels or internal naming conventions:
+
+```bash
+oci2bin --embed-loader-layer --label-prefix myorg.loader redis:7-alpine
+oci2bin reconstruct redis:7-alpine --label-prefix myorg.loader
+```
+
+The same prefix must be passed to both `oci2bin` at build time and `oci2bin reconstruct` at reconstruction time.
 
 #### Registry persistence
 
-Both embedding strategies are designed to survive a full registry round-trip. OCI registries store each layer blob and the image config separately, content-addressed by SHA256. Because the loader layer and the `oci2bin.loader.*` labels are part of the image config and layer list, they are preserved exactly through `docker push` and `docker pull` — there is nothing special for the registry to strip or rewrite.
+Both embedding strategies are designed to survive a full registry round-trip. OCI registries store each layer blob and the image config separately, content-addressed by SHA256. Because the loader layer and the `<prefix>.*` labels (default `oci2bin.loader.*`) are part of the image config and layer list, they are preserved exactly through `docker push` and `docker pull` — there is nothing special for the registry to strip or rewrite.
 
 ```bash
 # Build once, push to registry

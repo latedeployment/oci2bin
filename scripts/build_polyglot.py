@@ -491,25 +491,36 @@ def _rebuild_oci_with_new_config(oci_data, manifest, old_config_path, new_config
     return _repack_oci_tar(oci_data, replacements, []), new_config_path
 
 
-def embed_loader_as_layer(oci_data, loader_bytes, arch):
+DEFAULT_LOADER_DIR    = '.oci2bin'
+DEFAULT_LABEL_PREFIX  = 'oci2bin.loader'
+
+
+def embed_loader_as_layer(oci_data, loader_bytes, arch,
+                          loader_dir=DEFAULT_LOADER_DIR,
+                          label_prefix=DEFAULT_LABEL_PREFIX):
     """
-    Inject the loader binary as an extra OCI layer (.oci2bin/loader) and add
-    labels so the image can be reconstructed later.  Returns updated OCI tar
-    bytes.  The loader layer is appended last so it is easy to strip on
+    Inject the loader binary as an extra OCI layer (<loader_dir>/loader) and
+    add labels so the image can be reconstructed later.  Returns updated OCI
+    tar bytes.  The loader layer is appended last so it is easy to strip on
     reconstruct.
+
+    loader_dir    — directory inside the container filesystem (default '.oci2bin')
+    label_prefix  — prefix for all oci2bin.loader.* labels (default 'oci2bin.loader')
     """
     loader_sha = hashlib.sha256(loader_bytes).hexdigest()
+    loader_dir = loader_dir.rstrip('/')
+    loader_file_path = f'{loader_dir}/loader'
 
-    # Build the layer tar (uncompressed): one entry ".oci2bin/loader"
+    # Build the layer tar (uncompressed): one entry "<loader_dir>/loader"
     layer_buf = io.BytesIO()
     with tarfile.open(fileobj=layer_buf, mode='w:') as lt:
         # Directory entry first
-        dir_info = _make_tar_info('.oci2bin', 0, mode=0o755)
+        dir_info = _make_tar_info(loader_dir, 0, mode=0o755)
         dir_info.type = tarfile.DIRTYPE
         dir_info.size = 0
         lt.addfile(dir_info)
         # Loader binary entry
-        file_info = _make_tar_info('.oci2bin/loader', len(loader_bytes), mode=0o755)
+        file_info = _make_tar_info(loader_file_path, len(loader_bytes), mode=0o755)
         lt.addfile(file_info, io.BytesIO(loader_bytes))
     layer_uncompressed = layer_buf.getvalue()
     diff_id = hashlib.sha256(layer_uncompressed).hexdigest()
@@ -531,10 +542,10 @@ def embed_loader_as_layer(oci_data, loader_bytes, arch):
     # Add diff_id and labels to config
     config.setdefault('rootfs', {}).setdefault('diff_ids', []).append(
         f'sha256:{diff_id}')
-    config.setdefault('config', {}).setdefault('Labels', {}  ).update({
-        'oci2bin.loader.path':   '.oci2bin/loader',
-        'oci2bin.loader.arch':   arch,
-        'oci2bin.loader.sha256': loader_sha,
+    config.setdefault('config', {}).setdefault('Labels', {}).update({
+        f'{label_prefix}.path':   loader_file_path,
+        f'{label_prefix}.arch':   arch,
+        f'{label_prefix}.sha256': loader_sha,
     })
 
     new_config_raw = json.dumps(config, separators=(',', ':')).encode()
@@ -572,13 +583,15 @@ DEFAULT_LABEL_CHUNK_BYTES = 6144
 
 
 def embed_loader_as_labels(oci_data, loader_bytes, arch,
-                           chunk_bytes=DEFAULT_LABEL_CHUNK_BYTES):
+                           chunk_bytes=DEFAULT_LABEL_CHUNK_BYTES,
+                           label_prefix=DEFAULT_LABEL_PREFIX):
     """
     Embed the loader binary as chunked base64 strings in image config Labels.
     No filesystem layer is added.  Returns updated OCI tar bytes.
 
-    chunk_bytes controls how many binary bytes go into each label before
-    base64 encoding (default 6144 → ~8 KB base64 per label).
+    chunk_bytes   — binary bytes per label before base64 encoding
+                    (default 6144 → ~8 KB base64 per label)
+    label_prefix  — prefix for all label keys (default 'oci2bin.loader')
     """
     if chunk_bytes < 1:
         raise ValueError(f'chunk_bytes must be >= 1, got {chunk_bytes}')
@@ -592,11 +605,11 @@ def embed_loader_as_labels(oci_data, loader_bytes, arch,
         oci_data)
 
     labels = config.setdefault('config', {}).setdefault('Labels', {})
-    labels['oci2bin.loader.arch'] = arch
-    labels['oci2bin.loader.sha256'] = loader_sha
-    labels['oci2bin.loader.chunks'] = str(len(chunks))
+    labels[f'{label_prefix}.arch'] = arch
+    labels[f'{label_prefix}.sha256'] = loader_sha
+    labels[f'{label_prefix}.chunks'] = str(len(chunks))
     for i, chunk in enumerate(chunks):
-        labels[f'oci2bin.loader.{i}'] = chunk
+        labels[f'{label_prefix}.{i}'] = chunk
 
     new_oci, _ = _rebuild_oci_with_new_config(
         oci_data, manifest, old_config_path, config)
@@ -608,7 +621,9 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    digest=None, image_name_for_meta=None,
                    kernel_path=None, initramfs_path=None,
                    embed_loader_layer=False, embed_loader_labels=False,
-                   label_chunk_bytes=DEFAULT_LABEL_CHUNK_BYTES):
+                   label_chunk_bytes=DEFAULT_LABEL_CHUNK_BYTES,
+                   loader_dir=DEFAULT_LOADER_DIR,
+                   label_prefix=DEFAULT_LABEL_PREFIX):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -655,13 +670,16 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
         with open(loader_path, 'rb') as f:
             loader_bytes_for_embed = f.read()
         oci_data = embed_loader_as_layer(oci_data, loader_bytes_for_embed,
-                                         arch_name)
+                                         arch_name,
+                                         loader_dir=loader_dir,
+                                         label_prefix=label_prefix)
     elif embed_loader_labels:
         with open(loader_path, 'rb') as f:
             loader_bytes_for_embed = f.read()
         oci_data = embed_loader_as_labels(oci_data, loader_bytes_for_embed,
                                           arch_name,
-                                          chunk_bytes=label_chunk_bytes)
+                                          chunk_bytes=label_chunk_bytes,
+                                          label_prefix=label_prefix)
 
     oci_size = len(oci_data)
 
@@ -900,6 +918,14 @@ def main():
                         metavar='BYTES',
                         help=f'Binary bytes per base64 label chunk when using '
                              f'--embed-loader-labels (default: {DEFAULT_LABEL_CHUNK_BYTES})')
+    parser.add_argument('--loader-dir', default=DEFAULT_LOADER_DIR,
+                        metavar='DIR',
+                        help=f'Directory inside the container for the embedded loader binary '
+                             f'when using --embed-loader-layer (default: {DEFAULT_LOADER_DIR!r})')
+    parser.add_argument('--label-prefix', default=DEFAULT_LABEL_PREFIX,
+                        metavar='PREFIX',
+                        help=f'Label key prefix for all oci2bin.loader.* labels '
+                             f'(default: {DEFAULT_LABEL_PREFIX!r})')
 
     args = parser.parse_args()
 
@@ -946,7 +972,9 @@ def main():
                    initramfs_path=args.initramfs,
                    embed_loader_layer=args.embed_loader_layer,
                    embed_loader_labels=args.embed_loader_labels,
-                   label_chunk_bytes=args.label_chunk_size)
+                   label_chunk_bytes=args.label_chunk_size,
+                   loader_dir=args.loader_dir,
+                   label_prefix=args.label_prefix)
 
 
 if __name__ == '__main__':
