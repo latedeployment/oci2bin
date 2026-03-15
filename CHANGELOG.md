@@ -2,6 +2,100 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.6.0] - 2026-03-15
+
+### Added
+
+- **`oci2vm`** — symlink alias for `oci2bin` that enables VM mode by default.
+  Binaries built via `oci2vm` are named `oci2vm_<image>` and detect their own
+  invocation name (`basename argv[0] == "oci2vm"`) to prepend `--vm`
+  automatically. Any `oci2bin` binary renamed or symlinked to a name starting
+  with `oci2vm` gets the same behaviour.
+
+- **`--embed-loader-layer`** — injects the loader binary as an extra OCI layer
+  (`<loader-dir>/loader` inside the container filesystem, default
+  `.oci2bin/loader`) and records its location via image config labels.
+  The layer survives `docker load`, `docker push`, and `docker pull` intact.
+
+- **`--embed-loader-labels`** — encodes the loader binary as chunked base64
+  strings in the image config labels. No filesystem layer is added; useful
+  when layer count matters.
+
+- **`--label-chunk-size BYTES`** — controls the binary byte count per base64
+  label when using `--embed-loader-labels` (default 6144 → ~8 KB base64 per
+  label). Tune down for registries that enforce per-label or total-config size
+  limits.
+
+- **`--loader-dir DIR`** — overrides the directory inside the container
+  filesystem where the embedded loader is stored when using
+  `--embed-loader-layer` (default `.oci2bin`). Use when the default name
+  conflicts with an application directory.
+
+- **`--label-prefix PREFIX`** — overrides the label key namespace for all
+  embed metadata (default `oci2bin.loader`). Must be passed identically to
+  `oci2bin reconstruct` at reconstruction time.
+
+- **`oci2bin reconstruct <image-or-file>`** — rebuilds a polyglot binary from
+  a Docker image (or saved tar / `.img` file) that was built with
+  `--embed-loader-layer` or `--embed-loader-labels`. Auto-detects the
+  embedding strategy from the labels. Verifies the loader SHA-256 before
+  rebuilding. By default strips the embedding from the reconstructed OCI data
+  (pass `--no-strip` to keep it). Accepts `--label-prefix PREFIX` when a
+  custom prefix was used at build time.
+
+- **`--user UID[:GID]`** — OCI `USER` directive support. Reads the `User`
+  field from the image config and resolves it via `/etc/passwd` inside the
+  rootfs; supports numeric UID, `name`, and `name:group` / `uid:gid` forms.
+  Runtime `--user` overrides the image default.
+
+- **`VM_CPUS` / `VM_MEM_MB` build-time defaults** — compile-time constants
+  that set the default vCPU count and memory for libkrun and
+  cloud-hypervisor VM backends.
+
+### Fixed
+
+- **TTY / job control** — `setsid()` + `TIOCSCTTY` before exec so interactive
+  shells get a controlling terminal; `devpts` mounted and `/dev/ptmx`
+  bind-mounted for full PTY support; host `/dev` nodes bind-mounted before
+  `chroot` so devices are available at container start.
+
+- **PTY allocation hang** — fixed a hang that occurred when the output binary
+  was run from an interactive terminal due to premature PTY setup.
+
+- **`clearenv()` before exec** — host environment variables are now cleared
+  before executing the container entrypoint; only variables from the OCI image
+  config and explicit `-e` / `--env-file` flags are passed through.
+
+- **`--vm` with images using `gosu` / `chown`** — fixed a re-entry loop in
+  the chown shim and corrected gosu pass-through so Redis and similar images
+  start correctly under VM mode.
+
+- **libkrun API fixes** — corrected libkrun API call sequence and
+  auto-detection logic in the `oci2bin` wrapper.
+
+- **VM sentinel collision** — added `PATCHED` flag sentinels to distinguish
+  unpatched from zero-patched values; fixed `build_polyglot.py` path search
+  for kernel/initramfs blobs.
+
+### Tests
+
+- 38 new Python unit and Docker integration tests for loader embedding:
+  `TestEmbedLoaderLayer` (14 tests), `TestEmbedLoaderLabels` (16 tests),
+  `TestEmbedLoaderDockerPersistence` (6 Docker round-trip tests). The
+  first two classes run as part of `make test-unit` (no Docker required).
+
+- C unit tests for `path_has_dotdot_component` and `--tmpfs` edge cases.
+
+- VM integration test script (`tests/test_vm_integration.sh`).
+
+### Tooling
+
+- `make lint-clang` — clang static analysis target (`clang --analyze`).
+- `make lint-semgrep` — semgrep ruleset target.
+- `make lint-scan-build` — scan-build wrapper target.
+
+---
+
 ## [0.5.0] - 2026-03-13
 
 ### Added
