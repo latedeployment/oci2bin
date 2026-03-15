@@ -219,7 +219,7 @@ This is equivalent to building with `oci2bin` and always running with `--vm`, bu
 
 ### Embedding the loader for reconstruction
 
-By default, a polyglot binary is self-sufficient but not self-reconstructing — if you lose the `.img` file you cannot rebuild it from the Docker image alone, because the loader binary is not stored there. The two `--embed-loader-*` flags fix this by persisting the loader inside the Docker image so that `oci2bin reconstruct` can rebuild the polyglot from any Docker image name or saved tar.
+By default, a polyglot binary is self-sufficient but not self-reconstructing, so if you lose the `.img` file you cannot rebuild it from the Docker image alone, because the loader binary is not stored there. The two `--embed-loader-*` flags fix this by persisting the loader inside the Docker image so that `oci2bin reconstruct` can rebuild the polyglot from any Docker image name or saved tar.
 
 **`--embed-loader-layer`** — adds the loader binary as a dedicated OCI layer (`<loader-dir>/loader` inside the container filesystem) and records its location in image labels:
 
