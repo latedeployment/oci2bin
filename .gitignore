@@ -3,3 +3,4 @@ oci2bin.img
 __pycache__/
 *.pyc
 *.pyo
+CLAUDE.md
