@@ -831,7 +831,7 @@ make test-unit-aarch64
 
 ## How it works
 
-The output file is a [polyglot](https://sysfatal.github.io/polyglottar-en.html): simultaneously a valid ELF64 executable and a valid POSIX tar archive. The two formats place their magic bytes at non-overlapping offsets:
+The output file is a [polyglot](https://sysfatal.github.io/polyglottar-en.html): simultaneously a valid ELF64 executable and a valid POSIX tar archive, which is the OCI file format as well. The two formats place their magic bytes at non-overlapping offsets:
 
 ```
 Byte   0-3:   7f 45 4c 46   ELF magic  (kernel identifies it as an executable)
@@ -839,6 +839,18 @@ Byte 257-262: 75 73 74 61   ustar\0    (tar identifies it as an archive)
 ```
 
 The 64-byte ELF header fits within the tar header's 100-byte filename field. When executed, the kernel processes the ELF; when passed to `tar` or `docker load`, the tar structure is read.
+
+**OCI images are tar archives:**
+
+An OCI image (as produced by `docker save` or `skopeo copy`) is itself a POSIX tar archive containing:
+
+```
+manifest.json          — list of layers and the config blob digest
+<sha256>.json          — image config (Entrypoint, Cmd, Env, WorkingDir, …)
+<sha256>/layer.tar     — one gzip-compressed tar per filesystem layer
+```
+
+Each layer tar records filesystem additions, modifications, and deletions (whiteout files). The loader applies them in order — earlier layers first — so later layers win, exactly as a union filesystem would. The final result is a complete rootfs directory tree ready for `chroot`.
 
 **File layout:**
 
@@ -853,12 +865,13 @@ The 64-byte ELF header fits within the tar header's 100-byte filename field. Whe
 **At runtime the loader:**
 
 1. Opens itself via `/proc/self/exe` and reads the embedded OCI tar from the patched offset
-2. Extracts the image layers into a temporary rootfs under `/tmp`
-3. Patches the rootfs for single-UID namespace compatibility
-4. Enters a user namespace (UID mapped to host UID)
-5. Enters mount, PID, and UTS namespaces
-6. Applies volume bind mounts before `chroot`
-7. `chroot`s into the rootfs and `exec`s the entrypoint
+2. Parses `manifest.json` and the image config to find the layer list and runtime settings
+3. Extracts each layer tar in order into a temporary rootfs under `/tmp`, applying whiteout deletions
+4. Patches the rootfs for single-UID namespace compatibility
+5. Enters a user namespace (UID mapped to host UID)
+6. Enters mount, PID, and UTS namespaces
+7. Applies volume bind mounts before `chroot`
+8. `chroot`s into the rootfs and `exec`s the entrypoint
 
 The only runtime dependency on the target machine is `tar`.
 
