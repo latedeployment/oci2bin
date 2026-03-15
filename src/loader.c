@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -15,6 +16,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <ftw.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <grp.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -31,6 +35,17 @@ static volatile unsigned long OCI_DATA_OFFSET = 0xDEADBEEFCAFEBABEUL;
 static volatile unsigned long OCI_DATA_SIZE   = 0xCAFEBABEDEADBEEFUL;
 static volatile unsigned long OCI_PATCHED     = 0xAAAAAAAAAAAAAAAAUL;
 
+/* VM blob markers — patched by build_polyglot.py --kernel / --initramfs.
+ * Sentinels match build_polyglot.py KERNEL_OFFSET_MARKER etc. (little-endian).
+ * Use KERNEL_DATA_PATCHED / INITRAMFS_DATA_PATCHED to check presence — never
+ * compare OFFSET/SIZE against sentinel literals in C (embeds extra copies). */
+static volatile unsigned long KERNEL_DATA_OFFSET    = 0x7E57AB1E7E57AB1EUL;
+static volatile unsigned long KERNEL_DATA_SIZE      = 0xB00BB00BB00BB00BUL;
+static volatile unsigned long KERNEL_DATA_PATCHED   = 0x5A5A5A5A5A5A5A5AUL;
+static volatile unsigned long INITRAMFS_DATA_OFFSET = 0xC0FFEE00C0FFEE00UL;
+static volatile unsigned long INITRAMFS_DATA_SIZE   = 0xFACEB00CFACEB00CUL;
+static volatile unsigned long INITRAMFS_DATA_PATCHED = 0x6B6B6B6B6B6B6B6BUL;
+
 /* Max layers / volumes / exec args we support */
 #define MAX_LAYERS   128
 #define MAX_VOLUMES   32
@@ -38,6 +53,42 @@ static volatile unsigned long OCI_PATCHED     = 0xAAAAAAAAAAAAAAAAUL;
 #define MAX_ARGS      64
 #define MAX_ENV       64
 #define BUF_SIZE    65536
+
+/* VM defaults — overridable at build time via -DDEFAULT_VM_CPUS=N etc. */
+#ifndef DEFAULT_VM_CPUS
+#define DEFAULT_VM_CPUS   1
+#endif
+#ifndef DEFAULT_VM_MEM_MB
+#define DEFAULT_VM_MEM_MB 256
+#endif
+
+/* Debug logging toggle (set by --debug). */
+static int g_debug = 0;
+
+static const char* safe_str(const char* s)
+{
+    return s ? s : "(null)";
+}
+
+__attribute__((format(printf, 2, 3)))
+static void debug_log(const char* event, const char* fmt, ...)
+{
+    if (!g_debug)
+    {
+        return;
+    }
+    fprintf(stderr, "oci2bin[debug] pid=%d event=%s", (int)getpid(),
+            safe_str(event));
+    if (fmt && fmt[0] != '\0')
+    {
+        fputc(' ', stderr);
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+    }
+    fputc('\n', stderr);
+}
 
 /* ── runtime options parsed from argv ───────────────────────────────────── */
 
@@ -85,6 +136,7 @@ struct container_opts
 
     /* --no-seccomp  (disable the default seccomp filter) */
     int no_seccomp;
+    int no_host_dev; /* --no-host-dev: skip bind-mounting host /dev nodes */
 
     /* --hostname NAME  (override the UTS hostname) */
     char* hostname;
@@ -125,9 +177,13 @@ struct container_opts
     /* --verify-key PATH  (verify binary signature before execution) */
     char* verify_key;
 
+    /* --debug (print verbose runtime diagnostics for troubleshooting) */
+    int debug;
+
     /* --memory MEM, --cpus FLOAT, --pids-limit N  (cgroup v2 limits) */
     long long cg_memory_bytes; /* 0 = unset */
     long      cg_cpu_quota;    /* 0 = unset; cpu.max quota in 100000 period */
+    double    vm_cpus;         /* 0 = unset; raw --cpus value for VM backends */
     long      cg_pids;         /* 0 = unset */
 
     /* -e KEY=VALUE  (additional environment variables, up to MAX_ENV) */
@@ -137,7 +193,83 @@ struct container_opts
     /* extra args after flags (overrides OCI Cmd) */
     char** extra_args;
     int    n_extra;
+
+    /* --vm / --vmm VMM  (microVM isolation) */
+    int   use_vm;   /* 1 if --vm was given */
+    char* vmm;      /* "cloud-hypervisor" | path; NULL = default */
+
+    /* PTY relay: set by run_container() before fork, used by container_main() */
+    int pty_master_fd; /* -1 if no PTY; parent closes slave, uses this for relay */
+    int pty_slave_fd;  /* -1 if no PTY; child sets as controlling terminal */
 };
+
+static int argv_has_debug_flag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--debug") == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char* opts_net_mode(const struct container_opts* opts)
+{
+    if (opts->net_join_pid > 0)
+    {
+        return "container";
+    }
+    return opts->net ? opts->net : "host";
+}
+
+static void debug_dump_opts(const struct container_opts* opts)
+{
+    debug_log("opts.summary",
+              "vm=%d vmm=%s net=%s ipc_join_pid=%d read_only=%d detach=%d "
+              "no_seccomp=%d debug=%d",
+              opts->use_vm,
+              opts->vmm ? opts->vmm : "(default)",
+              opts_net_mode(opts),
+              (int)opts->ipc_join_pid,
+              opts->read_only,
+              opts->detach,
+              opts->no_seccomp,
+              opts->debug);
+    debug_log("opts.resources",
+              "memory_bytes=%lld cpus_quota=%ld vm_cpus=%.3f pids=%ld",
+              opts->cg_memory_bytes,
+              opts->cg_cpu_quota,
+              opts->vm_cpus,
+              opts->cg_pids);
+    debug_log("opts.counts",
+              "volumes=%d secrets=%d env=%d tmpfs=%d ulimits=%d devices=%d "
+              "extra_args=%d",
+              opts->n_vols,
+              opts->n_secrets,
+              opts->n_env,
+              opts->n_tmpfs,
+              opts->n_ulimits,
+              opts->n_devices,
+              opts->n_extra);
+    if (opts->entrypoint)
+    {
+        debug_log("opts.entrypoint", "value=%s", opts->entrypoint);
+    }
+    if (opts->workdir)
+    {
+        debug_log("opts.workdir", "value=%s", opts->workdir);
+    }
+    if (opts->overlay_persist)
+    {
+        debug_log("opts.overlay_persist", "dir=%s", opts->overlay_persist);
+    }
+    if (opts->verify_key)
+    {
+        debug_log("opts.verify_key", "path=%s", opts->verify_key);
+    }
+}
 
 /* ── tiny JSON helpers (just enough to parse manifest.json and config) ─── */
 
@@ -327,6 +459,454 @@ static int json_escape_string(const char* src, char* dst, size_t dstsz)
 
 /* ── file helpers ────────────────────────────────────────────────────────── */
 
+static int path_has_dotdot_component(const char* path);
+static int path_is_absolute_and_clean(const char* path);
+static ssize_t read_all_fd(int fd, char* buf, size_t len);
+static int write_all_fd(int fd, const char* data, size_t len);
+static int parent_dir_path(const char* path, char* out, size_t out_sz);
+static int mkdir_p_secure(const char* path, mode_t leaf_mode, const char* what);
+static int ensure_path_not_symlink(const char* path, const char* what);
+static int ensure_bind_mount_target(const char* src, const char* dst,
+                                    const char* what);
+static int parse_id_value(const char* text, long max_value, long* out);
+static int lookup_passwd_user(const char* passwd_path, const char* name,
+                              uid_t* out_uid, gid_t* out_gid);
+static int lookup_group_name(const char* group_path, const char* name,
+                             gid_t* out_gid);
+
+/*
+ * Create a runtime tmpdir in OCI2BIN_TMPDIR, TMPDIR, /tmp, or /var/tmp.
+ * Returns 0 on success, -1 on failure.
+ */
+static int make_runtime_tmpdir(char* out, size_t out_sz, const char* prefix)
+{
+    const char* candidates[] =
+    {
+        getenv("OCI2BIN_TMPDIR"),
+        getenv("TMPDIR"),
+        "/tmp",
+        "/var/tmp",
+    };
+    int n_candidates = (int)(sizeof(candidates) / sizeof(candidates[0]));
+
+    for (int i = 0; i < n_candidates; i++)
+    {
+        const char* base = candidates[i];
+        if (!base || base[0] == '\0')
+        {
+            continue;
+        }
+        if (path_has_dotdot_component(base))
+        {
+            continue;
+        }
+        int n = snprintf(out, out_sz, "%s/%sXXXXXX", base, prefix);
+        if (n < 0 || (size_t)n >= out_sz)
+        {
+            continue;
+        }
+        if (mkdtemp(out))
+        {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int path_join_suffix(char* out, size_t out_sz,
+                            const char* base, const char* suffix)
+{
+    size_t base_len = strlen(base);
+    size_t suf_len  = strlen(suffix);
+    if (base_len + suf_len + 1 > out_sz)
+    {
+        return -1;
+    }
+    memcpy(out, base, base_len);
+    memcpy(out + base_len, suffix, suf_len + 1);
+    return 0;
+}
+
+static int path_has_dotdot_component(const char* path)
+{
+    if (!path)
+    {
+        return 0;
+    }
+
+    const char* p = path;
+    while (*p)
+    {
+        while (*p == '/')
+        {
+            p++;
+        }
+
+        const char* start = p;
+        while (*p && *p != '/')
+        {
+            p++;
+        }
+        if ((size_t)(p - start) == 2 &&
+                start[0] == '.' &&
+                start[1] == '.')
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int path_is_absolute_and_clean(const char* path)
+{
+    return path && path[0] == '/' && !path_has_dotdot_component(path);
+}
+
+static ssize_t read_all_fd(int fd, char* buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        ssize_t n = read(fd, buf + off, len - off);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        off += (size_t)n;
+    }
+    return (ssize_t)off;
+}
+
+static int write_all_fd(int fd, const char* data, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        ssize_t n = write(fd, data + off, len - off);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int parent_dir_path(const char* path, char* out, size_t out_sz)
+{
+    int n = snprintf(out, out_sz, "%s", path);
+    if (n < 0 || (size_t)n >= out_sz)
+    {
+        return -1;
+    }
+
+    char* slash = strrchr(out, '/');
+    if (!slash)
+    {
+        return -1;
+    }
+    if (slash == out)
+    {
+        slash[1] = '\0';
+        return 0;
+    }
+    *slash = '\0';
+    return 0;
+}
+
+static int mkdir_p_secure(const char* path, mode_t leaf_mode, const char* what)
+{
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(tmp))
+    {
+        fprintf(stderr, "oci2bin: %s path too long: %s\n", what, path);
+        return -1;
+    }
+
+    for (char* p = tmp + 1;; p++)
+    {
+        if (*p != '/' && *p != '\0')
+        {
+            continue;
+        }
+
+        char saved = *p;
+        *p = '\0';
+
+        struct stat st;
+        if (lstat(tmp, &st) == 0)
+        {
+            if (S_ISLNK(st.st_mode))
+            {
+                fprintf(stderr,
+                        "oci2bin: %s path contains symlink component: %s\n",
+                        what, tmp);
+                return -1;
+            }
+            if (!S_ISDIR(st.st_mode))
+            {
+                fprintf(stderr,
+                        "oci2bin: %s path component is not a directory: %s\n",
+                        what, tmp);
+                return -1;
+            }
+        }
+        else if (errno == ENOENT)
+        {
+            mode_t mode = (saved == '\0') ? leaf_mode : 0755;
+            if (mkdir(tmp, mode) < 0 && errno != EEXIST)
+            {
+                fprintf(stderr, "oci2bin: mkdir %s: %s\n",
+                        tmp, strerror(errno));
+                return -1;
+            }
+        }
+        else
+        {
+            fprintf(stderr, "oci2bin: lstat %s: %s\n",
+                    tmp, strerror(errno));
+            return -1;
+        }
+
+        if (saved == '\0')
+        {
+            break;
+        }
+        *p = saved;
+    }
+
+    return 0;
+}
+
+static int ensure_path_not_symlink(const char* path, const char* what)
+{
+    struct stat st;
+    if (lstat(path, &st) < 0)
+    {
+        if (errno == ENOENT)
+        {
+            return 0;
+        }
+        fprintf(stderr, "oci2bin: lstat %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (S_ISLNK(st.st_mode))
+    {
+        fprintf(stderr, "oci2bin: %s target must not be a symlink: %s\n",
+                what, path);
+        return -1;
+    }
+    return 0;
+}
+
+static int ensure_bind_mount_target(const char* src, const char* dst,
+                                    const char* what)
+{
+    struct stat src_st;
+    if (stat(src, &src_st) < 0)
+    {
+        fprintf(stderr, "oci2bin: stat %s: %s\n", src, strerror(errno));
+        return -1;
+    }
+
+    char parent[PATH_MAX];
+    if (parent_dir_path(dst, parent, sizeof(parent)) < 0)
+    {
+        fprintf(stderr, "oci2bin: %s destination path too long: %s\n",
+                what, dst);
+        return -1;
+    }
+    if (mkdir_p_secure(parent, 0755, what) < 0)
+    {
+        return -1;
+    }
+
+    struct stat dst_st;
+    if (lstat(dst, &dst_st) == 0)
+    {
+        if (S_ISLNK(dst_st.st_mode))
+        {
+            fprintf(stderr,
+                    "oci2bin: %s destination must not be a symlink: %s\n",
+                    what, dst);
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT)
+    {
+        fprintf(stderr, "oci2bin: lstat %s: %s\n", dst, strerror(errno));
+        return -1;
+    }
+
+    if (S_ISDIR(src_st.st_mode))
+    {
+        if (mkdir(dst, 0755) < 0 && errno != EEXIST)
+        {
+            fprintf(stderr, "oci2bin: mkdir %s: %s\n",
+                    dst, strerror(errno));
+            return -1;
+        }
+        return ensure_path_not_symlink(dst, what);
+    }
+
+    int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+                  src_st.st_mode & 0777 ? (src_st.st_mode & 0777) : 0600);
+    if (fd < 0)
+    {
+        fprintf(stderr, "oci2bin: create %s: %s\n", dst, strerror(errno));
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int parse_id_value(const char* text, long max_value, long* out)
+{
+    if (!text || !text[0])
+    {
+        return -1;
+    }
+
+    char* endp = NULL;
+    errno = 0;
+    long value = strtol(text, &endp, 10);
+    if (endp == text || *endp != '\0' || errno == ERANGE ||
+            value < 0 || value > max_value)
+    {
+        return -1;
+    }
+
+    *out = value;
+    return 0;
+}
+
+static int lookup_passwd_user(const char* passwd_path, const char* name,
+                              uid_t* out_uid, gid_t* out_gid)
+{
+    FILE* f = fopen(passwd_path, "r");
+    if (!f)
+    {
+        return -1;
+    }
+
+    char line[1024];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f))
+    {
+        char* user = line;
+        char* passwd = strchr(user, ':');
+        if (!passwd)
+        {
+            continue;
+        }
+        *passwd++ = '\0';
+
+        char* uid_field = strchr(passwd, ':');
+        if (!uid_field)
+        {
+            continue;
+        }
+        *uid_field++ = '\0';
+
+        char* gid_field = strchr(uid_field, ':');
+        if (!gid_field)
+        {
+            continue;
+        }
+        *gid_field++ = '\0';
+
+        char* tail = strchr(gid_field, ':');
+        if (!tail)
+        {
+            continue;
+        }
+        *tail = '\0';
+
+        if (strcmp(user, name) == 0)
+        {
+            long uid_val = 0;
+            long gid_val = 0;
+            if (parse_id_value(uid_field, 65534, &uid_val) < 0 ||
+                    parse_id_value(gid_field, 65534, &gid_val) < 0)
+            {
+                fclose(f);
+                return -1;
+            }
+            *out_uid = (uid_t)uid_val;
+            *out_gid = (gid_t)gid_val;
+            found = 1;
+        }
+    }
+
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+static int lookup_group_name(const char* group_path, const char* name,
+                             gid_t* out_gid)
+{
+    FILE* f = fopen(group_path, "r");
+    if (!f)
+    {
+        return -1;
+    }
+
+    char line[1024];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f))
+    {
+        char* group = line;
+        char* passwd = strchr(group, ':');
+        if (!passwd)
+        {
+            continue;
+        }
+        *passwd++ = '\0';
+
+        char* gid_field = strchr(passwd, ':');
+        if (!gid_field)
+        {
+            continue;
+        }
+        *gid_field++ = '\0';
+
+        char* members = strchr(gid_field, ':');
+        if (members)
+        {
+            *members = '\0';
+        }
+
+        if (strcmp(group, name) == 0)
+        {
+            long gid_val = 0;
+            if (parse_id_value(gid_field, 65534, &gid_val) < 0)
+            {
+                fclose(f);
+                return -1;
+            }
+            *out_gid = (gid_t)gid_val;
+            found = 1;
+        }
+    }
+
+    fclose(f);
+    return found ? 0 : -1;
+}
+
 static char* read_file(const char* path, size_t* out_size)
 {
     int fd = open(path, O_RDONLY);
@@ -352,7 +932,7 @@ static char* read_file(const char* path, size_t* out_size)
         close(fd);
         return NULL;
     }
-    ssize_t n = read(fd, buf, st.st_size);
+    ssize_t n = read_all_fd(fd, buf, (size_t)st.st_size);
     close(fd);
     if (n < 0)
     {
@@ -374,9 +954,179 @@ static int write_file(const char* path, const char* data, size_t len)
     {
         return -1;
     }
-    ssize_t written = write(fd, data, len);
+    int rc = write_all_fd(fd, data, len);
     close(fd);
-    return (written == (ssize_t)len) ? 0 : -1;
+    return rc;
+}
+
+/*
+ * Resolve a username to numeric UID:GID using rootfs/etc/passwd.
+ * Stores "uid:gid" in out (at least 32 bytes).  Returns 0 on success.
+ * If the spec is already numeric (or "uid:gid"), it is copied as-is.
+ */
+static int resolve_user_in_rootfs(const char* rootfs, const char* spec,
+                                  char* out, size_t outsz)
+{
+    if (!spec || !spec[0])
+    {
+        return -1;
+    }
+    /* Already numeric — copy as-is */
+    if (spec[0] >= '0' && spec[0] <= '9')
+    {
+        if (snprintf(out, outsz, "%s", spec) >= (int)outsz)
+        {
+            return -1;
+        }
+        return 0;
+    }
+    char passwd_path[PATH_MAX];
+    if (snprintf(passwd_path, sizeof(passwd_path), "%s/etc/passwd",
+                 rootfs) >= (int)sizeof(passwd_path))
+    {
+        return -1;
+    }
+    uid_t uid = 0;
+    gid_t gid = 0;
+    if (lookup_passwd_user(passwd_path, spec, &uid, &gid) < 0)
+    {
+        return -1;
+    }
+    return snprintf(out, outsz, "%u:%u",
+                    (unsigned)uid, (unsigned)gid) < (int)outsz ? 0 : -1;
+}
+
+/*
+ * Copy the host /etc/resolv.conf into rootfs/etc/resolv.conf.
+ * Prefers /run/systemd/resolve/resolv.conf (real upstream nameservers)
+ * over /etc/resolv.conf which may contain 127.0.0.53 (systemd-resolved
+ * stub, unreachable inside VMs).
+ */
+static void install_resolv_conf(const char* rootfs)
+{
+    char dst[PATH_MAX];
+    int n = snprintf(dst, sizeof(dst), "%s/etc/resolv.conf", rootfs);
+    if (n < 0 || (size_t)n >= sizeof(dst))
+    {
+        return;
+    }
+    size_t sz;
+    char* data = read_file("/run/systemd/resolve/resolv.conf", &sz);
+    if (!data)
+    {
+        data = read_file("/etc/resolv.conf", &sz);
+    }
+    if (data)
+    {
+        unlink(dst);
+        write_file(dst, data, sz);
+        free(data);
+    }
+}
+
+/*
+ * Parsed OCI image config.  Populated by read_oci_config() from the
+ * .oci2bin_config JSON written during extraction.  Caller must free
+ * all non-NULL pointers when done.
+ */
+struct oci_config
+{
+    char* entrypoint_json; /* "Entrypoint" array or NULL */
+    char* cmd_json;        /* "Cmd" array or NULL */
+    char* env_json;        /* "Env" array or NULL */
+    char* workdir;         /* "WorkingDir" string or NULL */
+    char* user;            /* "User" string or NULL */
+};
+
+/*
+ * Read and parse .oci2bin_config from rootfs (or "/" if rootfs is NULL).
+ * Returns 0 on success, -1 if the config file cannot be read.
+ */
+static int read_oci_config(const char* rootfs, struct oci_config* out)
+{
+    memset(out, 0, sizeof(*out));
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/.oci2bin_config",
+                     rootfs ? rootfs : "");
+    if (n < 0 || (size_t)n >= sizeof(path))
+    {
+        fprintf(stderr, "oci2bin: config path truncated\n");
+        return -1;
+    }
+    char* cfg = read_file(path, NULL);
+    if (!cfg)
+    {
+        return -1;
+    }
+    out->entrypoint_json = json_get_array(cfg, "Entrypoint");
+    out->cmd_json        = json_get_array(cfg, "Cmd");
+    out->env_json        = json_get_array(cfg, "Env");
+    out->workdir         = json_get_string(cfg, "WorkingDir");
+    out->user            = json_get_string(cfg, "User");
+    free(cfg);
+    return 0;
+}
+
+static void free_oci_config(struct oci_config* c)
+{
+    free(c->entrypoint_json);
+    free(c->cmd_json);
+    free(c->env_json);
+    free(c->workdir);
+    free(c->user);
+    memset(c, 0, sizeof(*c));
+}
+
+/*
+ * Build an exec argv from parsed OCI config.
+ *   - If user_entrypoint is non-NULL, it replaces the image Entrypoint.
+ *   - If extra_args/n_extra are provided, they replace the image Cmd.
+ *   - Falls back to /bin/sh if nothing resolves.
+ * Returns the number of args placed in exec_args (null-terminated).
+ */
+static int build_exec_args(const struct oci_config* cfg,
+                           const char* user_entrypoint,
+                           char* const* extra_args, int n_extra,
+                           char* exec_args[], int max_args)
+{
+    int argc = 0;
+
+    /* Entrypoint */
+    if (user_entrypoint)
+    {
+        exec_args[argc++] = (char*)user_entrypoint;
+    }
+    else if (cfg->entrypoint_json &&
+             strcmp(cfg->entrypoint_json, "null") != 0)
+    {
+        argc += json_parse_string_array(cfg->entrypoint_json,
+                                        exec_args + argc,
+                                        max_args - argc);
+    }
+
+    /* Cmd / extra args */
+    if (n_extra > 0)
+    {
+        for (int i = 0; i < n_extra && argc < max_args; i++)
+        {
+            exec_args[argc++] = extra_args[i];
+        }
+    }
+    else if (cfg->cmd_json && strcmp(cfg->cmd_json, "null") != 0)
+    {
+        argc += json_parse_string_array(cfg->cmd_json,
+                                        exec_args + argc,
+                                        max_args - argc);
+    }
+
+    /* Fallback */
+    if (argc == 0)
+    {
+        exec_args[0] = "/bin/sh";
+        argc = 1;
+    }
+    exec_args[argc] = NULL;
+    return argc;
 }
 
 /* Write to /proc files (no O_CREAT, no O_TRUNC) */
@@ -387,14 +1137,21 @@ static int write_proc(const char* path, const char* data, size_t len)
     {
         return -1;
     }
-    ssize_t written = write(fd, data, len);
+    int rc = write_all_fd(fd, data, len);
     close(fd);
-    return (written == (ssize_t)len) ? 0 : -1;
+    return rc;
 }
 
 /* Run a command, wait for it. Returns exit status. */
 static int run_cmd(char* const argv[])
 {
+    if (g_debug && argv && argv[0])
+    {
+        for (int i = 0; argv[i] && i < 32; i++)
+        {
+            debug_log("run_cmd.arg", "index=%d value=%s", i, argv[i]);
+        }
+    }
     pid_t pid = fork();
     if (pid < 0)
     {
@@ -409,6 +1166,8 @@ static int run_cmd(char* const argv[])
     }
     int status;
     waitpid(pid, &status, 0);
+    debug_log("run_cmd.exit", "status=%d", WIFEXITED(status) ?
+              WEXITSTATUS(status) : -1);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
@@ -423,9 +1182,12 @@ static int run_cmd(char* const argv[])
 static char* extract_oci_rootfs(const char* self_path)
 {
     static char rootfs[PATH_MAX];
-    char tmpdir[] = "/tmp/oci2bin.XXXXXX";
+    char tmpdir[PATH_MAX];
 
-    if (!mkdtemp(tmpdir))
+    debug_log("extract.begin", "self=%s oci_offset=0x%lx oci_size=0x%lx",
+              self_path, OCI_DATA_OFFSET, OCI_DATA_SIZE);
+
+    if (make_runtime_tmpdir(tmpdir, sizeof(tmpdir), "oci2bin.") < 0)
     {
         perror("mkdtemp");
         return NULL;
@@ -433,7 +1195,12 @@ static char* extract_oci_rootfs(const char* self_path)
 
     /* 1. Extract the embedded OCI tar from ourselves */
     char oci_tar_path[PATH_MAX];
-    snprintf(oci_tar_path, sizeof(oci_tar_path), "%s/image.tar", tmpdir);
+    if (path_join_suffix(oci_tar_path, sizeof(oci_tar_path), tmpdir,
+                         "/image.tar") < 0)
+    {
+        fprintf(stderr, "oci2bin: oci tar path too long\n");
+        return NULL;
+    }
 
     int self_fd = open(self_path, O_RDONLY);
     if (self_fd < 0)
@@ -486,7 +1253,11 @@ static char* extract_oci_rootfs(const char* self_path)
 
     /* 2. Extract the OCI tar into tmpdir/oci/ */
     char oci_dir[PATH_MAX];
-    snprintf(oci_dir, sizeof(oci_dir), "%s/oci", tmpdir);
+    if (path_join_suffix(oci_dir, sizeof(oci_dir), tmpdir, "/oci") < 0)
+    {
+        fprintf(stderr, "oci2bin: oci dir path too long\n");
+        return NULL;
+    }
     if (mkdir(oci_dir, 0755) < 0)
     {
         perror("mkdir oci_dir");
@@ -529,7 +1300,14 @@ static char* extract_oci_rootfs(const char* self_path)
     }
 
     /* 5. Extract layers in order into rootfs */
-    snprintf(rootfs, sizeof(rootfs), "%s/rootfs", tmpdir);
+    if (path_join_suffix(rootfs, sizeof(rootfs), tmpdir, "/rootfs") < 0)
+    {
+        fprintf(stderr, "oci2bin: rootfs path too long\n");
+        free(config_path_rel);
+        free(layers_json);
+        free(manifest);
+        return NULL;
+    }
     if (mkdir(rootfs, 0755) < 0)
     {
         perror("mkdir rootfs");
@@ -538,11 +1316,13 @@ static char* extract_oci_rootfs(const char* self_path)
 
     char* layers[MAX_LAYERS];
     int nlayers = json_parse_string_array(layers_json, layers, MAX_LAYERS);
+    debug_log("extract.manifest", "config=%s layers=%d",
+              safe_str(config_path_rel), nlayers);
 
     for (int i = 0; i < nlayers; i++)
     {
         /* Reject any layer path that tries to traverse out of oci_dir */
-        if (strstr(layers[i], "..") != NULL || layers[i][0] == '/')
+        if (path_has_dotdot_component(layers[i]) || layers[i][0] == '/')
         {
             fprintf(stderr, "oci2bin: rejecting dangerous layer path: %s\n", layers[i]);
             free(layers[i]);
@@ -571,7 +1351,8 @@ static char* extract_oci_rootfs(const char* self_path)
 
     /* 6. Read the image config to get Cmd/Entrypoint */
     /* Reject config paths that could traverse outside oci_dir */
-    if (strstr(config_path_rel, "..") != NULL || config_path_rel[0] == '/')
+    if (path_has_dotdot_component(config_path_rel) ||
+            config_path_rel[0] == '/')
     {
         fprintf(stderr, "oci2bin: rejecting dangerous config path: %s\n",
                 config_path_rel);
@@ -600,6 +1381,7 @@ static char* extract_oci_rootfs(const char* self_path)
         char* entrypoint = json_get_array(config, "Entrypoint");
         char* env_json   = json_get_array(config, "Env");
         char* workdir    = json_get_string(config, "WorkingDir");
+        char* img_user   = json_get_string(config, "User");
 
         char info_path[PATH_MAX];
         if (snprintf(info_path, sizeof(info_path), "%s/.oci2bin_config", rootfs)
@@ -610,7 +1392,7 @@ static char* extract_oci_rootfs(const char* self_path)
             char*  info_buf = calloc(1, bufsz);
             if (info_buf)
             {
-                /* JSON-escape WorkingDir to prevent injection into the config */
+                /* JSON-escape WorkingDir and User to prevent injection */
                 char workdir_escaped[PATH_MAX * 2];
                 const char* wdir_safe = NULL;
                 if (workdir)
@@ -620,17 +1402,40 @@ static char* extract_oci_rootfs(const char* self_path)
                     {
                         wdir_safe = workdir_escaped;
                     }
-                    /* If escaping fails (path absurdly long), omit WorkingDir */
+                }
+                /* Resolve username to numeric uid:gid now, before
+                 * patch_rootfs_ids() rewrites /etc/passwd to uid=0 */
+                char user_resolved[64] = {0};
+                char user_escaped[512];
+                const char* user_safe = NULL;
+                if (img_user && img_user[0])
+                {
+                    const char* user_src = img_user;
+                    if (resolve_user_in_rootfs(rootfs, img_user,
+                                               user_resolved,
+                                               sizeof(user_resolved)) == 0)
+                    {
+                        user_src = user_resolved;
+                    }
+                    if (json_escape_string(user_src, user_escaped,
+                                           sizeof(user_escaped)) == 0)
+                    {
+                        user_safe = user_escaped;
+                    }
                 }
                 int n = snprintf(info_buf, bufsz,
                                  "{\"Cmd\":%s,\"Entrypoint\":%s,"
-                                 "\"Env\":%s,\"WorkingDir\":%s%s%s}",
+                                 "\"Env\":%s,\"WorkingDir\":%s%s%s,"
+                                 "\"User\":%s%s%s}",
                                  cmd        ? cmd        : "null",
                                  entrypoint ? entrypoint : "null",
                                  env_json   ? env_json   : "null",
                                  wdir_safe  ? "\""       : "null",
                                  wdir_safe  ? wdir_safe  : "",
-                                 wdir_safe  ? "\""       : "");
+                                 wdir_safe  ? "\""       : "",
+                                 user_safe  ? "\""       : "null",
+                                 user_safe  ? user_safe  : "",
+                                 user_safe  ? "\""       : "");
                 if (n > 0 && (size_t)n < bufsz)
                 {
                     write_file(info_path, info_buf, strlen(info_buf));
@@ -643,6 +1448,7 @@ static char* extract_oci_rootfs(const char* self_path)
         free(entrypoint);
         free(env_json);
         free(workdir);
+        free(img_user);
         free(config);
     }
 
@@ -650,6 +1456,7 @@ static char* extract_oci_rootfs(const char* self_path)
     free(layers_json);
     free(manifest);
 
+    debug_log("extract.done", "rootfs=%s", rootfs);
     return rootfs;
 }
 
@@ -688,6 +1495,13 @@ static int setup_uid_map(uid_t real_uid, gid_t real_gid)
  */
 static void patch_rootfs_ids(const char* rootfs)
 {
+    /* Reject rootfs paths that would overflow any of the paths built below.
+     * "/etc/apt/apt.conf.d" is the longest suffix (19 chars + NUL = 20). */
+    if (strlen(rootfs) + 20 > PATH_MAX)
+    {
+        return;
+    }
+
     /* ── /etc/passwd ── remap all uid:gid fields to 0:0 ── */
     char passwd_path[PATH_MAX];
     snprintf(passwd_path, sizeof(passwd_path), "%s/etc/passwd", rootfs);
@@ -818,7 +1632,8 @@ static void patch_rootfs_ids(const char* rootfs)
 
     /* ── apt sandbox ── belt-and-suspenders for Debian/Ubuntu images ── */
     char apt_conf_dir[PATH_MAX];
-    snprintf(apt_conf_dir, sizeof(apt_conf_dir), "%s/etc/apt/apt.conf.d", rootfs);
+    snprintf(apt_conf_dir, sizeof(apt_conf_dir), "%s/etc/apt/apt.conf.d",
+             rootfs);
     struct stat st;
     if (stat(apt_conf_dir, &st) == 0 && S_ISDIR(st.st_mode))
     {
@@ -831,19 +1646,107 @@ static void patch_rootfs_ids(const char* rootfs)
         }
     }
 
-    /* ── /etc/resolv.conf ── copy host resolver into chroot ── */
+    /* ── user-switching wrappers ── replace setpriv/gosu/su-exec with
+     * no-op shims so entrypoints that try to drop privileges don't fail
+     * in the single-UID user namespace (only UID 0 is mapped). */
+    static const char setpriv_shim[] =
+        "#!/bin/sh\n"
+        "# oci2bin shim: in a single-UID namespace, privilege changes\n"
+        "# are impossible.  For -d/--dump, report no capabilities so\n"
+        "# entrypoints that check has_cap skip the priv-drop path.\n"
+        "# For exec mode, strip all flags and run the command directly.\n"
+        "case \"$1\" in -d|--dump) echo 'Capability bounding set:'; exit 0;; esac\n"
+        "while [ $# -gt 0 ]; do\n"
+        "  case \"$1\" in\n"
+        "    --reuid|--regid|--groups|--inh-caps|--ambient-caps|--bounding-set|\\\n"
+        "--securebits|--selinux-label|--apparmor-profile)\n"
+        "      shift 2;;\n"
+        "    --reuid=*|--regid=*|--groups=*|--inh-caps=*|--ambient-caps=*|\\\n"
+        "--bounding-set=*|--securebits=*|--selinux-label=*|--apparmor-profile=*)\n"
+        "      shift;;\n"
+        "    --clear-groups|--keep-groups|--init-groups|--reset-env|--nnp|\\\n"
+        "--no-new-privs)\n"
+        "      shift;;\n"
+        "    --) shift; break;;\n"
+        "    *) break;;\n"
+        "  esac\n"
+        "done\n"
+        "exec \"$@\"\n";
+    /* gosu/su-exec shim: we cannot change uid in a single-UID namespace, so
+     * just exec the command.  Two invocation patterns exist:
+     *
+     *   Pattern A: gosu user command [args...]
+     *     → exec command args                (direct, depth=0)
+     *
+     *   Pattern B (redis-style re-entry): gosu user entrypoint.sh command [args...]
+     *     The entrypoint calls "exec gosu user $0 $@", which re-runs itself
+     *     as the same uid=0.  On the second call (depth≥1) we detect >1 arg
+     *     after removing the user, skip the leading script, and exec the
+     *     real command.
+     */
+    static const char gosu_shim[] =
+        "#!/bin/sh\n"
+        "# oci2bin shim: skip user arg, exec the command.\n"
+        "shift\n"
+        "if [ \"${OCI2BIN_GOSU_DEPTH:-0}\" -ge 1 ] && [ $# -gt 1 ]; then\n"
+        "  shift\n"
+        "fi\n"
+        "export OCI2BIN_GOSU_DEPTH=$(( ${OCI2BIN_GOSU_DEPTH:-0} + 1 ))\n"
+        "exec \"$@\"\n";
+    /* chown shim: virtiofs passes host UIDs through untranslated, so
+     * chown inside a microVM (or single-UID user namespace) always fails
+     * with EPERM.  Replace the binary with a no-op that exits 0. */
+    static const char chown_shim[] =
+        "#!/bin/sh\n"
+        "# oci2bin shim: ownership changes are impossible in a single-UID\n"
+        "# environment; silently succeed so entrypoint scripts continue.\n"
+        "exit 0\n";
+    static const struct
     {
-        size_t resolv_sz;
-        char* resolv = read_file("/etc/resolv.conf", &resolv_sz);
-        if (resolv)
+        const char* path;
+        const char* script;
+    } shims[] =
+    {
+        {"/usr/bin/setpriv", setpriv_shim},
+        {"/bin/setpriv",     setpriv_shim},
+        {"/usr/sbin/gosu",       gosu_shim},
+        {"/usr/local/bin/gosu",  gosu_shim},
+        {"/sbin/gosu",           gosu_shim},
+        {"/usr/local/bin/su-exec", gosu_shim},
+        {"/sbin/su-exec",          gosu_shim},
+        {"/bin/chown",       chown_shim},
+        {"/usr/bin/chown",   chown_shim},
+    };
+
+    for (size_t i = 0; i < sizeof(shims) / sizeof(shims[0]); i++)
+    {
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof(full), "%s%s", rootfs, shims[i].path)
+                >= (int)sizeof(full))
         {
-            char resolv_path[PATH_MAX];
-            snprintf(resolv_path, sizeof(resolv_path), "%s/etc/resolv.conf", rootfs);
-            unlink(resolv_path);
-            write_file(resolv_path, resolv, resolv_sz);
-            free(resolv);
+            continue;
+        }
+        struct stat sb;
+        if (lstat(full, &sb) == 0)
+        {
+            /* Remove first: the file may be a symlink (e.g. to busybox)
+             * and O_TRUNC would corrupt the shared target. */
+            unlink(full);
+            if (write_file(full, shims[i].script, strlen(shims[i].script))
+                    < 0)
+            {
+                fprintf(stderr, "oci2bin: warning: could not write shim %s: %s\n",
+                        shims[i].path, strerror(errno));
+            }
+            else
+            {
+                chmod(full, 0755);
+            }
         }
     }
+
+    /* ── /etc/resolv.conf ── copy host resolver into chroot ── */
+    install_resolv_conf(rootfs);
 }
 
 /*
@@ -858,16 +1761,19 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
 {
     for (int i = 0; i < opts->n_vols; i++)
     {
+        const char* host_path = opts->vol_host[i];
         const char* ctr_path = opts->vol_ctr[i];
         /* Container path must be absolute and must not contain '..' components */
-        if (ctr_path[0] != '/')
+        if (!path_is_absolute_and_clean(host_path))
         {
-            fprintf(stderr, "oci2bin: -v container path must be absolute: %s\n", ctr_path);
+            fprintf(stderr, "oci2bin: -v host path must be absolute and clean: %s\n",
+                    host_path);
             continue;
         }
-        if (strstr(ctr_path, "..") != NULL)
+        if (!path_is_absolute_and_clean(ctr_path))
         {
-            fprintf(stderr, "oci2bin: -v container path must not contain '..': %s\n",
+            fprintf(stderr,
+                    "oci2bin: -v container path must be absolute and clean: %s\n",
                     ctr_path);
             continue;
         }
@@ -880,23 +1786,21 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
             continue;
         }
 
-        /* Create mount point if it doesn't exist */
-        struct stat st;
-        if (stat(dst, &st) != 0)
+        if (ensure_bind_mount_target(host_path, dst, "-v") < 0)
         {
-            mkdir(dst, 0755);
+            continue;
         }
 
         /* Bind mount: host path → container path (pre-chroot, both accessible) */
-        if (mount(opts->vol_host[i], dst, NULL, MS_BIND | MS_REC, NULL) < 0)
+        if (mount(host_path, dst, NULL, MS_BIND | MS_REC, NULL) < 0)
         {
             fprintf(stderr, "oci2bin: bind mount %s -> %s failed: %s\n",
-                    opts->vol_host[i], opts->vol_ctr[i], strerror(errno));
+                    host_path, opts->vol_ctr[i], strerror(errno));
         }
         else
         {
             fprintf(stderr, "oci2bin: mounted %s -> %s\n",
-                    opts->vol_host[i], opts->vol_ctr[i]);
+                    host_path, opts->vol_ctr[i]);
         }
     }
 }
@@ -913,7 +1817,6 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         return;
     }
 
-    /* Ensure /run/secrets exists in the rootfs */
     char run_secrets[PATH_MAX];
     if (snprintf(run_secrets, sizeof(run_secrets), "%s/run/secrets", rootfs)
             >= (int)sizeof(run_secrets))
@@ -929,8 +1832,11 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         fprintf(stderr, "oci2bin: rootfs path too long for /run\n");
         return;
     }
-    mkdir(run_dir, 0755);   /* EEXIST is expected and fine */
-    mkdir(run_secrets, 0700); /* EEXIST is expected and fine */
+    if (mkdir_p_secure(run_dir, 0755, "--secret") < 0 ||
+            mkdir_p_secure(run_secrets, 0700, "--secret") < 0)
+    {
+        return;
+    }
 
     for (int i = 0; i < opts->n_secrets; i++)
     {
@@ -938,14 +1844,10 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         const char* ctr  = opts->secret_ctr[i]; /* may be NULL */
 
         /* Validate src is absolute and has no '..' */
-        if (src[0] != '/')
+        if (!path_is_absolute_and_clean(src))
         {
-            fprintf(stderr, "oci2bin: --secret host path must be absolute: %s\n", src);
-            continue;
-        }
-        if (strstr(src, "..") != NULL)
-        {
-            fprintf(stderr, "oci2bin: --secret host path must not contain '..': %s\n",
+            fprintf(stderr,
+                    "oci2bin: --secret host path must be absolute and clean: %s\n",
                     src);
             continue;
         }
@@ -954,16 +1856,10 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         char ctr_buf[PATH_MAX];
         if (ctr)
         {
-            if (ctr[0] != '/')
+            if (!path_is_absolute_and_clean(ctr))
             {
                 fprintf(stderr,
-                        "oci2bin: --secret container path must be absolute: %s\n", ctr);
-                continue;
-            }
-            if (strstr(ctr, "..") != NULL)
-            {
-                fprintf(stderr,
-                        "oci2bin: --secret container path must not contain '..': %s\n",
+                        "oci2bin: --secret container path must be absolute and clean: %s\n",
                         ctr);
                 continue;
             }
@@ -999,28 +1895,9 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
             continue;
         }
 
-        /* Create parent directory if needed */
-        char par[PATH_MAX];
-        int plen = snprintf(par, sizeof(par), "%s", dst);
-        if (plen > 0 && (size_t)plen < sizeof(par))
+        if (ensure_bind_mount_target(src, dst, "--secret") < 0)
         {
-            char* slash = strrchr(par, '/');
-            if (slash && slash != par)
-            {
-                *slash = '\0';
-                mkdir(par, 0755);
-            }
-        }
-
-        /* Create an empty target file so bind-mount has something to attach to.
-         * O_CREAT|O_EXCL is atomic: no stat() pre-check needed or wanted. */
-        {
-            int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0000);
-            if (fd >= 0)
-            {
-                close(fd);
-            }
-            /* EEXIST is fine: file already present, bind-mount will attach to it */
+            continue;
         }
 
         /* Bind-mount the secret file read-only */
@@ -1507,79 +2384,350 @@ static void apply_seccomp_filter(void)
     }
 }
 
+/* ── PTY relay for job control ──────────────────────────────────────────── */
+
+/* Global master fd used by SIGWINCH handler to forward terminal resize. */
+static volatile int g_pty_master_fd = -1;
+
+/* Global child PID for signal forwarding from PTY parent. */
+static volatile pid_t g_pty_child_pid = 0;
+
+static void pty_forward_signal(int sig)
+{
+    if (g_pty_child_pid > 0)
+    {
+        kill(g_pty_child_pid, sig);
+    }
+}
+
+static void sigwinch_handler(int sig)
+{
+    (void)sig;
+    if (g_pty_master_fd < 0)
+    {
+        return;
+    }
+    struct winsize ws;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+    {
+        ioctl(g_pty_master_fd, TIOCSWINSZ, &ws);
+    }
+}
+
+/*
+ * Relay data between the host terminal (stdin/stdout) and the PTY master.
+ * Runs until the slave side closes (child exits) — read() returns EIO or 0.
+ * Restores the saved terminal settings before returning.
+ */
+static void relay_pty(int master_fd, struct termios *saved_termios,
+                      int saved_termios_ok)
+{
+    char buf[4096];
+    struct pollfd fds[2];
+
+    fds[0].fd     = STDIN_FILENO;
+    fds[0].events = POLLIN;
+    fds[1].fd     = master_fd;
+    fds[1].events = POLLIN;
+
+    for (;;)
+    {
+        int n = poll(fds, 2, -1);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+
+        /* stdin → master: user keystrokes into container */
+        if (fds[0].revents & POLLIN)
+        {
+            ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+            if (r <= 0)
+            {
+                break;
+            }
+            if (write(master_fd, buf, r) < 0)
+            {
+                break;
+            }
+        }
+
+        /* master → stdout: container output to user */
+        if (fds[1].revents & POLLIN)
+        {
+            ssize_t r = read(master_fd, buf, sizeof(buf));
+            if (r <= 0)
+            {
+                break;
+            }
+            ssize_t w = 0;
+            while (w < r)
+            {
+                ssize_t ww = write(STDOUT_FILENO, buf + w, r - w);
+                if (ww < 0)
+                {
+                    goto done;
+                }
+                w += ww;
+            }
+        }
+
+        /* stdin closed — stop sending to master, but keep draining output */
+        if (fds[0].revents & (POLLHUP | POLLERR))
+        {
+            fds[0].fd = -1;   /* stop polling stdin */
+        }
+
+        /* master closed — drain any final data then exit */
+        if (fds[1].revents & POLLHUP)
+        {
+            /* drain remaining bytes */
+            for (;;)
+            {
+                ssize_t r = read(master_fd, buf, sizeof(buf));
+                if (r <= 0)
+                {
+                    break;
+                }
+                ssize_t w = 0;
+                while (w < r)
+                {
+                    ssize_t ww = write(STDOUT_FILENO, buf + w, r - w);
+                    if (ww < 0)
+                    {
+                        goto done;
+                    }
+                    w += ww;
+                }
+            }
+            break;
+        }
+        if (fds[1].revents & POLLERR)
+        {
+            break;
+        }
+    }
+done:
+    /* Restore the host terminal before returning so the prompt looks right */
+    if (saved_termios_ok)
+    {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, saved_termios);
+    }
+    g_pty_master_fd = -1;
+    close(master_fd);
+}
+
+/* ── end PTY relay ──────────────────────────────────────────────────────── */
+
+/*
+ * Resolve an OCI "User" spec into uid/gid.  Called after chroot so
+ * /etc/passwd and /etc/group refer to the container's files.
+ *
+ * Formats: "user" | "uid" | "user:group" | "uid:gid" | "uid:group" | "user:gid"
+ * Returns 0 on success, -1 if the spec cannot be resolved.
+ */
+static int resolve_user(const char* spec, uid_t* out_uid, gid_t* out_gid)
+{
+    if (!spec || !spec[0])
+    {
+        return -1;
+    }
+    char buf[256];
+    int sn = snprintf(buf, sizeof(buf), "%s", spec);
+    if (sn < 0 || (size_t)sn >= sizeof(buf))
+    {
+        return -1;
+    }
+
+    char* colon      = strchr(buf, ':');
+    char* group_part = NULL;
+    if (colon)
+    {
+        *colon     = '\0';
+        group_part = colon + 1;
+    }
+
+    uid_t uid = 0;
+    gid_t gid = 0;
+
+    /* Resolve user part: numeric UID or name lookup in /etc/passwd */
+    if (buf[0] >= '0' && buf[0] <= '9')
+    {
+        long v = 0;
+        if (parse_id_value(buf, 65534, &v) < 0)
+        {
+            return -1;
+        }
+        uid = (uid_t)v;
+        /* numeric UID with no group spec → gid defaults to 0 */
+    }
+    else
+    {
+        if (lookup_passwd_user("/etc/passwd", buf, &uid, &gid) < 0)
+        {
+            return -1;
+        }
+    }
+
+    /* Resolve group part if given: numeric GID or name lookup in /etc/group */
+    if (group_part)
+    {
+        if (group_part[0] >= '0' && group_part[0] <= '9')
+        {
+            long v = 0;
+            if (parse_id_value(group_part, 65534, &v) < 0)
+            {
+                return -1;
+            }
+            gid = (gid_t)v;
+        }
+        else
+        {
+            if (lookup_group_name("/etc/group", group_part, &gid) < 0)
+            {
+                return -1;
+            }
+        }
+    }
+
+    *out_uid = uid;
+    *out_gid = gid;
+    return 0;
+}
+
 static int container_main(const char* rootfs, struct container_opts *opts)
 {
-    /* Read entrypoint/cmd config written by extract_oci_rootfs() */
-    char config_path[PATH_MAX];
-    snprintf(config_path, sizeof(config_path), "%s/.oci2bin_config", rootfs);
-    char* config = read_file(config_path, NULL);
+    debug_log("container_main.begin", "rootfs=%s", rootfs);
 
-    /* Build exec_args: [entrypoint...] [cmd...] */
+    /* Read OCI image config and build exec argv */
+    struct oci_config oci_cfg;
+    read_oci_config(rootfs, &oci_cfg);
+
     char* exec_args[MAX_ARGS + 1];
-    int exec_argc = 0;
-
-    /* --- Determine entrypoint --- */
-    if (opts->entrypoint)
+    int exec_argc = build_exec_args(&oci_cfg, opts->entrypoint,
+                                    opts->extra_args, opts->n_extra,
+                                    exec_args, MAX_ARGS);
+    if (g_debug)
     {
-        /* User supplied --entrypoint: use it as a single string */
-        exec_args[exec_argc++] = opts->entrypoint;
-    }
-    else if (config)
-    {
-        char* ep_json = json_get_array(config, "Entrypoint");
-        if (ep_json && strcmp(ep_json, "null") != 0)
+        for (int i = 0; i < exec_argc; i++)
         {
-            exec_argc += json_parse_string_array(ep_json, exec_args + exec_argc,
-                                                 MAX_ARGS - exec_argc);
-        }
-        free(ep_json);
-    }
-
-    /* --- Determine cmd / extra args --- */
-    if (opts->n_extra > 0)
-    {
-        /* User supplied extra args: they replace OCI Cmd entirely */
-        for (int i = 0; i < opts->n_extra && exec_argc < MAX_ARGS; i++)
-        {
-            exec_args[exec_argc++] = opts->extra_args[i];
+            debug_log("container.exec_arg", "index=%d value=%s", i,
+                      safe_str(exec_args[i]));
         }
     }
-    else if (config)
-    {
-        char* cmd_json = json_get_array(config, "Cmd");
-        if (cmd_json && strcmp(cmd_json, "null") != 0)
-        {
-            exec_argc += json_parse_string_array(cmd_json, exec_args + exec_argc,
-                                                 MAX_ARGS - exec_argc);
-        }
-        free(cmd_json);
-    }
 
-    /* Save image Env and WorkingDir before freeing config — applied after chroot */
-    char* image_env_json = NULL;
-    char* image_workdir  = NULL;
-    if (config)
+    /* Save image Env, WorkingDir and User — applied after chroot.
+     * Transfer ownership from oci_cfg so free_oci_config won't free them.
+     * User is copied to a stack buffer to survive subsequent heap activity. */
+    char* image_env_json = oci_cfg.env_json;
+    char* image_workdir  = oci_cfg.workdir;
+    char  image_user_buf[256] = {0};
+    if (oci_cfg.user && oci_cfg.user[0])
     {
-        image_env_json = json_get_array(config, "Env");
-        image_workdir  = json_get_string(config, "WorkingDir");
+        snprintf(image_user_buf, sizeof(image_user_buf), "%s", oci_cfg.user);
     }
-
-    free(config);
-
-    /* Fallback: if nothing resolved, run /bin/sh */
-    if (exec_argc == 0)
-    {
-        exec_args[0] = "/bin/sh";
-        exec_argc = 1;
-    }
-    exec_args[exec_argc] = NULL;
+    char* image_user = image_user_buf;
+    oci_cfg.env_json = NULL;
+    oci_cfg.workdir  = NULL;
+    free_oci_config(&oci_cfg);
 
     /* Remove our temp config file */
-    unlink(config_path);
+    {
+        char config_path[PATH_MAX];
+        int cpn = snprintf(config_path, sizeof(config_path),
+                           "%s/.oci2bin_config", rootfs);
+        if (cpn > 0 && (size_t)cpn < sizeof(config_path))
+        {
+            unlink(config_path);
+        }
+    }
 
     /* Set up volume bind mounts BEFORE chroot (host paths still reachable) */
     setup_volumes(rootfs, opts);
     setup_secrets(rootfs, opts);
+
+    /* Mount tmpfs on rootfs/dev and bind-mount host device nodes.
+     * Must be done before chroot so the host paths are still reachable as
+     * bind-mount sources.  After chroot the paths resolve inside the
+     * container and the bind would silently map an empty tmpfs file to
+     * itself instead of the real host device node. */
+    {
+        char dev_dir[PATH_MAX];
+        int dlen = snprintf(dev_dir, sizeof(dev_dir), "%s/dev", rootfs);
+        if (dlen > 0 && (size_t)dlen < sizeof(dev_dir))
+        {
+            if (mkdir_p_secure(dev_dir, 0755, "/dev") < 0)
+            {
+                return 1;
+            }
+            if (mount("tmpfs", dev_dir, "tmpfs",
+                      MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
+            {
+                perror("mount /dev tmpfs (non-fatal)");
+            }
+            else
+            {
+                if (!opts->no_host_dev)
+                {
+                    static const char* const HOST_DEVS[] =
+                    {
+                        "/dev/null", "/dev/zero", "/dev/random",
+                        "/dev/urandom", "/dev/tty", NULL,
+                    };
+                    for (int di = 0; HOST_DEVS[di]; di++)
+                    {
+                        char dst[PATH_MAX];
+                        int plen = snprintf(dst, sizeof(dst), "%s%s",
+                                            rootfs, HOST_DEVS[di]);
+                        if (plen < 0 || (size_t)plen >= sizeof(dst))
+                        {
+                            continue;
+                        }
+                        if (ensure_bind_mount_target(HOST_DEVS[di], dst,
+                                                     "/dev") < 0)
+                        {
+                            continue;
+                        }
+                        if (mount(HOST_DEVS[di], dst, NULL,
+                                  MS_BIND, NULL) < 0)
+                        {
+                            fprintf(stderr,
+                                    "oci2bin: bind-mount %s"
+                                    " (non-fatal): %s\n",
+                                    HOST_DEVS[di], strerror(errno));
+                        }
+                    }
+                }
+                /* Create /dev/pts dir; devpts is mounted after chroot */
+                char pts_dir[PATH_MAX];
+                int plen = snprintf(pts_dir, sizeof(pts_dir),
+                                    "%s/dev/pts", rootfs);
+                if (plen > 0 && (size_t)plen < sizeof(pts_dir))
+                {
+                    if (mkdir_p_secure(pts_dir, 0755, "/dev/pts") < 0)
+                    {
+                        return 1;
+                    }
+                }
+                /* Create /dev/ptmx placeholder for post-chroot bind */
+                char ptmx_path[PATH_MAX];
+                int mlen = snprintf(ptmx_path, sizeof(ptmx_path),
+                                    "%s/dev/ptmx", rootfs);
+                if (mlen > 0 && (size_t)mlen < sizeof(ptmx_path))
+                {
+                    if (ensure_bind_mount_target("/dev/null", ptmx_path,
+                                                 "/dev/ptmx") < 0)
+                    {
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
 
     /* --ssh-agent: forward host SSH_AUTH_SOCK into the container.
      * The socket is bind-mounted at /run/ssh-agent.sock and SSH_AUTH_SOCK
@@ -1599,9 +2747,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                     "oci2bin: --ssh-agent: SSH_AUTH_SOCK must be an absolute path: %s\n",
                     sock);
         }
-        else if (strstr(sock, "/../") != NULL ||
-                 (strlen(sock) >= 3 &&
-                  strcmp(sock + strlen(sock) - 3, "/..") == 0))
+        else if (path_has_dotdot_component(sock))
         {
             fprintf(stderr,
                     "oci2bin: --ssh-agent: SSH_AUTH_SOCK must not contain '..': %s\n",
@@ -1639,7 +2785,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                     int dlen = snprintf(sock_dir, sizeof(sock_dir), "%s/run", rootfs);
                     if (dlen > 0 && (size_t)dlen < sizeof(sock_dir))
                     {
-                        mkdir(sock_dir, 0755);
+                        if (mkdir_p_secure(sock_dir, 0755, "--ssh-agent") < 0)
+                        {
+                            ssh_auth_sock_host[0] = '\0';
+                        }
                     }
                     char sock_dst[PATH_MAX];
                     int tlen = snprintf(sock_dst, sizeof(sock_dst),
@@ -1650,25 +2799,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                                 "oci2bin: --ssh-agent: destination path too long\n");
                         ssh_auth_sock_host[0] = '\0';
                     }
-                    else
+                    else if (ssh_auth_sock_host[0] != '\0')
                     {
-                        /* Create empty placeholder file as bind-mount target.
-                         * O_EXCL ensures we abort if the file already exists
-                         * (e.g. a symlink planted by a malicious image layer)
-                         * rather than silently following it. */
-                        int fd = open(sock_dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
-                                      0600);
-                        if (fd < 0)
+                        if (ensure_bind_mount_target(ssh_auth_sock_host, sock_dst,
+                                                     "--ssh-agent") < 0)
                         {
-                            fprintf(stderr,
-                                    "oci2bin: --ssh-agent: cannot create socket placeholder"
-                                    " %s: %s\n",
-                                    sock_dst, strerror(errno));
                             ssh_auth_sock_host[0] = '\0';
-                        }
-                        else
-                        {
-                            close(fd);
                         }
                         if (ssh_auth_sock_host[0] != '\0')
                         {
@@ -1852,37 +2988,18 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         perror("mount /tmp tmpfs (non-fatal)");
     }
 
-    /* Mount /dev and create essential device nodes via mknod.
-     * We cannot bind-mount host /dev in a rootless user namespace,
-     * so we create the nodes manually after entering the namespace. */
-    mkdir("/dev", 0755);
-    if (mount("tmpfs", "/dev", "tmpfs",
-              MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
+    /* Mount devpts for TTY/job control support.  /dev is already a tmpfs
+     * with host device nodes bind-mounted (done pre-chroot above). */
+    if (mount("devpts", "/dev/pts", "devpts",
+              MS_NOSUID | MS_NOEXEC,
+              "newinstance,ptmxmode=0666,mode=0620") < 0)
     {
-        perror("mount /dev tmpfs (non-fatal)");
+        perror("mount devpts (non-fatal)");
     }
-    else
+    /* /dev/ptmx -> pts/ptmx so openpty() finds the right multiplexer */
+    if (mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL) < 0)
     {
-        /* c 1 3 */ if (mknod("/dev/null",    S_IFCHR | 0666, makedev(1, 3)) < 0)
-        {
-            perror("mknod /dev/null (non-fatal)");
-        }
-        /* c 1 5 */ if (mknod("/dev/zero",    S_IFCHR | 0666, makedev(1, 5)) < 0)
-        {
-            perror("mknod /dev/zero (non-fatal)");
-        }
-        /* c 1 8 */ if (mknod("/dev/random",  S_IFCHR | 0666, makedev(1, 8)) < 0)
-        {
-            perror("mknod /dev/random (non-fatal)");
-        }
-        /* c 1 9 */ if (mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9)) < 0)
-        {
-            perror("mknod /dev/urandom (non-fatal)");
-        }
-        /* c 5 0 */ if (mknod("/dev/tty",     S_IFCHR | 0620, makedev(5, 0)) < 0)
-        {
-            perror("mknod /dev/tty (non-fatal)");
-        }
+        perror("bind-mount /dev/ptmx (non-fatal)");
     }
 
     /* Expose --device host devices inside the container */
@@ -1961,6 +3078,11 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                     strerror(errno));
         }
     }
+
+    /* Build a clean environment — drop all host vars so that LANG, USER,
+     * DISPLAY, XDG_*, etc. cannot bleed into the container.  All required
+     * variables are set explicitly below. */
+    clearenv();
 
     /* Set standard env */
     setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -2085,35 +3207,84 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         return rc;
     }
 
-    /* Drop to requested UID/GID if --user was given (fatal if it fails) */
+    /* Drop to requested UID/GID.  --user overrides the image User field. */
+    uid_t drop_uid = 0;
+    gid_t drop_gid = 0;
+    int   do_drop  = 0;
+
     if (opts->has_user)
     {
-        if (setgroups(0, NULL) < 0)
+        drop_uid = opts->run_uid;
+        drop_gid = opts->run_gid;
+        do_drop  = 1;
+    }
+    else if (image_user && image_user[0])
+    {
+        if (resolve_user(image_user, &drop_uid, &drop_gid) == 0 &&
+                (drop_uid != 0 || drop_gid != 0))
         {
-            fprintf(stderr, "oci2bin: setgroups failed: %s\n", strerror(errno));
-            return 1;
+            do_drop = 1;
+            debug_log("container.user", "spec=%s uid=%d gid=%d",
+                      image_user, (int)drop_uid, (int)drop_gid);
         }
-        if (setgid(opts->run_gid) < 0)
+        else
         {
-            fprintf(stderr, "oci2bin: setgid(%d) failed: %s\n",
-                    (int)opts->run_gid, strerror(errno));
-            return 1;
-        }
-        if (setuid(opts->run_uid) < 0)
-        {
-            fprintf(stderr, "oci2bin: setuid(%d) failed: %s\n",
-                    (int)opts->run_uid, strerror(errno));
-            return 1;
+            fprintf(stderr,
+                    "oci2bin: warning: could not resolve image User \"%s\"\n",
+                    image_user);
         }
     }
 
-    /* Exec the entrypoint — execvp searches PATH so relative names work */
-    fprintf(stderr, "oci2bin: exec %s\n", exec_args[0]);
+    if (do_drop)
+    {
+        /* setgroups may be denied in a user namespace (EPERM) — non-fatal */
+        setgroups(0, NULL);
+        /* In a user namespace only UID/GID 0 is mapped; setgid/setuid
+         * for other IDs fails with EINVAL.  Treat as non-fatal so the
+         * container still runs as the mapped uid=0. */
+        if (setgid(drop_gid) < 0)
+        {
+            debug_log("container.setgid_skip", "gid=%d err=%s",
+                      (int)drop_gid, strerror(errno));
+        }
+        if (setuid(drop_uid) < 0)
+        {
+            debug_log("container.setuid_skip", "uid=%d err=%s",
+                      (int)drop_uid, strerror(errno));
+        }
+    }
+
+    /* Set up PTY slave as controlling terminal for job control.
+     * The PTY master/slave pair was allocated before fork() in main().
+     * The child closes the master (parent's end) and claims the slave
+     * via setsid() + TIOCSCTTY so the container shell gets full job control. */
+    if (opts->pty_slave_fd >= 0)
+    {
+        if (opts->pty_master_fd >= 0)
+        {
+            close(opts->pty_master_fd);
+        }
+        setsid();
+        if (ioctl(opts->pty_slave_fd, TIOCSCTTY, 0) == 0)
+        {
+            dup2(opts->pty_slave_fd, STDIN_FILENO);
+            dup2(opts->pty_slave_fd, STDOUT_FILENO);
+            dup2(opts->pty_slave_fd, STDERR_FILENO);
+        }
+        if (opts->pty_slave_fd > STDERR_FILENO)
+        {
+            close(opts->pty_slave_fd);
+        }
+    }
+
+    /* Exec the entrypoint */
+    debug_log("container.exec", "path=%s argc=%d", safe_str(exec_args[0]),
+              exec_argc);
     execvp(exec_args[0], exec_args);
 
     /* If exec failed, try /bin/sh as fallback */
     perror("execvp");
-    fprintf(stderr, "oci2bin: falling back to /bin/sh\n");
+    debug_log("container.exec_fallback", "path=/bin/sh");
     execlp("/bin/sh", "sh", NULL);
     perror("execlp /bin/sh");
     return 1;
@@ -2161,7 +3332,7 @@ static int load_env_file(const char* path, struct container_opts* opts)
         return -1;
     }
 
-    ssize_t n = read(fd, buf, sz);
+    ssize_t n = read_all_fd(fd, buf, sz);
     close(fd);
     if (n < 0)
     {
@@ -2262,6 +3433,8 @@ static void usage(const char* prog)
             "                      state accumulates across runs\n"
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
+            "  --no-host-dev       Skip bind-mounting host /dev nodes (null, zero, "
+            "random, tty)\n"
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
             "  --hostname NAME     Set the hostname inside the container\n"
             "  --cap-drop CAP      Drop a capability (or 'all' to drop all)\n"
@@ -2282,6 +3455,10 @@ static void usage(const char* prog)
             "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
             "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
             "  --config PATH       Load options from a key=value config file\n"
+            "  --debug             Emit verbose runtime debug diagnostics\n"
+            "  --vm               run container inside a microVM (requires KVM or HVF)\n"
+            "  --vmm VMM          VMM backend: cloud-hypervisor, or path to binary\n"
+            "                     (default: cloud-hypervisor; libkrun if compiled with LIBKRUN=1)\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -2308,11 +3485,8 @@ static void usage(const char* prog)
  * Returns a heap-allocated argv array (NULL-terminated) on success.
  * Returns NULL on error (error message already printed).
  * *out_argc is set to the new argc.
- * *out_heap_strings is set to a NULL-terminated list of strings to free
- *   on error only; on success the caller must NOT free them.
  */
-static char** build_merged_argv(int argc, char* argv[], int* out_argc,
-                                char*** out_heap_strings)
+static char** build_merged_argv(int argc, char* argv[], int* out_argc)
 {
     /* First pass: find --config PATH pairs and validate the path */
     const char* config_path = NULL;
@@ -2334,7 +3508,7 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc,
                 return NULL;
             }
             config_path = argv[i + 1];
-            if (strstr(config_path, ".."))
+            if (path_has_dotdot_component(config_path))
             {
                 fprintf(stderr,
                         "oci2bin: --config: path must not"
@@ -2348,10 +3522,11 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc,
     /* If no --config, return original argv unchanged */
     if (!config_path)
     {
-        *out_argc         = argc;
-        *out_heap_strings = NULL;
+        debug_log("argv.merge", "config=none argc=%d", argc);
+        *out_argc = argc;
         return argv;
     }
+    debug_log("argv.merge", "config=%s", config_path);
 
     /* Read config file into a temporary heap-string array.
      * Each line "key=value" → two strings: "--key", "value"
@@ -2510,10 +3685,9 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc,
     }
     merged[mi] = NULL;
 
-    *out_argc         = merged_argc;
-    *out_heap_strings = cfg; /* caller must NOT free on success */
+    *out_argc = merged_argc;
     free(cfg);               /* free the indirection array; strings live in merged */
-    *out_heap_strings = NULL;
+    debug_log("argv.merge", "merged_argc=%d", merged_argc);
 
     /* The cfg[] strings are now referenced from merged[] directly.
      * They are heap-allocated and persist for the process lifetime —
@@ -2613,7 +3787,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         "oci2bin: --tmpfs path must be absolute: %s\n", tp);
                 return -1;
             }
-            if (strstr(tp, ".."))
+            if (path_has_dotdot_component(tp))
             {
                 fprintf(stderr,
                         "oci2bin: --tmpfs path must not contain '..': %s\n",
@@ -2887,7 +4061,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             i++;
-            if (strstr(argv[i], ".."))
+            if (path_has_dotdot_component(argv[i]))
             {
                 fprintf(stderr,
                         "oci2bin: --overlay-persist: path must not"
@@ -2904,14 +4078,35 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         {
             opts->no_seccomp = 1;
         }
+        else if (strcmp(argv[i], "--no-host-dev") == 0)
+        {
+            opts->no_host_dev = 1;
+        }
         else if (strcmp(argv[i], "--init") == 0)
         {
             opts->use_init = 1;
+        }
+        else if (strcmp(argv[i], "--debug") == 0)
+        {
+            opts->debug = 1;
         }
         else if (strcmp(argv[i], "--detach") == 0
                  || strcmp(argv[i], "-d") == 0)
         {
             opts->detach = 1;
+        }
+        else if (strcmp(argv[i], "--vm") == 0)
+        {
+            opts->use_vm = 1;
+        }
+        else if (strcmp(argv[i], "--vmm") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --vmm requires a VMM argument\n");
+                return -1;
+            }
+            opts->vmm = argv[++i];
         }
         else if (strcmp(argv[i], "--memory") == 0)
         {
@@ -3011,6 +4206,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 quota = 1;
             }
             opts->cg_cpu_quota = quota;
+            opts->vm_cpus = cpus;
         }
         else if (strcmp(argv[i], "--pids-limit") == 0)
         {
@@ -3047,7 +4243,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             i++;
-            if (strstr(argv[i], ".."))
+            if (path_has_dotdot_component(argv[i]))
             {
                 fprintf(stderr,
                         "oci2bin: --verify-key: key path must not"
@@ -3124,7 +4320,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         spec);
                 return -1;
             }
-            if (strstr(spec, ".."))
+            if (path_has_dotdot_component(spec))
             {
                 fprintf(stderr,
                         "oci2bin: --device path must not contain '..': %s\n",
@@ -3144,7 +4340,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                             ctr);
                     return -1;
                 }
-                if (strstr(ctr, ".."))
+                if (path_has_dotdot_component(ctr))
                 {
                     fprintf(stderr,
                             "oci2bin: --device container path must not"
@@ -3298,7 +4494,7 @@ static int verify_signature(const char* key_path)
     }
 
     /* Validate key_path: must not contain '..' */
-    if (strstr(key_path, ".."))
+    if (path_has_dotdot_component(key_path))
     {
         fprintf(stderr,
                 "oci2bin: --verify-key: key path must not contain "
@@ -3359,10 +4555,10 @@ static int cg_write(const char* path, const char* value)
                 path, strerror(errno));
         return -1;
     }
-    ssize_t n = write(fd, value, strlen(value));
+    int rc = write_all_fd(fd, value, strlen(value));
     int saved = errno;
     close(fd);
-    if (n < 0)
+    if (rc < 0)
     {
         fprintf(stderr, "oci2bin: cgroup: write %s (%s): %s\n",
                 path, value, strerror(saved));
@@ -3568,10 +4764,935 @@ static void rm_rf_dir(const char* path)
     nftw(path, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
 }
 
+/* ── VM backend ──────────────────────────────────────────────────────────── */
+
+/*
+ * extract_vm_blob: read SIZE bytes from /proc/self/exe at OFFSET, write to
+ * OUT_PATH.  Returns 0 on success, -1 on error.
+ * Security checks: rejects sentinel offsets, sizes > 64 MiB, and
+ * offset+size overflow.
+ */
+static int extract_vm_blob(unsigned long offset, unsigned long size,
+                           const char* out_path)
+{
+    /* Reject zero offset (unpatched binary — caller must check PATCHED flag) */
+    if (offset == 0)
+    {
+        fprintf(stderr, "oci2bin: VM blob not embedded (zero offset)\n");
+        return -1;
+    }
+    /* Reject unreasonably large blobs (> 64 MiB) */
+    if (size == 0 || size > 67108864UL)
+    {
+        fprintf(stderr, "oci2bin: VM blob size out of range: %lu\n", size);
+        return -1;
+    }
+    /* Reject offset+size overflow */
+    if (offset + size < offset)
+    {
+        fprintf(stderr, "oci2bin: VM blob offset+size overflow\n");
+        return -1;
+    }
+
+    int in_fd = open("/proc/self/exe", O_RDONLY);
+    if (in_fd < 0)
+    {
+        perror("open /proc/self/exe");
+        return -1;
+    }
+    if (lseek(in_fd, (off_t)offset, SEEK_SET) < 0)
+    {
+        perror("lseek VM blob");
+        close(in_fd);
+        return -1;
+    }
+
+    int out_fd = open(out_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (out_fd < 0)
+    {
+        perror("open VM blob output");
+        close(in_fd);
+        return -1;
+    }
+
+    char buf[65536];
+    unsigned long remaining = size;
+    while (remaining > 0)
+    {
+        size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        ssize_t n = read(in_fd, buf, to_read);
+        if (n <= 0)
+        {
+            fprintf(stderr, "oci2bin: read VM blob: short read at offset %lu\n",
+                    size - remaining);
+            close(in_fd);
+            close(out_fd);
+            return -1;
+        }
+        if (write(out_fd, buf, (size_t)n) != n)
+        {
+            perror("write VM blob");
+            close(in_fd);
+            close(out_fd);
+            return -1;
+        }
+        remaining -= (unsigned long)n;
+    }
+    close(in_fd);
+    if (close(out_fd) < 0)
+    {
+        perror("close VM blob output");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * vm_init_main: PID 1 inside the microVM.
+ * Called when OCI2BIN_VM_INIT is set in the environment.
+ */
+static int vm_init_main(void)
+{
+    size_t dbg_cmdline_size = 0;
+    char* dbg_cmdline = read_file("/proc/cmdline", &dbg_cmdline_size);
+    (void)dbg_cmdline_size;
+    if (dbg_cmdline && strstr(dbg_cmdline, "OCI2BIN_DEBUG=1"))
+    {
+        g_debug = 1;
+    }
+    free(dbg_cmdline);
+
+    debug_log("vm.init.begin", "bootstrap=1");
+
+    /* 1. Mount pseudo-filesystems */
+    mkdir("/proc", 0555); /* ignore EEXIST */
+    if (mount("proc", "/proc", "proc",
+              MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) < 0)
+    {
+        perror("mount /proc");
+        /* continue anyway — some images may have it already */
+    }
+    mkdir("/sys", 0555);
+    if (mount("sysfs", "/sys", "sysfs",
+              MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) < 0)
+    {
+        perror("mount /sys");
+    }
+    /* /dev should already exist from initramfs rootfs */
+    if (mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID, "mode=0755") < 0)
+    {
+        perror("mount /dev");
+    }
+    mkdir("/dev/pts", 0755);
+    if (mount("devpts", "/dev/pts", "devpts",
+              MS_NOSUID | MS_NOEXEC, NULL) < 0)
+    {
+        perror("mount /dev/pts");
+    }
+
+    /* 2. Handle virtiofs mounts from cmdline: oci2bin.mount.N=tag:path */
+    size_t cmdline_size;
+    char* vm_cmdline = read_file("/proc/cmdline", &cmdline_size);
+    if (vm_cmdline)
+    {
+        for (int mi = 0; mi < 64; mi++)
+        {
+            char key[32];
+            int kn = snprintf(key, sizeof(key), "oci2bin.mount.%d=", mi);
+            if (kn < 0 || (size_t)kn >= sizeof(key))
+            {
+                break;
+            }
+            char* pos = strstr(vm_cmdline, key);
+            if (!pos)
+            {
+                break;
+            }
+            pos += strlen(key);
+            /* format: tag:path */
+            char* colon = strchr(pos, ':');
+            if (!colon)
+            {
+                break;
+            }
+            size_t tag_len = (size_t)(colon - pos);
+            char tag[256];
+            if (tag_len >= sizeof(tag))
+            {
+                break;
+            }
+            memcpy(tag, pos, tag_len);
+            tag[tag_len] = '\0';
+            /* path ends at space or end-of-string */
+            char* path_end = colon + 1;
+            while (*path_end && *path_end != ' ' && *path_end != '\n')
+            {
+                path_end++;
+            }
+            size_t path_len = (size_t)(path_end - (colon + 1));
+            char mnt_path[PATH_MAX];
+            if (path_len >= sizeof(mnt_path))
+            {
+                break;
+            }
+            memcpy(mnt_path, colon + 1, path_len);
+            mnt_path[path_len] = '\0';
+            /* validate path — reject .. */
+            if (strstr(mnt_path, "..") != NULL || mnt_path[0] != '/')
+            {
+                fprintf(stderr,
+                        "oci2bin-init: skipping unsafe mount path: %s\n",
+                        mnt_path);
+                continue;
+            }
+            /* mkdir and mount */
+            mkdir(mnt_path, 0755); /* ignore errors */
+            if (mount(tag, mnt_path, "virtiofs", 0, NULL) < 0)
+            {
+                perror("mount virtiofs");
+            }
+        }
+        free(vm_cmdline);
+    }
+
+    /* 3. Read OCI config and build exec argv */
+    struct oci_config oci_cfg;
+    if (read_oci_config("", &oci_cfg) < 0)
+    {
+        fprintf(stderr, "oci2bin-init: /.oci2bin_config not found\n");
+        return 1;
+    }
+
+    char* exec_args[MAX_ARGS + 1];
+    int exec_argc = build_exec_args(&oci_cfg, NULL, NULL, 0, exec_args,
+                                    MAX_ARGS);
+    if (g_debug)
+    {
+        for (int i = 0; i < exec_argc; i++)
+        {
+            debug_log("vm.init.exec_arg", "index=%d value=%s", i,
+                      safe_str(exec_args[i]));
+        }
+    }
+
+    /* 4. Build flat env array */
+    char* flat_env[MAX_ENV + 1];
+    int flat_env_n = 0;
+
+    /* Seed with defaults */
+    flat_env[flat_env_n++] =
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    flat_env[flat_env_n++] = "HOME=/root";
+    flat_env[flat_env_n++] = "TERM=xterm";
+
+    char* image_envs[MAX_ENV];
+    int n_image_env = 0;
+    if (oci_cfg.env_json && strcmp(oci_cfg.env_json, "null") != 0)
+    {
+        n_image_env = json_parse_string_array(oci_cfg.env_json,
+                                              image_envs, MAX_ENV);
+        for (int i = 0; i < n_image_env && flat_env_n < MAX_ENV; i++)
+        {
+            flat_env[flat_env_n++] = image_envs[i];
+        }
+    }
+    flat_env[flat_env_n] = NULL;
+
+    /* 5. chdir to workdir */
+    if (oci_cfg.workdir && oci_cfg.workdir[0])
+    {
+        if (chdir(oci_cfg.workdir) < 0)
+        {
+            perror("chdir workdir"); /* non-fatal */
+        }
+    }
+
+    /* 6. exec */
+    debug_log("vm.init.exec", "path=%s argc=%d env=%d", safe_str(exec_args[0]),
+              exec_argc, flat_env_n);
+    execvpe(exec_args[0], exec_args, flat_env);
+    perror("oci2bin-init: execvpe");
+
+    /* Cleanup on failure */
+    for (int i = 0; i < n_image_env; i++)
+    {
+        free(image_envs[i]);
+    }
+    free_oci_config(&oci_cfg);
+    return 1;
+}
+
+#ifdef USE_LIBKRUN
+#include <libkrun.h>
+
+/*
+ * run_as_vm_libkrun: launch the container using libkrun in-process VM.
+ * Does not return on success (krun_start_enter never returns).
+ */
+static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
+                             struct container_opts* opts)
+{
+    (void)tmpdir; /* unused in libkrun path */
+    debug_log("vm.libkrun.begin", "rootfs=%s", rootfs);
+
+    /* Read OCI config and build exec argv */
+    struct oci_config oci_cfg;
+    if (read_oci_config(rootfs, &oci_cfg) < 0)
+    {
+        fprintf(stderr, "oci2bin: cannot read OCI config\n");
+        return 1;
+    }
+
+    char* exec_args[MAX_ARGS + 1];
+    build_exec_args(&oci_cfg, opts->entrypoint,
+                    opts->extra_args, opts->n_extra,
+                    exec_args, MAX_ARGS);
+
+    /* Build flat env array (image Env + opts->env_vars) */
+    char* flat_env[MAX_ENV + 1];
+    int flat_env_n = 0;
+    char* image_envs[MAX_ENV];
+    int n_image_env = 0;
+
+    if (oci_cfg.env_json && strcmp(oci_cfg.env_json, "null") != 0)
+    {
+        n_image_env = json_parse_string_array(oci_cfg.env_json,
+                                              image_envs, MAX_ENV);
+        for (int i = 0; i < n_image_env && flat_env_n < MAX_ENV; i++)
+        {
+            flat_env[flat_env_n++] = image_envs[i];
+        }
+    }
+
+    for (int i = 0; i < opts->n_env && flat_env_n < MAX_ENV; i++)
+    {
+        flat_env[flat_env_n++] = opts->env_vars[i];
+    }
+    flat_env[flat_env_n] = NULL;
+
+    /* Create libkrun context */
+    int32_t ctx = krun_create_ctx();
+    if (ctx < 0)
+    {
+        fprintf(stderr, "oci2bin: krun_create_ctx failed: %d\n", ctx);
+        goto cleanup;
+    }
+
+    /* Set VM config */
+    uint8_t vcpus = (opts->vm_cpus > 0.0) ?
+                    (uint8_t)(opts->vm_cpus < 255.0 ?
+                              (int)(opts->vm_cpus + 0.5) : 255)
+                    : DEFAULT_VM_CPUS;
+    uint32_t mem_mb =
+        (opts->cg_memory_bytes > 0) ?
+        (uint32_t)((unsigned long long)opts->cg_memory_bytes >> 20)
+        : DEFAULT_VM_MEM_MB;
+    debug_log("vm.libkrun.config", "vcpus=%u mem_mb=%u", (unsigned)vcpus,
+              (unsigned)mem_mb);
+    if (krun_set_vm_config((uint32_t)ctx, vcpus, mem_mb) != 0)
+    {
+        fprintf(stderr, "oci2bin: krun_set_vm_config failed\n");
+        goto cleanup;
+    }
+
+    /* Ensure VM guest has a usable /etc/resolv.conf (not 127.0.0.53) */
+    install_resolv_conf(rootfs);
+
+    /* Set rootfs */
+    if (krun_set_root((uint32_t)ctx, rootfs) != 0)
+    {
+        fprintf(stderr, "oci2bin: krun_set_root failed\n");
+        goto cleanup;
+    }
+
+    /* Add volume mounts via krun_set_mapped_volumes (format: "host:guest") */
+    if (opts->n_vols > 0)
+    {
+        char vol_bufs[MAX_VOLUMES][PATH_MAX * 2 + 2];
+        const char* mapped[MAX_VOLUMES + 1];
+        for (int vi = 0; vi < opts->n_vols; vi++)
+        {
+            if (strstr(opts->vol_host[vi], "..") != NULL)
+            {
+                fprintf(stderr, "oci2bin: -v host path contains ..: %s\n",
+                        opts->vol_host[vi]);
+                goto cleanup;
+            }
+            if (strstr(opts->vol_ctr[vi], "..") != NULL ||
+                    opts->vol_ctr[vi][0] != '/')
+            {
+                fprintf(stderr, "oci2bin: -v container path invalid: %s\n",
+                        opts->vol_ctr[vi]);
+                goto cleanup;
+            }
+            int vn = snprintf(vol_bufs[vi], sizeof(vol_bufs[vi]),
+                              "%s:%s", opts->vol_host[vi], opts->vol_ctr[vi]);
+            if (vn < 0 || (size_t)vn >= sizeof(vol_bufs[vi]))
+            {
+                fprintf(stderr, "oci2bin: volume path too long\n");
+                goto cleanup;
+            }
+            mapped[vi] = vol_bufs[vi];
+        }
+        mapped[opts->n_vols] = NULL;
+        if (krun_set_mapped_volumes((uint32_t)ctx, mapped) != 0)
+        {
+            fprintf(stderr, "oci2bin: krun_set_mapped_volumes failed\n");
+            goto cleanup;
+        }
+    }
+
+    /* Set workdir */
+    {
+        const char* wdir = opts->workdir ? opts->workdir :
+                           (oci_cfg.workdir ? oci_cfg.workdir : NULL);
+        if (wdir && wdir[0])
+        {
+            if (strstr(wdir, "..") != NULL)
+            {
+                fprintf(stderr,
+                        "oci2bin: workdir contains ..: %s\n", wdir);
+                goto cleanup;
+            }
+            if (krun_set_workdir((uint32_t)ctx, wdir) != 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: krun_set_workdir failed\n");
+                goto cleanup;
+            }
+        }
+    }
+
+    /* Set exec */
+    if (krun_set_exec((uint32_t)ctx, exec_args[0],
+                      (const char* const *)(exec_args + 1),
+                      (const char* const *)flat_env) != 0)
+    {
+        fprintf(stderr, "oci2bin: krun_set_exec failed\n");
+        goto cleanup_ctx;
+    }
+
+    /* Start VM — does not return on success */
+    debug_log("vm.libkrun.start", "entering_guest=1");
+    if (krun_start_enter((uint32_t)ctx) != 0)
+    {
+        fprintf(stderr, "oci2bin: krun_start_enter returned unexpectedly\n");
+    }
+
+cleanup_ctx:
+    for (int i = 0; i < n_image_env; i++)
+    {
+        free(image_envs[i]);
+    }
+    free_oci_config(&oci_cfg);
+    return 1;
+
+cleanup:
+    for (int i = 0; i < n_image_env; i++)
+    {
+        free(image_envs[i]);
+    }
+    free_oci_config(&oci_cfg);
+    return 1;
+}
+#endif /* USE_LIBKRUN */
+
+/*
+ * run_as_vm_ch: launch cloud-hypervisor with kernel + initramfs embedded in
+ * this binary.  Calls execvp — does not return on success.
+ * rootfs: path to the extracted OCI rootfs directory.
+ */
+static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
+                        struct container_opts* opts)
+{
+    debug_log("vm.ch.begin", "rootfs=%s tmpdir=%s", rootfs, tmpdir);
+
+    /* Ensure VM guest has a usable /etc/resolv.conf (not 127.0.0.53) */
+    install_resolv_conf(rootfs);
+
+    /* Check kernel is embedded */
+    if (KERNEL_DATA_PATCHED != 1)
+    {
+        fprintf(stderr,
+                "oci2bin: --vm: no kernel embedded; "
+                "rebuild with: oci2bin --kernel build/vmlinux IMAGE OUTPUT\n"
+                "  or build with: make LIBKRUN=1 (no kernel needed)\n");
+        return 1;
+    }
+
+    /* Extract kernel blob */
+    char kernel_path[PATH_MAX];
+    int n = snprintf(kernel_path, sizeof(kernel_path), "%s/vmlinux", tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(kernel_path))
+    {
+        fprintf(stderr, "oci2bin: kernel path truncated\n");
+        return 1;
+    }
+    if (extract_vm_blob(KERNEL_DATA_OFFSET, KERNEL_DATA_SIZE, kernel_path) < 0)
+    {
+        return 1;
+    }
+    debug_log("vm.ch.kernel", "path=%s size=%lu", kernel_path,
+              KERNEL_DATA_SIZE);
+
+    /* Extract or build initramfs */
+    char initramfs_path[PATH_MAX];
+    n = snprintf(initramfs_path, sizeof(initramfs_path),
+                 "%s/rootfs.cpio.gz", tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(initramfs_path))
+    {
+        fprintf(stderr, "oci2bin: initramfs path truncated\n");
+        return 1;
+    }
+
+    if (INITRAMFS_DATA_PATCHED == 1)
+    {
+        /* Pre-embedded initramfs: just write the blob */
+        if (extract_vm_blob(INITRAMFS_DATA_OFFSET, INITRAMFS_DATA_SIZE,
+                            initramfs_path) < 0)
+        {
+            return 1;
+        }
+        debug_log("vm.ch.initramfs", "source=embedded path=%s size=%lu",
+                  initramfs_path, INITRAMFS_DATA_SIZE);
+    }
+    else
+    {
+        /*
+         * Build initramfs at runtime from the extracted rootfs.
+         * First, copy /proc/self/exe to rootfs/init so our binary
+         * becomes PID 1 in the VM.
+         */
+        char init_dst[PATH_MAX];
+        n = snprintf(init_dst, sizeof(init_dst), "%s/init", rootfs);
+        if (n < 0 || (size_t)n >= sizeof(init_dst))
+        {
+            fprintf(stderr, "oci2bin: init path truncated\n");
+            return 1;
+        }
+        {
+            int src_fd = open("/proc/self/exe", O_RDONLY);
+            if (src_fd < 0)
+            {
+                perror("open /proc/self/exe for init copy");
+                return 1;
+            }
+            int dst_fd = open(init_dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+            if (dst_fd < 0)
+            {
+                perror("open rootfs/init for writing");
+                close(src_fd);
+                return 1;
+            }
+            char cpbuf[65536];
+            ssize_t nr;
+            while ((nr = read(src_fd, cpbuf, sizeof(cpbuf))) > 0)
+            {
+                if (write(dst_fd, cpbuf, (size_t)nr) != nr)
+                {
+                    perror("write rootfs/init");
+                    close(src_fd);
+                    close(dst_fd);
+                    return 1;
+                }
+            }
+            close(src_fd);
+            if (close(dst_fd) < 0)
+            {
+                perror("close rootfs/init");
+                return 1;
+            }
+            if (chmod(init_dst, 0755) < 0)
+            {
+                perror("chmod rootfs/init");
+                return 1;
+            }
+        }
+
+        /* Find build_polyglot.py relative to self */
+        char self_path[PATH_MAX];
+        ssize_t slen = readlink("/proc/self/exe", self_path,
+                                sizeof(self_path) - 1);
+        if (slen < 0)
+        {
+            perror("readlink /proc/self/exe (initramfs)");
+            return 1;
+        }
+        self_path[slen] = '\0';
+
+        char polyglot_py[PATH_MAX];
+        polyglot_py[0] = '\0';
+
+        /* Find dirname of self_path */
+        char self_dir[PATH_MAX];
+        int sd = snprintf(self_dir, sizeof(self_dir), "%s", self_path);
+        if (sd > 0 && (size_t)sd < sizeof(self_dir))
+        {
+            char* slash = strrchr(self_dir, '/');
+            if (slash)
+            {
+                *slash = '\0';
+            }
+        }
+
+        /* Search for build_polyglot.py in order:
+         *  1. dirname(self)/scripts/          (dev / project root)
+         *  2. dirname(self)/../scripts/       (bin/ next to scripts/)
+         *  3. dirname(self)/../../share/oci2bin/scripts/ (installed)
+         *  4. /usr/share/oci2bin/scripts/     (system fallback)
+         */
+        static const char* const PY_SUFFIXES[] =
+        {
+            "/scripts/build_polyglot.py",
+            "/../scripts/build_polyglot.py",
+            "/../../share/oci2bin/scripts/build_polyglot.py",
+            NULL,
+        };
+        struct stat pystat;
+        int found_py = 0;
+        for (int si = 0; PY_SUFFIXES[si]; si++)
+        {
+            n = snprintf(polyglot_py, sizeof(polyglot_py),
+                         "%s%s", self_dir, PY_SUFFIXES[si]);
+            if (n > 0 && (size_t)n < sizeof(polyglot_py) &&
+                    stat(polyglot_py, &pystat) == 0)
+            {
+                found_py = 1;
+                break;
+            }
+        }
+        if (!found_py)
+        {
+            n = snprintf(polyglot_py, sizeof(polyglot_py),
+                         "/usr/share/oci2bin/scripts/build_polyglot.py");
+            if (n < 0 || (size_t)n >= sizeof(polyglot_py))
+            {
+                fprintf(stderr,
+                        "oci2bin: build_polyglot.py path truncated\n");
+                return 1;
+            }
+        }
+
+        /* build_polyglot.py --initramfs-only ROOTFSDIR OUTPATH */
+        char* args[] =
+        {
+            "python3",
+            polyglot_py,
+            "--initramfs-only",
+            (char*)rootfs,
+            initramfs_path,
+            NULL
+        };
+        pid_t pid = fork();
+        if (pid < 0)
+        {
+            perror("fork initramfs build");
+            return 1;
+        }
+        if (pid == 0)
+        {
+            execvp("python3", args);
+            perror("execvp python3 build_polyglot.py");
+            _exit(1);
+        }
+        int wstatus;
+        if (waitpid(pid, &wstatus, 0) < 0)
+        {
+            perror("waitpid initramfs build");
+            return 1;
+        }
+        if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0)
+        {
+            fprintf(stderr, "oci2bin: initramfs build failed\n");
+            return 1;
+        }
+        debug_log("vm.ch.initramfs", "source=built path=%s", initramfs_path);
+    }
+
+    /* --overlay-persist: create/reuse a data disk image */
+    char data_img_path[PATH_MAX];
+    int have_data_disk = 0;
+    if (opts->overlay_persist)
+    {
+        /* Sanitize: reject paths with .. */
+        if (strstr(opts->overlay_persist, "..") != NULL)
+        {
+            fprintf(stderr,
+                    "oci2bin: --overlay-persist path contains ..\n");
+            return 1;
+        }
+        /* Build data image path: overlay_persist/oci2bin-data.ext2 */
+        int nn = snprintf(data_img_path, sizeof(data_img_path),
+                          "%s/oci2bin-data.ext2", opts->overlay_persist);
+        if (nn < 0 || (size_t)nn >= sizeof(data_img_path))
+        {
+            fprintf(stderr,
+                    "oci2bin: overlay_persist path too long\n");
+            return 1;
+        }
+        /* Create data directory */
+        if (mkdir(opts->overlay_persist, 0700) < 0 && errno != EEXIST)
+        {
+            perror("mkdir overlay_persist");
+            return 1;
+        }
+        /* Create ext2 image if not already present */
+        struct stat st;
+        if (stat(data_img_path, &st) != 0)
+        {
+            /* Create sparse file (1 GiB) */
+            int fd = open(data_img_path,
+                          O_CREAT | O_RDWR | O_TRUNC, 0600);
+            if (fd < 0)
+            {
+                perror("open data_img");
+                return 1;
+            }
+            if (ftruncate(fd, 1073741824LL) < 0)
+            {
+                perror("ftruncate data_img");
+                close(fd);
+                return 1;
+            }
+            close(fd);
+            /* mkfs.ext2 */
+            char* mkfs_argv[] =
+            {
+                "mkfs.ext2", "-F", data_img_path, NULL
+            };
+            pid_t mkfs_pid = fork();
+            if (mkfs_pid < 0)
+            {
+                perror("fork mkfs");
+                return 1;
+            }
+            if (mkfs_pid == 0)
+            {
+                execvp("mkfs.ext2", mkfs_argv);
+                perror("execvp mkfs.ext2");
+                _exit(1);
+            }
+            int wst;
+            if (waitpid(mkfs_pid, &wst, 0) < 0 ||
+                    !WIFEXITED(wst) || WEXITSTATUS(wst) != 0)
+            {
+                fprintf(stderr, "oci2bin: mkfs.ext2 failed\n");
+                return 1;
+            }
+        }
+        have_data_disk = 1;
+    }
+
+    /* Build cpu/memory strings */
+    char cpus_str[32];
+    int vcpus = (opts->vm_cpus > 0.0) ? (int)(opts->vm_cpus + 0.5)
+                : DEFAULT_VM_CPUS;
+    n = snprintf(cpus_str, sizeof(cpus_str), "boot=%d", vcpus);
+    if (n < 0 || (size_t)n >= sizeof(cpus_str))
+    {
+        fprintf(stderr, "oci2bin: cpus string truncated\n");
+        return 1;
+    }
+
+    char mem_str[32];
+    unsigned long mem_mb =
+        (opts->cg_memory_bytes > 0) ?
+        (unsigned long)(opts->cg_memory_bytes >> 20)
+        : DEFAULT_VM_MEM_MB;
+    n = snprintf(mem_str, sizeof(mem_str), "size=%luM", mem_mb);
+    if (n < 0 || (size_t)n >= sizeof(mem_str))
+    {
+        fprintf(stderr, "oci2bin: memory string truncated\n");
+        return 1;
+    }
+
+    /* Build cmdline string (4096 bytes for multiple virtiofs entries) */
+    char cmdline[4096];
+    n = snprintf(cmdline, sizeof(cmdline),
+                 "console=ttyS0 reboot=k panic=1 pci=off OCI2BIN_VM_INIT=1"
+                 " init=/init");
+    if (n < 0 || (size_t)n >= sizeof(cmdline))
+    {
+        fprintf(stderr, "oci2bin: cmdline truncated\n");
+        return 1;
+    }
+
+    if (opts->debug)
+    {
+        int cn = snprintf(cmdline + strlen(cmdline),
+                          sizeof(cmdline) - strlen(cmdline),
+                          " OCI2BIN_DEBUG=1");
+        if (cn < 0 || (size_t)cn >= sizeof(cmdline) - strlen(cmdline))
+        {
+            fprintf(stderr, "oci2bin: cmdline truncated (debug)\n");
+            return 1;
+        }
+    }
+
+    /* Append data disk cmdline param if applicable */
+    if (have_data_disk)
+    {
+        int cn = snprintf(cmdline + strlen(cmdline),
+                          sizeof(cmdline) - strlen(cmdline),
+                          " oci2bin.data=/dev/vda");
+        if (cn < 0 || (size_t)cn >= sizeof(cmdline) - strlen(cmdline))
+        {
+            fprintf(stderr,
+                    "oci2bin: cmdline truncated (data disk)\n");
+            return 1;
+        }
+    }
+
+    /* Append virtiofs mount params to cmdline */
+    for (int vi = 0; vi < opts->n_vols; vi++)
+    {
+        /* Validate container path */
+        if (strstr(opts->vol_ctr[vi], "..") != NULL ||
+                opts->vol_ctr[vi][0] != '/')
+        {
+            fprintf(stderr,
+                    "oci2bin: -v container path invalid: %s\n",
+                    opts->vol_ctr[vi]);
+            return 1;
+        }
+        size_t cur_len = strlen(cmdline);
+        int cn = snprintf(cmdline + cur_len,
+                          sizeof(cmdline) - cur_len,
+                          " oci2bin.mount.%d=vol%d:%s",
+                          vi, vi, opts->vol_ctr[vi]);
+        if (cn < 0 || (size_t)cn >= sizeof(cmdline) - cur_len)
+        {
+            fprintf(stderr,
+                    "oci2bin: cmdline truncated (mount %d)\n", vi);
+            return 1;
+        }
+    }
+
+    /* Build argv for cloud-hypervisor */
+    const char* vmm_bin = opts->vmm ? opts->vmm : "cloud-hypervisor";
+    debug_log("vm.ch.config", "vmm=%s vcpus=%d mem_mb=%lu", vmm_bin, vcpus,
+              mem_mb);
+    debug_log("vm.ch.cmdline", "value=%s", cmdline);
+    const char* argv[128];
+    int ai = 0;
+
+#define CH_ARG(x) do { \
+    if (ai >= 126) { \
+        fprintf(stderr, "oci2bin: too many cloud-hypervisor args\n"); \
+        return 1; \
+    } \
+    argv[ai++] = (x); \
+} while (0)
+
+    CH_ARG(vmm_bin);
+    CH_ARG("--kernel");
+    CH_ARG(kernel_path);
+    CH_ARG("--initramfs");
+    CH_ARG(initramfs_path);
+    CH_ARG("--cmdline");
+    CH_ARG(cmdline);
+    CH_ARG("--cpus");
+    CH_ARG(cpus_str);
+    CH_ARG("--memory");
+    CH_ARG(mem_str);
+
+    /* Add data disk if present */
+    char disk_arg[PATH_MAX + 16];
+    if (have_data_disk)
+    {
+        int nn = snprintf(disk_arg, sizeof(disk_arg),
+                          "path=%s", data_img_path);
+        if (nn < 0 || (size_t)nn >= sizeof(disk_arg))
+        {
+            fprintf(stderr, "oci2bin: disk arg too long\n");
+            return 1;
+        }
+        CH_ARG("--disk");
+        CH_ARG(disk_arg);
+    }
+
+    /* Per-volume virtiofs: fork virtiofsd for each -v mount */
+    char fs_args[MAX_VOLUMES][PATH_MAX + 64];
+    for (int vi = 0; vi < opts->n_vols; vi++)
+    {
+        char sock_path[PATH_MAX];
+        int nn = snprintf(sock_path, sizeof(sock_path),
+                          "%s/vfs-%d.sock", tmpdir, vi);
+        if (nn < 0 || (size_t)nn >= sizeof(sock_path))
+        {
+            fprintf(stderr,
+                    "oci2bin: virtiofs sock path too long\n");
+            return 1;
+        }
+        /* Sanitize host path */
+        if (strstr(opts->vol_host[vi], "..") != NULL)
+        {
+            fprintf(stderr,
+                    "oci2bin: -v host path contains ..: %s\n",
+                    opts->vol_host[vi]);
+            return 1;
+        }
+        char* vfsd_argv[] =
+        {
+            "virtiofsd",
+            "--socket-path", sock_path,
+            "--shared-dir",  opts->vol_host[vi],
+            "--sandbox",     "namespace",
+            NULL
+        };
+        pid_t vfsd_pid = fork();
+        if (vfsd_pid < 0)
+        {
+            perror("fork virtiofsd");
+            return 1;
+        }
+        if (vfsd_pid == 0)
+        {
+            execvp("virtiofsd", vfsd_argv);
+            perror("execvp virtiofsd");
+            _exit(1);
+        }
+        /* Don't waitpid — virtiofsd runs for the lifetime of the VM */
+        nn = snprintf(fs_args[vi], sizeof(fs_args[vi]),
+                      "tag=vol%d,socket=%s,num_queues=1,queue_size=512",
+                      vi, sock_path);
+        if (nn < 0 || (size_t)nn >= sizeof(fs_args[vi]))
+        {
+            fprintf(stderr, "oci2bin: --fs arg too long\n");
+            return 1;
+        }
+        CH_ARG("--fs");
+        CH_ARG(fs_args[vi]);
+    }
+
+    argv[ai] = NULL;
+#undef CH_ARG
+
+    debug_log("vm.ch.exec", "binary=%s argc=%d", vmm_bin, ai);
+    execvp(vmm_bin, (char* const*)argv);
+    perror("execvp cloud-hypervisor");
+    return 1;
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char* argv[])
 {
+    if (getenv("OCI2BIN_DEBUG"))
+    {
+        g_debug = 1;
+    }
+    if (argv_has_debug_flag(argc, argv))
+    {
+        g_debug = 1;
+    }
+
+    /* 0. If running as VM init (OCI2BIN_VM_INIT=1), skip all host logic */
+    if (getenv("OCI2BIN_VM_INIT"))
+    {
+        return vm_init_main();
+    }
+
     /* 1. Find ourselves */
     char self_path[PATH_MAX];
     ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
@@ -3581,15 +5702,14 @@ int main(int argc, char* argv[])
         return 1;
     }
     self_path[len] = '\0';
+    debug_log("main.self", "path=%s", self_path);
 
     /* 2. Parse command-line options.
      * build_merged_argv pre-scans for --config PATH and, if found, reads
      * the config file and prepends its options as defaults.  parse_opts is
      * then called exactly once on the merged argv. */
     int    merged_argc = 0;
-    char** unused_heap = NULL;
-    char** merged_argv = build_merged_argv(argc, argv,
-                                           &merged_argc, &unused_heap);
+    char** merged_argv = build_merged_argv(argc, argv, &merged_argc);
     if (!merged_argv)
     {
         return 1;
@@ -3600,9 +5720,14 @@ int main(int argc, char* argv[])
     {
         return 1;
     }
+    if (opts.debug)
+    {
+        g_debug = 1;
+    }
+    debug_dump_opts(&opts);
 
-    fprintf(stderr, "oci2bin: self=%s offset=0x%lx size=0x%lx\n",
-            self_path, OCI_DATA_OFFSET, OCI_DATA_SIZE);
+    debug_log("main.oci_blob", "offset=0x%lx size=0x%lx",
+              OCI_DATA_OFFSET, OCI_DATA_SIZE);
 
     /* 3. Sanity check the markers */
     if (OCI_PATCHED != 1)
@@ -3629,18 +5754,42 @@ int main(int argc, char* argv[])
         fprintf(stderr, "oci2bin: failed to extract OCI rootfs\n");
         return 1;
     }
+    debug_log("main.rootfs", "path=%s", rootfs);
 
-    fprintf(stderr, "oci2bin: rootfs at %s\n", rootfs);
-
-    /* 5. Patch rootfs so privilege-dropping tools work in a single-UID namespace */
+    /* 5. Patch rootfs so privilege-dropping tools work in a single-UID namespace
+     * (container mode) or microVM where real setpriv/chown may fail. */
     patch_rootfs_ids(rootfs);
+
+    /* 4b. VM dispatch: after rootfs extraction so rootfs is available */
+    if (opts.use_vm)
+    {
+        char vm_tmpdir[PATH_MAX];
+        if (make_runtime_tmpdir(vm_tmpdir, sizeof(vm_tmpdir),
+                                "oci2bin-vm.") < 0)
+        {
+            perror("mkdtemp VM tmpdir");
+            return 1;
+        }
+        debug_log("main.vm_dispatch", "tmpdir=%s vmm=%s", vm_tmpdir,
+                  opts.vmm ? opts.vmm : "(default)");
+#ifdef USE_LIBKRUN
+        if (!opts.vmm || strcmp(opts.vmm, "libkrun") == 0)
+        {
+            return run_as_vm_libkrun(rootfs, vm_tmpdir, &opts);
+        }
+#endif
+        return run_as_vm_ch(rootfs, vm_tmpdir, &opts);
+    }
 
     /* 6. Capture real UID/GID before entering user namespace */
     uid_t real_uid = getuid();
     gid_t real_gid = getgid();
+    debug_log("main.identity", "uid=%d gid=%d", (int)real_uid, (int)real_gid);
 
     /* 6a. Set up cgroup v2 resource limits (before unshare, uses host cgroupfs) */
     int cg_did_setup = setup_cgroup(&opts);
+    debug_log("main.cgroup", "enabled=%d dir=%s", cg_did_setup,
+              g_cgroup_dir[0] ? g_cgroup_dir : "(none)");
 
     /* 7. Enter user namespace first (needed before we can map UIDs) */
     if (unshare(CLONE_NEWUSER) < 0)
@@ -3739,6 +5888,7 @@ int main(int argc, char* argv[])
             perror("unshare(NEWNS|NEWPID|NEWUTS)");
             return 1;
         }
+        debug_log("main.unshare", "flags=0x%x", ns_flags);
     }
 
     /* 10b. For slirp/pasta modes: fork a net helper AFTER CLONE_NEWNET.
@@ -3845,22 +5995,132 @@ int main(int argc, char* argv[])
         close(sync_pipe[1]);
     }
 
-    /* 11. Fork for PID namespace (child becomes PID 1) */
+    /* 11. Allocate a PTY so the container shell gets job control.
+     * We open /dev/ptmx (the POSIX PTY multiplexer) before fork():
+     *   parent  → master_fd: relays host terminal ↔ container I/O
+     *   child   → slave_fd:  setsid() + TIOCSCTTY → controlling terminal
+     * Only done when stdin is an interactive terminal and not --detach. */
+    opts.pty_master_fd = -1;
+    opts.pty_slave_fd  = -1;
+    struct termios saved_termios;
+    int saved_termios_ok = 0;
+
+    if (!opts.detach && isatty(STDIN_FILENO) &&
+            tcgetpgrp(STDIN_FILENO) == getpgrp())
+    {
+        int master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (master_fd >= 0 && grantpt(master_fd) == 0 &&
+                unlockpt(master_fd) == 0)
+        {
+            char* slave_name = ptsname(master_fd);
+            if (slave_name)
+            {
+                int slave_fd = open(slave_name, O_RDWR | O_NOCTTY);
+                if (slave_fd >= 0)
+                {
+                    /* Propagate current terminal size to slave */
+                    struct winsize ws;
+                    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+                    {
+                        ioctl(slave_fd, TIOCSWINSZ, &ws);
+                    }
+                    opts.pty_master_fd = master_fd;
+                    opts.pty_slave_fd  = slave_fd;
+
+                    /* Save terminal state and switch to raw mode */
+                    if (tcgetattr(STDIN_FILENO, &saved_termios) == 0)
+                    {
+                        saved_termios_ok = 1;
+                        struct termios raw = saved_termios;
+                        cfmakeraw(&raw);
+                        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+                    }
+
+                    /* Install SIGWINCH handler to forward resize events */
+                    g_pty_master_fd = master_fd;
+                    struct sigaction sa;
+                    memset(&sa, 0, sizeof(sa));
+                    sa.sa_handler = sigwinch_handler;
+                    sigemptyset(&sa.sa_mask);
+                    sigaction(SIGWINCH, &sa, NULL);
+                }
+                else
+                {
+                    close(master_fd);
+                }
+            }
+            else
+            {
+                close(master_fd);
+            }
+        }
+    }
+
+    /* 12. Fork for PID namespace (child becomes PID 1) */
     pid_t child = fork();
     if (child < 0)
     {
         perror("fork");
+        if (saved_termios_ok)
+        {
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
+        }
         return 1;
     }
 
     if (child == 0)
     {
+        /* Redirect stderr to the PTY slave immediately so all child
+         * diagnostic output goes through the PTY line discipline
+         * (LF→CRLF) and the parent relay, instead of writing directly
+         * to the raw-mode host terminal where \n skips carriage return. */
+        if (opts.pty_slave_fd >= 0)
+        {
+            dup2(opts.pty_slave_fd, STDERR_FILENO);
+        }
         _exit(container_main(rootfs, &opts));
     }
+    debug_log("main.child", "pid=%d", (int)child);
 
-    /* Parent: wait for container to exit */
-    int status;
-    waitpid(child, &status, 0);
+    /* Parent: close slave end — only the child needs it */
+    if (opts.pty_slave_fd >= 0)
+    {
+        close(opts.pty_slave_fd);
+    }
+
+    /* Forward SIGINT/SIGTERM/SIGHUP to the child so that signals from
+     * the host (e.g. kill, systemd stop) reach the container process.
+     * Ctrl-C in the PTY relay goes through the slave line discipline,
+     * but external signals need explicit forwarding. */
+    g_pty_child_pid = child;
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = pty_forward_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags   = SA_RESTART;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
+    }
+
+    /* Parent: if PTY active, relay until child exits */
+    int status = 0;
+    if (opts.pty_master_fd >= 0)
+    {
+        relay_pty(opts.pty_master_fd, &saved_termios, saved_termios_ok);
+        /* relay_pty() returned because slave closed; reap child */
+        waitpid(child, &status, 0);
+    }
+    else
+    {
+        waitpid(child, &status, 0);
+        if (saved_termios_ok)
+        {
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
+        }
+    }
+
     /* Reap net helper if it was started */
     if (net_helper_pid > 0)
     {

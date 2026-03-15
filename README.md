@@ -347,6 +347,104 @@ echo $?   # 42
 
 ---
 
+## VM isolation (--vm)
+
+`--vm` runs the container inside a hardware-isolated microVM instead of a Linux
+namespace. The OCI rootfs becomes the VM's root filesystem; the container
+process runs as PID 1 via a minimal in-binary init.
+
+### Prerequisites
+
+Two backends are supported:
+
+| Backend | When to use | Kernel required? | Extra requirements |
+|---|---|---|---|
+| **libkrun** (default when available) | macOS (HVF) or Linux (KVM) | **No** — libkrun bundles its own kernel internally | `libkrun-dev` at build time |
+| **cloud-hypervisor** | Linux (KVM); full VM control | **Yes** — you must embed a vmlinux (see below) | `cloud-hypervisor` in `$PATH`, embedded kernel |
+
+`--vm` requires `/dev/kvm` on Linux. On macOS, libkrun uses the Hypervisor
+framework (HVF) — no KVM is needed.
+
+### Building with libkrun
+
+```bash
+make loader-libkrun     # builds build/loader-libkrun-$(ARCH)
+oci2bin alpine myapp    # auto-detects libkrun loader if present
+```
+
+Requires the `libkrun` and `libkrun-dev` packages (available on Fedora, Ubuntu,
+and from [containers/libkrun](https://github.com/containers/libkrun)).
+
+libkrun is an in-process microVM library that includes its own guest kernel, so
+the output binary does not need a separate kernel blob embedded. Just pass
+`--vm` at runtime and it works.
+
+### Building the kernel (cloud-hypervisor only)
+
+The cloud-hypervisor backend requires an external Linux kernel embedded in the
+binary. This is **not needed for libkrun**.
+
+```bash
+make kernel             # downloads Linux 6.1, builds vmlinux (~10 min first time)
+oci2bin alpine myapp --kernel build/vmlinux   # embeds kernel in polyglot
+```
+
+The embedded kernel adds ~10 MB to the binary. The initramfs is built at
+runtime from the extracted rootfs if not pre-embedded.
+
+### Custom VM defaults
+
+Override the default vCPU count (1) and memory (256 MiB) at build time:
+
+```bash
+make VM_CPUS=4 VM_MEM_MB=512             # Makefile
+VM_CPUS=4 VM_MEM_MB=512 oci2bin alpine myapp  # oci2bin wrapper
+```
+
+These defaults apply when `--cpus` or `--memory` are not passed at runtime.
+
+### Usage
+
+```bash
+# Basic: run command inside microVM
+./myapp --vm /bin/echo hello
+
+# Custom resources
+./myapp --vm --memory 512m --cpus 2 /bin/sh
+
+# Persistent state across runs (ext2 data disk, cloud-hypervisor path)
+./myapp --vm --overlay-persist ./state /bin/sh
+
+# Volume mount via virtiofs (cloud-hypervisor) or mapped volume (libkrun)
+./myapp --vm -v $(pwd):/work /bin/sh
+
+# Explicit VMM selection
+./myapp --vmm cloud-hypervisor /bin/echo hello
+./myapp --vmm /opt/bin/cloud-hypervisor /bin/echo hello
+```
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--vm` | Enable microVM isolation |
+| `--vmm PATH` | VMM binary or name (`cloud-hypervisor`; default is libkrun if available) |
+| `--memory SIZE` | VM RAM (e.g. `256m`, `1g`; default 256 MiB) |
+| `--cpus N` | Number of vCPUs (default 1) |
+| `--overlay-persist DIR` | Persist a 1 GiB ext2 data disk in `DIR/oci2bin-data.ext2` |
+| `-v HOST:CTR` | Mount host directory inside the VM |
+| `--debug` | Print verbose runtime diagnostics (execution path, VM config, extracted paths) |
+
+### Notes
+
+- The binary itself becomes the VM's `/init`. When the kernel starts, it detects
+  `OCI2BIN_VM_INIT=1` in the cmdline and runs `vm_init_main()` instead of the
+  host extraction path.
+- Volume mounts use **virtiofs** (cloud-hypervisor) or libkrun mapped volumes.
+  `virtiofsd` must be in `$PATH` for the cloud-hypervisor path.
+- `--overlay-persist` in VM mode creates a separate ext2 block device. It does
+  not use overlayfs (that is the namespace-mode behaviour).
+
 ## Isolation and security
 
 ### Networking
@@ -711,7 +809,16 @@ make test-python             # Python unit tests
 make test-integration        # all integration tests (runtime, build, Redis, nginx)
 make test-integration-redis  # Redis PING/SET/GET smoke test
 make test-integration-nginx  # nginx HTTP 200 smoke test
+make test-integration-services  # Redis (container+VM) + 5 service images (container+VM)
 ```
+
+`test-integration-services` validates:
+- `redis:7-alpine` (SET/GET in both container mode and `--vm`)
+- `nginx:alpine`
+- `caddy:2-alpine`
+- `postgres:16-alpine`
+- `memcached:1.6-alpine`
+- `httpd:2.4-alpine`
 
 The aarch64 C unit tests can be cross-compiled and run under qemu without real hardware:
 
@@ -765,6 +872,8 @@ An unprivileged user namespace allows exactly one UID mapping. Container UID 0 m
 | `/etc/group` | All GIDs set to `0` (except `65534`) | Same for GID operations |
 | `/etc/apt/apt.conf.d/99oci2bin` | `APT::Sandbox::User "root";` | Disables the apt sandbox |
 | `/etc/resolv.conf` | Replaced with host resolver content | Symlink target not present in chroot |
+| `/usr/bin/setpriv` | Replaced with no-op shim (skips flags, execs command) | `setpriv --reuid` fails in single-UID namespace |
+| `gosu`, `su-exec` | Replaced with no-op shim (skips user arg, execs command) | Same — user switching is impossible |
 
 **Security properties:**
 

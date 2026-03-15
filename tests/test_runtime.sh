@@ -13,9 +13,17 @@
 set -euo pipefail
 
 IMG="./oci2bin.img"
-TAP_COUNT=17
+TAP_COUNT=19
 FAIL=0
 T=0
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -z "${TMPDIR:-}" ]]; then
+    TMPDIR="$SCRIPT_DIR/build/test-tmp"
+fi
+mkdir -p "$TMPDIR"
+export TMPDIR
+export OCI2BIN_TMPDIR="${OCI2BIN_TMPDIR:-$TMPDIR}"
 
 # ── TAP helpers ───────────────────────────────────────────────────────────
 
@@ -270,7 +278,51 @@ run_test "-e overrides built-in PATH" \
     0 "/custom/path" \
     "$IMG" -e PATH=/custom/path /bin/sh -c 'echo $PATH'
 
-# ── Test 17: Binary runs without docker in PATH ───────────────────────────
+# ── Test 17: Host LANG does not leak into container ──────────────────────
+# Redis 8 (and other glibc programs) call setlocale(LC_ALL,"") on startup.
+# If the host LANG (e.g. en_US.UTF-8) leaks in and the container has no
+# locale data for it, the process fails immediately.  clearenv() in
+# container_main() prevents this.
+
+T=$(( T + 1 ))
+out=""
+exit_code=0
+out=$(LANG=en_US.UTF-8 timeout 15 "$IMG" /bin/sh -c 'echo ${LANG:-UNSET}' \
+    2>/dev/null) || exit_code=$?
+if [[ "$exit_code" -eq 0 ]] && ! echo "$out" | grep -q "en_US"; then
+    echo "ok $T - host LANG does not leak into container"
+else
+    echo "not ok $T - host LANG does not leak into container"
+    echo "# exit=$exit_code LANG inside container: '$out'"
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# ── Test 18: No unexpected host env vars inside container ────────────────
+# The container environment must contain only vars that oci2bin sets
+# explicitly (PATH, HOME, TERM, image Env, user -e flags).
+# Variables like USER, DISPLAY, XDG_SESSION_TYPE, DBUS_SESSION_BUS_ADDRESS
+# must not appear.
+
+T=$(( T + 1 ))
+out=""
+exit_code=0
+out=$(USER=hostuser DISPLAY=:99 XDG_SESSION_TYPE=x11 \
+    timeout 15 "$IMG" /bin/sh -c 'env' 2>/dev/null) || exit_code=$?
+leaked=""
+for var in USER DISPLAY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS; do
+    if echo "$out" | grep -q "^${var}="; then
+        leaked="$leaked $var"
+    fi
+done
+if [[ "$exit_code" -eq 0 ]] && [[ -z "$leaked" ]]; then
+    echo "ok $T - no unexpected host env vars leak into container"
+else
+    echo "not ok $T - no unexpected host env vars leak into container"
+    echo "# leaked:$leaked"
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# ── Test 19: Binary runs without docker in PATH ───────────────────────────
 
 T=$(( T + 1 ))
 out=""

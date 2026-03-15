@@ -31,6 +31,10 @@
 #                         Inject a host directory recursively (repeatable)
 #   --oci-dir DIR         Use an OCI image layout directory instead of docker save
 #                         (skips docker pull/save; IMAGE arg used only for naming)
+#   --kernel PATH         Embed a vmlinux kernel blob (enables --vm mode)
+#   --initramfs PATH      Embed a pre-built initramfs cpio.gz blob
+#   --libkrun             Force libkrun loader (default: auto-detected)
+#   --no-libkrun          Force static loader even if libkrun is available
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -62,6 +66,7 @@
 #   --tmpfs PATH          Mount a fresh tmpfs at PATH inside the container
 #   --ulimit TYPE=N       Set resource limit (nofile, nproc, cpu, as, fsize)
 #   --config PATH         Load options from a key=value config file
+#   --debug               Emit verbose runtime debug diagnostics
 #   --                    End of options; remaining args are CMD
 #
 # Cache subcommands:
@@ -89,7 +94,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OCI2BIN_HOME="${OCI2BIN_HOME:-$SCRIPT_DIR}"
 
 usage() {
-    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//'
+    sed -n '/^#!/d; /^#/!q; s/^# \?//p' "$0"
     exit 1
 }
 
@@ -403,6 +408,14 @@ DO_STRIP=0
 ADD_FILE_ARGS=()
 ADD_DIR_ARGS=()
 OCI_DIR=""
+KERNEL_PATH=""
+INITRAMFS_PATH=""
+# Auto-detect libkrun; --no-libkrun opts out
+if pkg-config --exists libkrun 2>/dev/null || ldconfig -p 2>/dev/null | grep -q libkrun; then
+    USE_LIBKRUN=1
+else
+    USE_LIBKRUN=0
+fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -439,6 +452,24 @@ while [[ $# -gt 0 ]]; do
             OCI_DIR="$2"
             shift 2
             ;;
+        --kernel)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --kernel requires a PATH argument" >&2; exit 1; }
+            KERNEL_PATH="$2"
+            shift 2
+            ;;
+        --initramfs)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --initramfs requires a PATH argument" >&2; exit 1; }
+            INITRAMFS_PATH="$2"
+            shift 2
+            ;;
+        --libkrun)
+            USE_LIBKRUN=1
+            shift
+            ;;
+        --no-libkrun)
+            USE_LIBKRUN=0
+            shift
+            ;;
         --help|-h)
             usage
             ;;
@@ -455,6 +486,21 @@ fi
 IMAGE="$1"
 # Derive output name from image: "nginx:1.25" -> "nginx_1.25"
 OUTPUT="${2:-${IMAGE//[:\/]/_}}"
+shift 2 2>/dev/null || shift 1
+
+# Parse any remaining flags that follow the positional args (e.g. --kernel, --initramfs)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --kernel)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --kernel requires a PATH argument" >&2; exit 1; }
+            KERNEL_PATH="$2"; shift 2 ;;
+        --initramfs)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --initramfs requires a PATH argument" >&2; exit 1; }
+            INITRAMFS_PATH="$2"; shift 2 ;;
+        *)
+            echo "oci2bin: unexpected argument: $1" >&2; exit 1 ;;
+    esac
+done
 
 # ── architecture / compiler selection ─────────────────────────────────────
 
@@ -481,13 +527,21 @@ need docker
 
 # ── build loader if needed ────────────────────────────────────────────────
 
-LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
 SRC="$OCI2BIN_HOME/src/loader.c"
-
-if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
-    echo "oci2bin: building loader for $TARGET_ARCH..."
-    mkdir -p "$OCI2BIN_HOME/build"
-    $CC_CROSS $CFLAGS_CROSS -static -O2 -s -o "$LOADER" "$SRC"
+if [[ "$USE_LIBKRUN" -eq 1 ]]; then
+    LOADER="$OCI2BIN_HOME/build/loader-libkrun-$TARGET_ARCH"
+    if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
+        echo "oci2bin: building loader with libkrun for $TARGET_ARCH..."
+        mkdir -p "$OCI2BIN_HOME/build"
+        $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC" -lkrun
+    fi
+else
+    LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
+    if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
+        echo "oci2bin: building loader for $TARGET_ARCH..."
+        mkdir -p "$OCI2BIN_HOME/build"
+        $CC_CROSS $CFLAGS_CROSS -static -O2 -s ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC"
+    fi
 fi
 
 # ── OCI image layout: convert to docker-save tar, skip docker entirely ────
@@ -643,6 +697,10 @@ fi
 # Build common extra args for metadata embedding
 DIGEST_ARG=()
 [[ -n "${DIGEST:-}" ]] && DIGEST_ARG=(--digest "$DIGEST")
+KERNEL_ARG=()
+[[ -n "$KERNEL_PATH" ]] && KERNEL_ARG=(--kernel "$KERNEL_PATH")
+INITRAMFS_ARG=()
+[[ -n "$INITRAMFS_PATH" ]] && INITRAMFS_ARG=(--initramfs "$INITRAMFS_PATH")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
@@ -651,6 +709,8 @@ if [[ -n "$BUILD_TAR_ARG" ]]; then
         --tar        "$BUILD_TAR_ARG" \
         --image-name "$IMAGE" \
         "${DIGEST_ARG[@]}" \
+        "${KERNEL_ARG[@]}" \
+        "${INITRAMFS_ARG[@]}" \
         --output     "$OUTPUT"
 else
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
@@ -658,6 +718,8 @@ else
         --image      "$IMAGE" \
         --image-name "$IMAGE" \
         "${DIGEST_ARG[@]}" \
+        "${KERNEL_ARG[@]}" \
+        "${INITRAMFS_ARG[@]}" \
         --output     "$OUTPUT"
 fi
 
