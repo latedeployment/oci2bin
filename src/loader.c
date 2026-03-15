@@ -3079,6 +3079,11 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Build a clean environment — drop all host vars so that LANG, USER,
+     * DISPLAY, XDG_*, etc. cannot bleed into the container.  All required
+     * variables are set explicitly below. */
+    clearenv();
+
     /* Set standard env */
     setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
            1);

@@ -192,7 +192,11 @@ class TestExistingPolyglot(unittest.TestCase):
 @unittest.skipUnless(_alpine_available(), 'Docker + alpine:latest not available')
 class TestBuildPolyglotIntegration(unittest.TestCase):
     def test_build_and_verify(self):
-        loader = ROOT / 'build' / 'loader'
+        import platform
+        arch = platform.machine()
+        loader = ROOT / 'build' / f'loader-{arch}'
+        if not loader.exists():
+            loader = ROOT / 'build' / 'loader'
         if not loader.exists():
             self.skipTest('build/loader not found — run make loader first')
 
