@@ -138,6 +138,28 @@ struct container_opts
     int no_seccomp;
     int no_host_dev; /* --no-host-dev: skip bind-mounting host /dev nodes */
 
+    /* --seccomp-profile FILE  (load Docker-compatible JSON seccomp policy) */
+    char* seccomp_profile;
+
+    /* --add-host HOST:IP  (inject into /etc/hosts) */
+    char* add_hosts[32];
+    int   n_add_hosts;
+
+    /* --dns IP  (custom DNS server, up to 8) */
+    char* dns_servers[8];
+    int   n_dns_servers;
+
+    /* --dns-search DOMAIN  (DNS search domains, up to 8) */
+    char* dns_search[8];
+    int   n_dns_search;
+
+    /* --no-auto-tmpfs  (skip auto /run tmpfs when --read-only) */
+    int no_auto_tmpfs;
+
+    /* --security-opt apparmor=PROFILE | label=TYPE:VAL */
+    char* security_opt_apparmor; /* NULL = no AppArmor profile */
+    char* security_opt_label;    /* NULL = no SELinux label */
+
     /* --hostname NAME  (override the UTS hostname) */
     char* hostname;
 
@@ -1143,6 +1165,125 @@ static void install_resolv_conf(const char* rootfs)
     }
     close(rootfs_fd);
     free(data);
+}
+
+/*
+ * Write a custom resolv.conf when --dns or --dns-search are given.
+ * Called after install_resolv_conf() so it overwrites the host copy.
+ */
+static void install_custom_resolv_conf(const char* rootfs,
+                                       char* const* dns_servers,
+                                       int n_dns_servers,
+                                       char* const* dns_search,
+                                       int n_dns_search)
+{
+    if (n_dns_servers == 0 && n_dns_search == 0)
+    {
+        return;
+    }
+
+    int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfs_fd < 0)
+    {
+        return;
+    }
+
+    /* Build the content in a heap buffer */
+    char buf[4096];
+    int pos = 0;
+
+    for (int i = 0; i < n_dns_servers && pos < (int)sizeof(buf) - 1; i++)
+    {
+        int n = snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                         "nameserver %s\n", dns_servers[i]);
+        if (n > 0 && n < (int)(sizeof(buf) - (size_t)pos))
+        {
+            pos += n;
+        }
+    }
+    if (n_dns_search > 0 && pos < (int)sizeof(buf) - 1)
+    {
+        int n = snprintf(buf + pos, sizeof(buf) - (size_t)pos, "search");
+        if (n > 0 && n < (int)(sizeof(buf) - (size_t)pos))
+        {
+            pos += n;
+        }
+        for (int i = 0; i < n_dns_search && pos < (int)sizeof(buf) - 2; i++)
+        {
+            int n = snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                             " %s", dns_search[i]);
+            if (n > 0 && n < (int)(sizeof(buf) - (size_t)pos))
+            {
+                pos += n;
+            }
+        }
+        if (pos < (int)sizeof(buf) - 1)
+        {
+            buf[pos++] = '\n';
+        }
+    }
+    buf[pos] = '\0';
+
+    unlinkat_beneath(rootfs_fd, "etc/resolv.conf", 0);
+    int dst_fd = openat_beneath(rootfs_fd, "etc/resolv.conf",
+                                O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst_fd >= 0)
+    {
+        write_all_fd(dst_fd, buf, (size_t)pos);
+        close(dst_fd);
+    }
+    close(rootfs_fd);
+}
+
+/*
+ * Append --add-host HOST:IP entries to /etc/hosts inside the rootfs.
+ * Called pre-chroot so rootfs paths are directly accessible.
+ */
+static void install_extra_hosts(const char* rootfs,
+                                char* const* add_hosts,
+                                int n_add_hosts)
+{
+    if (n_add_hosts == 0)
+    {
+        return;
+    }
+
+    int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfs_fd < 0)
+    {
+        return;
+    }
+
+    /* Open for append (create if missing) */
+    int dst_fd = openat_beneath(rootfs_fd, "etc/hosts",
+                                O_WRONLY | O_CREAT | O_APPEND, 0644);
+    close(rootfs_fd);
+    if (dst_fd < 0)
+    {
+        return;
+    }
+
+    for (int i = 0; i < n_add_hosts; i++)
+    {
+        /* Format is HOST:IP — split on ':' and write as "IP HOST\n" */
+        const char* spec = add_hosts[i];
+        const char* colon = strchr(spec, ':');
+        if (!colon)
+        {
+            continue;
+        }
+        size_t host_len = (size_t)(colon - spec);
+        const char* ip   = colon + 1;
+
+        char line[512];
+        int n = snprintf(line, sizeof(line), "%s %.*s\n",
+                         ip, (int)host_len, spec);
+        if (n > 0 && (size_t)n < sizeof(line))
+        {
+            write_all_fd(dst_fd, line, (size_t)n);
+        }
+    }
+    close(dst_fd);
 }
 
 /*
@@ -2510,6 +2651,1255 @@ static void apply_seccomp_filter(void)
     }
 }
 
+/*
+ * Apply a Docker-compatible JSON seccomp profile from a file.
+ *
+ * Docker profile format (subset we support):
+ *   {
+ *     "defaultAction": "SCMP_ACT_ERRNO" | "SCMP_ACT_ALLOW" | "SCMP_ACT_KILL",
+ *     "syscalls": [
+ *       { "names": ["read","write",...], "action": "SCMP_ACT_ALLOW" }
+ *     ]
+ *   }
+ *
+ * We parse the JSON manually (no external deps) and build a BPF program that:
+ * - If defaultAction=ALLOW: only block explicitly denied syscalls.
+ * - If defaultAction=ERRNO/KILL: only allow explicitly listed syscalls.
+ *
+ * For defaultAction=ALLOW we emit BPF_BLOCK for each denied syscall.
+ * For defaultAction=KILL/ERRNO we build an allowlist (more complex BPF).
+ *
+ * To keep the BPF program size reasonable we limit to at most 256 syscall
+ * rules.  PR_SET_NO_NEW_PRIVS is always set.
+ *
+ * Returns 0 on success, -1 on error (non-fatal: caller should warn and
+ * fall through to the built-in default filter).
+ */
+
+/* Static syscall name→number table (x86_64 and aarch64 common subset). */
+struct sc_entry
+{
+    const char* name;
+    int         nr;
+};
+
+/* We include the platform headers to get __NR_* numbers. */
+static const struct sc_entry g_syscall_table[] =
+{
+#define S(name) { #name, __NR_##name }
+#ifdef __NR_read
+    S(read),
+#endif
+#ifdef __NR_write
+    S(write),
+#endif
+#ifdef __NR_open
+    S(open),
+#endif
+#ifdef __NR_close
+    S(close),
+#endif
+#ifdef __NR_stat
+    S(stat),
+#endif
+#ifdef __NR_fstat
+    S(fstat),
+#endif
+#ifdef __NR_lstat
+    S(lstat),
+#endif
+#ifdef __NR_poll
+    S(poll),
+#endif
+#ifdef __NR_lseek
+    S(lseek),
+#endif
+#ifdef __NR_mmap
+    S(mmap),
+#endif
+#ifdef __NR_mprotect
+    S(mprotect),
+#endif
+#ifdef __NR_munmap
+    S(munmap),
+#endif
+#ifdef __NR_brk
+    S(brk),
+#endif
+#ifdef __NR_rt_sigaction
+    S(rt_sigaction),
+#endif
+#ifdef __NR_rt_sigprocmask
+    S(rt_sigprocmask),
+#endif
+#ifdef __NR_rt_sigreturn
+    S(rt_sigreturn),
+#endif
+#ifdef __NR_ioctl
+    S(ioctl),
+#endif
+#ifdef __NR_pread64
+    S(pread64),
+#endif
+#ifdef __NR_pwrite64
+    S(pwrite64),
+#endif
+#ifdef __NR_readv
+    S(readv),
+#endif
+#ifdef __NR_writev
+    S(writev),
+#endif
+#ifdef __NR_access
+    S(access),
+#endif
+#ifdef __NR_pipe
+    S(pipe),
+#endif
+#ifdef __NR_select
+    S(select),
+#endif
+#ifdef __NR_sched_yield
+    S(sched_yield),
+#endif
+#ifdef __NR_mremap
+    S(mremap),
+#endif
+#ifdef __NR_msync
+    S(msync),
+#endif
+#ifdef __NR_mincore
+    S(mincore),
+#endif
+#ifdef __NR_madvise
+    S(madvise),
+#endif
+#ifdef __NR_dup
+    S(dup),
+#endif
+#ifdef __NR_dup2
+    S(dup2),
+#endif
+#ifdef __NR_pause
+    S(pause),
+#endif
+#ifdef __NR_nanosleep
+    S(nanosleep),
+#endif
+#ifdef __NR_getitimer
+    S(getitimer),
+#endif
+#ifdef __NR_alarm
+    S(alarm),
+#endif
+#ifdef __NR_setitimer
+    S(setitimer),
+#endif
+#ifdef __NR_getpid
+    S(getpid),
+#endif
+#ifdef __NR_sendfile
+    S(sendfile),
+#endif
+#ifdef __NR_socket
+    S(socket),
+#endif
+#ifdef __NR_connect
+    S(connect),
+#endif
+#ifdef __NR_accept
+    S(accept),
+#endif
+#ifdef __NR_sendto
+    S(sendto),
+#endif
+#ifdef __NR_recvfrom
+    S(recvfrom),
+#endif
+#ifdef __NR_sendmsg
+    S(sendmsg),
+#endif
+#ifdef __NR_recvmsg
+    S(recvmsg),
+#endif
+#ifdef __NR_shutdown
+    S(shutdown),
+#endif
+#ifdef __NR_bind
+    S(bind),
+#endif
+#ifdef __NR_listen
+    S(listen),
+#endif
+#ifdef __NR_getsockname
+    S(getsockname),
+#endif
+#ifdef __NR_getpeername
+    S(getpeername),
+#endif
+#ifdef __NR_socketpair
+    S(socketpair),
+#endif
+#ifdef __NR_setsockopt
+    S(setsockopt),
+#endif
+#ifdef __NR_getsockopt
+    S(getsockopt),
+#endif
+#ifdef __NR_clone
+    S(clone),
+#endif
+#ifdef __NR_fork
+    S(fork),
+#endif
+#ifdef __NR_vfork
+    S(vfork),
+#endif
+#ifdef __NR_execve
+    S(execve),
+#endif
+#ifdef __NR_exit
+    S(exit),
+#endif
+#ifdef __NR_wait4
+    S(wait4),
+#endif
+#ifdef __NR_kill
+    S(kill),
+#endif
+#ifdef __NR_uname
+    S(uname),
+#endif
+#ifdef __NR_fcntl
+    S(fcntl),
+#endif
+#ifdef __NR_flock
+    S(flock),
+#endif
+#ifdef __NR_fsync
+    S(fsync),
+#endif
+#ifdef __NR_fdatasync
+    S(fdatasync),
+#endif
+#ifdef __NR_truncate
+    S(truncate),
+#endif
+#ifdef __NR_ftruncate
+    S(ftruncate),
+#endif
+#ifdef __NR_getdents
+    S(getdents),
+#endif
+#ifdef __NR_getcwd
+    S(getcwd),
+#endif
+#ifdef __NR_chdir
+    S(chdir),
+#endif
+#ifdef __NR_fchdir
+    S(fchdir),
+#endif
+#ifdef __NR_rename
+    S(rename),
+#endif
+#ifdef __NR_mkdir
+    S(mkdir),
+#endif
+#ifdef __NR_rmdir
+    S(rmdir),
+#endif
+#ifdef __NR_creat
+    S(creat),
+#endif
+#ifdef __NR_link
+    S(link),
+#endif
+#ifdef __NR_unlink
+    S(unlink),
+#endif
+#ifdef __NR_symlink
+    S(symlink),
+#endif
+#ifdef __NR_readlink
+    S(readlink),
+#endif
+#ifdef __NR_chmod
+    S(chmod),
+#endif
+#ifdef __NR_fchmod
+    S(fchmod),
+#endif
+#ifdef __NR_chown
+    S(chown),
+#endif
+#ifdef __NR_fchown
+    S(fchown),
+#endif
+#ifdef __NR_lchown
+    S(lchown),
+#endif
+#ifdef __NR_umask
+    S(umask),
+#endif
+#ifdef __NR_gettimeofday
+    S(gettimeofday),
+#endif
+#ifdef __NR_getrlimit
+    S(getrlimit),
+#endif
+#ifdef __NR_getrusage
+    S(getrusage),
+#endif
+#ifdef __NR_sysinfo
+    S(sysinfo),
+#endif
+#ifdef __NR_times
+    S(times),
+#endif
+#ifdef __NR_getuid
+    S(getuid),
+#endif
+#ifdef __NR_syslog
+    S(syslog),
+#endif
+#ifdef __NR_getgid
+    S(getgid),
+#endif
+#ifdef __NR_setuid
+    S(setuid),
+#endif
+#ifdef __NR_setgid
+    S(setgid),
+#endif
+#ifdef __NR_geteuid
+    S(geteuid),
+#endif
+#ifdef __NR_getegid
+    S(getegid),
+#endif
+#ifdef __NR_setpgid
+    S(setpgid),
+#endif
+#ifdef __NR_getppid
+    S(getppid),
+#endif
+#ifdef __NR_getpgrp
+    S(getpgrp),
+#endif
+#ifdef __NR_setsid
+    S(setsid),
+#endif
+#ifdef __NR_setreuid
+    S(setreuid),
+#endif
+#ifdef __NR_setregid
+    S(setregid),
+#endif
+#ifdef __NR_getgroups
+    S(getgroups),
+#endif
+#ifdef __NR_setgroups
+    S(setgroups),
+#endif
+#ifdef __NR_setresuid
+    S(setresuid),
+#endif
+#ifdef __NR_getresuid
+    S(getresuid),
+#endif
+#ifdef __NR_setresgid
+    S(setresgid),
+#endif
+#ifdef __NR_getresgid
+    S(getresgid),
+#endif
+#ifdef __NR_getpgid
+    S(getpgid),
+#endif
+#ifdef __NR_setfsuid
+    S(setfsuid),
+#endif
+#ifdef __NR_setfsgid
+    S(setfsgid),
+#endif
+#ifdef __NR_getsid
+    S(getsid),
+#endif
+#ifdef __NR_rt_sigsuspend
+    S(rt_sigsuspend),
+#endif
+#ifdef __NR_sigaltstack
+    S(sigaltstack),
+#endif
+#ifdef __NR_mknod
+    S(mknod),
+#endif
+#ifdef __NR_personality
+    S(personality),
+#endif
+#ifdef __NR_statfs
+    S(statfs),
+#endif
+#ifdef __NR_fstatfs
+    S(fstatfs),
+#endif
+#ifdef __NR_getpriority
+    S(getpriority),
+#endif
+#ifdef __NR_setpriority
+    S(setpriority),
+#endif
+#ifdef __NR_sched_setparam
+    S(sched_setparam),
+#endif
+#ifdef __NR_sched_getparam
+    S(sched_getparam),
+#endif
+#ifdef __NR_sched_setscheduler
+    S(sched_setscheduler),
+#endif
+#ifdef __NR_sched_getscheduler
+    S(sched_getscheduler),
+#endif
+#ifdef __NR_sched_get_priority_max
+    S(sched_get_priority_max),
+#endif
+#ifdef __NR_sched_get_priority_min
+    S(sched_get_priority_min),
+#endif
+#ifdef __NR_sched_rr_get_interval
+    S(sched_rr_get_interval),
+#endif
+#ifdef __NR_mlock
+    S(mlock),
+#endif
+#ifdef __NR_munlock
+    S(munlock),
+#endif
+#ifdef __NR_mlockall
+    S(mlockall),
+#endif
+#ifdef __NR_munlockall
+    S(munlockall),
+#endif
+#ifdef __NR_vhangup
+    S(vhangup),
+#endif
+#ifdef __NR_prctl
+    S(prctl),
+#endif
+#ifdef __NR_arch_prctl
+    S(arch_prctl),
+#endif
+#ifdef __NR_setrlimit
+    S(setrlimit),
+#endif
+#ifdef __NR_chroot
+    S(chroot),
+#endif
+#ifdef __NR_sync
+    S(sync),
+#endif
+#ifdef __NR_acct
+    S(acct),
+#endif
+#ifdef __NR_mount
+    S(mount),
+#endif
+#ifdef __NR_umount2
+    S(umount2),
+#endif
+#ifdef __NR_swapon
+    S(swapon),
+#endif
+#ifdef __NR_swapoff
+    S(swapoff),
+#endif
+#ifdef __NR_gettid
+    S(gettid),
+#endif
+#ifdef __NR_futex
+    S(futex),
+#endif
+#ifdef __NR_sched_setaffinity
+    S(sched_setaffinity),
+#endif
+#ifdef __NR_sched_getaffinity
+    S(sched_getaffinity),
+#endif
+#ifdef __NR_set_thread_area
+    S(set_thread_area),
+#endif
+#ifdef __NR_get_thread_area
+    S(get_thread_area),
+#endif
+#ifdef __NR_epoll_create
+    S(epoll_create),
+#endif
+#ifdef __NR_epoll_ctl_old
+    S(epoll_ctl_old),
+#endif
+#ifdef __NR_epoll_wait_old
+    S(epoll_wait_old),
+#endif
+#ifdef __NR_set_tid_address
+    S(set_tid_address),
+#endif
+#ifdef __NR_restart_syscall
+    S(restart_syscall),
+#endif
+#ifdef __NR_semtimedop
+    S(semtimedop),
+#endif
+#ifdef __NR_fadvise64
+    S(fadvise64),
+#endif
+#ifdef __NR_timer_create
+    S(timer_create),
+#endif
+#ifdef __NR_timer_settime
+    S(timer_settime),
+#endif
+#ifdef __NR_timer_gettime
+    S(timer_gettime),
+#endif
+#ifdef __NR_timer_getoverrun
+    S(timer_getoverrun),
+#endif
+#ifdef __NR_timer_delete
+    S(timer_delete),
+#endif
+#ifdef __NR_clock_settime
+    S(clock_settime),
+#endif
+#ifdef __NR_clock_gettime
+    S(clock_gettime),
+#endif
+#ifdef __NR_clock_getres
+    S(clock_getres),
+#endif
+#ifdef __NR_clock_nanosleep
+    S(clock_nanosleep),
+#endif
+#ifdef __NR_exit_group
+    S(exit_group),
+#endif
+#ifdef __NR_epoll_wait
+    S(epoll_wait),
+#endif
+#ifdef __NR_epoll_ctl
+    S(epoll_ctl),
+#endif
+#ifdef __NR_tgkill
+    S(tgkill),
+#endif
+#ifdef __NR_utimes
+    S(utimes),
+#endif
+#ifdef __NR_mbind
+    S(mbind),
+#endif
+#ifdef __NR_set_mempolicy
+    S(set_mempolicy),
+#endif
+#ifdef __NR_get_mempolicy
+    S(get_mempolicy),
+#endif
+#ifdef __NR_waitid
+    S(waitid),
+#endif
+#ifdef __NR_ioprio_set
+    S(ioprio_set),
+#endif
+#ifdef __NR_ioprio_get
+    S(ioprio_get),
+#endif
+#ifdef __NR_inotify_init
+    S(inotify_init),
+#endif
+#ifdef __NR_inotify_add_watch
+    S(inotify_add_watch),
+#endif
+#ifdef __NR_inotify_rm_watch
+    S(inotify_rm_watch),
+#endif
+#ifdef __NR_openat
+    S(openat),
+#endif
+#ifdef __NR_mkdirat
+    S(mkdirat),
+#endif
+#ifdef __NR_mknodat
+    S(mknodat),
+#endif
+#ifdef __NR_fchownat
+    S(fchownat),
+#endif
+#ifdef __NR_futimesat
+    S(futimesat),
+#endif
+#ifdef __NR_newfstatat
+    S(newfstatat),
+#endif
+#ifdef __NR_unlinkat
+    S(unlinkat),
+#endif
+#ifdef __NR_renameat
+    S(renameat),
+#endif
+#ifdef __NR_linkat
+    S(linkat),
+#endif
+#ifdef __NR_symlinkat
+    S(symlinkat),
+#endif
+#ifdef __NR_readlinkat
+    S(readlinkat),
+#endif
+#ifdef __NR_fchmodat
+    S(fchmodat),
+#endif
+#ifdef __NR_faccessat
+    S(faccessat),
+#endif
+#ifdef __NR_pselect6
+    S(pselect6),
+#endif
+#ifdef __NR_ppoll
+    S(ppoll),
+#endif
+#ifdef __NR_unshare
+    S(unshare),
+#endif
+#ifdef __NR_set_robust_list
+    S(set_robust_list),
+#endif
+#ifdef __NR_get_robust_list
+    S(get_robust_list),
+#endif
+#ifdef __NR_splice
+    S(splice),
+#endif
+#ifdef __NR_tee
+    S(tee),
+#endif
+#ifdef __NR_sync_file_range
+    S(sync_file_range),
+#endif
+#ifdef __NR_vmsplice
+    S(vmsplice),
+#endif
+#ifdef __NR_move_pages
+    S(move_pages),
+#endif
+#ifdef __NR_utimensat
+    S(utimensat),
+#endif
+#ifdef __NR_epoll_pwait
+    S(epoll_pwait),
+#endif
+#ifdef __NR_signalfd
+    S(signalfd),
+#endif
+#ifdef __NR_timerfd_create
+    S(timerfd_create),
+#endif
+#ifdef __NR_eventfd
+    S(eventfd),
+#endif
+#ifdef __NR_fallocate
+    S(fallocate),
+#endif
+#ifdef __NR_timerfd_settime
+    S(timerfd_settime),
+#endif
+#ifdef __NR_timerfd_gettime
+    S(timerfd_gettime),
+#endif
+#ifdef __NR_accept4
+    S(accept4),
+#endif
+#ifdef __NR_signalfd4
+    S(signalfd4),
+#endif
+#ifdef __NR_eventfd2
+    S(eventfd2),
+#endif
+#ifdef __NR_epoll_create1
+    S(epoll_create1),
+#endif
+#ifdef __NR_dup3
+    S(dup3),
+#endif
+#ifdef __NR_pipe2
+    S(pipe2),
+#endif
+#ifdef __NR_inotify_init1
+    S(inotify_init1),
+#endif
+#ifdef __NR_preadv
+    S(preadv),
+#endif
+#ifdef __NR_pwritev
+    S(pwritev),
+#endif
+#ifdef __NR_rt_tgsigqueueinfo
+    S(rt_tgsigqueueinfo),
+#endif
+#ifdef __NR_prlimit64
+    S(prlimit64),
+#endif
+#ifdef __NR_fanotify_init
+    S(fanotify_init),
+#endif
+#ifdef __NR_fanotify_mark
+    S(fanotify_mark),
+#endif
+#ifdef __NR_name_to_handle_at
+    S(name_to_handle_at),
+#endif
+#ifdef __NR_open_by_handle_at
+    S(open_by_handle_at),
+#endif
+#ifdef __NR_clock_adjtime
+    S(clock_adjtime),
+#endif
+#ifdef __NR_syncfs
+    S(syncfs),
+#endif
+#ifdef __NR_sendmmsg
+    S(sendmmsg),
+#endif
+#ifdef __NR_setns
+    S(setns),
+#endif
+#ifdef __NR_getcpu
+    S(getcpu),
+#endif
+#ifdef __NR_process_vm_readv
+    S(process_vm_readv),
+#endif
+#ifdef __NR_process_vm_writev
+    S(process_vm_writev),
+#endif
+#ifdef __NR_kcmp
+    S(kcmp),
+#endif
+#ifdef __NR_finit_module
+    S(finit_module),
+#endif
+#ifdef __NR_sched_setattr
+    S(sched_setattr),
+#endif
+#ifdef __NR_sched_getattr
+    S(sched_getattr),
+#endif
+#ifdef __NR_renameat2
+    S(renameat2),
+#endif
+#ifdef __NR_seccomp
+    S(seccomp),
+#endif
+#ifdef __NR_getrandom
+    S(getrandom),
+#endif
+#ifdef __NR_memfd_create
+    S(memfd_create),
+#endif
+#ifdef __NR_execveat
+    S(execveat),
+#endif
+#ifdef __NR_copy_file_range
+    S(copy_file_range),
+#endif
+#ifdef __NR_preadv2
+    S(preadv2),
+#endif
+#ifdef __NR_pwritev2
+    S(pwritev2),
+#endif
+#ifdef __NR_statx
+    S(statx),
+#endif
+#ifdef __NR_io_uring_setup
+    S(io_uring_setup),
+#endif
+#ifdef __NR_io_uring_enter
+    S(io_uring_enter),
+#endif
+#ifdef __NR_io_uring_register
+    S(io_uring_register),
+#endif
+#ifdef __NR_clone3
+    S(clone3),
+#endif
+#ifdef __NR_close_range
+    S(close_range),
+#endif
+#ifdef __NR_openat2
+    S(openat2),
+#endif
+#ifdef __NR_faccessat2
+    S(faccessat2),
+#endif
+#ifdef __NR_landlock_create_ruleset
+    S(landlock_create_ruleset),
+#endif
+#ifdef __NR_landlock_add_rule
+    S(landlock_add_rule),
+#endif
+#ifdef __NR_landlock_restrict_self
+    S(landlock_restrict_self),
+#endif
+#undef S
+};
+
+static const int g_syscall_table_size =
+    (int)(sizeof(g_syscall_table) / sizeof(g_syscall_table[0]));
+
+/* Look up a syscall name and return its number, or -1 if not found. */
+static int syscall_name_to_nr(const char* name)
+{
+    for (int i = 0; i < g_syscall_table_size; i++)
+    {
+        if (strcmp(g_syscall_table[i].name, name) == 0)
+        {
+            return g_syscall_table[i].nr;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Parse a JSON string array value: ["a","b","c"].
+ * Returns array of malloc'd strings.  *out_n is set to count.
+ * Caller must free each string and the array.
+ */
+static char** json_parse_names_array(const char* json, const char* key,
+                                     int* out_n)
+{
+    *out_n = 0;
+    char needle[256];
+    int nlen = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (nlen < 0 || (size_t)nlen >= sizeof(needle))
+    {
+        return NULL;
+    }
+    const char* p = strstr(json, needle);
+    if (!p)
+    {
+        return NULL;
+    }
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
+    {
+        p++;
+    }
+    if (*p != '[')
+    {
+        return NULL;
+    }
+    p++; /* skip '[' */
+
+    /* Count items first */
+    int count = 0;
+    const char* scan = p;
+    while (*scan && *scan != ']')
+    {
+        while (*scan == ' ' || *scan == ',' || *scan == '\n')
+        {
+            scan++;
+        }
+        if (*scan == '"')
+        {
+            scan++;
+            while (*scan && *scan != '"')
+            {
+                if (*scan == '\\')
+                {
+                    scan++;
+                }
+                if (*scan)
+                {
+                    scan++;
+                }
+            }
+            if (*scan == '"')
+            {
+                scan++;
+            }
+            count++;
+        }
+        else if (*scan == ']')
+        {
+            break;
+        }
+        else
+        {
+            scan++;
+        }
+    }
+    if (count == 0)
+    {
+        return NULL;
+    }
+
+    char** arr = calloc((size_t)count, sizeof(char*));
+    if (!arr)
+    {
+        return NULL;
+    }
+
+    int idx = 0;
+    while (*p && *p != ']' && idx < count)
+    {
+        while (*p == ' ' || *p == ',' || *p == '\n')
+        {
+            p++;
+        }
+        if (*p == '"')
+        {
+            p++;
+            const char* end = p;
+            while (*end && *end != '"')
+            {
+                if (*end == '\\')
+                {
+                    end++;
+                    if (*end)
+                    {
+                        end++;
+                    }
+                }
+                else
+                {
+                    end++;
+                }
+            }
+            size_t len = (size_t)(end - p);
+            arr[idx] = malloc(len + 1);
+            if (arr[idx])
+            {
+                memcpy(arr[idx], p, len);
+                arr[idx][len] = '\0';
+                idx++;
+            }
+            if (*end == '"')
+            {
+                p = end + 1;
+            }
+        }
+        else if (*p == ']')
+        {
+            break;
+        }
+        else
+        {
+            p++;
+        }
+    }
+    *out_n = idx;
+    return arr;
+}
+
+/*
+ * Apply a Docker-compatible JSON seccomp profile.
+ * Returns 0 on success, -1 on error.
+ */
+static int apply_seccomp_profile(const char* profile_path)
+{
+#ifdef __aarch64__
+#define MY_AUDIT_ARCH_PROFILE AUDIT_ARCH_AARCH64
+#else
+#define MY_AUDIT_ARCH_PROFILE AUDIT_ARCH_X86_64
+#endif
+
+    size_t json_sz = 0;
+    char* json = read_file(profile_path, &json_sz);
+    if (!json)
+    {
+        fprintf(stderr, "oci2bin: --seccomp-profile: cannot read '%s': %s\n",
+                profile_path, strerror(errno));
+        return -1;
+    }
+
+    /* Determine defaultAction */
+    char* default_action_str = json_get_string(json, "defaultAction");
+    if (!default_action_str)
+    {
+        fprintf(stderr,
+                "oci2bin: --seccomp-profile: missing 'defaultAction' field\n");
+        free(json);
+        return -1;
+    }
+
+    /* 0=ALLOW (allowlist needed), 1=ERRNO/KILL (denylist) */
+    int default_is_allow = (strstr(default_action_str, "ALLOW") != NULL);
+    free(default_action_str);
+
+    /* We support up to 256 syscall numbers from the profile */
+    int listed_nrs[256];
+    int n_listed = 0;
+    int listed_is_allow = -1; /* -1 = unset; 0 = deny; 1 = allow */
+    int mixed_actions   = 0;  /* set if profile has conflicting entry actions */
+
+    /* Find each "syscalls" entry object and collect names+action */
+    const char* p = json;
+    while ((p = strstr(p, "\"names\"")) != NULL)
+    {
+        /* Get the action for this entry by looking for "action" nearby */
+        const char* action_search = p;
+        const char* action_end   = strstr(p, "},");
+        if (!action_end)
+        {
+            action_end = strstr(p, "}");
+        }
+        char action_buf[64] = {0};
+        const char* akey = strstr(action_search, "\"action\"");
+        if (akey && (!action_end || akey < action_end + 64))
+        {
+            /* Extract action value */
+            akey += 8; /* skip "action" */
+            while (*akey == ' ' || *akey == ':' || *akey == '\t')
+            {
+                akey++;
+            }
+            if (*akey == '"')
+            {
+                akey++;
+                int ai = 0;
+                while (*akey && *akey != '"' && ai < 62)
+                {
+                    action_buf[ai++] = *akey++;
+                }
+                action_buf[ai] = '\0';
+            }
+        }
+
+        int entry_allow = (strstr(action_buf, "ALLOW") != NULL);
+
+        /* Detect mixed actions across entries — we only support a single
+         * uniform action across all "syscalls" entries.  If different
+         * entries have different actions (e.g. one ALLOW, one ERRNO) the
+         * single listed_is_allow flag cannot represent both correctly, so
+         * record the conflict and fall back to the built-in filter. */
+        if (listed_is_allow == -1)
+        {
+            listed_is_allow = entry_allow;
+        }
+        else if (listed_is_allow != entry_allow)
+        {
+            mixed_actions = 1;
+        }
+
+        /* Parse names array at current position */
+        int n_names = 0;
+        char** names = json_parse_names_array(p, "names", &n_names);
+        if (names)
+        {
+            for (int ni = 0; ni < n_names && n_listed < 256; ni++)
+            {
+                int nr = syscall_name_to_nr(names[ni]);
+                if (nr >= 0)
+                {
+                    listed_nrs[n_listed++] = nr;
+                }
+                free(names[ni]);
+            }
+            free(names);
+        }
+
+        p++;
+    }
+
+    if (listed_is_allow == -1)
+    {
+        listed_is_allow = 0; /* default: treat unlabelled entries as deny */
+    }
+
+    if (mixed_actions)
+    {
+        fprintf(stderr,
+                "oci2bin: --seccomp-profile: profile has mixed ALLOW/DENY"
+                " entry actions which are not supported; falling back to"
+                " built-in filter\n");
+        free(json);
+        return -1;
+    }
+
+    free(json);
+
+    /* PR_SET_NO_NEW_PRIVS */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: prctl(PR_SET_NO_NEW_PRIVS) failed: %s (non-fatal)\n",
+                strerror(errno));
+    }
+
+    if (n_listed == 0)
+    {
+        /* No rules — just apply the default */
+        if (!default_is_allow)
+        {
+            /* defaultAction=KILL with no exceptions: block all.
+             * Use a minimal filter that kills every syscall. */
+            struct sock_filter kill_all[] =
+            {
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+            };
+            struct sock_fprog prog2 =
+            {
+                .len = 1, .filter = kill_all
+            };
+            if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                        SECCOMP_FILTER_FLAG_TSYNC, &prog2) == 0 ||
+                    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog2) == 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: seccomp profile applied (kill-all)\n");
+                return 0;
+            }
+        }
+        /* defaultAction=ALLOW with no exceptions: allow all — no filter needed */
+        return 0;
+    }
+
+    /*
+     * Build BPF program.
+     * Each instruction is a struct sock_filter (8 bytes).
+     * Maximum size: arch check (3) + load nr (1) + per-syscall (2 each) + default (1)
+     * = 4 + 2*n_listed + 1
+     */
+    int max_insns = 4 + 2 * n_listed + 1;
+    struct sock_filter* filter = calloc((size_t)max_insns,
+                                        sizeof(struct sock_filter));
+    if (!filter)
+    {
+        fprintf(stderr, "oci2bin: --seccomp-profile: out of memory\n");
+        return -1;
+    }
+
+    int fi = 0;
+
+    /* 1. Verify architecture */
+    filter[fi++] = (struct sock_filter)BPF_STMT(
+                       BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, arch));
+    filter[fi++] = (struct sock_filter)BPF_JUMP(
+                       BPF_JMP | BPF_JEQ | BPF_K, MY_AUDIT_ARCH_PROFILE, 1, 0);
+    filter[fi++] = (struct sock_filter)BPF_STMT(
+                       BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+
+    /* 2. Load syscall number */
+    filter[fi++] = (struct sock_filter)BPF_STMT(
+                       BPF_LD | BPF_W | BPF_ABS,
+                       offsetof(struct seccomp_data, nr));
+
+    /* 3. Per-syscall rules */
+    if (default_is_allow)
+    {
+        /* Allowlist mode: default=ALLOW, listed syscalls with non-ALLOW action
+         * → emit BPF_KILL/ERRNO for each listed non-allow syscall */
+        for (int li = 0; li < n_listed; li++)
+        {
+            if (!listed_is_allow)
+            {
+                /* if nr == listed_nrs[li] → kill */
+                filter[fi++] = (struct sock_filter)BPF_JUMP(
+                                   BPF_JMP | BPF_JEQ | BPF_K,
+                                   (unsigned int)listed_nrs[li], 0, 1);
+                filter[fi++] = (struct sock_filter)BPF_STMT(
+                                   BPF_RET | BPF_K,
+                                   SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA));
+            }
+        }
+        /* Default: allow */
+        filter[fi++] = (struct sock_filter)BPF_STMT(
+                           BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    }
+    else
+    {
+        /* Denylist mode: default=KILL/ERRNO, listed=ALLOW
+         * → emit jump-to-allow for each listed syscall, then kill.
+         *
+         * Each BPF_JUMP jump-true offset (jt) encodes the number of
+         * instructions to skip forward to reach the final ALLOW stmt.
+         * For entry [li] that is: (n_listed - li - 1) + 1 = n_listed - li
+         * instructions ahead (one BPF_JUMP per remaining rule, then KILL,
+         * then ALLOW).  The offset is stored in an unsigned char (0–255),
+         * so the maximum safe n_listed is 128 (first entry jt = 128*1 - 1
+         * ... actually let's be precise):
+         *   entry li=0: jt = (n_listed-1) instructions to skip
+         * jt must fit in unsigned char → n_listed-1 ≤ 255 → n_listed ≤ 128
+         * (at n_listed=128, li=0: jt=127 JUMPs remaining + 1 KILL = 128—fits).
+         * Cap here to prevent silent wrap-around which would misclassify
+         * syscalls as denied when they should be allowed. */
+        if (n_listed > 128)
+        {
+            fprintf(stderr,
+                    "oci2bin: --seccomp-profile: denylist has %d rules,"
+                    " truncating to 128 (BPF jump offset limit)\n",
+                    n_listed);
+            n_listed = 128;
+        }
+        int remaining = n_listed;
+        for (int li = 0; li < n_listed; li++)
+        {
+            remaining--;
+            /* if nr == listed_nrs[li] → jump forward past remaining rules
+             * and the KILL stmt to land on the ALLOW stmt at the end.
+             * Distance = remaining (one BPF_JUMP each) + 1 (KILL stmt). */
+            int jt = remaining + 1;
+            filter[fi++] = (struct sock_filter)BPF_JUMP(
+                               BPF_JMP | BPF_JEQ | BPF_K,
+                               (unsigned int)listed_nrs[li],
+                               (unsigned char)jt, 0);
+        }
+        /* Kill (default) */
+        filter[fi++] = (struct sock_filter)BPF_STMT(
+                           BPF_RET | BPF_K,
+                           SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA));
+        /* Allow */
+        filter[fi++] = (struct sock_filter)BPF_STMT(
+                           BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    }
+
+    struct sock_fprog prog =
+    {
+        .len    = (unsigned short)fi,
+        .filter = filter,
+    };
+
+    int rc = -1;
+    if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0)
+    {
+        fprintf(stderr, "oci2bin: seccomp profile applied (%d rules)\n",
+                n_listed);
+        rc = 0;
+    }
+    else if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == 0)
+    {
+        fprintf(stderr,
+                "oci2bin: seccomp profile applied via prctl (%d rules)\n",
+                n_listed);
+        rc = 0;
+    }
+    else
+    {
+        fprintf(stderr,
+                "oci2bin: --seccomp-profile: failed to apply: %s\n",
+                strerror(errno));
+    }
+
+    free(filter);
+
+#undef MY_AUDIT_ARCH_PROFILE
+    return rc;
+}
+
 /* ── PTY relay for job control ──────────────────────────────────────────── */
 
 /* Global master fd used by SIGWINCH handler to forward terminal resize. */
@@ -2775,6 +4165,17 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     /* Set up volume bind mounts BEFORE chroot (host paths still reachable) */
     setup_volumes(rootfs, opts);
     setup_secrets(rootfs, opts);
+
+    /* Append --add-host entries to /etc/hosts before chroot */
+    install_extra_hosts(rootfs, opts->add_hosts, opts->n_add_hosts);
+
+    /* Apply custom DNS resolv.conf if --dns or --dns-search were given */
+    if (opts->n_dns_servers > 0 || opts->n_dns_search > 0)
+    {
+        install_custom_resolv_conf(rootfs,
+                                   opts->dns_servers, opts->n_dns_servers,
+                                   opts->dns_search, opts->n_dns_search);
+    }
 
     /* Mount tmpfs on rootfs/dev and bind-mount host device nodes.
      * Must be done before chroot so the host paths are still reachable as
@@ -3114,6 +4515,32 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         perror("mount /tmp tmpfs (non-fatal)");
     }
 
+    /* When --read-only is active, also mount /run as tmpfs so containers
+     * that need a writable /run (e.g. systemd, D-Bus, ssh) still work.
+     * Skip if user passed --no-auto-tmpfs. */
+    if (opts->read_only && !opts->no_auto_tmpfs)
+    {
+        /* Only mount if not already covered by a user-supplied --tmpfs /run */
+        int run_covered = 0;
+        for (int ti = 0; ti < opts->n_tmpfs; ti++)
+        {
+            if (strcmp(opts->tmpfs_mounts[ti], "/run") == 0)
+            {
+                run_covered = 1;
+                break;
+            }
+        }
+        if (!run_covered)
+        {
+            mkdir("/run", 0755);
+            if (mount("tmpfs", "/run", "tmpfs",
+                      MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=0755") < 0)
+            {
+                perror("mount /run tmpfs (non-fatal)");
+            }
+        }
+    }
+
     /* Mount devpts for TTY/job control support.  /dev is already a tmpfs
      * with host device nodes bind-mounted (done pre-chroot above). */
     if (mount("devpts", "/dev/pts", "devpts",
@@ -3297,7 +4724,21 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     /* Apply seccomp filter (must be before fork so child inherits it) */
     if (!opts->no_seccomp)
     {
-        apply_seccomp_filter();
+        if (opts->seccomp_profile)
+        {
+            /* Custom profile: fall back to built-in default on parse error */
+            if (apply_seccomp_profile(opts->seccomp_profile) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --seccomp-profile failed,"
+                        " falling back to built-in filter\n");
+                apply_seccomp_filter();
+            }
+        }
+        else
+        {
+            apply_seccomp_filter();
+        }
     }
 
     /* --detach: fork to background, print child PID, parent exits */
@@ -3402,6 +4843,56 @@ static int container_main(const char* rootfs, struct container_opts *opts)
             close(opts->pty_slave_fd);
         }
     }
+
+    /* Apply AppArmor profile if requested (optional compile-time support) */
+#ifdef HAVE_APPARMOR
+    if (opts->security_opt_apparmor)
+    {
+        if (aa_change_onexec(opts->security_opt_apparmor) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --security-opt apparmor=%s: %s (non-fatal)\n",
+                    opts->security_opt_apparmor, strerror(errno));
+        }
+        else
+        {
+            fprintf(stderr, "oci2bin: AppArmor profile '%s' set\n",
+                    opts->security_opt_apparmor);
+        }
+    }
+#else
+    if (opts->security_opt_apparmor)
+    {
+        fprintf(stderr,
+                "oci2bin: --security-opt apparmor: not compiled with "
+                "AppArmor support (-DHAVE_APPARMOR)\n");
+    }
+#endif
+
+    /* Apply SELinux exec label if requested (optional compile-time support) */
+#ifdef HAVE_SELINUX
+    if (opts->security_opt_label)
+    {
+        if (setexeccon(opts->security_opt_label) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --security-opt label=%s: %s (non-fatal)\n",
+                    opts->security_opt_label, strerror(errno));
+        }
+        else
+        {
+            fprintf(stderr, "oci2bin: SELinux label '%s' set\n",
+                    opts->security_opt_label);
+        }
+    }
+#else
+    if (opts->security_opt_label)
+    {
+        fprintf(stderr,
+                "oci2bin: --security-opt label: not compiled with "
+                "SELinux support (-DHAVE_SELINUX)\n");
+    }
+#endif
 
     /* Exec the entrypoint */
     debug_log("container.exec", "path=%s argc=%d", safe_str(exec_args[0]),
@@ -3535,6 +5026,9 @@ static void usage(const char* prog)
             "Options:\n"
             "  -v HOST:CONTAINER   Bind mount a host path into the container\n"
             "                      (may be repeated)\n"
+            "  -p HOST_PORT:CTR_PORT\n"
+            "                      Publish a container port to the host via slirp\n"
+            "                      (may be repeated; implies --net slirp)\n"
             "  --secret HOST_FILE[:CONTAINER_PATH]\n"
             "                      Bind mount a host file read-only; defaults to\n"
             "                      /run/secrets/<basename> (may be repeated)\n"
@@ -3553,12 +5047,27 @@ static void usage(const char* prog)
             "  --ipc host|container:<PID>\n"
             "                      IPC namespace: host (default, shares SysV IPC),\n"
             "                      or join the IPC namespace of PID\n"
-            "  --read-only         Mount rootfs read-only via overlayfs\n"
+            "  --add-host HOST:IP  Inject a hostname→IP mapping into /etc/hosts\n"
+            "                      (may be repeated)\n"
+            "  --dns IP            Add a DNS server to resolv.conf (may be repeated)\n"
+            "  --dns-search DOMAIN Add a DNS search domain (may be repeated)\n"
+            "  --read-only         Mount rootfs read-only via overlayfs;\n"
+            "                      auto-mounts /run as tmpfs (see --no-auto-tmpfs)\n"
+            "  --no-auto-tmpfs     Do not auto-mount /run as tmpfs with --read-only\n"
             "  --overlay-persist DIR\n"
             "                      Persist the overlay upper layer to DIR;\n"
             "                      state accumulates across runs\n"
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
+            "  --seccomp-profile FILE\n"
+            "                      Apply a Docker-compatible JSON seccomp profile\n"
+            "                      instead of the built-in default filter\n"
+            "  --security-opt apparmor=PROFILE\n"
+            "                      Apply AppArmor profile before exec\n"
+            "                      (requires -DHAVE_APPARMOR at build time)\n"
+            "  --security-opt label=TYPE:VAL\n"
+            "                      Set SELinux exec label before exec\n"
+            "                      (requires -DHAVE_SELINUX at build time)\n"
             "  --no-host-dev       Skip bind-mounting host /dev nodes (null, zero, "
             "random, tty)\n"
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
@@ -3856,6 +5365,37 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             opts->vol_host[opts->n_vols] = spec;
             opts->vol_ctr[opts->n_vols]  = colon + 1;
             opts->n_vols++;
+        }
+        else if (strcmp(argv[i], "-p") == 0)
+        {
+            /* -p HOST_PORT:CTR_PORT — shorthand for --net slirp:HOST:CTR */
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: -p requires HOST_PORT:CTR_PORT argument\n");
+                return -1;
+            }
+            i++;
+            char* spec = argv[i];
+            char* colon = strchr(spec, ':');
+            if (!colon || colon == spec || *(colon + 1) == '\0')
+            {
+                fprintf(stderr,
+                        "oci2bin: -p argument must be HOST_PORT:CTR_PORT\n");
+                return -1;
+            }
+            if (opts->n_portfwd >= 16)
+            {
+                fprintf(stderr,
+                        "oci2bin: too many -p / port forward flags (max 16)\n");
+                return -1;
+            }
+            opts->net_portfwd[opts->n_portfwd++] = spec;
+            /* Auto-enable slirp networking if not already set */
+            if (!opts->net || strcmp(opts->net, "host") == 0)
+            {
+                opts->net = "slirp";
+            }
         }
         else if (strcmp(argv[i], "--secret") == 0)
         {
@@ -4203,6 +5743,110 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-seccomp") == 0)
         {
             opts->no_seccomp = 1;
+        }
+        else if (strcmp(argv[i], "--seccomp-profile") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --seccomp-profile requires a FILE argument\n");
+                return -1;
+            }
+            i++;
+            if (path_has_dotdot_component(argv[i]))
+            {
+                fprintf(stderr,
+                        "oci2bin: --seccomp-profile: path must not"
+                        " contain '..'\n");
+                return -1;
+            }
+            opts->seccomp_profile = argv[i];
+        }
+        else if (strcmp(argv[i], "--add-host") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --add-host requires HOST:IP argument\n");
+                return -1;
+            }
+            i++;
+            if (opts->n_add_hosts >= 32)
+            {
+                fprintf(stderr,
+                        "oci2bin: too many --add-host flags (max 32)\n");
+                return -1;
+            }
+            if (!strchr(argv[i], ':'))
+            {
+                fprintf(stderr,
+                        "oci2bin: --add-host argument must be HOST:IP\n");
+                return -1;
+            }
+            opts->add_hosts[opts->n_add_hosts++] = argv[i];
+        }
+        else if (strcmp(argv[i], "--dns") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --dns requires IP argument\n");
+                return -1;
+            }
+            i++;
+            if (opts->n_dns_servers >= 8)
+            {
+                fprintf(stderr,
+                        "oci2bin: too many --dns flags (max 8)\n");
+                return -1;
+            }
+            opts->dns_servers[opts->n_dns_servers++] = argv[i];
+        }
+        else if (strcmp(argv[i], "--dns-search") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --dns-search requires DOMAIN argument\n");
+                return -1;
+            }
+            i++;
+            if (opts->n_dns_search >= 8)
+            {
+                fprintf(stderr,
+                        "oci2bin: too many --dns-search flags (max 8)\n");
+                return -1;
+            }
+            opts->dns_search[opts->n_dns_search++] = argv[i];
+        }
+        else if (strcmp(argv[i], "--no-auto-tmpfs") == 0)
+        {
+            opts->no_auto_tmpfs = 1;
+        }
+        else if (strcmp(argv[i], "--security-opt") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --security-opt requires apparmor=PROFILE"
+                        " or label=TYPE:VAL\n");
+                return -1;
+            }
+            i++;
+            if (strncmp(argv[i], "apparmor=", 9) == 0)
+            {
+                opts->security_opt_apparmor = argv[i] + 9;
+            }
+            else if (strncmp(argv[i], "label=", 6) == 0)
+            {
+                opts->security_opt_label = argv[i] + 6;
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: --security-opt: unknown option '%s'\n"
+                        "  supported: apparmor=PROFILE, label=TYPE:VAL\n",
+                        argv[i]);
+                return -1;
+            }
         }
         else if (strcmp(argv[i], "--no-host-dev") == 0)
         {
@@ -6274,10 +7918,10 @@ int main(int argc, char* argv[])
         close(opts.pty_slave_fd);
     }
 
-    /* Forward SIGINT/SIGTERM/SIGHUP to the child so that signals from
-     * the host (e.g. kill, systemd stop) reach the container process.
-     * Ctrl-C in the PTY relay goes through the slave line discipline,
-     * but external signals need explicit forwarding. */
+    /* Forward SIGINT/SIGTERM/SIGHUP/SIGUSR1/SIGUSR2 to the child so that
+     * signals from the host (e.g. kill, systemd stop) reach the container
+     * process.  Ctrl-C in the PTY relay goes through the slave line
+     * discipline, but external signals need explicit forwarding. */
     g_pty_child_pid = child;
     {
         struct sigaction sa;
@@ -6288,6 +7932,8 @@ int main(int argc, char* argv[])
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
         sigaction(SIGHUP, &sa, NULL);
+        sigaction(SIGUSR1, &sa, NULL);
+        sigaction(SIGUSR2, &sa, NULL);
     }
 
     /* Parent: if PTY active, relay until child exits */

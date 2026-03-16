@@ -4,6 +4,7 @@
 # Usage:
 #   oci2bin [--arch ARCH] <image[:tag]> [output]
 #   oci2vm  [--arch ARCH] <image[:tag]> [output]   (VM mode by default)
+#   oci2bin exec <PID> [--] <CMD> [ARGS...]
 #   oci2bin inspect <binary>
 #   oci2bin sign   --key KEY.pem  --in BINARY [--out BINARY]
 #   oci2bin verify --key PUB.pem  --in BINARY
@@ -20,9 +21,10 @@
 #   ./output [OPTIONS] CMD [ARGS...]
 #
 # Build options:
-#   --arch ARCH           Target architecture: x86_64 (default) or aarch64
-#                         Cross-compilation requires the matching musl cross-
-#                         compiler (aarch64-linux-musl-gcc) to be in PATH.
+#   --arch ARCH           Target architecture: x86_64 (default), aarch64, or
+#                         'all' (builds both and emits a wrapper shell script).
+#                         Cross-compilation requires the matching cross-
+#                         compiler (aarch64-linux-gnu-gcc) to be in PATH.
 #   --cache               Cache the output binary; skip rebuild if already built
 #   --layer IMAGE         Merge additional image layers on top of the base image
 #                         (may be repeated; layers are applied in order)
@@ -61,7 +63,19 @@
 #   --read-only           Mount rootfs read-only via overlayfs
 #   --overlay-persist DIR Persist overlay upper layer to DIR (state survives restarts)
 #   --ssh-agent           Forward host SSH_AUTH_SOCK into the container
+#   -p HOST_PORT:CTR_PORT Publish a port from the container to the host;
+#                         implies --net slirp (may be repeated)
+#   --add-host HOST:IP    Inject a hostname→IP entry into /etc/hosts
+#   --dns IP              Override DNS server in resolv.conf (may be repeated)
+#   --dns-search DOMAIN   Add DNS search domain (may be repeated)
 #   --no-seccomp          Disable the default seccomp syscall filter
+#   --seccomp-profile FILE
+#                         Apply a Docker-compatible JSON seccomp profile
+#   --no-auto-tmpfs       Do not auto-mount /run as tmpfs with --read-only
+#   --security-opt apparmor=PROFILE
+#                         Apply AppArmor profile (build with -DHAVE_APPARMOR)
+#   --security-opt label=TYPE:VAL
+#                         Set SELinux exec label (build with -DHAVE_SELINUX)
 #   --user UID[:GID]      Run as this numeric UID (and optional GID)
 #   --hostname NAME       Set the hostname inside the container
 #   --cap-drop CAP        Drop a Linux capability (or 'all' to drop all)
@@ -125,6 +139,45 @@ usage() {
     sed -n '/^#!/d; /^#/!q; s/^# \?//p' "$0"
     exit 1
 }
+
+# ── exec subcommand ──────────────────────────────────────────────────────
+# Usage: oci2bin exec <PID> [--] <CMD> [ARGS...]
+# Joins the namespaces of a running container by PID and executes CMD inside.
+# Requires nsenter(1) from util-linux.
+
+if [[ "${1:-}" == "exec" ]]; then
+    shift
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: oci2bin exec <PID> [--] <CMD> [ARGS...]" >&2
+        echo "  Joins the namespaces of the container identified by PID" >&2
+        echo "  and executes CMD inside it." >&2
+        exit 1
+    fi
+    EXEC_PID="$1"; shift
+    # Validate PID is numeric
+    if ! [[ "$EXEC_PID" =~ ^[0-9]+$ ]]; then
+        echo "oci2bin exec: PID must be a positive integer, got: $EXEC_PID" >&2
+        exit 1
+    fi
+    # Strip leading '--' separator if present
+    [[ "${1:-}" == "--" ]] && shift
+    if [[ $# -lt 1 ]]; then
+        echo "oci2bin exec: CMD is required after PID" >&2
+        exit 1
+    fi
+    need nsenter
+    # Join user, mount, pid, uts, and ipc namespaces of the target process.
+    # --preserve-credentials keeps the user namespace mapping correct.
+    exec nsenter \
+        --target "$EXEC_PID" \
+        --user \
+        --mount \
+        --pid \
+        --uts \
+        --ipc \
+        --preserve-credentials \
+        -- "$@"
+fi
 
 # ── inspect subcommand ────────────────────────────────────────────────────
 
@@ -464,6 +517,10 @@ while [[ $# -gt 0 ]]; do
             TARGET_ARCH="$2"
             shift 2
             ;;
+        --no-auto-tmpfs)
+            # pass-through runtime flag; handled by loader
+            shift
+            ;;
         --cache)
             USE_CACHE=1
             shift
@@ -571,6 +628,49 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── architecture / compiler selection ─────────────────────────────────────
+
+# Handle --arch all: build for all supported architectures and produce a
+# wrapper script that detects the running arch and delegates to the right
+# binary.  Both arch-specific binaries are placed next to the output.
+if [[ "$TARGET_ARCH" == "all" ]]; then
+    # Recursively invoke oci2bin for each target arch
+    MULTI_ARCH_ARCHS=("x86_64" "aarch64")
+    MULTI_ARCH_OUTPUTS=()
+    for a in "${MULTI_ARCH_ARCHS[@]}"; do
+        out_a="${OUTPUT}_${a}"
+        echo "oci2bin: building for $a → $out_a" >&2
+        env_args=()
+        [[ -n "${OCI2BIN_HOME:-}" ]] && env_args=(env "OCI2BIN_HOME=$OCI2BIN_HOME")
+        # Rebuild arg list without --arch all
+        _rebuild_args=()
+        _skip_next=0
+        for arg in "$@"; do
+            if [[ "$_skip_next" -eq 1 ]]; then _skip_next=0; continue; fi
+            _rebuild_args+=("$arg")
+        done
+        "${env_args[@]}" "$0" --arch "$a" "${_rebuild_args[@]}" "$IMAGE" "$out_a"
+        MULTI_ARCH_OUTPUTS+=("$out_a")
+    done
+
+    # Write the wrapper script that auto-selects the right binary
+    cat > "$OUTPUT" <<WRAPPER_EOF
+#!/bin/sh
+_ARCH=\$(uname -m)
+_DIR=\$(dirname "\$0")
+case "\$_ARCH" in
+    x86_64)  exec "\$_DIR/${OUTPUT}_x86_64" "\$@" ;;
+    aarch64) exec "\$_DIR/${OUTPUT}_aarch64" "\$@" ;;
+    *)
+        echo "oci2bin: unsupported architecture: \$_ARCH" >&2
+        exit 1
+        ;;
+esac
+WRAPPER_EOF
+    chmod +x "$OUTPUT"
+    echo "oci2bin: multi-arch wrapper → $OUTPUT"
+    echo "oci2bin: arch binaries: ${MULTI_ARCH_OUTPUTS[*]}"
+    exit 0
+fi
 
 if [[ "$TARGET_ARCH" == "$HOST_ARCH" ]]; then
     CC_CROSS="gcc"

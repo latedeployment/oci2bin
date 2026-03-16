@@ -127,6 +127,20 @@ AARCH64_SYSROOT=/path/to/sysroot oci2bin --arch aarch64 alpine:latest
 
 The output runs only on aarch64 Linux (or under qemu-aarch64).
 
+#### Multi-arch fat binaries
+
+`--arch all` builds both x86_64 and aarch64 variants and emits a thin wrapper shell script that auto-selects the correct binary at runtime using `uname -m`:
+
+```bash
+oci2bin --arch all alpine:latest
+# produces:
+#   alpine_latest          ← wrapper script (any host)
+#   alpine_latest_x86_64   ← ELF for x86_64
+#   alpine_latest_aarch64  ← ELF for aarch64
+```
+
+The wrapper and the arch-specific binaries must remain in the same directory.
+
 ### Injecting files at build time
 
 Use `--add-file HOST:CONTAINER` and `--add-dir HOST:CONTAINER` to inject files or directories into the image at build time, without needing a volume mount at runtime:
@@ -534,7 +548,29 @@ By default, containers share the host network stack. Use `--net none` for a full
 ./alpine_latest --net host /bin/sh -c 'curl ...'  # host networking (default)
 ```
 
-The container process runs as root inside a user namespace. The host UID is mapped to UID 0 — no real privilege is granted on the host. `/etc/resolv.conf` from the host is copied into the rootfs so DNS resolution works.
+The container process runs as root inside a user namespace. The host UID is mapped to UID 0 — no real privilege is granted on the host. `/etc/resolv.conf` from the host is copied into the rootfs so DNS resolution works out of the box.
+
+#### Custom DNS
+
+Override the DNS servers and search domains inside the container:
+
+```bash
+./myapp --dns 1.1.1.1 --dns 8.8.8.8          # use Cloudflare + Google DNS
+./myapp --dns 192.168.1.1 --dns-search corp.example.com
+```
+
+`--dns` and `--dns-search` write a custom `resolv.conf` into the container rootfs, overriding the host's resolver. May each be repeated up to 8 times.
+
+#### Custom /etc/hosts entries
+
+Inject hostname→IP mappings with `--add-host`:
+
+```bash
+./myapp --add-host db.internal:10.0.0.5
+./myapp --add-host redis.local:127.0.0.1 --add-host api.local:10.1.2.3
+```
+
+Entries are appended to the container's `/etc/hosts` before exec. May be repeated up to 32 times.
 
 #### Userspace networking with slirp4netns or pasta
 
@@ -547,7 +583,11 @@ namespace with real outbound TCP/UDP without requiring root. This uses
 ./myapp --net slirp             # outbound internet via slirp4netns
 ./myapp --net pasta             # outbound internet via pasta (faster, IPv6)
 ./myapp --net slirp:8080:80     # slirp + port-forward host:8080 → ctr:80
+./myapp -p 8080:80              # shorthand for the above (implies --net slirp)
+./myapp -p 8080:80 -p 8443:443  # multiple ports (may be repeated)
 ```
+
+`-p HOST_PORT:CTR_PORT` is a Docker-style shorthand for `--net slirp:HOST:CTR`. It automatically enables slirp networking if `--net` was not already set.
 
 `slirp4netns` or `pasta` must be installed (`dnf install slirp4netns` /
 `apt install slirp4netns` or `dnf install passt`). The loader forks the
@@ -683,6 +723,38 @@ Containers run with a default seccomp-BPF filter that blocks syscalls with no le
 ./my-app --no-seccomp
 ```
 
+#### Custom seccomp profiles
+
+Load a Docker-compatible JSON seccomp profile with `--seccomp-profile`:
+
+```bash
+./my-app --seccomp-profile ./my-seccomp.json
+```
+
+The profile format is a subset of Docker's seccomp schema:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "syscalls": [
+    { "names": ["read","write","exit","exit_group","brk","mmap","mprotect","munmap","rt_sigreturn"], "action": "SCMP_ACT_ALLOW" }
+  ]
+}
+```
+
+`defaultAction` must be `SCMP_ACT_ALLOW`, `SCMP_ACT_ERRNO`, or `SCMP_ACT_KILL`. When `defaultAction` is `ALLOW`, listed syscalls with non-ALLOW actions are blocked. When `defaultAction` is `ERRNO` or `KILL`, only the listed ALLOW syscalls are permitted. If the profile cannot be parsed, oci2bin falls back to the built-in default filter and prints a warning.
+
+#### AppArmor and SELinux confinement
+
+Apply an AppArmor profile or SELinux exec label with `--security-opt`:
+
+```bash
+./my-app --security-opt apparmor=docker-default
+./my-app --security-opt label=type:svirt_sandbox_file_t
+```
+
+AppArmor support requires building with `-DHAVE_APPARMOR -lapparmor`. SELinux support requires `-DHAVE_SELINUX -lselinux`. Without these flags the option is accepted but a warning is printed at runtime. Both options are non-fatal if the underlying system call fails.
+
 ### Running as non-root
 
 By default the container process runs as UID 0 inside the user namespace. Use `--user` to run as a different numeric UID:
@@ -804,6 +876,27 @@ to disk.
 ---
 
 ## Subcommands
+
+### exec
+
+Attach to a running container by PID and execute a command inside its namespaces. Requires `nsenter(1)` from `util-linux`.
+
+```bash
+# Start a container in the background
+./redis_7-alpine --detach
+PID=$!
+
+# Exec a shell inside the running container
+oci2bin exec $PID /bin/sh
+
+# Run a one-shot command
+oci2bin exec $PID redis-cli PING
+
+# With argument separator
+oci2bin exec $PID -- redis-cli -p 6379 INFO server
+```
+
+`exec` joins the user, mount, PID, UTS, and IPC namespaces of the target process. The process must still be running — use `--detach` or run in another terminal.
 
 ### inspect
 
