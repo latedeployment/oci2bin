@@ -3505,6 +3505,10 @@ static char** json_parse_names_array(const char* json, const char* key,
         {
             scan++;
         }
+        if (!*scan)
+        {
+            break;    /* truncated input — NUL before ']' */
+        }
         if (*scan == '"')
         {
             scan++;
@@ -3551,6 +3555,10 @@ static char** json_parse_names_array(const char* json, const char* key,
         while (*p == ' ' || *p == ',' || *p == '\n')
         {
             p++;
+        }
+        if (!*p)
+        {
+            break;    /* truncated input */
         }
         if (*p == '"')
         {
@@ -3692,12 +3700,15 @@ static int apply_seccomp_profile(const char* profile_path)
         char** names = json_parse_names_array(p, "names", &n_names);
         if (names)
         {
-            for (int ni = 0; ni < n_names && n_listed < 256; ni++)
+            for (int ni = 0; ni < n_names; ni++)
             {
-                int nr = syscall_name_to_nr(names[ni]);
-                if (nr >= 0)
+                if (n_listed < 256)
                 {
-                    listed_nrs[n_listed++] = nr;
+                    int nr = syscall_name_to_nr(names[ni]);
+                    if (nr >= 0)
+                    {
+                        listed_nrs[n_listed++] = nr;
+                    }
                 }
                 free(names[ni]);
             }

@@ -58,7 +58,8 @@ VMLINUX_OUT    = build/vmlinux
         test-integration-nginx test-integration-services \
         test-c test-c-aarch64 test-python \
         test-vm-unit test-vm \
-        lint lint-clang lint-semgrep lint-scan-build
+        lint lint-clang lint-semgrep lint-scan-build \
+        fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-clean
 
 all: polyglot
 
@@ -290,3 +291,51 @@ test-integration-services:
 	@echo "=== Service matrix integration tests (container + VM) ==="
 	@mkdir -p $(TEST_TMPDIR)
 	$(TEST_ENV) python3 -m unittest tests.test_service_matrix -v
+
+# ── Fuzz targets (libFuzzer, requires clang) ───────────────────────────────────
+#
+# Usage:
+#   make fuzz-json       # fuzz JSON helpers
+#   make fuzz-seccomp    # fuzz seccomp profile parser
+#   make fuzz-parse-opts # fuzz parse_opts + load_env_file
+#   make fuzz-all        # build all fuzz binaries
+#
+# Run a harness (example):
+#   ./build/fuzz_json tests/fuzz/corpus/json -max_len=65536 -jobs=4
+#   ./build/fuzz_seccomp tests/fuzz/corpus/seccomp -max_len=65536 -jobs=4
+#   ./build/fuzz_parse_opts tests/fuzz/corpus/parse_opts -max_len=4096 -jobs=4
+#
+# Findings are written to crash-* / timeout-* / oom-* files in the CWD.
+# Replay a crash:
+#   ./build/fuzz_json crash-<hash>
+
+FUZZ_CC      ?= clang
+FUZZ_CFLAGS   = -g -O1 -fsanitize=fuzzer,address,undefined \
+                -fno-omit-frame-pointer \
+                -Wno-unused-function -Wno-unused-variable \
+                -Wno-return-local-addr
+
+FUZZ_BINS = build/fuzz_json build/fuzz_seccomp build/fuzz_parse_opts
+
+.PHONY: fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-clean
+
+fuzz-all: $(FUZZ_BINS)
+
+fuzz-json: build/fuzz_json
+fuzz-seccomp: build/fuzz_seccomp
+fuzz-parse-opts: build/fuzz_parse_opts
+
+build/fuzz_json: tests/fuzz/fuzz_json.c src/loader.c
+	@mkdir -p build
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $<
+
+build/fuzz_seccomp: tests/fuzz/fuzz_seccomp.c src/loader.c
+	@mkdir -p build
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $<
+
+build/fuzz_parse_opts: tests/fuzz/fuzz_parse_opts.c src/loader.c
+	@mkdir -p build
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $<
+
+fuzz-clean:
+	rm -f $(FUZZ_BINS)

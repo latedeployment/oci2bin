@@ -1,0 +1,1 @@
+{"Entrypoint":["/bin/sh","-c"],"Cmd":["echo","hello"],"Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","HOME=/root"],"WorkingDir":"/app","User":"1000:1000"}
