@@ -2,6 +2,68 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.7.0] - 2026-03-16
+
+### Added
+
+- **`oci2bin exec PID [--] CMD [ARGS...]`** — attach to a running container by
+  host PID and execute a command inside its user/mount/PID/UTS/IPC namespaces
+  via `nsenter(1)`. Requires `util-linux` nsenter on the host.
+
+- **`-p HOST_PORT:CTR_PORT`** — Docker-style port publish shorthand. Equivalent
+  to `--net slirp:HOST_PORT:CTR_PORT`; automatically enables slirp networking
+  when `--net` is not already set. May be repeated for multiple ports.
+
+- **`--dns IP`** — override DNS nameservers inside the container by writing a
+  custom `resolv.conf` into the rootfs before exec. May be repeated up to 8
+  times.
+
+- **`--dns-search DOMAIN`** — set DNS search domains inside the container.
+  May be repeated up to 8 times.
+
+- **`--add-host HOSTNAME:IP`** — inject extra hostname→IP entries into the
+  container's `/etc/hosts` before exec. May be repeated up to 32 times.
+
+- **`--seccomp-profile FILE`** — load a Docker-compatible JSON seccomp profile
+  instead of the built-in filter. Supports `SCMP_ACT_ALLOW`, `SCMP_ACT_ERRNO`,
+  and `SCMP_ACT_KILL` as `defaultAction`; includes a ~250-entry static syscall
+  name table covering x86_64 and aarch64. Falls back to the built-in filter on
+  parse errors.
+
+- **`--security-opt apparmor=PROFILE`** — apply an AppArmor profile via
+  `aa_change_onexec()` before exec. Requires building with
+  `-DHAVE_APPARMOR -lapparmor`.
+
+- **`--security-opt label=TYPE:VAL`** — set an SELinux exec context via
+  `setexeccon()` before exec. Requires building with
+  `-DHAVE_SELINUX -lselinux`.
+
+- **`--no-auto-tmpfs`** — opt out of the automatic `/run` tmpfs that is
+  mounted when `--read-only` is active.
+
+- **`--arch all`** — build both x86_64 and aarch64 binaries in a single
+  invocation and emit a thin wrapper shell script (`uname -m` dispatch).
+  The wrapper and arch-specific binaries must remain in the same directory.
+
+- **SIGUSR1 / SIGUSR2 forwarding** — both signals are now forwarded to the
+  container process alongside the existing SIGINT / SIGTERM / SIGHUP set.
+
+### Fixed
+
+- **Read-only rootfs + `/run`** — when `--read-only` is active, `/run` is
+  automatically mounted as a tmpfs so applications that write pid-files or
+  sockets there do not crash at startup.
+
+- **BPF denylist jump offsets** — corrected the BPF jump offset formula in
+  `apply_seccomp_profile` for denylist mode (was `remaining * 2`, should be
+  `remaining + 1`). Also added a 128-rule cap to prevent silent unsigned-char
+  overflow that would have misclassified allowed syscalls as denied.
+
+- **`resolv.conf` builder snprintf truncation** — fixed incorrect truncation
+  guards in `install_custom_resolv_conf` that could advance the write position
+  past the end of the buffer when a DNS entry was longer than the remaining
+  space.
+
 ## [0.6.0] - 2026-03-15
 
 ### Added
