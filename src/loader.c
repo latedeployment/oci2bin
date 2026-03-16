@@ -295,26 +295,39 @@ static void debug_dump_opts(const struct container_opts* opts)
 
 /* ── tiny JSON helpers (just enough to parse manifest.json and config) ─── */
 
-/* Find a JSON string value for a given key. Returns malloc'd string or NULL. */
-static char* json_get_string(const char* json, const char* key)
+/*
+ * Locate a JSON key and return a pointer to the first non-whitespace
+ * character after the "key": separator.  Returns NULL if the key is not
+ * found or the key string would overflow the internal needle buffer
+ * (keys longer than 254 bytes).  Shared by json_get_string,
+ * json_get_array, and json_parse_names_array.
+ */
+static const char* json_skip_to_value(const char* json, const char* key)
 {
     char needle[256];
     int nlen = snprintf(needle, sizeof(needle), "\"%s\"", key);
     if (nlen < 0 || (size_t)nlen >= sizeof(needle))
     {
-        return NULL;    /* key too long — refuse to match a truncated needle */
+        return NULL;    /* key too long */
     }
     const char* p = strstr(json, needle);
     if (!p)
     {
         return NULL;
     }
-    p += strlen(needle);
+    p += (size_t)nlen;
     while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
     {
         p++;
     }
-    if (*p != '"')
+    return p;
+}
+
+/* Find a JSON string value for a given key. Returns malloc'd string or NULL. */
+static char* json_get_string(const char* json, const char* key)
+{
+    const char* p = json_skip_to_value(json, key);
+    if (!p || *p != '"')
     {
         return NULL;
     }
@@ -351,23 +364,8 @@ static char* json_get_string(const char* json, const char* key)
 /* Find a JSON array value for a given key. Returns malloc'd string (with []) or NULL. */
 static char* json_get_array(const char* json, const char* key)
 {
-    char needle[256];
-    int nlen = snprintf(needle, sizeof(needle), "\"%s\"", key);
-    if (nlen < 0 || (size_t)nlen >= sizeof(needle))
-    {
-        return NULL;    /* key too long — refuse to match a truncated needle */
-    }
-    const char* p = strstr(json, needle);
-    if (!p)
-    {
-        return NULL;
-    }
-    p += strlen(needle);
-    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
-    {
-        p++;
-    }
-    if (*p != '[')
+    const char* p = json_skip_to_value(json, key);
+    if (!p || *p != '[')
     {
         return NULL;
     }
@@ -1160,7 +1158,11 @@ static void install_resolv_conf(const char* rootfs)
                                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (dst_fd >= 0)
     {
-        write_all_fd(dst_fd, data, sz);
+        if (write_all_fd(dst_fd, data, sz) < 0)
+        {
+            fprintf(stderr, "oci2bin: warning: write resolv.conf: %s\n",
+                    strerror(errno));
+        }
         close(dst_fd);
     }
     close(rootfs_fd);
@@ -1229,7 +1231,11 @@ static void install_custom_resolv_conf(const char* rootfs,
                                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (dst_fd >= 0)
     {
-        write_all_fd(dst_fd, buf, (size_t)pos);
+        if (write_all_fd(dst_fd, buf, (size_t)pos) < 0)
+        {
+            fprintf(stderr, "oci2bin: warning: write custom resolv.conf: %s\n",
+                    strerror(errno));
+        }
         close(dst_fd);
     }
     close(rootfs_fd);
@@ -1280,7 +1286,11 @@ static void install_extra_hosts(const char* rootfs,
                          ip, (int)host_len, spec);
         if (n > 0 && (size_t)n < sizeof(line))
         {
-            write_all_fd(dst_fd, line, (size_t)n);
+            if (write_all_fd(dst_fd, line, (size_t)n) < 0)
+            {
+                fprintf(stderr, "oci2bin: warning: write /etc/hosts: %s\n",
+                        strerror(errno));
+            }
         }
     }
     close(dst_fd);
@@ -1736,6 +1746,115 @@ static int setup_uid_map(uid_t real_uid, gid_t real_gid)
 }
 
 /*
+ * Rewrite a colon-delimited identity file (/etc/passwd or /etc/group),
+ * mapping the fields at remap_indices[] to "0" whenever their numeric value
+ * is neither 0 nor 65534 (the nobody sentinel).
+ * n_fields: minimum number of colon-separated fields a line must have.
+ * remap_indices[]: zero-terminated array of 0-based field indices to remap.
+ * Fixes the double-newline bug: trailing '\n' is stripped before reassembly.
+ */
+static void rewrite_id_fields(int rootfs_fd, const char* rel_path,
+                              const char* full_path,
+                              int n_fields,
+                              const int* remap_indices)
+{
+    size_t file_sz;
+    char*  data = read_file(full_path, &file_sz);
+    if (!data)
+    {
+        return;
+    }
+
+    int   out_fd = openat_beneath(rootfs_fd, rel_path, O_WRONLY | O_TRUNC, 0);
+    FILE* out    = out_fd >= 0 ? fdopen(out_fd, "w") : NULL;
+    if (!out)
+    {
+        free(data);
+        return;
+    }
+
+    char* line = data;
+    while (*line)
+    {
+        char*  nl       = strchr(line, '\n');
+        size_t line_len = nl ? (size_t)(nl - line + 1) : strlen(line);
+        char   linebuf[4096];
+        if (line_len >= sizeof(linebuf))
+        {
+            line += line_len;
+            continue;
+        }
+        memcpy(linebuf, line, line_len);
+        linebuf[line_len] = '\0';
+        /* Strip trailing newline so reassembly doesn't double it */
+        size_t buf_len = line_len;
+        if (buf_len > 0 && linebuf[buf_len - 1] == '\n')
+        {
+            linebuf[--buf_len] = '\0';
+        }
+
+        /* Split on ':' (up to 8 fields) */
+        char* f[8];
+        int   nf = 0;
+        char* p  = linebuf;
+        while (nf < 8)
+        {
+            f[nf++] = p;
+            p = strchr(p, ':');
+            if (!p)
+            {
+                break;
+            }
+            *p++ = '\0';
+        }
+
+        if (nf >= n_fields)
+        {
+            /* Remap specified id fields to "0" unless nobody (65534) */
+            for (const int* ip = remap_indices; *ip >= 0; ip++)
+            {
+                int idx = *ip;
+                if (idx < nf)
+                {
+                    unsigned long v = strtoul(f[idx], NULL, 10);
+                    if (v != 0 && v != 65534)
+                    {
+                        /* Write only "0\0" (2 bytes); any id field is at
+                         * least 2 bytes wide (1-digit value + NUL delimiter).
+                         * The bound 8 is a conservative upper limit — do not
+                         * change the format string to a longer string without
+                         * verifying the actual field width first. */
+                        snprintf(f[idx], 8, "0");
+                    }
+                }
+            }
+            /* Reassemble fields with ':' separator then newline */
+            for (int k = 0; k < nf; k++)
+            {
+                if (k > 0)
+                {
+                    fputc(':', out);
+                }
+                fputs(f[k], out);
+            }
+            fputc('\n', out);
+        }
+        else
+        {
+            /* Not enough fields — write original line unchanged */
+            fwrite(line, 1, line_len, out);
+            if (!nl)
+            {
+                fputc('\n', out);
+            }
+        }
+        line += line_len;
+    }
+    fclose(out);
+    free(data);
+}
+
+/*
  * Patch the extracted rootfs so that tools which try to drop privileges
  * (e.g. apt's _apt sandbox) succeed inside a single-UID user namespace.
  */
@@ -1754,136 +1873,26 @@ static void patch_rootfs_ids(const char* rootfs)
         return;
     }
 
-    /* ── /etc/passwd ── remap all uid:gid fields to 0:0 ── */
-    char passwd_path[PATH_MAX];
-    snprintf(passwd_path, sizeof(passwd_path), "%s/etc/passwd", rootfs);
-    size_t passwd_sz;
-    char* passwd = read_file(passwd_path, &passwd_sz);
-    if (passwd)
+    /* ── /etc/passwd ── remap uid (field 2) and gid (field 3) to 0 ── */
     {
-        int passwd_fd = openat_beneath(rootfs_fd, "etc/passwd",
-                                       O_WRONLY | O_TRUNC, 0);
-        FILE *out = passwd_fd >= 0 ? fdopen(passwd_fd, "w") : NULL;
-        if (out)
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/etc/passwd", rootfs);
+        if (n > 0 && (size_t)n < sizeof(path))
         {
-            char* line = passwd;
-            while (*line)
-            {
-                char* nl = strchr(line, '\n');
-                size_t line_len = nl ? (size_t)(nl - line + 1) : strlen(line);
-                char linebuf[4096];
-                if (line_len >= sizeof(linebuf))
-                {
-                    line += line_len;
-                    continue;
-                }
-                memcpy(linebuf, line, line_len);
-                linebuf[line_len] = '\0';
-
-                char* f[7];
-                int nf = 0;
-                char* p = linebuf;
-                while (nf < 7)
-                {
-                    f[nf++] = p;
-                    p = strchr(p, ':');
-                    if (!p)
-                    {
-                        break;
-                    }
-                    *p++ = '\0';
-                }
-                if (nf == 7)
-                {
-                    unsigned long uid = strtoul(f[2], NULL, 10);
-                    unsigned long gid = strtoul(f[3], NULL, 10);
-                    if (uid != 0 && uid != 65534)
-                    {
-                        snprintf(f[2], 8, "0");
-                    }
-                    if (gid != 0 && gid != 65534)
-                    {
-                        snprintf(f[3], 8, "0");
-                    }
-                    fprintf(out, "%s:%s:%s:%s:%s:%s:%s\n",
-                            f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
-                }
-                else
-                {
-                    fwrite(line, 1, line_len, out);
-                    if (!nl)
-                    {
-                        fputc('\n', out);
-                    }
-                }
-                line += line_len;
-            }
-            fclose(out);
+            static const int remap[] = {2, 3, -1};
+            rewrite_id_fields(rootfs_fd, "etc/passwd", path, 7, remap);
         }
-        free(passwd);
     }
 
-    /* ── /etc/group ── remap all gid fields to 0 ── */
-    char group_path[PATH_MAX];
-    snprintf(group_path, sizeof(group_path), "%s/etc/group", rootfs);
-    size_t group_sz;
-    char* grp = read_file(group_path, &group_sz);
-    if (grp)
+    /* ── /etc/group ── remap gid (field 2) to 0 ── */
     {
-        int group_fd = openat_beneath(rootfs_fd, "etc/group",
-                                      O_WRONLY | O_TRUNC, 0);
-        FILE *out = group_fd >= 0 ? fdopen(group_fd, "w") : NULL;
-        if (out)
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/etc/group", rootfs);
+        if (n > 0 && (size_t)n < sizeof(path))
         {
-            char* line = grp;
-            while (*line)
-            {
-                char* nl = strchr(line, '\n');
-                size_t line_len = nl ? (size_t)(nl - line + 1) : strlen(line);
-                char linebuf[4096];
-                if (line_len >= sizeof(linebuf))
-                {
-                    line += line_len;
-                    continue;
-                }
-                memcpy(linebuf, line, line_len);
-                linebuf[line_len] = '\0';
-
-                char* f[4];
-                int nf = 0;
-                char* p = linebuf;
-                while (nf < 4)
-                {
-                    f[nf++] = p;
-                    p = strchr(p, ':');
-                    if (!p)
-                    {
-                        break;
-                    }
-                    *p++ = '\0';
-                }
-                if (nf == 4)
-                {
-                    unsigned long gid = strtoul(f[2], NULL, 10);
-                    if (gid != 0 && gid != 65534)
-                    {
-                        snprintf(f[2], 8, "0");
-                    }
-                    fprintf(out, "%s:%s:%s:%s\n", f[0], f[1], f[2], f[3]);
-                }
-                else
-                {
-                    fwrite(line, 1, line_len, out);
-                    if (!nl)
-                    {
-                        fputc('\n', out);
-                    }
-                }
-                line += line_len;
-            }
-            fclose(out);
+            static const int remap[] = {2, -1};
+            rewrite_id_fields(rootfs_fd, "etc/group", path, 4, remap);
         }
-        free(grp);
     }
 
     /* ── apt sandbox ── belt-and-suspenders for Debian/Ubuntu images ── */
@@ -3480,23 +3489,8 @@ static char** json_parse_names_array(const char* json, const char* key,
                                      int* out_n)
 {
     *out_n = 0;
-    char needle[256];
-    int nlen = snprintf(needle, sizeof(needle), "\"%s\"", key);
-    if (nlen < 0 || (size_t)nlen >= sizeof(needle))
-    {
-        return NULL;
-    }
-    const char* p = strstr(json, needle);
-    if (!p)
-    {
-        return NULL;
-    }
-    p += strlen(needle);
-    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
-    {
-        p++;
-    }
-    if (*p != '[')
+    const char* p = json_skip_to_value(json, key);
+    if (!p || *p != '[')
     {
         return NULL;
     }
@@ -4256,6 +4250,64 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Expose --device host devices inside the container.
+     * Must be done PRE-CHROOT so host device paths resolve on the host
+     * filesystem, not inside the container's /dev tmpfs.  Container paths
+     * are prefixed with rootfs so bind-mount targets land in the right place.
+     * stat() and mknod() fallback to bind-mount use the host-side source. */
+    for (int di = 0; di < opts->n_devices; di++)
+    {
+        const char* host_dev = opts->devices[di];
+        const char* ctr_dev  = opts->device_ctr[di]
+                               ? opts->device_ctr[di]
+                               : host_dev;
+
+        struct stat st;
+        if (stat(host_dev, &st) < 0)
+        {
+            fprintf(stderr, "oci2bin: --device stat %s: %s (non-fatal)\n",
+                    host_dev, strerror(errno));
+            continue;
+        }
+
+        /* Destination inside rootfs (pre-chroot path) */
+        char dst[PATH_MAX];
+        int dlen = snprintf(dst, sizeof(dst), "%s%s", rootfs, ctr_dev);
+        if (dlen < 0 || (size_t)dlen >= sizeof(dst))
+        {
+            fprintf(stderr, "oci2bin: --device destination path too long: %s%s"
+                            " (non-fatal)\n", rootfs, ctr_dev);
+            continue;
+        }
+
+        /* Try mknod first; fall back to bind-mount in user namespaces */
+        if (mknod(dst, st.st_mode, st.st_rdev) < 0)
+        {
+            if (errno == EPERM || errno == ENOTSUP)
+            {
+                if (ensure_bind_mount_target(host_dev, dst, "--device") < 0)
+                {
+                    continue;
+                }
+                if (mount(host_dev, dst, NULL, MS_BIND, NULL) < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --device bind-mount %s→%s: %s (non-fatal)\n",
+                            host_dev, ctr_dev, strerror(errno));
+                }
+            }
+            else
+            {
+                fprintf(stderr, "oci2bin: --device mknod %s: %s (non-fatal)\n",
+                        dst, strerror(errno));
+            }
+        }
+        else
+        {
+            chmod(dst, st.st_mode & 0777);
+        }
+    }
+
     /* --ssh-agent: forward host SSH_AUTH_SOCK into the container.
      * The socket is bind-mounted at /run/ssh-agent.sock and SSH_AUTH_SOCK
      * is set accordingly so tools like ssh and git pick it up automatically. */
@@ -4553,54 +4605,6 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     if (mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL) < 0)
     {
         perror("bind-mount /dev/ptmx (non-fatal)");
-    }
-
-    /* Expose --device host devices inside the container */
-    for (int di = 0; di < opts->n_devices; di++)
-    {
-        const char* host_dev = opts->devices[di];
-        const char* ctr_dev  = opts->device_ctr[di]
-                               ? opts->device_ctr[di]
-                               : host_dev;
-
-        struct stat st;
-        if (stat(host_dev, &st) < 0)
-        {
-            fprintf(stderr, "oci2bin: --device stat %s: %s (non-fatal)\n",
-                    host_dev, strerror(errno));
-            continue;
-        }
-
-        /* Create the device node inside the container */
-        if (mknod(ctr_dev, st.st_mode, st.st_rdev) < 0)
-        {
-            /* mknod may fail in user namespaces — fall back to bind mount */
-            if (errno == EPERM || errno == ENOTSUP)
-            {
-                /* Ensure container path exists */
-                int fd = open(ctr_dev, O_CREAT | O_WRONLY, 0600);
-                if (fd >= 0)
-                {
-                    close(fd);
-                }
-                if (mount(host_dev, ctr_dev, NULL, MS_BIND, NULL) < 0)
-                {
-                    fprintf(stderr,
-                            "oci2bin: --device bind-mount %s→%s: %s (non-fatal)\n",
-                            host_dev, ctr_dev, strerror(errno));
-                }
-            }
-            else
-            {
-                fprintf(stderr, "oci2bin: --device mknod %s: %s (non-fatal)\n",
-                        ctr_dev, strerror(errno));
-            }
-        }
-        else
-        {
-            /* Set same permissions as host device */
-            chmod(ctr_dev, st.st_mode & 0777);
-        }
     }
 
     /* Mount extra --tmpfs paths inside the container */
