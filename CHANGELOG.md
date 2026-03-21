@@ -2,6 +2,60 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.8.0] - 2026-03-21
+
+### Added
+
+- **`-t` / `--tty`** — explicitly allocate a pseudo-terminal for the container,
+  even when stdin is not a terminal. `-i` / `--interactive` keeps stdin open for
+  piped input without a PTY. Combine as `-it` for a full interactive shell
+  session (equivalent to `docker run -it`).
+
+- **`--name NAME`** — assign a name to a container. Combined with `--detach`,
+  writes a JSON state file to `~/.cache/oci2bin/containers/<name>.json` and
+  redirects the container's stdout/stderr to a log file at the same location.
+
+- **`oci2bin ps`** — list all named containers with their PID and live running
+  status (running / stopped).
+
+- **`oci2bin stop NAME`** — send SIGTERM then SIGKILL to a named detached
+  container and remove its state file.
+
+- **`oci2bin logs [-f] NAME`** — print or follow the stdout/stderr log of a
+  named detached container.
+
+- **`oci2bin push BINARY REGISTRY/IMAGE:TAG`** — load the polyglot binary into
+  Docker and push it to an OCI registry. The binary is already a valid
+  `docker load` archive so no re-packaging is needed.
+
+- **`oci2bin sbom BINARY [--format spdx|cyclonedx]`** — generate a Software
+  Bill of Materials from the embedded OCI rootfs. Reads dpkg, apk, and rpm
+  package databases and outputs SPDX 2.3 or CycloneDX 1.4 JSON.
+
+- **`oci2bin update BINARY`** — re-pull the original image and atomically
+  rebuild the binary in-place (temp file + rename). Reads the image reference
+  from the embedded metadata block.
+
+- **`oci2bin diff --live PID BINARY`** — compare a running container's live
+  filesystem (`/proc/PID/root`) against its source binary. Shows added,
+  removed, and modified files. Useful for auditing runtime changes and
+  detecting unexpected mutations.
+
+- **`--squash`** — merge all OCI image layers into a single squashed layer
+  before embedding, processing whiteout entries correctly. Reduces layer count
+  and can shrink the output binary for images with many overlapping writes.
+
+- **`--compress gzip|zstd`** — choose the compression format for the squashed
+  layer (default: gzip). `zstd` requires the `zstd` binary on the build host.
+
+- **`--verify-cosign`** — verify the input image's Sigstore/cosign signature
+  before embedding. `--require-cosign` makes a failed or missing verification
+  fatal. `--cosign-key PATH` passes a specific public key to cosign.
+
+- **`oci2bin pod run --network-alias NAME`** — register a hostname alias for a
+  pod container. Injects `--add-host ALIAS:127.0.0.1` into every container in
+  the pod so they can reach each other by name over the shared loopback.
+
 ## [0.7.0] - 2026-03-16
 
 ### Added
