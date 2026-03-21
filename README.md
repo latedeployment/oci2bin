@@ -24,6 +24,8 @@ See below [How it works](#how-it-works).
   - [Injecting files at build time](#injecting-files-at-build-time)
   - [Merging image layers](#merging-image-layers)
   - [Stripping images](#stripping-images)
+  - [Squashing layers](#squashing-layers)
+  - [Verifying image signatures (cosign)](#verifying-image-signatures-cosign)
   - [Using OCI image layout](#using-oci-image-layout-no-docker-daemon)
   - [Caching builds](#caching-builds)
   - [Reproducible builds and digest pinning](#reproducible-builds-and-digest-pinning)
@@ -51,12 +53,21 @@ See below [How it works](#how-it-works).
 - [Process management](#process-management)
   - [Init process and zombie reaping](#init-process-and-zombie-reaping)
   - [Running in background](#running-in-background)
+  - [Named containers and lifecycle management](#named-containers-and-lifecycle-management)
+  - [Interactive and TTY mode](#interactive-and-tty-mode)
 - [Subcommands](#subcommands)
+  - [exec](#exec)
   - [inspect](#inspect)
   - [list](#list)
   - [prune](#prune)
   - [diff](#diff)
   - [reconstruct](#reconstruct)
+  - [push](#push)
+  - [sbom](#sbom)
+  - [update](#update)
+  - [ps](#ps)
+  - [stop](#stop)
+  - [logs](#logs)
 - [Testing](#testing)
 - [How it works](#how-it-works)
 - [References](#references)
@@ -183,6 +194,44 @@ oci2bin --strip --layer extra:latest base:latest output
 ```
 
 Removed path prefixes: `usr/share/doc/`, `usr/share/man/`, `usr/share/info/`, `usr/share/locale/`, `usr/share/i18n/`, `var/cache/apt/`, `var/lib/apt/lists/`, `tmp/`.
+
+### Squashing layers
+
+`--squash` merges all image layers into a single squashed layer before packaging. This reduces the number of layers and can shrink the output binary for images with many overlapping writes:
+
+```bash
+oci2bin --squash ubuntu:22.04 ubuntu-squashed
+```
+
+Combine with `--compress` to choose the layer compression format (default: gzip):
+
+```bash
+oci2bin --squash --compress zstd ubuntu:22.04 ubuntu-squashed
+```
+
+`--compress zstd` requires the `zstd` binary to be installed. Whiteout entries are processed correctly so the squashed layer faithfully represents the final filesystem state.
+
+### Verifying image signatures (cosign)
+
+`--verify-cosign` checks the OCI image's Sigstore/cosign signature before packaging:
+
+```bash
+oci2bin --verify-cosign redis:7-alpine
+```
+
+If verification fails, a warning is printed but the build continues. Use `--require-cosign` to abort on failure:
+
+```bash
+oci2bin --require-cosign redis:7-alpine
+```
+
+Specify a local public key with `--cosign-key`:
+
+```bash
+oci2bin --require-cosign --cosign-key /etc/keys/trusted.pub redis:7-alpine
+```
+
+Requires the `cosign` binary to be installed. With `--require-cosign`, the build aborts if `cosign` is not found.
 
 ### Using OCI image layout (no Docker daemon)
 
@@ -651,6 +700,17 @@ The command:
 SIGTERM and SIGINT are forwarded to all children. Use with `--detach` in the
 individual binaries for fully background pods.
 
+`--network-alias NAME` registers a hostname alias resolvable via `--add-host` injection into each container's `/etc/hosts`. In shared-net mode all containers share `127.0.0.1` loopback, so aliases resolve to the loopback address:
+
+```bash
+oci2bin pod run \
+    --net shared \
+    --network-alias myapp \
+    --network-alias backend \
+    ./envoy \
+    ./myapp
+```
+
 ### Read-only containers
 
 `--read-only` mounts the rootfs read-only via overlayfs. Writes go to a temporary upper layer discarded on exit. The on-disk rootfs is never modified.
@@ -839,6 +899,39 @@ kill "$PID"
 
 The child calls `setsid()` to detach from the terminal and redirects stdin from `/dev/null`. Combine with `--init` for a fully-managed background service.
 
+### Named containers and lifecycle management
+
+`--name NAME` assigns a name to the container. Combined with `--detach`, it writes a JSON state file to `$HOME/.cache/oci2bin/containers/<name>.json` and redirects the container's stdout/stderr to a log file at the same location. This enables the `ps`, `stop`, and `logs` subcommands.
+
+```bash
+# Start a named container in the background
+./redis --detach --name myredis
+
+# List running containers
+oci2bin ps
+
+# Tail container logs
+oci2bin logs -f myredis
+
+# Stop it gracefully
+oci2bin stop myredis
+```
+
+### Interactive and TTY mode
+
+`-t` / `--tty` allocates a pseudo-terminal for the container, even if stdin is not a terminal. `-i` / `--interactive` keeps stdin open for piped input without a PTY. Combine them as `-it` for an interactive shell session:
+
+```bash
+# Interactive shell with TTY
+./alpine_latest -it /bin/sh
+
+# Feed commands via stdin (no TTY)
+echo "ls /" | ./alpine_latest -i /bin/sh
+
+# Explicit TTY even when stdin is redirected
+./alpine_latest -t /bin/sh
+```
+
 ---
 
 ## Binary signing
@@ -968,6 +1061,15 @@ M /etc/redis/redis.conf    (512 B -> 768 B)
 
 Exits with status 0 if the filesystems are identical, or 1 if there are differences.
 
+`--live PID BINARY` compares a running container's live filesystem against the image embedded in BINARY. Requires access to `/proc/<PID>/root` (same user or root):
+
+```bash
+# Compare live container filesystem against the original image
+oci2bin diff --live $CONTAINER_PID ./redis_7-alpine
+```
+
+This is useful for detecting drift between the running filesystem and the packaged image (e.g. after exec-ing into the container and modifying files).
+
 ### reconstruct
 
 Rebuild a polyglot binary from a Docker image that was built with `--embed-loader-layer` or `--embed-loader-labels`. Accepts either a Docker image name (runs `docker save` internally) or a path to an existing tar or `.img` file:
@@ -990,6 +1092,72 @@ oci2bin reconstruct redis:7-alpine --no-strip --output redis_7-alpine
 ```
 
 `reconstruct` verifies the loader's SHA256 before rebuilding and exits with a non-zero status if the digest does not match or if no `oci2bin.loader.*` labels are present in the image.
+
+### push
+
+Re-load an oci2bin binary into Docker and push it to a registry:
+
+```bash
+oci2bin push ./redis_7-alpine registry.example.com/myredis:latest
+```
+
+The binary is loaded via `docker load`, tagged as the target, pushed, and the local tag cleaned up. Requires `docker` and write access to the registry.
+
+### sbom
+
+Generate a Software Bill of Materials (SBOM) from an oci2bin binary by extracting the embedded OCI rootfs and reading its package database:
+
+```bash
+oci2bin sbom ./redis_7-alpine                        # SPDX 2.3 JSON (default)
+oci2bin sbom ./redis_7-alpine --format cyclonedx     # CycloneDX 1.4 JSON
+oci2bin sbom ./redis_7-alpine > sbom.spdx.json
+```
+
+Supported package managers: `dpkg` (Debian/Ubuntu), `apk` (Alpine), `rpm` (Fedora/RHEL). The output goes to stdout; status messages go to stderr.
+
+### update
+
+Rebuild an existing oci2bin binary from the same Docker image it was built from:
+
+```bash
+oci2bin update ./redis_7-alpine
+```
+
+Reads the embedded image name from the binary's metadata block, pulls the latest version of that image, rebuilds the polyglot, and atomically replaces the original file. Useful for updating binaries when the upstream image is refreshed.
+
+### ps
+
+List named containers that were started with `--detach --name`:
+
+```bash
+oci2bin ps
+```
+
+```
+NAME                 PID      STATUS   BINARY                         STARTED
+myredis              12345    running  redis_7-alpine                 2026-03-21T10:00:00
+myweb                12346    stopped  nginx_alpine                   2026-03-21T09:00:00
+```
+
+### stop
+
+Gracefully stop a named container:
+
+```bash
+oci2bin stop myredis
+```
+
+Sends `SIGTERM`, waits up to 10 seconds, then sends `SIGKILL` if still running. Removes the state file on completion.
+
+### logs
+
+Print or follow the log output of a named container started with `--detach --name`:
+
+```bash
+oci2bin logs myredis          # print all logs
+oci2bin logs -f myredis       # follow (tail -f)
+oci2bin logs --follow myredis
+```
 
 ---
 

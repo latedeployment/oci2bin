@@ -25,6 +25,7 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <time.h>
 
 /*
  * These markers get patched by the polyglot builder.
@@ -196,6 +197,9 @@ struct container_opts
     /* --detach / -d  (fork to background, print child PID) */
     int detach;
 
+    /* --name NAME  (container name for lifecycle management) */
+    char* name;
+
     /* --verify-key PATH  (verify binary signature before execution) */
     char* verify_key;
 
@@ -223,6 +227,11 @@ struct container_opts
     /* PTY relay: set by run_container() before fork, used by container_main() */
     int pty_master_fd; /* -1 if no PTY; parent closes slave, uses this for relay */
     int pty_slave_fd;  /* -1 if no PTY; child sets as controlling terminal */
+
+    /* -t / --tty: explicitly allocate a pseudo-terminal */
+    int allocate_tty;
+    /* -i / --interactive: keep stdin open even if not a TTY */
+    int interactive;
 };
 
 static int argv_has_debug_flag(int argc, char* argv[])
@@ -291,6 +300,153 @@ static void debug_dump_opts(const struct container_opts* opts)
     {
         debug_log("opts.verify_key", "path=%s", opts->verify_key);
     }
+}
+
+/*
+ * Create each directory component of dir (mkdir -p equivalent).
+ */
+static void mkdirs_for_state(const char* dir)
+{
+    char buf[PATH_MAX];
+    int n = snprintf(buf, sizeof(buf), "%s", dir);
+    if (n < 0 || n >= (int)sizeof(buf))
+    {
+        return;
+    }
+    for (char* p = buf + 1; *p; p++)
+    {
+        if (*p == '/')
+        {
+            *p = '\0';
+            mkdir(buf, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(buf, 0755);
+}
+
+/*
+ * Write a JSON container state file to
+ * $HOME/.cache/oci2bin/containers/<name>.json.
+ * When redirect_output is 1, redirect stdout/stderr to the log file.
+ */
+static void write_container_state(const char* name, pid_t pid,
+                                  int redirect_output)
+{
+    const char* home = getenv("HOME");
+    if (!home || !name || !*name)
+    {
+        return;
+    }
+
+    /* Reject HOME values that contain JSON-breaking characters or path
+     * traversal.  HOME is trusted but a hostile environment could set it. */
+    for (const char* hp = home; *hp; hp++)
+    {
+        if (*hp == '"' || *hp == '\\' || *hp == '\n')
+        {
+            return;
+        }
+    }
+    if (strstr(home, ".."))
+    {
+        return;
+    }
+
+    /* Resolve our own path for the state file */
+    char self_path[PATH_MAX] = "";
+    ssize_t slen = readlink("/proc/self/exe", self_path,
+                            sizeof(self_path) - 1);
+    if (slen > 0)
+    {
+        self_path[slen] = '\0';
+    }
+
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof(dir),
+                     "%s/.cache/oci2bin/containers", home);
+    if (n < 0 || n >= (int)sizeof(dir))
+    {
+        return;
+    }
+    mkdirs_for_state(dir);
+
+    char log_path[PATH_MAX];
+    n = snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, name);
+    if (n < 0 || n >= (int)sizeof(log_path))
+    {
+        return;
+    }
+
+    /* Redirect stdout/stderr to log file (detached child) */
+    if (redirect_output)
+    {
+        int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (log_fd >= 0)
+        {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
+    }
+
+    char state_path[PATH_MAX];
+    n = snprintf(state_path, sizeof(state_path), "%s/%s.json", dir, name);
+    if (n < 0 || n >= (int)sizeof(state_path))
+    {
+        return;
+    }
+
+    /* Build ISO-8601 timestamp */
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    char ts[32] = "unknown";
+    if (gmtime_r(&now, &tm_buf) != NULL)
+    {
+        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+    }
+
+    /* Sanitize self_path: replace '"' and '\' to prevent JSON injection */
+    for (int i = 0; self_path[i]; i++)
+    {
+        if (self_path[i] == '"' || self_path[i] == '\\')
+        {
+            self_path[i] = '?';
+        }
+    }
+
+    char json[2048];
+    n = snprintf(json, sizeof(json),
+                 "{\"name\":\"%s\",\"pid\":%d,\"binary\":\"%s\","
+                 "\"started_at\":\"%s\","
+                 "\"log_file\":\"%s/%s.log\"}\n",
+                 name, (int)pid, self_path, ts, dir, name);
+    if (n < 0 || n >= (int)sizeof(json))
+    {
+        return;
+    }
+
+    int fd = open(state_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        return;
+    }
+    size_t total = 0;
+    size_t len   = strlen(json);
+    while (total < len)
+    {
+        ssize_t w = write(fd, json + total, len - total);
+        if (w < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+        total += (size_t)w;
+    }
+    close(fd);
 }
 
 /* ── tiny JSON helpers (just enough to parse manifest.json and config) ─── */
@@ -4767,18 +4923,29 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
         if (bg > 0)
         {
-            /* Parent: print child PID and exit cleanly */
+            /* Parent: write state file then print child PID and exit */
+            if (opts->name)
+            {
+                write_container_state(opts->name, bg, 0);
+            }
             printf("%d\n", (int)bg);
             fflush(stdout);
             _exit(0);
         }
-        /* Child: detach from terminal */
+        /* Child: detach from terminal, redirect output to log */
         setsid();
-        int null_fd = open("/dev/null", O_RDONLY);
-        if (null_fd >= 0)
+        if (opts->name)
         {
-            dup2(null_fd, STDIN_FILENO);
-            close(null_fd);
+            write_container_state(opts->name, getpid(), 1);
+        }
+        if (!opts->interactive)
+        {
+            int null_fd = open("/dev/null", O_RDONLY);
+            if (null_fd >= 0)
+            {
+                dup2(null_fd, STDIN_FILENO);
+                close(null_fd);
+            }
         }
     }
 
@@ -5093,6 +5260,10 @@ static void usage(const char* prog)
             "                      Expose a host device inside the container\n"
             "  --init              Run a zombie-reaping init as PID 1\n"
             "  --detach, -d        Run container in background; print PID to stdout\n"
+            "  -t, --tty           Allocate a pseudo-terminal for the container\n"
+            "  -i, --interactive   Keep stdin open; combine with -t for -it mode\n"
+            "  --name NAME         Assign a name for lifecycle management\n"
+            "                      (use with --detach for oci2bin ps/stop/logs)\n"
             "  --memory SIZE       Limit container memory (e.g. 512m, 2g) via"
             " cgroup v2\n"
             "  --cpus FLOAT        Limit container CPU (e.g. 0.5 = 50%%)"
@@ -6211,6 +6382,51 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 opts->run_gid = (gid_t)uid_val;
             }
             opts->has_user = 1;
+        }
+        else if (strcmp(argv[i], "-t") == 0
+                 || strcmp(argv[i], "--tty") == 0)
+        {
+            opts->allocate_tty = 1;
+        }
+        else if (strcmp(argv[i], "-i") == 0
+                 || strcmp(argv[i], "--interactive") == 0)
+        {
+            opts->interactive = 1;
+        }
+        else if (strcmp(argv[i], "-it") == 0
+                 || strcmp(argv[i], "-ti") == 0)
+        {
+            opts->allocate_tty = 1;
+            opts->interactive  = 1;
+        }
+        else if (strcmp(argv[i], "--name") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --name requires NAME\n");
+                return -1;
+            }
+            i++;
+            const char* p = argv[i];
+            while (*p)
+            {
+                if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                        (*p >= '0' && *p <= '9') || *p == '-' || *p == '_'))
+                {
+                    fprintf(stderr,
+                            "oci2bin: --name: only alphanumeric, "
+                            "'-', '_' allowed\n");
+                    return -1;
+                }
+                p++;
+            }
+            if (strlen(argv[i]) == 0 || strlen(argv[i]) > 128)
+            {
+                fprintf(stderr,
+                        "oci2bin: --name: length must be 1-128 chars\n");
+                return -1;
+            }
+            opts->name = argv[i];
         }
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
         {
@@ -7844,14 +8060,21 @@ int main(int argc, char* argv[])
      * We open /dev/ptmx (the POSIX PTY multiplexer) before fork():
      *   parent  → master_fd: relays host terminal ↔ container I/O
      *   child   → slave_fd:  setsid() + TIOCSCTTY → controlling terminal
-     * Only done when stdin is an interactive terminal and not --detach. */
+     *
+     * PTY is allocated when:
+     *   -t / --tty was given explicitly, OR
+     *   stdin is an interactive terminal and --detach was not given.
+     *
+     * -i / --interactive keeps stdin open (pipe mode) without a PTY.
+     * SIGWINCH handler is only installed when stdin is a real terminal. */
     opts.pty_master_fd = -1;
     opts.pty_slave_fd  = -1;
     struct termios saved_termios;
     int saved_termios_ok = 0;
 
-    if (!opts.detach && isatty(STDIN_FILENO) &&
-            tcgetpgrp(STDIN_FILENO) == getpgrp())
+    if (opts.allocate_tty ||
+            (!opts.detach && isatty(STDIN_FILENO) &&
+             tcgetpgrp(STDIN_FILENO) == getpgrp()))
     {
         int master_fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
         if (master_fd >= 0 && grantpt(master_fd) == 0 &&
@@ -7881,13 +8104,18 @@ int main(int argc, char* argv[])
                         tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
                     }
 
-                    /* Install SIGWINCH handler to forward resize events */
+                    /* Install SIGWINCH handler to forward resize events.
+                     * Only useful when stdin is a real terminal that
+                     * can report window size via TIOCGWINSZ. */
                     g_pty_master_fd = master_fd;
-                    struct sigaction sa;
-                    memset(&sa, 0, sizeof(sa));
-                    sa.sa_handler = sigwinch_handler;
-                    sigemptyset(&sa.sa_mask);
-                    sigaction(SIGWINCH, &sa, NULL);
+                    if (isatty(STDIN_FILENO))
+                    {
+                        struct sigaction sa;
+                        memset(&sa, 0, sizeof(sa));
+                        sa.sa_handler = sigwinch_handler;
+                        sigemptyset(&sa.sa_mask);
+                        sigaction(SIGWINCH, &sa, NULL);
+                    }
                 }
                 else
                 {

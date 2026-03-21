@@ -21,6 +21,7 @@ import gzip
 import io
 import json
 import os
+import stat as stat_module
 import struct
 import sys
 import tarfile
@@ -180,24 +181,54 @@ def fmt_size(n):
     return f'{n / (1024 * 1024):.1f} MB'
 
 
-def main():
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <binary1> <binary2>", file=sys.stderr)
+def build_file_dict_from_rootfs(rootfs_path):
+    """
+    Walk a live container rootfs at rootfs_path (e.g. /proc/PID/root)
+    and build the same dict format as build_file_dict():
+        path -> ('file', size)
+        path -> ('link', target)
+        path -> ('dir', None)
+    Does NOT follow symlinks outside the rootfs.
+    """
+    import re
+    if not re.match(r'^/proc/[0-9]+/root$', rootfs_path):
+        print(f"diff: invalid live rootfs path: {rootfs_path}", file=sys.stderr)
         sys.exit(1)
 
-    b1, b2 = sys.argv[1], sys.argv[2]
-    for p in (b1, b2):
-        if not os.path.isfile(p):
-            print(f"diff: file not found: {p}", file=sys.stderr)
-            sys.exit(1)
+    file_dict = {}
+    rootfs_len = len(rootfs_path.rstrip('/'))
 
-    print(f"Comparing {b1} → {b2}", file=sys.stderr)
+    for dirpath, dirnames, filenames, dirfd in os.fwalk(
+            rootfs_path, follow_symlinks=False):
+        # Compute the path relative to rootfs
+        rel = dirpath[rootfs_len:] or '/'
+        if not rel.startswith('/'):
+            rel = '/' + rel
 
-    d1 = build_file_dict(read_oci_data(b1))
-    d2 = build_file_dict(read_oci_data(b2))
+        # Record directory itself (skip the root)
+        if rel != '/':
+            file_dict[rel] = ('dir', None)
 
-    added, removed, modified = diff_dicts(d1, d2)
+        for fname in filenames:
+            fpath = rel.rstrip('/') + '/' + fname
+            try:
+                st = os.lstat(os.path.join(dirpath, fname))
+            except OSError:
+                continue
+            if stat_module.S_ISLNK(st.st_mode):
+                try:
+                    target = os.readlink(os.path.join(dirpath, fname))
+                except OSError:
+                    target = ''
+                file_dict[fpath] = ('link', target)
+            elif stat_module.S_ISREG(st.st_mode):
+                file_dict[fpath] = ('file', st.st_size)
 
+    return file_dict
+
+
+def print_diff_results(added, removed, modified, d1, d2):
+    """Print diff results and return exit code."""
     for path in removed:
         v = d1[path]
         if v[0] == 'file':
@@ -222,9 +253,48 @@ def main():
 
     print()
     print(f"{len(added)} added, {len(removed)} removed, {len(modified)} modified")
+    return 1 if (added or removed or modified) else 0
 
-    if added or removed or modified:
+
+def main():
+    # --live PID BINARY mode
+    if len(sys.argv) >= 4 and sys.argv[1] == '--live':
+        pid_str = sys.argv[2]
+        binary  = sys.argv[3]
+        if not pid_str.isdigit():
+            print("diff: PID must be a positive integer", file=sys.stderr)
+            sys.exit(1)
+        rootfs = f'/proc/{pid_str}/root'
+        if not os.path.isdir(rootfs):
+            print(f"diff: {rootfs}: not accessible", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.isfile(binary):
+            print(f"diff: file not found: {binary}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Comparing live container PID={pid_str} → {binary}", file=sys.stderr)
+        d1 = build_file_dict(read_oci_data(binary))   # reference (image)
+        d2 = build_file_dict_from_rootfs(rootfs)      # live state
+        added, removed, modified = diff_dicts(d1, d2)
+        sys.exit(print_diff_results(added, removed, modified, d1, d2))
+
+    if len(sys.argv) != 3:
+        print(f"Usage: {sys.argv[0]} <binary1> <binary2>", file=sys.stderr)
+        print(f"       {sys.argv[0]} --live PID BINARY", file=sys.stderr)
         sys.exit(1)
+
+    b1, b2 = sys.argv[1], sys.argv[2]
+    for p in (b1, b2):
+        if not os.path.isfile(p):
+            print(f"diff: file not found: {p}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"Comparing {b1} → {b2}", file=sys.stderr)
+
+    d1 = build_file_dict(read_oci_data(b1))
+    d2 = build_file_dict(read_oci_data(b2))
+
+    added, removed, modified = diff_dicts(d1, d2)
+    sys.exit(print_diff_results(added, removed, modified, d1, d2))
 
 
 if __name__ == '__main__':

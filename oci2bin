@@ -362,8 +362,28 @@ fi
 
 if [[ "${1:-}" == "diff" ]]; then
     shift
+    if [[ "${1:-}" == "--live" ]]; then
+        shift
+        if [[ $# -lt 2 ]]; then
+            echo "Usage: oci2bin diff --live PID BINARY" >&2
+            exit 1
+        fi
+        DIFF_PID="$1"; shift
+        DIFF_BINARY="$1"; shift
+        if ! [[ "$DIFF_PID" =~ ^[0-9]+$ ]]; then
+            echo "oci2bin diff: PID must be a positive integer" >&2
+            exit 1
+        fi
+        if [[ ! -d "/proc/$DIFF_PID/root" ]]; then
+            echo "oci2bin diff: /proc/$DIFF_PID/root not accessible" >&2
+            exit 1
+        fi
+        exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" \
+            --live "$DIFF_PID" "$DIFF_BINARY"
+    fi
     if [[ $# -lt 2 ]]; then
         echo "Usage: oci2bin diff <binary1> <binary2>" >&2
+        echo "       oci2bin diff --live PID BINARY" >&2
         exit 1
     fi
     exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" "$1" "$2"
@@ -374,6 +394,238 @@ fi
 if [[ "${1:-}" == "reconstruct" ]]; then
     shift
     exec python3 "$OCI2BIN_HOME/scripts/reconstruct.py" "$@"
+fi
+
+# ── push subcommand ───────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "push" ]]; then
+    shift
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: oci2bin push BINARY REGISTRY/IMAGE:TAG" >&2
+        exit 1
+    fi
+    PUSH_BINARY="$1"
+    PUSH_TARGET="$2"
+
+    if [[ ! -f "$PUSH_BINARY" ]]; then
+        echo "oci2bin push: binary not found: $PUSH_BINARY" >&2
+        exit 1
+    fi
+
+    need docker
+
+    echo "oci2bin push: loading $PUSH_BINARY into Docker..." >&2
+    LOAD_OUTPUT="$(docker load < "$PUSH_BINARY" 2>&1)"
+    LOADED_IMAGE="$(echo "$LOAD_OUTPUT" | grep -oP 'Loaded image: \K.*' | head -1)"
+
+    if [[ -z "$LOADED_IMAGE" ]]; then
+        echo "oci2bin push: docker load failed:" >&2
+        echo "$LOAD_OUTPUT" >&2
+        exit 1
+    fi
+
+    echo "oci2bin push: tagging as $PUSH_TARGET..." >&2
+    docker tag "$LOADED_IMAGE" "$PUSH_TARGET"
+
+    echo "oci2bin push: pushing to $PUSH_TARGET..." >&2
+    docker push "$PUSH_TARGET"
+
+    echo "oci2bin push: cleaning up..." >&2
+    docker rmi "$PUSH_TARGET" 2>/dev/null || true
+    [[ "$LOADED_IMAGE" != "$PUSH_TARGET" ]] && docker rmi "$LOADED_IMAGE" 2>/dev/null || true
+
+    echo "oci2bin push: done → $PUSH_TARGET" >&2
+    exit 0
+fi
+
+# ── sbom subcommand ───────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "sbom" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin sbom BINARY [--format spdx|cyclonedx]" >&2
+        exit 1
+    fi
+    exec python3 "$OCI2BIN_HOME/scripts/sbom_generate.py" "$@"
+fi
+
+# ── update subcommand ─────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "update" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin update BINARY" >&2
+        exit 1
+    fi
+    UPDATE_BINARY="$1"
+    if [[ ! -f "$UPDATE_BINARY" ]]; then
+        echo "oci2bin update: binary not found: $UPDATE_BINARY" >&2
+        exit 1
+    fi
+
+    # Read image name from embedded metadata block
+    IMAGE_NAME="$(python3 - "$UPDATE_BINARY" "$OCI2BIN_HOME" <<'PYEOF'
+import sys, os
+binary = sys.argv[1]
+home = sys.argv[2]
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+    "inspect_image",
+    os.path.join(home, "scripts", "inspect_image.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+meta = mod.read_meta_block(binary) or {}
+image = meta.get('image', '')
+if not image:
+    try:
+        oci = mod.read_oci_data(binary)
+        tags, _, _ = mod.parse_config(oci)
+        image = tags[0] if tags else ''
+    except SystemExit:
+        image = ''
+print(image)
+PYEOF
+)"
+
+    if [[ -z "$IMAGE_NAME" ]]; then
+        echo "oci2bin update: could not read image name from $UPDATE_BINARY" >&2
+        exit 1
+    fi
+
+    echo "oci2bin update: rebuilding from $IMAGE_NAME..." >&2
+
+    # Build to a temp file in the same directory (for atomic rename)
+    UPDATE_DIR="$(dirname "$UPDATE_BINARY")"
+    UPDATE_TMP="$(mktemp "$UPDATE_DIR/.oci2bin-update.XXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -f \"$UPDATE_TMP\"" EXIT
+
+    "$0" "$IMAGE_NAME" "$UPDATE_TMP"
+
+    mv "$UPDATE_TMP" "$UPDATE_BINARY"
+    chmod +x "$UPDATE_BINARY"
+    trap - EXIT
+
+    echo "oci2bin update: done → $UPDATE_BINARY" >&2
+    exit 0
+fi
+
+# ── ps subcommand ─────────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "ps" ]]; then
+    shift
+    CTR_DIR="$HOME/.cache/oci2bin/containers"
+    python3 - "$CTR_DIR" <<'PYEOF'
+import json, os, sys
+ctr_dir = sys.argv[1]
+if not os.path.isdir(ctr_dir):
+    print("No containers", file=sys.stderr)
+    sys.exit(0)
+fmt = "%-20s %-8s %-8s %-30s %s"
+print(fmt % ("NAME", "PID", "STATUS", "BINARY", "STARTED"))
+print("-" * 76)
+for name in sorted(os.listdir(ctr_dir)):
+    if not name.endswith('.json'):
+        continue
+    path = os.path.join(ctr_dir, name)
+    try:
+        d = json.load(open(path))
+    except (json.JSONDecodeError, OSError):
+        continue
+    pid = d.get('pid', 0)
+    try:
+        os.kill(pid, 0)
+        status = "running"
+    except (ProcessLookupError, PermissionError, OSError):
+        status = "stopped"
+    print(fmt % (
+        d.get('name', '?')[:20],
+        str(pid),
+        status,
+        os.path.basename(d.get('binary', '?'))[:30],
+        d.get('started_at', '?')[:19],
+    ))
+PYEOF
+    exit 0
+fi
+
+# ── stop subcommand ───────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "stop" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin stop NAME" >&2
+        exit 1
+    fi
+    # Validate name: alphanumeric + hyphens + underscores only
+    if ! [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+        echo "oci2bin stop: invalid name '$1'" >&2
+        exit 1
+    fi
+    STATE_FILE="$HOME/.cache/oci2bin/containers/$1.json"
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "oci2bin stop: no container named '$1'" >&2
+        exit 1
+    fi
+    STOP_PID="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('pid',0))" "$STATE_FILE")"
+    if ! [[ "$STOP_PID" =~ ^[0-9]+$ ]]; then
+        echo "oci2bin stop: invalid PID in state file" >&2
+        rm -f "$STATE_FILE"
+        exit 1
+    fi
+    if kill -0 "$STOP_PID" 2>/dev/null; then
+        echo "oci2bin stop: sending SIGTERM to PID $STOP_PID..." >&2
+        kill -TERM "$STOP_PID" 2>/dev/null || true
+        for _ in $(seq 1 10); do
+            kill -0 "$STOP_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$STOP_PID" 2>/dev/null; then
+            echo "oci2bin stop: sending SIGKILL to PID $STOP_PID..." >&2
+            kill -KILL "$STOP_PID" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$STATE_FILE"
+    echo "oci2bin stop: '$1' stopped" >&2
+    exit 0
+fi
+
+# ── logs subcommand ───────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "logs" ]]; then
+    shift
+    LOGS_FOLLOW=0
+    [[ "${1:-}" == "-f" || "${1:-}" == "--follow" ]] && { LOGS_FOLLOW=1; shift; }
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin logs [-f] NAME" >&2
+        exit 1
+    fi
+    # Validate name
+    if ! [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+        echo "oci2bin logs: invalid name '$1'" >&2
+        exit 1
+    fi
+    STATE_FILE="$HOME/.cache/oci2bin/containers/$1.json"
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "oci2bin logs: no container named '$1'" >&2
+        exit 1
+    fi
+    LOG_FILE="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('log_file',''))" "$STATE_FILE")"
+    if [[ -z "$LOG_FILE" || ! -f "$LOG_FILE" ]]; then
+        echo "oci2bin logs: log file not found for '$1'" >&2
+        exit 1
+    fi
+    # Validate log file is under the expected container cache directory
+    EXPECTED_LOG_DIR="$HOME/.cache/oci2bin/containers"
+    case "$LOG_FILE" in
+        "$EXPECTED_LOG_DIR"/*) ;;
+        *) echo "oci2bin logs: log file path outside expected directory" >&2; exit 1 ;;
+    esac
+    if [[ "$LOGS_FOLLOW" -eq 1 ]]; then
+        exec tail -f "$LOG_FILE"
+    else
+        exec cat "$LOG_FILE"
+    fi
 fi
 
 # ── pod subcommand ────────────────────────────────────────────────────────
@@ -389,6 +641,7 @@ if [[ "${1:-}" == "pod" ]]; then
     POD_NET_SHARED=0
     POD_IPC_SHARED=0
     POD_BINARIES=()
+    POD_ALIASES=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -398,6 +651,14 @@ if [[ "${1:-}" == "pod" ]]; then
             --ipc)
                 [[ "${2:-}" == "shared" ]] || { echo "oci2bin pod: --ipc only supports 'shared'" >&2; exit 1; }
                 POD_IPC_SHARED=1; shift 2 ;;
+            --network-alias)
+                [[ $# -lt 2 ]] && { echo "oci2bin pod: --network-alias requires NAME" >&2; exit 1; }
+                # Validate: only alphanumeric, hyphens, dots
+                if ! [[ "$2" =~ ^[a-zA-Z0-9][-a-zA-Z0-9.]*$ ]]; then
+                    echo "oci2bin pod: --network-alias: invalid name '$2'" >&2
+                    exit 1
+                fi
+                POD_ALIASES+=("$2"); shift 2 ;;
             -*)
                 echo "oci2bin pod: unknown option: $1" >&2; exit 1 ;;
             *)
@@ -438,6 +699,11 @@ if [[ "${1:-}" == "pod" ]]; then
         CHILD_FLAGS=()
         [[ $POD_NET_SHARED -eq 1 ]] && CHILD_FLAGS+=("--net" "container:$PAUSE_PID")
         [[ $POD_IPC_SHARED -eq 1 ]] && CHILD_FLAGS+=("--ipc" "container:$PAUSE_PID")
+        # Inject --add-host entries for each network alias
+        # In shared-net mode all containers share 127.0.0.1 loopback
+        for alias in "${POD_ALIASES[@]}"; do
+            CHILD_FLAGS+=("--add-host" "${alias}:127.0.0.1")
+        done
         "$b" "${CHILD_FLAGS[@]}" &
         cid=$!
         CHILD_PIDS+=("$cid")
@@ -503,6 +769,11 @@ EMBED_LOADER_LABELS=0
 LABEL_CHUNK_SIZE=""
 LOADER_DIR=""
 LABEL_PREFIX=""
+VERIFY_COSIGN=0
+REQUIRE_COSIGN=0
+COSIGN_KEY=""
+DO_SQUASH=0
+COMPRESS_FORMAT=""
 # Auto-detect libkrun; --no-libkrun opts out
 if pkg-config --exists libkrun 2>/dev/null || ldconfig -p 2>/dev/null | grep -q libkrun; then
     USE_LIBKRUN=1
@@ -590,6 +861,22 @@ while [[ $# -gt 0 ]]; do
             LABEL_PREFIX="$2"
             shift 2
             ;;
+        --verify-cosign)
+            VERIFY_COSIGN=1; shift ;;
+        --require-cosign)
+            VERIFY_COSIGN=1; REQUIRE_COSIGN=1; shift ;;
+        --cosign-key)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --cosign-key requires PATH" >&2; exit 1; }
+            COSIGN_KEY="$2"; shift 2 ;;
+        --squash)
+            DO_SQUASH=1; shift ;;
+        --compress)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --compress requires gzip|zstd" >&2; exit 1; }
+            case "$2" in
+                gzip|zstd) ;;
+                *) echo "oci2bin: --compress: unsupported format '$2' (use gzip or zstd)" >&2; exit 1 ;;
+            esac
+            COMPRESS_FORMAT="$2"; shift 2 ;;
         --help|-h)
             usage
             ;;
@@ -739,6 +1026,34 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker pull "$IMAGE"
 fi
 
+# ── cosign image signature verification ──────────────────────────────────
+
+if [[ "$VERIFY_COSIGN" -eq 1 ]]; then
+    if command -v cosign >/dev/null 2>&1; then
+        echo "oci2bin: verifying image signature with cosign..." >&2
+        COSIGN_ARGS=(cosign verify)
+        [[ -n "$COSIGN_KEY" ]] && COSIGN_ARGS+=(--key "$COSIGN_KEY")
+        COSIGN_ARGS+=("$IMAGE")
+        if "${COSIGN_ARGS[@]}" >/dev/null 2>&1; then
+            echo "oci2bin: cosign verification passed" >&2
+        else
+            if [[ "$REQUIRE_COSIGN" -eq 1 ]]; then
+                echo "oci2bin: cosign verification failed (--require-cosign)" >&2
+                exit 1
+            else
+                echo "oci2bin: warning: cosign verification failed" >&2
+            fi
+        fi
+    else
+        if [[ "$REQUIRE_COSIGN" -eq 1 ]]; then
+            echo "oci2bin: cosign not installed (--require-cosign)" >&2
+            exit 1
+        else
+            echo "oci2bin: warning: cosign not installed, skipping verification" >&2
+        fi
+    fi
+fi
+
 # ── get image digest for cache key and reproducibility ────────────────────
 #
 # docker inspect returns the content-addressed digest (e.g. repo@sha256:abc...)
@@ -832,6 +1147,27 @@ if [[ "$DO_STRIP" -eq 1 ]]; then
         --input  "$BUILD_TAR_ARG" \
         --output "$STRIPPED_TAR"
     BUILD_TAR_ARG="$STRIPPED_TAR"
+fi
+
+# ── squash layers if requested ────────────────────────────────────────────
+
+if [[ "$DO_SQUASH" -eq 1 ]]; then
+    if [[ -z "$BUILD_TAR_ARG" ]]; then
+        SQUASH_TMPDIR="$(mktemp -d)"
+        trap 'rm -rf "$SQUASH_TMPDIR"' EXIT
+        BASE_TAR_FOR_SQUASH="$SQUASH_TMPDIR/base.tar"
+        echo "oci2bin: saving $IMAGE for squashing..."
+        docker save -o "$BASE_TAR_FOR_SQUASH" "$IMAGE"
+        BUILD_TAR_ARG="$BASE_TAR_FOR_SQUASH"
+    fi
+    SQUASHED_TAR="${BUILD_TAR_ARG%.tar}_squashed.tar"
+    echo "oci2bin: squashing layers..."
+    SQUASH_ARGS=(python3 "$OCI2BIN_HOME/scripts/squash_layers.py"
+        --input  "$BUILD_TAR_ARG"
+        --output "$SQUASHED_TAR")
+    [[ -n "$COMPRESS_FORMAT" ]] && SQUASH_ARGS+=(--compress "$COMPRESS_FORMAT")
+    "${SQUASH_ARGS[@]}"
+    BUILD_TAR_ARG="$SQUASHED_TAR"
 fi
 
 # ── inject --add-file / --add-dir if requested ────────────────────────────
