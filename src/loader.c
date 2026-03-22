@@ -7215,6 +7215,7 @@ struct vm_ch_ctx
     char mem_str[32];
     char cmdline[4096];
     char fs_args[MAX_VOLUMES][PATH_MAX + 64];
+    char cpbuf[65536];
     const char* argv[128];
 };
 
@@ -7321,21 +7322,20 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
                 free(ctx);
                 return 1;
             }
-            char cpbuf[65536];
             ssize_t nr;
             int copy_err = 0;
             while (1)
             {
                 do
                 {
-                    nr = read(src_fd, cpbuf, sizeof(cpbuf));
+                    nr = read(src_fd, ctx->cpbuf, sizeof(ctx->cpbuf));
                 }
                 while (nr < 0 && errno == EINTR);
                 if (nr == 0)
                 {
                     break;
                 }
-                if (nr < 0 || write_all_fd(dst_fd, cpbuf, (size_t)nr) < 0)
+                if (nr < 0 || write_all_fd(dst_fd, ctx->cpbuf, (size_t)nr) < 0)
                 {
                     perror("oci2bin: write rootfs/init");
                     copy_err = 1;
