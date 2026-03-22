@@ -7197,6 +7197,28 @@ cleanup:
 #endif /* USE_LIBKRUN */
 
 /*
+ * All path/string buffers for run_as_vm_ch in one heap-allocated block.
+ * Keeps the function's stack frame small and makes lifetime explicit.
+ * The struct is intentionally freed before execvp (not needed after exec).
+ */
+struct vm_ch_ctx
+{
+    char kernel_path[PATH_MAX];
+    char initramfs_path[PATH_MAX];
+    char init_dst[PATH_MAX];
+    char self_path[PATH_MAX];
+    char self_dir[PATH_MAX];
+    char polyglot_py[PATH_MAX];
+    char data_img_path[PATH_MAX];
+    char disk_arg[PATH_MAX + 16];
+    char cpus_str[32];
+    char mem_str[32];
+    char cmdline[4096];
+    char fs_args[MAX_VOLUMES][PATH_MAX + 64];
+    const char* argv[128];
+};
+
+/*
  * run_as_vm_ch: launch cloud-hypervisor with kernel + initramfs embedded in
  * this binary.  Calls execvp — does not return on success.
  * rootfs: path to the extracted OCI rootfs directory.
@@ -7219,41 +7241,57 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         return 1;
     }
 
+    struct vm_ch_ctx* ctx = calloc(1, sizeof(*ctx));
+    if (!ctx)
+    {
+        perror("oci2bin: vm_ch_ctx alloc");
+        return 1;
+    }
+
+#define VM_CH_ERR(msg) do { fprintf(stderr, "oci2bin: " msg "\n"); free(ctx); return 1; } while (0)
+#define VM_CH_PERR(msg) do { perror("oci2bin: " msg); free(ctx); return 1; } while (0)
+#define CH_ARG(x) do { \
+    if (ai >= 126) { VM_CH_ERR("too many cloud-hypervisor args"); } \
+    ctx->argv[ai++] = (x); \
+} while (0)
+
+    int n;
+
     /* Extract kernel blob */
-    char kernel_path[PATH_MAX];
-    int n = snprintf(kernel_path, sizeof(kernel_path), "%s/vmlinux", tmpdir);
-    if (n < 0 || (size_t)n >= sizeof(kernel_path))
+    n = snprintf(ctx->kernel_path, sizeof(ctx->kernel_path),
+                 "%s/vmlinux", tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(ctx->kernel_path))
     {
-        fprintf(stderr, "oci2bin: kernel path truncated\n");
+        VM_CH_ERR("kernel path truncated");
+    }
+    if (extract_vm_blob(KERNEL_DATA_OFFSET, KERNEL_DATA_SIZE,
+                        ctx->kernel_path) < 0)
+    {
+        free(ctx);
         return 1;
     }
-    if (extract_vm_blob(KERNEL_DATA_OFFSET, KERNEL_DATA_SIZE, kernel_path) < 0)
-    {
-        return 1;
-    }
-    debug_log("vm.ch.kernel", "path=%s size=%lu", kernel_path,
+    debug_log("vm.ch.kernel", "path=%s size=%lu", ctx->kernel_path,
               KERNEL_DATA_SIZE);
 
     /* Extract or build initramfs */
-    char initramfs_path[PATH_MAX];
-    n = snprintf(initramfs_path, sizeof(initramfs_path),
+    n = snprintf(ctx->initramfs_path, sizeof(ctx->initramfs_path),
                  "%s/rootfs.cpio.gz", tmpdir);
-    if (n < 0 || (size_t)n >= sizeof(initramfs_path))
+    if (n < 0 || (size_t)n >= sizeof(ctx->initramfs_path))
     {
-        fprintf(stderr, "oci2bin: initramfs path truncated\n");
-        return 1;
+        VM_CH_ERR("initramfs path truncated");
     }
 
     if (INITRAMFS_DATA_PATCHED == 1)
     {
         /* Pre-embedded initramfs: just write the blob */
         if (extract_vm_blob(INITRAMFS_DATA_OFFSET, INITRAMFS_DATA_SIZE,
-                            initramfs_path) < 0)
+                            ctx->initramfs_path) < 0)
         {
+            free(ctx);
             return 1;
         }
         debug_log("vm.ch.initramfs", "source=embedded path=%s size=%lu",
-                  initramfs_path, INITRAMFS_DATA_SIZE);
+                  ctx->initramfs_path, INITRAMFS_DATA_SIZE);
     }
     else
     {
@@ -7262,25 +7300,25 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
          * First, copy /proc/self/exe to rootfs/init so our binary
          * becomes PID 1 in the VM.
          */
-        char init_dst[PATH_MAX];
-        n = snprintf(init_dst, sizeof(init_dst), "%s/init", rootfs);
-        if (n < 0 || (size_t)n >= sizeof(init_dst))
+        n = snprintf(ctx->init_dst, sizeof(ctx->init_dst),
+                     "%s/init", rootfs);
+        if (n < 0 || (size_t)n >= sizeof(ctx->init_dst))
         {
-            fprintf(stderr, "oci2bin: init path truncated\n");
-            return 1;
+            VM_CH_ERR("init path truncated");
         }
         {
             int src_fd = open("/proc/self/exe", O_RDONLY);
             if (src_fd < 0)
             {
-                perror("open /proc/self/exe for init copy");
-                return 1;
+                VM_CH_PERR("open /proc/self/exe for init copy");
             }
-            int dst_fd = open(init_dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+            int dst_fd = open(ctx->init_dst,
+                              O_CREAT | O_WRONLY | O_TRUNC, 0755);
             if (dst_fd < 0)
             {
-                perror("open rootfs/init for writing");
+                perror("oci2bin: open rootfs/init for writing");
                 close(src_fd);
+                free(ctx);
                 return 1;
             }
             char cpbuf[65536];
@@ -7299,50 +7337,42 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
                 }
                 if (nr < 0 || write_all_fd(dst_fd, cpbuf, (size_t)nr) < 0)
                 {
-                    perror("write rootfs/init");
+                    perror("oci2bin: write rootfs/init");
                     copy_err = 1;
                     break;
                 }
             }
-            if (copy_err)
-            {
-                close(src_fd);
-                close(dst_fd);
-                return 1;
-            }
             close(src_fd);
-            if (close(dst_fd) < 0)
+            if (close(dst_fd) < 0 || copy_err)
             {
-                perror("close rootfs/init");
+                if (!copy_err)
+                {
+                    perror("oci2bin: close rootfs/init");
+                }
+                free(ctx);
                 return 1;
             }
-            if (chmod(init_dst, 0755) < 0)
+            if (chmod(ctx->init_dst, 0755) < 0)
             {
-                perror("chmod rootfs/init");
-                return 1;
+                VM_CH_PERR("chmod rootfs/init");
             }
         }
 
         /* Find build_polyglot.py relative to self */
-        char self_path[PATH_MAX];
-        ssize_t slen = readlink("/proc/self/exe", self_path,
-                                sizeof(self_path) - 1);
+        ssize_t slen = readlink("/proc/self/exe", ctx->self_path,
+                                sizeof(ctx->self_path) - 1);
         if (slen < 0)
         {
-            perror("readlink /proc/self/exe (initramfs)");
-            return 1;
+            VM_CH_PERR("readlink /proc/self/exe (initramfs)");
         }
-        self_path[slen] = '\0';
+        ctx->self_path[slen] = '\0';
 
-        char polyglot_py[PATH_MAX];
-        polyglot_py[0] = '\0';
-
-        /* Find dirname of self_path */
-        char self_dir[PATH_MAX];
-        int sd = snprintf(self_dir, sizeof(self_dir), "%s", self_path);
-        if (sd > 0 && (size_t)sd < sizeof(self_dir))
+        /* Find dirname(self_path) into self_dir */
+        n = snprintf(ctx->self_dir, sizeof(ctx->self_dir),
+                     "%s", ctx->self_path);
+        if (n > 0 && (size_t)n < sizeof(ctx->self_dir))
         {
-            char* slash = strrchr(self_dir, '/');
+            char* slash = strrchr(ctx->self_dir, '/');
             if (slash)
             {
                 *slash = '\0';
@@ -7366,10 +7396,10 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         int found_py = 0;
         for (int si = 0; PY_SUFFIXES[si]; si++)
         {
-            n = snprintf(polyglot_py, sizeof(polyglot_py),
-                         "%s%s", self_dir, PY_SUFFIXES[si]);
-            if (n > 0 && (size_t)n < sizeof(polyglot_py) &&
-                    stat(polyglot_py, &pystat) == 0)
+            n = snprintf(ctx->polyglot_py, sizeof(ctx->polyglot_py),
+                         "%s%s", ctx->self_dir, PY_SUFFIXES[si]);
+            if (n > 0 && (size_t)n < sizeof(ctx->polyglot_py) &&
+                    stat(ctx->polyglot_py, &pystat) == 0)
             {
                 found_py = 1;
                 break;
@@ -7377,108 +7407,93 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         }
         if (!found_py)
         {
-            n = snprintf(polyglot_py, sizeof(polyglot_py),
+            n = snprintf(ctx->polyglot_py, sizeof(ctx->polyglot_py),
                          "/usr/share/oci2bin/scripts/build_polyglot.py");
-            if (n < 0 || (size_t)n >= sizeof(polyglot_py))
+            if (n < 0 || (size_t)n >= sizeof(ctx->polyglot_py))
             {
-                fprintf(stderr,
-                        "oci2bin: build_polyglot.py path truncated\n");
-                return 1;
+                VM_CH_ERR("build_polyglot.py path truncated");
             }
         }
 
         /* build_polyglot.py --initramfs-only ROOTFSDIR OUTPATH */
-        char* args[] =
+        char* py_args[] =
         {
             "python3",
-            polyglot_py,
+            ctx->polyglot_py,
             "--initramfs-only",
             (char*)rootfs,
-            initramfs_path,
+            ctx->initramfs_path,
             NULL
         };
         pid_t pid = fork();
         if (pid < 0)
         {
-            perror("fork initramfs build");
-            return 1;
+            VM_CH_PERR("fork initramfs build");
         }
         if (pid == 0)
         {
-            execvp("python3", args);
+            execvp("python3", py_args);
             perror("execvp python3 build_polyglot.py");
             _exit(1);
         }
         int wstatus;
         if (waitpid(pid, &wstatus, 0) < 0)
         {
-            perror("waitpid initramfs build");
-            return 1;
+            VM_CH_PERR("waitpid initramfs build");
         }
         if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0)
         {
-            fprintf(stderr, "oci2bin: initramfs build failed\n");
-            return 1;
+            VM_CH_ERR("initramfs build failed");
         }
-        debug_log("vm.ch.initramfs", "source=built path=%s", initramfs_path);
+        debug_log("vm.ch.initramfs", "source=built path=%s",
+                  ctx->initramfs_path);
     }
 
     /* --overlay-persist: create/reuse a data disk image */
-    char data_img_path[PATH_MAX];
     int have_data_disk = 0;
     if (opts->overlay_persist)
     {
         /* Sanitize: reject paths with .. */
         if (strstr(opts->overlay_persist, "..") != NULL)
         {
-            fprintf(stderr,
-                    "oci2bin: --overlay-persist path contains ..\n");
-            return 1;
+            VM_CH_ERR("--overlay-persist path contains ..");
         }
-        /* Build data image path: overlay_persist/oci2bin-data.ext2 */
-        int nn = snprintf(data_img_path, sizeof(data_img_path),
-                          "%s/oci2bin-data.ext2", opts->overlay_persist);
-        if (nn < 0 || (size_t)nn >= sizeof(data_img_path))
+        n = snprintf(ctx->data_img_path, sizeof(ctx->data_img_path),
+                     "%s/oci2bin-data.ext2", opts->overlay_persist);
+        if (n < 0 || (size_t)n >= sizeof(ctx->data_img_path))
         {
-            fprintf(stderr,
-                    "oci2bin: overlay_persist path too long\n");
-            return 1;
+            VM_CH_ERR("overlay_persist path too long");
         }
-        /* Create data directory */
         if (mkdir(opts->overlay_persist, 0700) < 0 && errno != EEXIST)
         {
-            perror("mkdir overlay_persist");
-            return 1;
+            VM_CH_PERR("mkdir overlay_persist");
         }
-        /* Create ext2 image if not already present */
         struct stat st;
-        if (stat(data_img_path, &st) != 0)
+        if (stat(ctx->data_img_path, &st) != 0)
         {
-            /* Create sparse file (1 GiB) */
-            int fd = open(data_img_path,
+            /* Create sparse 1 GiB file then format as ext2 */
+            int fd = open(ctx->data_img_path,
                           O_CREAT | O_RDWR | O_TRUNC, 0600);
             if (fd < 0)
             {
-                perror("open data_img");
-                return 1;
+                VM_CH_PERR("open data_img");
             }
             if (ftruncate(fd, 1073741824LL) < 0)
             {
-                perror("ftruncate data_img");
+                perror("oci2bin: ftruncate data_img");
                 close(fd);
+                free(ctx);
                 return 1;
             }
             close(fd);
-            /* mkfs.ext2 */
             char* mkfs_argv[] =
             {
-                "mkfs.ext2", "-F", data_img_path, NULL
+                "mkfs.ext2", "-F", ctx->data_img_path, NULL
             };
             pid_t mkfs_pid = fork();
             if (mkfs_pid < 0)
             {
-                perror("fork mkfs");
-                return 1;
+                VM_CH_PERR("fork mkfs");
             }
             if (mkfs_pid == 0)
             {
@@ -7490,94 +7505,80 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
             if (waitpid(mkfs_pid, &wst, 0) < 0 ||
                     !WIFEXITED(wst) || WEXITSTATUS(wst) != 0)
             {
-                fprintf(stderr, "oci2bin: mkfs.ext2 failed\n");
-                return 1;
+                VM_CH_ERR("mkfs.ext2 failed");
             }
         }
         have_data_disk = 1;
     }
 
     /* Build cpu/memory strings */
-    char cpus_str[32];
     int vcpus = (opts->vm_cpus > 0.0) ? (int)(opts->vm_cpus + 0.5)
                 : DEFAULT_VM_CPUS;
-    n = snprintf(cpus_str, sizeof(cpus_str), "boot=%d", vcpus);
-    if (n < 0 || (size_t)n >= sizeof(cpus_str))
+    n = snprintf(ctx->cpus_str, sizeof(ctx->cpus_str), "boot=%d", vcpus);
+    if (n < 0 || (size_t)n >= sizeof(ctx->cpus_str))
     {
-        fprintf(stderr, "oci2bin: cpus string truncated\n");
-        return 1;
+        VM_CH_ERR("cpus string truncated");
     }
 
-    char mem_str[32];
     unsigned long mem_mb =
         (opts->cg_memory_bytes > 0) ?
         (unsigned long)(opts->cg_memory_bytes >> 20)
         : DEFAULT_VM_MEM_MB;
-    n = snprintf(mem_str, sizeof(mem_str), "size=%luM", mem_mb);
-    if (n < 0 || (size_t)n >= sizeof(mem_str))
+    n = snprintf(ctx->mem_str, sizeof(ctx->mem_str), "size=%luM", mem_mb);
+    if (n < 0 || (size_t)n >= sizeof(ctx->mem_str))
     {
-        fprintf(stderr, "oci2bin: memory string truncated\n");
-        return 1;
+        VM_CH_ERR("memory string truncated");
     }
 
-    /* Build cmdline string (4096 bytes for multiple virtiofs entries) */
-    char cmdline[4096];
-    n = snprintf(cmdline, sizeof(cmdline),
+    /* Build kernel cmdline */
+    n = snprintf(ctx->cmdline, sizeof(ctx->cmdline),
                  "console=ttyS0 reboot=k panic=1 pci=off OCI2BIN_VM_INIT=1"
                  " init=/init");
-    if (n < 0 || (size_t)n >= sizeof(cmdline))
+    if (n < 0 || (size_t)n >= sizeof(ctx->cmdline))
     {
-        fprintf(stderr, "oci2bin: cmdline truncated\n");
-        return 1;
+        VM_CH_ERR("cmdline truncated");
     }
 
     if (opts->debug)
     {
-        int cn = snprintf(cmdline + strlen(cmdline),
-                          sizeof(cmdline) - strlen(cmdline),
+        size_t cur = strlen(ctx->cmdline);
+        int cn = snprintf(ctx->cmdline + cur, sizeof(ctx->cmdline) - cur,
                           " OCI2BIN_DEBUG=1");
-        if (cn < 0 || (size_t)cn >= sizeof(cmdline) - strlen(cmdline))
+        if (cn < 0 || (size_t)cn >= sizeof(ctx->cmdline) - cur)
         {
-            fprintf(stderr, "oci2bin: cmdline truncated (debug)\n");
-            return 1;
+            VM_CH_ERR("cmdline truncated (debug)");
         }
     }
 
-    /* Append data disk cmdline param if applicable */
     if (have_data_disk)
     {
-        int cn = snprintf(cmdline + strlen(cmdline),
-                          sizeof(cmdline) - strlen(cmdline),
+        size_t cur = strlen(ctx->cmdline);
+        int cn = snprintf(ctx->cmdline + cur, sizeof(ctx->cmdline) - cur,
                           " oci2bin.data=/dev/vda");
-        if (cn < 0 || (size_t)cn >= sizeof(cmdline) - strlen(cmdline))
+        if (cn < 0 || (size_t)cn >= sizeof(ctx->cmdline) - cur)
         {
-            fprintf(stderr,
-                    "oci2bin: cmdline truncated (data disk)\n");
-            return 1;
+            VM_CH_ERR("cmdline truncated (data disk)");
         }
     }
 
-    /* Append virtiofs mount params to cmdline */
     for (int vi = 0; vi < opts->n_vols; vi++)
     {
-        /* Validate container path */
         if (strstr(opts->vol_ctr[vi], "..") != NULL ||
                 opts->vol_ctr[vi][0] != '/')
         {
-            fprintf(stderr,
-                    "oci2bin: -v container path invalid: %s\n",
+            fprintf(stderr, "oci2bin: -v container path invalid: %s\n",
                     opts->vol_ctr[vi]);
+            free(ctx);
             return 1;
         }
-        size_t cur_len = strlen(cmdline);
-        int cn = snprintf(cmdline + cur_len,
-                          sizeof(cmdline) - cur_len,
+        size_t cur = strlen(ctx->cmdline);
+        int cn = snprintf(ctx->cmdline + cur, sizeof(ctx->cmdline) - cur,
                           " oci2bin.mount.%d=vol%d:%s",
                           vi, vi, opts->vol_ctr[vi]);
-        if (cn < 0 || (size_t)cn >= sizeof(cmdline) - cur_len)
+        if (cn < 0 || (size_t)cn >= sizeof(ctx->cmdline) - cur)
         {
-            fprintf(stderr,
-                    "oci2bin: cmdline truncated (mount %d)\n", vi);
+            fprintf(stderr, "oci2bin: cmdline truncated (mount %d)\n", vi);
+            free(ctx);
             return 1;
         }
     }
@@ -7586,47 +7587,34 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
     const char* vmm_bin = opts->vmm ? opts->vmm : "cloud-hypervisor";
     debug_log("vm.ch.config", "vmm=%s vcpus=%d mem_mb=%lu", vmm_bin, vcpus,
               mem_mb);
-    debug_log("vm.ch.cmdline", "value=%s", cmdline);
-    const char* argv[128];
+    debug_log("vm.ch.cmdline", "value=%s", ctx->cmdline);
     int ai = 0;
-
-#define CH_ARG(x) do { \
-    if (ai >= 126) { \
-        fprintf(stderr, "oci2bin: too many cloud-hypervisor args\n"); \
-        return 1; \
-    } \
-    argv[ai++] = (x); \
-} while (0)
 
     CH_ARG(vmm_bin);
     CH_ARG("--kernel");
-    CH_ARG(kernel_path);
+    CH_ARG(ctx->kernel_path);
     CH_ARG("--initramfs");
-    CH_ARG(initramfs_path);
+    CH_ARG(ctx->initramfs_path);
     CH_ARG("--cmdline");
-    CH_ARG(cmdline);
+    CH_ARG(ctx->cmdline);
     CH_ARG("--cpus");
-    CH_ARG(cpus_str);
+    CH_ARG(ctx->cpus_str);
     CH_ARG("--memory");
-    CH_ARG(mem_str);
+    CH_ARG(ctx->mem_str);
 
-    /* Add data disk if present */
-    char disk_arg[PATH_MAX + 16];
     if (have_data_disk)
     {
-        int nn = snprintf(disk_arg, sizeof(disk_arg),
-                          "path=%s", data_img_path);
-        if (nn < 0 || (size_t)nn >= sizeof(disk_arg))
+        n = snprintf(ctx->disk_arg, sizeof(ctx->disk_arg),
+                     "path=%s", ctx->data_img_path);
+        if (n < 0 || (size_t)n >= sizeof(ctx->disk_arg))
         {
-            fprintf(stderr, "oci2bin: disk arg too long\n");
-            return 1;
+            VM_CH_ERR("disk arg too long");
         }
         CH_ARG("--disk");
-        CH_ARG(disk_arg);
+        CH_ARG(ctx->disk_arg);
     }
 
     /* Per-volume virtiofs: fork virtiofsd for each -v mount */
-    char fs_args[MAX_VOLUMES][PATH_MAX + 64];
     for (int vi = 0; vi < opts->n_vols; vi++)
     {
         char sock_path[PATH_MAX];
@@ -7634,16 +7622,13 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
                           "%s/vfs-%d.sock", tmpdir, vi);
         if (nn < 0 || (size_t)nn >= sizeof(sock_path))
         {
-            fprintf(stderr,
-                    "oci2bin: virtiofs sock path too long\n");
-            return 1;
+            VM_CH_ERR("virtiofs sock path too long");
         }
-        /* Sanitize host path */
         if (strstr(opts->vol_host[vi], "..") != NULL)
         {
-            fprintf(stderr,
-                    "oci2bin: -v host path contains ..: %s\n",
+            fprintf(stderr, "oci2bin: -v host path contains ..: %s\n",
                     opts->vol_host[vi]);
+            free(ctx);
             return 1;
         }
         char* vfsd_argv[] =
@@ -7657,8 +7642,7 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         pid_t vfsd_pid = fork();
         if (vfsd_pid < 0)
         {
-            perror("fork virtiofsd");
-            return 1;
+            VM_CH_PERR("fork virtiofsd");
         }
         if (vfsd_pid == 0)
         {
@@ -7667,24 +7651,29 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
             _exit(1);
         }
         /* Don't waitpid — virtiofsd runs for the lifetime of the VM */
-        nn = snprintf(fs_args[vi], sizeof(fs_args[vi]),
+        nn = snprintf(ctx->fs_args[vi], sizeof(ctx->fs_args[vi]),
                       "tag=vol%d,socket=%s,num_queues=1,queue_size=512",
                       vi, sock_path);
-        if (nn < 0 || (size_t)nn >= sizeof(fs_args[vi]))
+        if (nn < 0 || (size_t)nn >= sizeof(ctx->fs_args[vi]))
         {
-            fprintf(stderr, "oci2bin: --fs arg too long\n");
-            return 1;
+            VM_CH_ERR("--fs arg too long");
         }
         CH_ARG("--fs");
-        CH_ARG(fs_args[vi]);
+        CH_ARG(ctx->fs_args[vi]);
     }
 
-    argv[ai] = NULL;
+    ctx->argv[ai] = NULL;
+
 #undef CH_ARG
+#undef VM_CH_ERR
+#undef VM_CH_PERR
 
     debug_log("vm.ch.exec", "binary=%s argc=%d", vmm_bin, ai);
-    execvp(vmm_bin, (char* const*)argv);
+    /* ctx is intentionally not freed here: execvp replaces the process
+     * image (OS reclaims all memory), and ctx->argv points into ctx. */
+    execvp(vmm_bin, (char* const*)ctx->argv);
     perror("execvp cloud-hypervisor");
+    free(ctx);
     return 1;
 }
 
