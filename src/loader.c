@@ -1574,7 +1574,7 @@ static int write_proc(const char* path, const char* data, size_t len)
     return rc;
 }
 
-/* Run a command, wait for it. Returns exit status. */
+/* Run a command, wait for it. Returns exit status (0 = success, -1 = error). */
 static int run_cmd(char* const argv[])
 {
     if (g_debug && argv && argv[0])
@@ -1601,6 +1601,25 @@ static int run_cmd(char* const argv[])
     debug_log("run_cmd.exit", "status=%d", WIFEXITED(status) ?
               WEXITSTATUS(status) : -1);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Fork a daemon: exec argv[0] without waiting (child runs for the caller's
+ * lifetime).  Returns the child pid, or -1 on error. */
+static pid_t spawn_daemon(char* const argv[])
+{
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        return -1;
+    }
+    if (pid == 0)
+    {
+        execvp(argv[0], argv);
+        perror("execvp");
+        _exit(1);
+    }
+    return pid;
 }
 
 /* ── OCI image extraction ────────────────────────────────────────────────── */
@@ -6522,35 +6541,16 @@ static int verify_signature(const char* key_path)
         return -1;
     }
 
-    /* execv: /usr/bin/python3 sign_binary.py verify --key KEY --in /proc/self/exe */
-    pid_t pid = fork();
-    if (pid < 0)
+    char* args[] =
     {
-        perror("oci2bin: --verify-key: fork");
-        return -1;
-    }
-    if (pid == 0)
-    {
-        char* args[] =
-        {
-            "/usr/bin/python3",
-            scripts_dir,
-            "verify",
-            "--key", (char*)key_path,
-            "--in", self_path,
-            NULL
-        };
-        execv("/usr/bin/python3", args);
-        perror("oci2bin: execv /usr/bin/python3");
-        _exit(127);
-    }
-    int status;
-    if (waitpid(pid, &status, 0) < 0)
-    {
-        perror("oci2bin: --verify-key: waitpid");
-        return -1;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        "/usr/bin/python3",
+        scripts_dir,
+        "verify",
+        "--key", (char*)key_path,
+        "--in", self_path,
+        NULL
+    };
+    if (run_cmd(args) != 0)
     {
         fprintf(stderr,
                 "oci2bin: signature verification failed — "
@@ -7365,25 +7365,7 @@ static int vm_ch_build_initramfs(struct vm_ch_ctx* ctx, const char* rootfs)
         "--initramfs-only", (char*)rootfs, ctx->initramfs_path,
         NULL
     };
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        perror("oci2bin: fork initramfs build");
-        return -1;
-    }
-    if (pid == 0)
-    {
-        execvp("python3", py_args);
-        perror("execvp python3 build_polyglot.py");
-        _exit(1);
-    }
-    int wstatus;
-    if (waitpid(pid, &wstatus, 0) < 0)
-    {
-        perror("oci2bin: waitpid initramfs build");
-        return -1;
-    }
-    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0)
+    if (run_cmd(py_args) != 0)
     {
         fprintf(stderr, "oci2bin: initramfs build failed\n");
         return -1;
@@ -7442,21 +7424,7 @@ static int vm_ch_prepare_data_disk(struct vm_ch_ctx* ctx,
     }
     close(fd);
     char* mkfs_argv[] = { "mkfs.ext2", "-F", ctx->data_img_path, NULL };
-    pid_t mkfs_pid = fork();
-    if (mkfs_pid < 0)
-    {
-        perror("oci2bin: fork mkfs");
-        return -1;
-    }
-    if (mkfs_pid == 0)
-    {
-        execvp("mkfs.ext2", mkfs_argv);
-        perror("execvp mkfs.ext2");
-        _exit(1);
-    }
-    int wst;
-    if (waitpid(mkfs_pid, &wst, 0) < 0 ||
-            !WIFEXITED(wst) || WEXITSTATUS(wst) != 0)
+    if (run_cmd(mkfs_argv) != 0)
     {
         fprintf(stderr, "oci2bin: mkfs.ext2 failed\n");
         return -1;
@@ -7548,19 +7516,11 @@ static int vm_ch_start_virtiofsd(struct vm_ch_ctx* ctx,
             "--sandbox",     "namespace",
             NULL
         };
-        pid_t vfsd_pid = fork();
-        if (vfsd_pid < 0)
+        /* spawn_daemon: virtiofsd runs for the lifetime of the VM */
+        if (spawn_daemon(vfsd_argv) < 0)
         {
-            perror("oci2bin: fork virtiofsd");
             return -1;
         }
-        if (vfsd_pid == 0)
-        {
-            execvp("virtiofsd", vfsd_argv);
-            perror("execvp virtiofsd");
-            _exit(1);
-        }
-        /* Don't waitpid — virtiofsd runs for the lifetime of the VM */
         nn = snprintf(ctx->fs_args[vi], sizeof(ctx->fs_args[vi]),
                       "tag=vol%d,socket=%s,num_queues=1,queue_size=512",
                       vi, sock_path);
