@@ -610,17 +610,12 @@ if [[ "${1:-}" == "logs" ]]; then
         echo "oci2bin logs: no container named '$1'" >&2
         exit 1
     fi
-    LOG_FILE="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('log_file',''))" "$STATE_FILE")"
-    if [[ -z "$LOG_FILE" || ! -f "$LOG_FILE" ]]; then
+    # Log path is always deterministic — reconstruct rather than read from JSON.
+    LOG_FILE="$HOME/.cache/oci2bin/containers/$1.log"
+    if [[ ! -f "$LOG_FILE" ]]; then
         echo "oci2bin logs: log file not found for '$1'" >&2
         exit 1
     fi
-    # Validate log file is under the expected container cache directory
-    EXPECTED_LOG_DIR="$HOME/.cache/oci2bin/containers"
-    case "$LOG_FILE" in
-        "$EXPECTED_LOG_DIR"/*) ;;
-        *) echo "oci2bin logs: log file path outside expected directory" >&2; exit 1 ;;
-    esac
     if [[ "$LOGS_FOLLOW" -eq 1 ]]; then
         exec tail -f "$LOG_FILE"
     else

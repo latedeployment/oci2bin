@@ -415,12 +415,16 @@ static void write_container_state(const char* name, pid_t pid,
         }
     }
 
+    /* Note: log_file is omitted from the JSON — its path is always
+     * $HOME/.cache/oci2bin/containers/<name>.log and is reconstructed
+     * by consumers (oci2bin logs).  Keeping HOME out of the JSON body
+     * breaks the getenv→write taint chain that triggers CodeQL
+     * cpp/system-data-exposure. */
     char json[2048];
     n = snprintf(json, sizeof(json),
                  "{\"name\":\"%s\",\"pid\":%d,\"binary\":\"%s\","
-                 "\"started_at\":\"%s\","
-                 "\"log_file\":\"%s/%s.log\"}\n",
-                 name, (int)pid, self_path, ts, dir, name);
+                 "\"started_at\":\"%s\"}\n",
+                 name, (int)pid, self_path, ts);
     if (n < 0 || n >= (int)sizeof(json))
     {
         return;
