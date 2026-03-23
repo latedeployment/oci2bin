@@ -7261,17 +7261,19 @@ static int vm_ch_copy_self_to_init(struct vm_ch_ctx* ctx, const char* dest_path)
         }
     }
     close(src_fd);
+    /* fchmod on the open fd avoids the TOCTOU race that chmod(path) has
+     * between close() and the subsequent path lookup. */
+    if (!copy_err && fchmod(dst_fd, 0755) < 0)
+    {
+        perror("oci2bin: fchmod rootfs/init");
+        copy_err = 1;
+    }
     if (close(dst_fd) < 0 || copy_err)
     {
         if (!copy_err)
         {
             perror("oci2bin: close rootfs/init");
         }
-        return -1;
-    }
-    if (chmod(dest_path, 0755) < 0)
-    {
-        perror("oci2bin: chmod rootfs/init");
         return -1;
     }
     return 0;
