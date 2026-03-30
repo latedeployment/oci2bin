@@ -3,15 +3,16 @@
 strip_image.py — remove docs/man/locale/cache files from a docker-save tar.
 
 Usage:
-    strip_image.py --input INPUT_TAR --output OUTPUT_TAR [--strip-prefix PREFIX ...]
+    strip_image.py --input INPUT_TAR --output OUTPUT_TAR
+                   [--strip-prefix PREFIX ...]
+                   [--no-autodetect]
 
---strip-prefix may be repeated.  If given, the supplied prefixes are used
-instead of the built-in defaults.  Prefixes must not start with '/' or
-contain '..'; leading './' is accepted and normalised.
+--strip-prefix may be repeated.  When given, the supplied prefixes replace
+the built-in defaults.  Prefixes must not start with '/' or contain '..'.
 
-Reads a docker-save OCI tar, extracts each layer tarball, rewrites each layer
-removing entries whose paths start with any of the strip prefixes, then writes
-a new image tar with the stripped layers.
+With --autodetect, the image is pre-scanned to detect installed package
+managers (apt, apk, pip, npm, dnf/yum, gem, Go, Cargo) and their cache paths
+are added automatically on top of the active prefix set.
 
 Pure Python, stdlib only.
 """
@@ -20,11 +21,12 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 
-# Path prefixes to strip from each layer (no leading slash — tar entries
-# typically start without one, but we strip either form).
+# ── built-in defaults ────────────────────────────────────────────────────────
+
 STRIP_PREFIXES = (
     'usr/share/doc/',
     'usr/share/man/',
@@ -36,33 +38,168 @@ STRIP_PREFIXES = (
     'tmp/',
 )
 
+# ── package-manager auto-detection tables ────────────────────────────────────
+
+# One marker path is enough to declare a PM present.
+# Paths are normalised (no leading './' or '/').
+_PM_MARKERS = {
+    'apt':   ('var/lib/dpkg/status', 'usr/bin/apt-get', 'usr/bin/dpkg'),
+    'apk':   ('sbin/apk', 'lib/apk/db/installed'),
+    'pip':   ('usr/bin/pip3', 'usr/bin/pip', 'usr/local/bin/pip3',
+               'usr/local/bin/pip'),
+    'npm':   ('usr/bin/npm', 'usr/lib/node_modules/npm'),
+    'dnf':   ('usr/bin/dnf', 'var/lib/rpm/Packages',
+               'var/lib/rpm/rpmdb.sqlite'),
+    'yum':   ('usr/bin/yum',),
+    'gem':   ('usr/bin/gem',),
+    'go':    ('usr/local/go/bin/go', 'usr/bin/go'),
+    'cargo': ('usr/local/cargo/bin/cargo', 'root/.cargo/bin/cargo'),
+}
+
+# Extra prefixes added when the corresponding PM is detected.
+_PM_EXTRA_PREFIXES = {
+    'apt':   ('var/cache/apt/', 'var/lib/apt/lists/'),
+    'apk':   ('var/cache/apk/', 'etc/apk/cache/'),
+    'pip':   ('root/.cache/pip/', 'home/app/.cache/pip/'),
+    'npm':   ('root/.npm/_cacache/', 'usr/lib/node_modules/.cache/',
+               'home/node/.npm/_cacache/'),
+    'dnf':   ('var/cache/dnf/', 'var/cache/yum/'),
+    'yum':   ('var/cache/yum/',),
+    'gem':   ('root/.gem/cache/', 'var/cache/rubygems/'),
+    'go':    ('root/go/pkg/mod/cache/', 'home/go/pkg/mod/cache/'),
+    'cargo': ('root/.cargo/registry/cache/',
+               'usr/local/cargo/registry/cache/'),
+}
+
+# Matches usr/lib/python3.X/ and usr/local/lib/python3.X/ directory entries.
+_PYTHON_LIB_RE = re.compile(
+    r'^(usr/(?:local/)?lib/python3\.\d+)/'
+)
+
+# Sub-directories inside each Python lib dir that are safe to strip.
+_PYTHON_STRIP_SUBDIRS = (
+    'test/',
+    'tests/',
+    'unittest/',
+    'turtledemo/',
+    'idlelib/',
+    'tkinter/',
+    '__pycache__/',
+)
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 def validate_prefix(p):
-    """Raise ValueError if p is unsafe to use as a strip prefix."""
+    """Raise ValueError if p is unsafe as a strip prefix."""
     if p.startswith('/'):
         raise ValueError(f"strip prefix must not start with '/': {p!r}")
     if '..' in p.split('/'):
         raise ValueError(f"strip prefix must not contain '..': {p!r}")
 
 
+def _norm(name):
+    """Normalise a tar member name: strip leading './' and '/'."""
+    return name.lstrip('./')
+
+
 def should_strip(name, prefixes):
-    """Return True if a tar entry name should be removed."""
-    # Normalise: remove leading './' or '/'
-    n = name.lstrip('./')
+    """Return True if a tar member name matches any active prefix."""
+    n = _norm(name)
     for prefix in prefixes:
         if n == prefix.rstrip('/') or n.startswith(prefix):
             return True
     return False
 
 
+def _iter_layer_names(input_tar):
+    """
+    Yield normalised member names from every layer in an image tar.
+    Silently skips layers that cannot be read.
+    """
+    try:
+        with tarfile.open(input_tar, 'r') as img_tf:
+            for member in img_tf.getmembers():
+                if not member.isfile():
+                    continue
+                name = member.name
+                if not (name.endswith('/layer.tar') or
+                        (name.endswith('.tar') and '/' in name)):
+                    continue
+                f = img_tf.extractfile(member)
+                if f is None:
+                    continue
+                layer_bytes = f.read()
+                try:
+                    mode_r = 'r:gz' if layer_bytes[:2] == b'\x1f\x8b' else 'r:'
+                    with tarfile.open(
+                            fileobj=io.BytesIO(layer_bytes),
+                            mode=mode_r) as layer_tf:
+                        for lm in layer_tf.getmembers():
+                            yield _norm(lm.name)
+                except tarfile.TarError:
+                    pass
+    except tarfile.TarError as e:
+        print(f"strip_image: warning: scan pass error: {e}", file=sys.stderr)
+
+
+def autodetect_extra_prefixes(input_tar):
+    """
+    Pre-scan the image to detect installed package managers.
+    Returns a (possibly empty) list of extra prefix strings to strip.
+    """
+    detected_pms = set()
+    python_lib_dirs = set()
+
+    for n in _iter_layer_names(input_tar):
+        for pm, markers in _PM_MARKERS.items():
+            if pm not in detected_pms:
+                for marker in markers:
+                    if n == marker or n.startswith(marker + '/'):
+                        detected_pms.add(pm)
+                        break
+        m = _PYTHON_LIB_RE.match(n)
+        if m:
+            python_lib_dirs.add(m.group(1) + '/')
+
+    if not detected_pms and not python_lib_dirs:
+        return []
+
+    extra = []
+    seen = set()
+
+    def _add(p):
+        p = p if p.endswith('/') else p + '/'
+        if p not in seen:
+            seen.add(p)
+            extra.append(p)
+
+    for pm in sorted(detected_pms):
+        for p in _PM_EXTRA_PREFIXES.get(pm, ()):
+            _add(p)
+
+    for pydir in sorted(python_lib_dirs):
+        for sub in _PYTHON_STRIP_SUBDIRS:
+            _add(pydir + sub)
+
+    if detected_pms or python_lib_dirs:
+        labels = sorted(detected_pms)
+        if python_lib_dirs:
+            labels.append('python(' + ', '.join(sorted(python_lib_dirs)) + ')')
+        print(f"strip_image: autodetected: {', '.join(labels)}", file=sys.stderr)
+
+    return extra
+
+
+# ── layer stripping ──────────────────────────────────────────────────────────
+
 def strip_layer(layer_bytes, prefixes):
     """
-    Read a gzip/raw layer tarball from bytes, strip unwanted entries,
-    and return the rewritten layer as bytes.
+    Rewrite a gzip/raw layer tarball, omitting entries that match prefixes.
+    Returns the rewritten bytes, or the original bytes on tar error.
     """
     src = io.BytesIO(layer_bytes)
     dst = io.BytesIO()
-
     try:
         mode_r = 'r:gz' if layer_bytes[:2] == b'\x1f\x8b' else 'r:'
         with tarfile.open(fileobj=src, mode=mode_r) as src_tf:
@@ -80,22 +217,34 @@ def strip_layer(layer_bytes, prefixes):
                         dst_tf.addfile(member)
     except tarfile.TarError as e:
         print(f"strip_image: warning: layer tar error: {e}", file=sys.stderr)
-        # Return original on error
         return layer_bytes
-
     return dst.getvalue()
 
 
-def strip_image(input_tar, output_tar, prefixes=None):
-    active = tuple(prefixes) if prefixes else STRIP_PREFIXES
-    # Ensure each prefix ends with '/' so startswith works correctly for dirs
-    active = tuple(p if p.endswith('/') else p + '/' for p in active)
+# ── main entry point ─────────────────────────────────────────────────────────
+
+def strip_image(input_tar, output_tar, prefixes=None, autodetect=False):
+    # Base prefix set: user-supplied or built-in defaults
+    base = tuple(prefixes) if prefixes else STRIP_PREFIXES
+    base = tuple(p if p.endswith('/') else p + '/' for p in base)
+
+    if autodetect:
+        extra = autodetect_extra_prefixes(input_tar)
+        seen = set(base)
+        active = list(base)
+        for p in extra:
+            if p not in seen:
+                seen.add(p)
+                active.append(p)
+        active = tuple(active)
+    else:
+        active = base
+
     stripped_total = 0
 
     with tarfile.open(input_tar, 'r') as src_tf:
         members = src_tf.getmembers()
 
-        # Read manifest.json
         manifest_bytes = None
         for m in members:
             if m.name == 'manifest.json':
@@ -118,16 +267,13 @@ def strip_image(input_tar, output_tar, prefixes=None):
                 if member.name in layer_names and f is not None:
                     original = f.read()
                     stripped = strip_layer(original, active)
-                    saved = len(original) - len(stripped)
-                    stripped_total += saved
+                    stripped_total += len(original) - len(stripped)
                     info = tarfile.TarInfo(name=member.name)
                     info.size = len(stripped)
                     info.mode = member.mode
                     info.mtime = member.mtime
                     out_tf.addfile(info, io.BytesIO(stripped))
                 elif member.name == 'manifest.json':
-                    # Re-write manifest with updated layer info
-                    # (digest field is informational; builder reads by offset)
                     info = tarfile.TarInfo(name='manifest.json')
                     info.size = len(manifest_bytes)
                     info.mode = member.mode
@@ -142,7 +288,7 @@ def strip_image(input_tar, output_tar, prefixes=None):
                 else:
                     out_tf.addfile(member)
 
-    print(f"strip_image: stripped ~{stripped_total // 1024} KiB of docs/locale/cache")
+    print(f"strip_image: stripped ~{stripped_total // 1024} KiB")
 
 
 def main():
@@ -153,7 +299,11 @@ def main():
     parser.add_argument('--output', required=True, help='Output OCI tar')
     parser.add_argument(
         '--strip-prefix', metavar='PREFIX', action='append', dest='prefixes',
-        help='Path prefix to strip (repeatable); replaces built-in defaults when given',
+        help='Path prefix to strip (repeatable); replaces built-in defaults',
+    )
+    parser.add_argument(
+        '--autodetect', action='store_true',
+        help='Scan layers to detect package managers and add their cache paths',
     )
     args = parser.parse_args()
 
@@ -169,7 +319,9 @@ def main():
                 print(f"strip_image: {e}", file=sys.stderr)
                 sys.exit(1)
 
-    strip_image(args.input, args.output, prefixes=args.prefixes)
+    strip_image(args.input, args.output,
+                prefixes=args.prefixes,
+                autodetect=args.autodetect)
 
 
 if __name__ == '__main__':

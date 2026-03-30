@@ -209,6 +209,26 @@ oci2bin --strip-prefix root/go/pkg/mod/cache/ golang:1.22 my-go
 
 `--strip-prefix` values must not start with `/` or contain `..`.
 
+#### Package-manager auto-detection
+
+Add `--strip-auto` to pre-scan image layers and automatically add extra cache paths for any package managers found:
+
+| Detected | Extra paths stripped |
+|---|---|
+| `apt` / `dpkg` | `var/cache/apt/`, `var/lib/apt/lists/` |
+| `apk` | `var/cache/apk/`, `etc/apk/cache/` |
+| `pip` | `root/.cache/pip/` |
+| `npm` | `root/.npm/_cacache/`, `usr/lib/node_modules/.cache/` |
+| `dnf` / `yum` | `var/cache/dnf/`, `var/cache/yum/` |
+| `gem` | `root/.gem/cache/` |
+| `go` | `root/go/pkg/mod/cache/` |
+| `cargo` | `root/.cargo/registry/cache/` |
+| Python stdlib | `usr/lib/python3.X/{test,tests,unittest,turtledemo,...}/` |
+
+```bash
+oci2bin --strip --strip-auto ubuntu:22.04 my-ubuntu
+```
+
 ### Squashing layers
 
 `--squash` merges all image layers into a single squashed layer before packaging. This reduces the number of layers and can shrink the output binary for images with many overlapping writes:

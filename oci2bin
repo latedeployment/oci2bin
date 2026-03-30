@@ -31,6 +31,7 @@
 #   --strip               Remove docs/man/locale/cache from the image before packaging
 #   --strip-prefix PREFIX Strip a custom path prefix instead of the built-in defaults
 #                         (may be repeated; each use implies --strip)
+#   --strip-auto          Auto-detect package managers and add their cache paths to --strip
 #   --add-file HOST:CONTAINER
 #                         Inject a host file into the image at build time (repeatable)
 #   --add-dir  HOST:CONTAINER
@@ -757,6 +758,7 @@ USE_CACHE=0
 LAYER_IMAGES=()
 DO_STRIP=0
 STRIP_PREFIX_ARGS=()
+STRIP_AUTO=0
 ADD_FILE_ARGS=()
 ADD_DIR_ARGS=()
 OCI_DIR=""
@@ -815,6 +817,10 @@ while [[ $# -gt 0 ]]; do
             DO_STRIP=1
             STRIP_PREFIX_ARGS+=("--strip-prefix" "$2")
             shift 2
+            ;;
+        --strip-auto)
+            STRIP_AUTO=1
+            shift
             ;;
         --add-file)
             [[ $# -lt 2 ]] && { echo "oci2bin: --add-file requires HOST:CONTAINER" >&2; exit 1; }
@@ -1157,7 +1163,8 @@ if [[ "$DO_STRIP" -eq 1 ]]; then
     python3 "$OCI2BIN_HOME/scripts/strip_image.py" \
         --input  "$BUILD_TAR_ARG" \
         --output "$STRIPPED_TAR" \
-        "${STRIP_PREFIX_ARGS[@]+"${STRIP_PREFIX_ARGS[@]}"}"
+        "${STRIP_PREFIX_ARGS[@]+"${STRIP_PREFIX_ARGS[@]}"}" \
+        $([[ "$STRIP_AUTO" -eq 1 ]] && echo "--autodetect")
     BUILD_TAR_ARG="$STRIPPED_TAR"
 fi
 
