@@ -193,7 +193,21 @@ oci2bin --strip ubuntu:22.04 my-ubuntu
 oci2bin --strip --layer extra:latest base:latest output
 ```
 
-Removed path prefixes: `usr/share/doc/`, `usr/share/man/`, `usr/share/info/`, `usr/share/locale/`, `usr/share/i18n/`, `var/cache/apt/`, `var/lib/apt/lists/`, `tmp/`.
+Default removed prefixes: `usr/share/doc/`, `usr/share/man/`, `usr/share/info/`, `usr/share/locale/`, `usr/share/i18n/`, `var/cache/apt/`, `var/lib/apt/lists/`, `tmp/`.
+
+Use `--strip-prefix` to strip different paths instead of the built-in defaults (each use also implies `--strip`):
+
+```bash
+# Strip only pip cache and compiled Python files
+oci2bin --strip-prefix usr/lib/python3/dist-packages/tests/ \
+        --strip-prefix root/.cache/pip/ \
+        python:3.12-slim my-python
+
+# Strip a Go module cache
+oci2bin --strip-prefix root/go/pkg/mod/cache/ golang:1.22 my-go
+```
+
+`--strip-prefix` values must not start with `/` or contain `..`.
 
 ### Squashing layers
 

@@ -3,7 +3,11 @@
 strip_image.py — remove docs/man/locale/cache files from a docker-save tar.
 
 Usage:
-    strip_image.py --input INPUT_TAR --output OUTPUT_TAR
+    strip_image.py --input INPUT_TAR --output OUTPUT_TAR [--strip-prefix PREFIX ...]
+
+--strip-prefix may be repeated.  If given, the supplied prefixes are used
+instead of the built-in defaults.  Prefixes must not start with '/' or
+contain '..'; leading './' is accepted and normalised.
 
 Reads a docker-save OCI tar, extracts each layer tarball, rewrites each layer
 removing entries whose paths start with any of the strip prefixes, then writes
@@ -33,17 +37,25 @@ STRIP_PREFIXES = (
 )
 
 
-def should_strip(name):
+def validate_prefix(p):
+    """Raise ValueError if p is unsafe to use as a strip prefix."""
+    if p.startswith('/'):
+        raise ValueError(f"strip prefix must not start with '/': {p!r}")
+    if '..' in p.split('/'):
+        raise ValueError(f"strip prefix must not contain '..': {p!r}")
+
+
+def should_strip(name, prefixes):
     """Return True if a tar entry name should be removed."""
     # Normalise: remove leading './' or '/'
     n = name.lstrip('./')
-    for prefix in STRIP_PREFIXES:
+    for prefix in prefixes:
         if n == prefix.rstrip('/') or n.startswith(prefix):
             return True
     return False
 
 
-def strip_layer(layer_bytes):
+def strip_layer(layer_bytes, prefixes):
     """
     Read a gzip/raw layer tarball from bytes, strip unwanted entries,
     and return the rewritten layer as bytes.
@@ -57,7 +69,7 @@ def strip_layer(layer_bytes):
             mode_w = 'w:gz' if layer_bytes[:2] == b'\x1f\x8b' else 'w:'
             with tarfile.open(fileobj=dst, mode=mode_w) as dst_tf:
                 for member in src_tf.getmembers():
-                    if should_strip(member.name):
+                    if should_strip(member.name, prefixes):
                         continue
                     if member.isfile():
                         f = src_tf.extractfile(member)
@@ -74,7 +86,10 @@ def strip_layer(layer_bytes):
     return dst.getvalue()
 
 
-def strip_image(input_tar, output_tar):
+def strip_image(input_tar, output_tar, prefixes=None):
+    active = tuple(prefixes) if prefixes else STRIP_PREFIXES
+    # Ensure each prefix ends with '/' so startswith works correctly for dirs
+    active = tuple(p if p.endswith('/') else p + '/' for p in active)
     stripped_total = 0
 
     with tarfile.open(input_tar, 'r') as src_tf:
@@ -102,7 +117,7 @@ def strip_image(input_tar, output_tar):
 
                 if member.name in layer_names and f is not None:
                     original = f.read()
-                    stripped = strip_layer(original)
+                    stripped = strip_layer(original, active)
                     saved = len(original) - len(stripped)
                     stripped_total += saved
                     info = tarfile.TarInfo(name=member.name)
@@ -136,13 +151,25 @@ def main():
     )
     parser.add_argument('--input', required=True, help='Input OCI tar')
     parser.add_argument('--output', required=True, help='Output OCI tar')
+    parser.add_argument(
+        '--strip-prefix', metavar='PREFIX', action='append', dest='prefixes',
+        help='Path prefix to strip (repeatable); replaces built-in defaults when given',
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
         print(f"strip_image: input not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    strip_image(args.input, args.output)
+    if args.prefixes:
+        for p in args.prefixes:
+            try:
+                validate_prefix(p)
+            except ValueError as e:
+                print(f"strip_image: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    strip_image(args.input, args.output, prefixes=args.prefixes)
 
 
 if __name__ == '__main__':
