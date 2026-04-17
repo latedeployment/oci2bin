@@ -100,7 +100,7 @@ def validate_prefix(p):
 
 def _norm(name):
     """Normalise a tar member name: strip leading './' and '/'."""
-    return name.lstrip('./')
+    return name.removeprefix('./').lstrip('/')
 
 
 def should_strip(name, prefixes):

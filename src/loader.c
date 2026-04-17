@@ -6526,11 +6526,19 @@ static int verify_signature(const char* key_path)
         return -1;
     }
 
-    /* Check that the verifier script is not writable by group/world */
+    /* Open the script fd first so stat and exec refer to the same inode,
+     * eliminating the TOCTOU race between permission check and execution. */
+    int script_fd = open(scripts_dir, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (script_fd < 0)
+    {
+        fprintf(stderr, "oci2bin: --verify-key: cannot open verifier script\n");
+        return -1;
+    }
     struct stat vst;
-    if (stat(scripts_dir, &vst) < 0)
+    if (fstat(script_fd, &vst) < 0)
     {
         fprintf(stderr, "oci2bin: --verify-key: cannot stat verifier script\n");
+        close(script_fd);
         return -1;
     }
     if (vst.st_mode & (S_IWGRP | S_IWOTH))
@@ -6538,19 +6546,26 @@ static int verify_signature(const char* key_path)
         fprintf(stderr,
                 "oci2bin: --verify-key: verifier script is group/world "
                 "writable — refusing to execute\n");
+        close(script_fd);
         return -1;
     }
 
+    /* Pass the already-open fd to python3 so the executed file is exactly
+     * the one we checked — no window for a rename() swap. */
+    char fd_path[32];
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", script_fd);
     char* args[] =
     {
         "/usr/bin/python3",
-        scripts_dir,
+        fd_path,
         "verify",
         "--key", (char*)key_path,
         "--in", self_path,
         NULL
     };
-    if (run_cmd(args) != 0)
+    int rc = run_cmd(args);
+    close(script_fd);
+    if (rc != 0)
     {
         fprintf(stderr,
                 "oci2bin: signature verification failed — "
@@ -7471,7 +7486,8 @@ static int vm_ch_build_cmdline(struct vm_ch_ctx* ctx,
     for (int vi = 0; vi < opts->n_vols; vi++)
     {
         if (strstr(opts->vol_ctr[vi], "..") != NULL ||
-                opts->vol_ctr[vi][0] != '/')
+                opts->vol_ctr[vi][0] != '/' ||
+                strchr(opts->vol_ctr[vi], ' ') != NULL)
         {
             fprintf(stderr, "oci2bin: -v container path invalid: %s\n",
                     opts->vol_ctr[vi]);
