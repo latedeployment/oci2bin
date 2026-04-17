@@ -1,16 +1,65 @@
 """
 Unit tests for strip_image.py helper functions.
 
-Covers: _norm, validate_prefix, should_strip.
+Covers: _norm, validate_prefix, should_strip, strip_layer,
+        autodetect_extra_prefixes.
 No Docker or filesystem access required.
 """
 
+import io
+import json
 import sys
 import os
+import tarfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
-from strip_image import _norm, validate_prefix, should_strip, STRIP_PREFIXES
+from strip_image import (
+    _norm, validate_prefix, should_strip, strip_layer,
+    autodetect_extra_prefixes, STRIP_PREFIXES,
+)
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _make_layer_tar(*names):
+    """Return raw (uncompressed) tar bytes containing empty files at *names*."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:') as tf:
+        for name in names:
+            info = tarfile.TarInfo(name=name)
+            info.size = 0
+            tf.addfile(info, io.BytesIO(b''))
+    return buf.getvalue()
+
+
+def _layer_names(layer_bytes):
+    """Return the list of member names in a raw-tar layer."""
+    with tarfile.open(fileobj=io.BytesIO(layer_bytes), mode='r:') as tf:
+        return [m.name for m in tf.getmembers()]
+
+
+def _make_image_tar(layers):
+    """
+    Build a minimal docker-save tar.
+
+    layers: list of (layer_filename, raw_tar_bytes) pairs.
+    Returns bytes of the image tar.
+    """
+    manifest = json.dumps([{'Layers': [fn for fn, _ in layers]}]).encode()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:') as tf:
+        # manifest.json
+        mi = tarfile.TarInfo(name='manifest.json')
+        mi.size = len(manifest)
+        tf.addfile(mi, io.BytesIO(manifest))
+        # each layer
+        for name, layer_bytes in layers:
+            li = tarfile.TarInfo(name=name)
+            li.size = len(layer_bytes)
+            tf.addfile(li, io.BytesIO(layer_bytes))
+    return buf.getvalue()
 
 
 class TestNorm(unittest.TestCase):
@@ -127,6 +176,126 @@ class TestShouldStrip(unittest.TestCase):
     def test_does_not_strip_tmpfs(self):
         # 'tmpfs' starts with 'tmp' but 'tmp/' prefix requires the slash
         self.assertFalse(should_strip('tmpfoo/bar', self._prefixes()))
+
+
+class TestStripLayer(unittest.TestCase):
+
+    def test_strips_matching_member(self):
+        layer = _make_layer_tar(
+            'usr/share/doc/foo/README',
+            'usr/bin/python3',
+        )
+        result = strip_layer(layer, list(STRIP_PREFIXES))
+        names = _layer_names(result)
+        self.assertNotIn('usr/share/doc/foo/README', names,
+                         'strip_layer: doc entry must be removed')
+        self.assertIn('usr/bin/python3', names,
+                      'strip_layer: non-doc entry must be preserved')
+
+    def test_preserves_all_when_no_match(self):
+        layer = _make_layer_tar('etc/passwd', 'usr/bin/ls')
+        result = strip_layer(layer, list(STRIP_PREFIXES))
+        self.assertEqual(set(_layer_names(result)), {'etc/passwd', 'usr/bin/ls'})
+
+    def test_strips_normalised_leading_dotslash(self):
+        # Tar members may have leading './' — must still be stripped
+        layer = _make_layer_tar('./usr/share/doc/foo', 'usr/bin/ls')
+        result = strip_layer(layer, list(STRIP_PREFIXES))
+        names = _layer_names(result)
+        self.assertNotIn('./usr/share/doc/foo', names,
+                         'strip_layer: leading ./ doc entry stripped')
+        self.assertIn('usr/bin/ls', names)
+
+    def test_strips_multiple_prefixes(self):
+        layer = _make_layer_tar(
+            'usr/share/doc/pkg/README',
+            'usr/share/man/man1/ls.1',
+            'usr/share/locale/fr/foo.mo',
+            'usr/bin/ls',
+        )
+        result = strip_layer(layer, list(STRIP_PREFIXES))
+        names = _layer_names(result)
+        self.assertNotIn('usr/share/doc/pkg/README', names)
+        self.assertNotIn('usr/share/man/man1/ls.1', names)
+        self.assertNotIn('usr/share/locale/fr/foo.mo', names)
+        self.assertIn('usr/bin/ls', names)
+
+    def test_returns_original_on_corrupt_tar(self):
+        bad = b'\x00' * 100
+        result = strip_layer(bad, list(STRIP_PREFIXES))
+        self.assertEqual(result, bad,
+                         'strip_layer: corrupt tar must return original bytes')
+
+    def test_empty_layer_roundtrip(self):
+        layer = _make_layer_tar()
+        result = strip_layer(layer, list(STRIP_PREFIXES))
+        self.assertEqual(_layer_names(result), [])
+
+    def test_custom_prefix(self):
+        layer = _make_layer_tar('root/.cache/pip/wheels/foo', 'usr/bin/pip3')
+        result = strip_layer(layer, ['root/.cache/pip/'])
+        names = _layer_names(result)
+        self.assertNotIn('root/.cache/pip/wheels/foo', names)
+        self.assertIn('usr/bin/pip3', names)
+
+
+class TestAutodetectExtraPrefixes(unittest.TestCase):
+
+    def _image_with_markers(self, *marker_names):
+        """Build a minimal image tar whose single layer contains *marker_names*."""
+        layer = _make_layer_tar(*marker_names)
+        return _make_image_tar([('layer.tar', layer)])
+
+    def test_detects_apt(self):
+        img = self._image_with_markers('var/lib/dpkg/status')
+        buf = io.BytesIO(img)
+        # autodetect_extra_prefixes expects a file path; write to tmp
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as f:
+            f.write(img)
+            tmp = f.name
+        try:
+            extra = autodetect_extra_prefixes(tmp)
+        finally:
+            os.unlink(tmp)
+        self.assertIn('var/cache/apt/', extra)
+        self.assertIn('var/lib/apt/lists/', extra)
+
+    def test_detects_pip(self):
+        import tempfile, os
+        img = self._image_with_markers('usr/bin/pip3')
+        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as f:
+            f.write(img)
+            tmp = f.name
+        try:
+            extra = autodetect_extra_prefixes(tmp)
+        finally:
+            os.unlink(tmp)
+        self.assertIn('root/.cache/pip/', extra)
+
+    def test_no_markers_returns_empty(self):
+        import tempfile, os
+        img = self._image_with_markers('etc/passwd', 'usr/bin/ls')
+        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as f:
+            f.write(img)
+            tmp = f.name
+        try:
+            extra = autodetect_extra_prefixes(tmp)
+        finally:
+            os.unlink(tmp)
+        self.assertEqual(extra, [])
+
+    def test_detects_npm(self):
+        import tempfile, os
+        img = self._image_with_markers('usr/bin/npm')
+        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as f:
+            f.write(img)
+            tmp = f.name
+        try:
+            extra = autodetect_extra_prefixes(tmp)
+        finally:
+            os.unlink(tmp)
+        self.assertIn('root/.npm/_cacache/', extra)
 
 
 if __name__ == '__main__':

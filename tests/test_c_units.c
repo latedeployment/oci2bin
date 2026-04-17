@@ -1413,6 +1413,396 @@ static void test_parse_opts_path_validation(void)
     }
 }
 
+/* ── test_json_escape_string ──────────────────────────────────────────────── */
+
+static void test_json_escape_string(void)
+{
+    char buf[256];
+
+    /* Plain ASCII — no escaping needed */
+    ASSERT_INT_EQ(json_escape_string("hello", buf, sizeof(buf)), 0,
+                  "json_escape_string: plain string returns 0");
+    ASSERT_STR_EQ(buf, "hello", "json_escape_string: plain string unchanged");
+
+    /* Empty string */
+    ASSERT_INT_EQ(json_escape_string("", buf, sizeof(buf)), 0,
+                  "json_escape_string: empty string returns 0");
+    ASSERT_STR_EQ(buf, "", "json_escape_string: empty string produces empty");
+
+    /* Double-quote in value must be escaped */
+    ASSERT_INT_EQ(json_escape_string("say \"hi\"", buf, sizeof(buf)), 0,
+                  "json_escape_string: quote escaping returns 0");
+    ASSERT_STR_EQ(buf, "say \\\"hi\\\"",
+                  "json_escape_string: quotes escaped correctly");
+
+    /* Backslash must be escaped */
+    ASSERT_INT_EQ(json_escape_string("a\\b", buf, sizeof(buf)), 0,
+                  "json_escape_string: backslash escaping returns 0");
+    ASSERT_STR_EQ(buf, "a\\\\b",
+                  "json_escape_string: backslash doubled");
+
+    /* Buffer exactly fits result (including NUL) — should succeed */
+    char small[4]; /* "ab" + NUL fits; "a\"" needs 4 bytes → "a\\\"" needs 5 */
+    ASSERT_INT_EQ(json_escape_string("ab", small, 3), 0,
+                  "json_escape_string: exact-fit buffer succeeds");
+
+    /* Buffer too small — must return -1, not overflow */
+    char tiny[3];
+    ASSERT_INT_EQ(json_escape_string("a\"b", tiny, 3), -1,
+                  "json_escape_string: buffer too small returns -1");
+}
+
+/* ── test_parse_id_value ──────────────────────────────────────────────────── */
+
+static void test_parse_id_value(void)
+{
+    long out;
+
+    /* Zero — valid */
+    out = -1;
+    ASSERT_INT_EQ(parse_id_value("0", 65534, &out), 0,
+                  "parse_id_value: 0 returns 0");
+    ASSERT_INT_EQ((int)out, 0, "parse_id_value: 0 stores 0");
+
+    /* Positive number within range */
+    out = -1;
+    ASSERT_INT_EQ(parse_id_value("1000", 65534, &out), 0,
+                  "parse_id_value: 1000 returns 0");
+    ASSERT_INT_EQ((int)out, 1000, "parse_id_value: 1000 stored");
+
+    /* Exact maximum */
+    out = -1;
+    ASSERT_INT_EQ(parse_id_value("65534", 65534, &out), 0,
+                  "parse_id_value: max value accepted");
+    ASSERT_INT_EQ((int)out, 65534, "parse_id_value: max value stored");
+
+    /* One over maximum — rejected */
+    ASSERT_INT_EQ(parse_id_value("65535", 65534, &out), -1,
+                  "parse_id_value: max+1 rejected");
+
+    /* Negative number — rejected */
+    ASSERT_INT_EQ(parse_id_value("-1", 65534, &out), -1,
+                  "parse_id_value: negative rejected");
+
+    /* Non-numeric — rejected */
+    ASSERT_INT_EQ(parse_id_value("abc", 65534, &out), -1,
+                  "parse_id_value: non-numeric rejected");
+
+    /* Trailing garbage — rejected */
+    ASSERT_INT_EQ(parse_id_value("123abc", 65534, &out), -1,
+                  "parse_id_value: trailing garbage rejected");
+
+    /* Empty string — rejected */
+    ASSERT_INT_EQ(parse_id_value("", 65534, &out), -1,
+                  "parse_id_value: empty string rejected");
+
+    /* NULL — rejected */
+    ASSERT_INT_EQ(parse_id_value(NULL, 65534, &out), -1,
+                  "parse_id_value: NULL rejected");
+}
+
+/* ── test_path_is_absolute_and_clean ─────────────────────────────────────── */
+
+static void test_path_is_absolute_and_clean(void)
+{
+    /* Valid absolute paths */
+    ASSERT(path_is_absolute_and_clean("/usr/bin/python3"),
+           "path_is_absolute_and_clean: deep absolute path accepted");
+    ASSERT(path_is_absolute_and_clean("/"),
+           "path_is_absolute_and_clean: root '/' accepted");
+    ASSERT(path_is_absolute_and_clean("/a/./b"),
+           "path_is_absolute_and_clean: single '.' component accepted");
+    ASSERT(path_is_absolute_and_clean("/usr/lib/python3..8"),
+           "path_is_absolute_and_clean: '..X' component name accepted");
+
+    /* Relative paths — rejected */
+    ASSERT(!path_is_absolute_and_clean("relative/path"),
+           "path_is_absolute_and_clean: relative path rejected");
+    ASSERT(!path_is_absolute_and_clean("./relative"),
+           "path_is_absolute_and_clean: ./ relative path rejected");
+
+    /* Paths with '..' component — rejected */
+    ASSERT(!path_is_absolute_and_clean("/usr/../etc"),
+           "path_is_absolute_and_clean: path with '..' rejected");
+    ASSERT(!path_is_absolute_and_clean("/.."),
+           "path_is_absolute_and_clean: '/..' rejected");
+
+    /* NULL and empty — rejected */
+    ASSERT(!path_is_absolute_and_clean(NULL),
+           "path_is_absolute_and_clean: NULL rejected");
+    ASSERT(!path_is_absolute_and_clean(""),
+           "path_is_absolute_and_clean: empty string rejected");
+}
+
+/* ── test_path_join_suffix ────────────────────────────────────────────────── */
+
+static void test_path_join_suffix(void)
+{
+    char buf[32];
+
+    /* Normal join */
+    ASSERT_INT_EQ(path_join_suffix(buf, sizeof(buf), "/tmp/dir", "/oci"), 0,
+                  "path_join_suffix: normal join returns 0");
+    ASSERT_STR_EQ(buf, "/tmp/dir/oci",
+                  "path_join_suffix: normal join result correct");
+
+    /* Result exactly fills buffer (base + suffix + NUL) */
+    char exact[13]; /* "/tmp/dir/oci" is 12 chars + NUL = 13 */
+    ASSERT_INT_EQ(path_join_suffix(exact, 13, "/tmp/dir", "/oci"), 0,
+                  "path_join_suffix: exact-fit buffer succeeds");
+
+    /* Result one byte too long — must return -1 */
+    char small[12];
+    ASSERT_INT_EQ(path_join_suffix(small, 12, "/tmp/dir", "/oci"), -1,
+                  "path_join_suffix: buffer too small returns -1");
+
+    /* Empty suffix */
+    ASSERT_INT_EQ(path_join_suffix(buf, sizeof(buf), "/tmp/dir", ""), 0,
+                  "path_join_suffix: empty suffix returns 0");
+    ASSERT_STR_EQ(buf, "/tmp/dir",
+                  "path_join_suffix: empty suffix result is base");
+}
+
+/* ── test_parse_opts_name ─────────────────────────────────────────────────── */
+
+static void test_parse_opts_name(void)
+{
+    struct container_opts opts;
+
+    /* Valid name */
+    {
+        char arg[] = "my-container_1";
+        char* argv[] = {"prog", "--name", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --name valid alphanumeric/dash returns 0");
+        ASSERT_STR_EQ(opts.name, "my-container_1",
+                      "parse_opts: --name value stored");
+    }
+
+    /* Space in name — rejected */
+    {
+        char arg[] = "bad name";
+        char* argv[] = {"prog", "--name", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --name with space rejected");
+    }
+
+    /* Slash in name — rejected */
+    {
+        char arg[] = "bad/name";
+        char* argv[] = {"prog", "--name", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --name with slash rejected");
+    }
+
+    /* 128-char name — accepted (boundary) */
+    {
+        char arg[129];
+        memset(arg, 'a', 128);
+        arg[128] = '\0';
+        char* argv[] = {"prog", "--name", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --name 128 chars (max) accepted");
+    }
+
+    /* 129-char name — rejected */
+    {
+        char arg[130];
+        memset(arg, 'a', 129);
+        arg[129] = '\0';
+        char* argv[] = {"prog", "--name", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --name 129 chars rejected");
+    }
+
+    /* Missing argument */
+    {
+        char* argv[] = {"prog", "--name", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --name missing arg returns -1");
+    }
+}
+
+/* ── test_parse_opts_limits ───────────────────────────────────────────────── */
+
+static void test_parse_opts_limits(void)
+{
+    struct container_opts opts;
+
+    /* MAX_VOLUMES (32) -v flags accepted; 33rd rejected */
+    {
+        /* Build argv with 32 -v flags */
+        /* Each -v takes 2 argv slots; plus prog = 65 total */
+        char specs[MAX_VOLUMES][32];
+        char* argv[MAX_VOLUMES * 2 + 2];
+        argv[0] = "prog";
+        int ai = 1;
+        for (int i = 0; i < MAX_VOLUMES; i++)
+        {
+            snprintf(specs[i], sizeof(specs[i]), "/host%d:/ctr%d", i, i);
+            argv[ai++] = "-v";
+            argv[ai++] = specs[i];
+        }
+        argv[ai] = NULL;
+
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(ai, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: MAX_VOLUMES -v flags accepted");
+        ASSERT_INT_EQ(opts.n_vols, MAX_VOLUMES,
+                      "parse_opts: n_vols == MAX_VOLUMES");
+    }
+
+    {
+        /* One more than MAX_VOLUMES */
+        char specs[MAX_VOLUMES + 1][32];
+        char* argv[MAX_VOLUMES * 2 + 4];
+        argv[0] = "prog";
+        int ai = 1;
+        for (int i = 0; i <= MAX_VOLUMES; i++)
+        {
+            snprintf(specs[i], sizeof(specs[i]), "/host%d:/ctr%d", i, i);
+            argv[ai++] = "-v";
+            argv[ai++] = specs[i];
+        }
+        argv[ai] = NULL;
+
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(ai, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: MAX_VOLUMES+1 -v flags rejected");
+    }
+
+    /* --add-host: valid HOST:IP accepted */
+    {
+        char arg[] = "myhost:192.168.1.1";
+        char* argv[] = {"prog", "--add-host", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --add-host valid returns 0");
+        ASSERT_INT_EQ(opts.n_add_hosts, 1,
+                      "parse_opts: --add-host n_add_hosts=1");
+    }
+
+    /* --add-host: missing colon rejected */
+    {
+        char arg[] = "myhost_192.168.1.1";
+        char* argv[] = {"prog", "--add-host", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --add-host missing colon rejected");
+    }
+
+    /* --add-host: missing argument rejected */
+    {
+        char* argv[] = {"prog", "--add-host", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --add-host missing arg returns -1");
+    }
+
+    /* --net slirp (no port-forward suffix) */
+    {
+        char arg[] = "slirp";
+        char* argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --net slirp returns 0");
+        ASSERT_STR_EQ(opts.net, "slirp",
+                      "parse_opts: --net slirp sets net=slirp");
+        ASSERT_INT_EQ(opts.n_portfwd, 0,
+                      "parse_opts: --net slirp n_portfwd=0");
+    }
+
+    /* --net pasta */
+    {
+        char arg[] = "pasta";
+        char* argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --net pasta returns 0");
+        ASSERT_STR_EQ(opts.net, "pasta",
+                      "parse_opts: --net pasta sets net=pasta");
+    }
+}
+
+/* ── test_build_exec_args_extended ────────────────────────────────────────── */
+
+static void test_build_exec_args_extended(void)
+{
+    struct oci_config cfg;
+    char* exec_args[16];
+
+    /* Multi-element entrypoint: ["/bin/sh", "-c"] + cmd ["echo", "hi"] */
+    {
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.entrypoint_json = strdup("[\"/bin/sh\",\"-c\"]");
+        cfg.cmd_json        = strdup("[\"echo\",\"hi\"]");
+        int n = build_exec_args(&cfg, NULL, NULL, 0, exec_args, 16);
+        ASSERT_INT_EQ(n, 4,
+                      "build_exec_args: multi-element ep + cmd = 4 args");
+        ASSERT_STR_EQ(exec_args[0], "/bin/sh",
+                      "build_exec_args: multi-ep [0]");
+        ASSERT_STR_EQ(exec_args[1], "-c",
+                      "build_exec_args: multi-ep [1]");
+        ASSERT_STR_EQ(exec_args[2], "echo",
+                      "build_exec_args: cmd[0] after multi-ep");
+        ASSERT_STR_EQ(exec_args[3], "hi",
+                      "build_exec_args: cmd[1] after multi-ep");
+        ASSERT_NULL(exec_args[4],
+                    "build_exec_args: null-terminated after multi-ep");
+        free(exec_args[0]);
+        free(exec_args[1]);
+        free(exec_args[2]);
+        free(exec_args[3]);
+        free_oci_config(&cfg);
+    }
+
+    /* max_args overflow: ep + cmd would exceed buffer; result capped and
+     * NULL-terminated within the buffer (no out-of-bounds write) */
+    {
+        memset(&cfg, 0, sizeof(cfg));
+        /* 4-element entrypoint; max_args=3 → only 3 fit */
+        cfg.entrypoint_json = strdup("[\"/a\",\"/b\",\"/c\",\"/d\"]");
+        int n = build_exec_args(&cfg, NULL, NULL, 0, exec_args, 3);
+        ASSERT_INT_EQ(n, 3,
+                      "build_exec_args: result capped at max_args");
+        ASSERT_NULL(exec_args[3],
+                    "build_exec_args: slot at max_args is NULL (null-terminated)");
+        for (int i = 0; i < 3; i++)
+        {
+            free(exec_args[i]);
+        }
+        free_oci_config(&cfg);
+    }
+
+    /* Both entrypoint_json and cmd_json are "null": fallback to /bin/sh */
+    {
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.entrypoint_json = strdup("null");
+        cfg.cmd_json        = strdup("null");
+        int n = build_exec_args(&cfg, NULL, NULL, 0, exec_args, 16);
+        ASSERT_INT_EQ(n, 1,
+                      "build_exec_args: both null → fallback /bin/sh count");
+        ASSERT_STR_EQ(exec_args[0], "/bin/sh",
+                      "build_exec_args: both null → fallback is /bin/sh");
+        free_oci_config(&cfg);
+    }
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1424,11 +1814,18 @@ int main(void)
     test_json_get_string_edge();
     test_json_get_array();
     test_json_parse_string_array();
+    test_json_escape_string();
     test_path_has_dotdot_component();
     test_path_has_dotdot_extra();
+    test_path_is_absolute_and_clean();
+    test_path_join_suffix();
+    test_parse_id_value();
     test_parse_opts();
     test_parse_opts_path_validation();
+    test_parse_opts_name();
+    test_parse_opts_limits();
     test_build_exec_args();
+    test_build_exec_args_extended();
     test_cap_name_to_num();
     test_parse_opts_resource_limits();
     test_parse_opts_user();
