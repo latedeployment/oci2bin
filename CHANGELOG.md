@@ -2,6 +2,61 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.9.0] - 2026-04-17
+
+### Added
+
+- **`--strip-prefix PREFIX`** — specify exact path prefixes to remove instead
+  of the built-in docs/locale/cache defaults. Repeatable; each use implies
+  `--strip`. Example: `oci2bin --strip-prefix root/.cache/pip/ python:3.12-slim`.
+
+- **`--strip-auto`** — pre-scan image layers to auto-detect installed package
+  managers (apt, apk, pip, npm, dnf/yum, gem, Go, Cargo, Python stdlib test
+  dirs) and add their cache paths to the strip set automatically. Opt-in.
+
+### Fixed
+
+- **TOCTOU in `--verify-key`** — replaced `stat(path)` + `exec(path)` with
+  `open` / `fstat` / exec via `/proc/self/fd/<n>` so the permission check and
+  the execution always refer to the same inode; a `rename()`-based swap between
+  the two calls is no longer possible.
+
+- **Kernel cmdline injection in VM mode** — `-v` container paths are now
+  rejected if they contain spaces before being appended to the kernel command
+  line, preventing injection of additional kernel parameters.
+
+- **`strip_image._norm` over-stripping** — replaced `lstrip('./')` with
+  `removeprefix('./').lstrip('/')` so filenames beginning with multiple dots
+  (e.g. `...hidden`) are no longer silently mangled.
+
+- **Early path validation in `parse_opts`** — `-v` host/container paths,
+  `--secret` host paths, and `--workdir` are now validated for absolute paths
+  and `..` components at argument-parse time, not deferred to container setup.
+
+- **`log_file` removed from container state JSON** — prevents leaking the log
+  path through the state file (CodeQL `cpp/system-data-exposure`).
+
+- **`chmod` → `fchmod`** — eliminates a TOCTOU race on the rootfs dev node
+  permission change.
+
+### Refactored
+
+- Eliminated four duplicate fork/exec/wait blocks via shared `run_cmd` and
+  `spawn_daemon` helpers.
+- Decomposed `run_as_vm_ch` into focused helper functions.
+- Moved 64 KB `cpbuf` from stack into `vm_ch_ctx` heap struct.
+
+### Tests
+
+- Added unit tests for previously-uncovered functions: `json_escape_string`,
+  `parse_id_value`, `path_is_absolute_and_clean`, `path_join_suffix`.
+- Added `parse_opts` boundary tests: `--name` allowlist/length, `--add-host`
+  colon check, MAX_VOLUMES (32) boundary, `--net slirp`/`pasta`.
+- Added `build_exec_args` tests: multi-element entrypoint, `max_args` overflow
+  cap, both-null fallback.
+- New `test_strip_image.py`: full coverage for `_norm`, `validate_prefix`,
+  `should_strip`, `strip_layer`, and `autodetect_extra_prefixes`.
+
 ## [0.8.0] - 2026-03-21
 
 ### Added
