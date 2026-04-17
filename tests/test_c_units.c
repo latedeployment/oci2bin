@@ -1309,6 +1309,110 @@ static void test_path_has_dotdot_extra(void)
            "path_has_dotdot_component: '//..' is traversal");
 }
 
+/* ── test_json_get_string_edge ────────────────────────────────────────────── */
+
+static void test_json_get_string_edge(void)
+{
+    /* Key exactly at the needle buffer limit (254 usable chars + 2 quotes = 256).
+     * json_skip_to_value must return NULL — not truncate and match a wrong key. */
+    char long_key[300];
+    memset(long_key, 'x', sizeof(long_key) - 1);
+    long_key[sizeof(long_key) - 1] = '\0';
+
+    /* Build {"<255-char key>":"value"} */
+    char json_buf[700];
+    snprintf(json_buf, sizeof(json_buf), "{\"%s\":\"value\"}", long_key);
+    char* v = json_get_string(json_buf, long_key);
+    ASSERT_NULL(v, "json_get_string: key > 254 chars returns NULL (needle overflow guard)");
+
+    /* Unterminated string value — no closing quote: must return NULL */
+    const char* bad = "{\"Key\":\"no closing quote}";
+    char* bad_val = json_get_string(bad, "Key");
+    ASSERT_NULL(bad_val, "json_get_string: unterminated value returns NULL");
+
+    /* Truncated escape at end of input: must return NULL */
+    const char* trunc = "{\"K\":\"val\\";
+    char* trunc_val = json_get_string(trunc, "K");
+    ASSERT_NULL(trunc_val, "json_get_string: truncated escape at EOI returns NULL");
+}
+
+/* ── test_parse_opts_path_validation ─────────────────────────────────────── */
+
+static void test_parse_opts_path_validation(void)
+{
+    struct container_opts opts;
+
+    /* -v: relative host path (no leading '/') must be rejected */
+    {
+        char spec[] = "relative/path:/ctr";
+        char* argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: -v relative host path rejected");
+    }
+
+    /* -v: host path with '..' must be rejected */
+    {
+        char spec[] = "/host/../etc:/ctr";
+        char* argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: -v host path with '..' rejected");
+    }
+
+    /* -v: container path with '..' must be rejected */
+    {
+        char spec[] = "/host:/ctr/../etc";
+        char* argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: -v container path with '..' rejected");
+    }
+
+    /* --secret: host path with '..' must be rejected */
+    {
+        char arg[] = "/host/../etc/passwd";
+        char* argv[] = {"prog", "--secret", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --secret host path with '..' rejected");
+    }
+
+    /* --secret: relative host path must be rejected */
+    {
+        char arg[] = "relative/secret.txt";
+        char* argv[] = {"prog", "--secret", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --secret relative host path rejected");
+    }
+
+    /* --workdir: path with '..' must be rejected */
+    {
+        char arg[] = "/app/../etc";
+        char* argv[] = {"prog", "--workdir", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --workdir with '..' rejected");
+    }
+
+    /* --tmpfs: path with '..' as a real component must be rejected */
+    {
+        char arg[] = "/run/../etc";
+        char* argv[] = {"prog", "--tmpfs", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --tmpfs path with '..' component rejected");
+    }
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1317,11 +1421,13 @@ int main(void)
     printf("TAP version 13\n");
 
     test_json_get_string();
+    test_json_get_string_edge();
     test_json_get_array();
     test_json_parse_string_array();
     test_path_has_dotdot_component();
     test_path_has_dotdot_extra();
     test_parse_opts();
+    test_parse_opts_path_validation();
     test_build_exec_args();
     test_cap_name_to_num();
     test_parse_opts_resource_limits();

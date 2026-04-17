@@ -5571,6 +5571,20 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             *colon = '\0';
+            if (!path_is_absolute_and_clean(spec))
+            {
+                fprintf(stderr,
+                        "oci2bin: -v host path must be absolute and clean: %s\n",
+                        spec);
+                return -1;
+            }
+            if (!path_is_absolute_and_clean(colon + 1))
+            {
+                fprintf(stderr,
+                        "oci2bin: -v container path must be absolute and clean: %s\n",
+                        colon + 1);
+                return -1;
+            }
             opts->vol_host[opts->n_vols] = spec;
             opts->vol_ctr[opts->n_vols]  = colon + 1;
             opts->n_vols++;
@@ -5622,10 +5636,24 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             i++;
             char* spec   = argv[i];
             char* colon  = strchr(spec, ':');
+            if (!path_is_absolute_and_clean(spec))
+            {
+                fprintf(stderr,
+                        "oci2bin: --secret host path must be absolute"
+                        " and clean: %s\n", spec);
+                return -1;
+            }
             opts->secret_host[opts->n_secrets] = spec;
             if (colon)
             {
                 *colon = '\0';
+                if (!path_is_absolute_and_clean(colon + 1))
+                {
+                    fprintf(stderr,
+                            "oci2bin: --secret container path must be"
+                            " absolute and clean: %s\n", colon + 1);
+                    return -1;
+                }
                 opts->secret_ctr[opts->n_secrets] = colon + 1;
             }
             else
@@ -5818,7 +5846,15 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 fprintf(stderr, "oci2bin: --workdir requires a path argument\n");
                 return -1;
             }
-            opts->workdir = argv[++i];
+            i++;
+            if (path_has_dotdot_component(argv[i]))
+            {
+                fprintf(stderr,
+                        "oci2bin: --workdir path must not contain"
+                        " '..' components: %s\n", argv[i]);
+                return -1;
+            }
+            opts->workdir = argv[i];
         }
         else if (strcmp(argv[i], "--net") == 0)
         {
