@@ -306,27 +306,130 @@ static void debug_dump_opts(const struct container_opts* opts)
     }
 }
 
-/*
- * Create each directory component of dir (mkdir -p equivalent).
- */
-static void mkdirs_for_state(const char* dir)
+static ssize_t read_all_fd(int fd, char* buf, size_t len);
+static int mkdir_p_secure(const char* path, mode_t leaf_mode, const char* what);
+
+static int read_proc_start_ticks(pid_t pid, unsigned long long* out)
 {
+    char path[64];
+    int n = snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    if (n < 0 || n >= (int)sizeof(path))
+    {
+        return -1;
+    }
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    char buf[4096];
+    ssize_t nr = read_all_fd(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (nr <= 0)
+    {
+        return -1;
+    }
+    buf[nr] = '\0';
+
+    char* rparen = strrchr(buf, ')');
+    if (!rparen || rparen[1] != ' ')
+    {
+        return -1;
+    }
+
+    char* fields[64];
+    int n_fields = 0;
+    char* field = rparen + 2;
+    while (field && *field && n_fields < (int)(sizeof(fields) / sizeof(fields[0])))
+    {
+        fields[n_fields++] = field;
+        char* space = strchr(field, ' ');
+        if (!space)
+        {
+            break;
+        }
+        *space = '\0';
+        field = space + 1;
+    }
+    if (n_fields <= 19)
+    {
+        return -1;
+    }
+
+    char* endp = NULL;
+    errno = 0;
+    unsigned long long ticks = strtoull(fields[19], &endp, 10);
+    if (errno != 0 || endp == fields[19] || *endp != '\0')
+    {
+        return -1;
+    }
+
+    *out = ticks;
+    return 0;
+}
+
+static int open_path_nofollow(const char* path, int flags, mode_t mode)
+{
+    if (!path || path[0] != '/')
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     char buf[PATH_MAX];
-    int n = snprintf(buf, sizeof(buf), "%s", dir);
+    int n = snprintf(buf, sizeof(buf), "%s", path + 1);
     if (n < 0 || n >= (int)sizeof(buf))
     {
-        return;
+        errno = ENAMETOOLONG;
+        return -1;
     }
-    for (char* p = buf + 1; *p; p++)
+
+    int cur_fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (cur_fd < 0)
     {
-        if (*p == '/')
+        return -1;
+    }
+
+    char* tok = buf;
+    while (*tok == '/')
+    {
+        tok++;
+    }
+    if (*tok == '\0')
+    {
+        close(cur_fd);
+        errno = EISDIR;
+        return -1;
+    }
+
+    char* slash = NULL;
+    while ((slash = strchr(tok, '/')) != NULL)
+    {
+        *slash = '\0';
+        if (*tok != '\0')
         {
-            *p = '\0';
-            mkdir(buf, 0755);
-            *p = '/';
+            int next = openat(cur_fd, tok,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                              O_CLOEXEC);
+            close(cur_fd);
+            if (next < 0)
+            {
+                return -1;
+            }
+            cur_fd = next;
+        }
+        tok = slash + 1;
+        while (*tok == '/')
+        {
+            tok++;
         }
     }
-    mkdir(buf, 0755);
+
+    int fd = openat(cur_fd, tok, flags | O_NOFOLLOW | O_CLOEXEC, mode);
+    close(cur_fd);
+    return fd;
 }
 
 /*
@@ -352,7 +455,7 @@ static void write_container_state(const char* name, pid_t pid,
             return;
         }
     }
-    if (strstr(home, ".."))
+    if (home[0] != '/' || strstr(home, ".."))
     {
         return;
     }
@@ -373,7 +476,13 @@ static void write_container_state(const char* name, pid_t pid,
     {
         return;
     }
-    mkdirs_for_state(dir);
+    if (mkdir_p_secure(dir, 0700, "container state") < 0)
+    {
+        return;
+    }
+
+    unsigned long long start_ticks = 0;
+    (void)read_proc_start_ticks(pid, &start_ticks);
 
     char log_path[PATH_MAX];
     n = snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, name);
@@ -385,11 +494,21 @@ static void write_container_state(const char* name, pid_t pid,
     /* Redirect stdout/stderr to log file (detached child) */
     if (redirect_output)
     {
-        int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        int log_fd = open_path_nofollow(log_path,
+                                        O_WRONLY | O_CREAT | O_APPEND,
+                                        0600);
         if (log_fd >= 0)
         {
-            dup2(log_fd, STDOUT_FILENO);
-            dup2(log_fd, STDERR_FILENO);
+            if (dup2(log_fd, STDOUT_FILENO) < 0)
+            {
+                close(log_fd);
+                return;
+            }
+            if (dup2(log_fd, STDERR_FILENO) < 0)
+            {
+                close(log_fd);
+                return;
+            }
             close(log_fd);
         }
     }
@@ -427,14 +546,16 @@ static void write_container_state(const char* name, pid_t pid,
     char json[2048];
     n = snprintf(json, sizeof(json),
                  "{\"name\":\"%s\",\"pid\":%d,\"binary\":\"%s\","
-                 "\"started_at\":\"%s\"}\n",
-                 name, (int)pid, self_path, ts);
+                 "\"started_at\":\"%s\",\"start_ticks\":%llu}\n",
+                 name, (int)pid, self_path, ts, start_ticks);
     if (n < 0 || n >= (int)sizeof(json))
     {
         return;
     }
 
-    int fd = open(state_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open_path_nofollow(state_path,
+                                O_WRONLY | O_CREAT | O_TRUNC,
+                                0600);
     if (fd < 0)
     {
         return;
@@ -1254,6 +1375,20 @@ static int write_file(const char* path, const char* data, size_t len)
     return rc;
 }
 
+static int write_file_beneath(int rootfs_fd, const char* rel_path,
+                              const char* data, size_t len, mode_t mode)
+{
+    int fd = openat_beneath(rootfs_fd, rel_path,
+                            O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    int rc = write_all_fd(fd, data, len);
+    close(fd);
+    return rc;
+}
+
 /*
  * Resolve a username to numeric UID:GID using rootfs/etc/passwd.
  * Stores "uid:gid" in out (at least 32 bytes).  Returns 0 on success.
@@ -1601,7 +1736,15 @@ static int run_cmd(char* const argv[])
         _exit(127);
     }
     int status;
-    waitpid(pid, &status, 0);
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        perror("waitpid");
+        return -1;
+    }
     debug_log("run_cmd.exit", "status=%d", WIFEXITED(status) ?
               WEXITSTATUS(status) : -1);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -1822,65 +1965,66 @@ static char* extract_oci_rootfs(const char* self_path)
         char* workdir    = json_get_string(config, "WorkingDir");
         char* img_user   = json_get_string(config, "User");
 
-        char info_path[PATH_MAX];
-        if (snprintf(info_path, sizeof(info_path), "%s/.oci2bin_config", rootfs)
-                < (int)sizeof(info_path))
+        /* Allocate generously — Env arrays can be large */
+        size_t bufsz = 16384;
+        char*  info_buf = calloc(1, bufsz);
+        if (info_buf)
         {
-            /* Allocate generously — Env arrays can be large */
-            size_t bufsz = 16384;
-            char*  info_buf = calloc(1, bufsz);
-            if (info_buf)
+            /* JSON-escape WorkingDir and User to prevent injection */
+            char workdir_escaped[PATH_MAX * 2];
+            const char* wdir_safe = NULL;
+            if (workdir)
             {
-                /* JSON-escape WorkingDir and User to prevent injection */
-                char workdir_escaped[PATH_MAX * 2];
-                const char* wdir_safe = NULL;
-                if (workdir)
+                if (json_escape_string(workdir, workdir_escaped,
+                                       sizeof(workdir_escaped)) == 0)
                 {
-                    if (json_escape_string(workdir, workdir_escaped,
-                                           sizeof(workdir_escaped)) == 0)
-                    {
-                        wdir_safe = workdir_escaped;
-                    }
+                    wdir_safe = workdir_escaped;
                 }
-                /* Resolve username to numeric uid:gid now, before
-                 * patch_rootfs_ids() rewrites /etc/passwd to uid=0 */
-                char user_resolved[64] = {0};
-                char user_escaped[512];
-                const char* user_safe = NULL;
-                if (img_user && img_user[0])
-                {
-                    const char* user_src = img_user;
-                    if (resolve_user_in_rootfs(rootfs, img_user,
-                                               user_resolved,
-                                               sizeof(user_resolved)) == 0)
-                    {
-                        user_src = user_resolved;
-                    }
-                    if (json_escape_string(user_src, user_escaped,
-                                           sizeof(user_escaped)) == 0)
-                    {
-                        user_safe = user_escaped;
-                    }
-                }
-                int n = snprintf(info_buf, bufsz,
-                                 "{\"Cmd\":%s,\"Entrypoint\":%s,"
-                                 "\"Env\":%s,\"WorkingDir\":%s%s%s,"
-                                 "\"User\":%s%s%s}",
-                                 cmd        ? cmd        : "null",
-                                 entrypoint ? entrypoint : "null",
-                                 env_json   ? env_json   : "null",
-                                 wdir_safe  ? "\""       : "null",
-                                 wdir_safe  ? wdir_safe  : "",
-                                 wdir_safe  ? "\""       : "",
-                                 user_safe  ? "\""       : "null",
-                                 user_safe  ? user_safe  : "",
-                                 user_safe  ? "\""       : "");
-                if (n > 0 && (size_t)n < bufsz)
-                {
-                    write_file(info_path, info_buf, strlen(info_buf));
-                }
-                free(info_buf);
             }
+            /* Resolve username to numeric uid:gid now, before
+             * patch_rootfs_ids() rewrites /etc/passwd to uid=0 */
+            char user_resolved[64] = {0};
+            char user_escaped[512];
+            const char* user_safe = NULL;
+            if (img_user && img_user[0])
+            {
+                const char* user_src = img_user;
+                if (resolve_user_in_rootfs(rootfs, img_user,
+                                           user_resolved,
+                                           sizeof(user_resolved)) == 0)
+                {
+                    user_src = user_resolved;
+                }
+                if (json_escape_string(user_src, user_escaped,
+                                       sizeof(user_escaped)) == 0)
+                {
+                    user_safe = user_escaped;
+                }
+            }
+            int n = snprintf(info_buf, bufsz,
+                             "{\"Cmd\":%s,\"Entrypoint\":%s,"
+                             "\"Env\":%s,\"WorkingDir\":%s%s%s,"
+                             "\"User\":%s%s%s}",
+                             cmd        ? cmd        : "null",
+                             entrypoint ? entrypoint : "null",
+                             env_json   ? env_json   : "null",
+                             wdir_safe  ? "\""       : "null",
+                             wdir_safe  ? wdir_safe  : "",
+                             wdir_safe  ? "\""       : "",
+                             user_safe  ? "\""       : "null",
+                             user_safe  ? user_safe  : "",
+                             user_safe  ? "\""       : "");
+            if (n > 0 && (size_t)n < bufsz)
+            {
+                int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                if (rootfs_fd >= 0)
+                {
+                    (void)write_file_beneath(rootfs_fd, ".oci2bin_config",
+                                             info_buf, strlen(info_buf), 0644);
+                    close(rootfs_fd);
+                }
+            }
+            free(info_buf);
         }
 
         free(cmd);

@@ -252,6 +252,7 @@ test-python:
 	@echo "=== Python unit tests ==="
 	@mkdir -p $(TEST_TMPDIR)
 	$(TEST_ENV) python3 -m unittest discover -s tests -p 'test_build.py' -v
+	$(TEST_ENV) python3 -m unittest tests.test_add_files -v
 	$(TEST_ENV) python3 -m unittest tests.test_build_meta -v
 	@echo "=== Polyglot structure tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v

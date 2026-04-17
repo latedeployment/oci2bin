@@ -156,6 +156,42 @@ usage() {
     exit 1
 }
 
+container_state_dir_or_die() {
+    python3 - "${HOME:-}" <<'PYEOF'
+import os
+import sys
+
+home = sys.argv[1]
+if not home or not os.path.isabs(home):
+    print("oci2bin: HOME must be an absolute path", file=sys.stderr)
+    sys.exit(1)
+
+home_parts = [part for part in home.split("/") if part]
+if any(part == ".." for part in home_parts):
+    print("oci2bin: HOME must not contain '..' components", file=sys.stderr)
+    sys.exit(1)
+
+state_dir = os.path.join(home, ".cache", "oci2bin", "containers")
+parts = [part for part in state_dir.split("/") if part]
+cur = "/"
+for part in parts:
+    cur = os.path.join(cur, part)
+    try:
+        os.lstat(cur)
+    except FileNotFoundError:
+        continue
+    except OSError as exc:
+        print(f"oci2bin: lstat {cur}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if os.path.islink(cur):
+        print(f"oci2bin: state path contains symlink component: {cur}",
+              file=sys.stderr)
+        sys.exit(1)
+
+print(state_dir)
+PYEOF
+}
+
 # ── exec subcommand ──────────────────────────────────────────────────────
 # Usage: oci2bin exec <PID> [--] <CMD> [ARGS...]
 # Joins the namespaces of a running container by PID and executes CMD inside.
@@ -605,7 +641,7 @@ fi
 
 if [[ "${1:-}" == "ps" ]]; then
     shift
-    CTR_DIR="$HOME/.cache/oci2bin/containers"
+    CTR_DIR="$(container_state_dir_or_die)"
     python3 - "$CTR_DIR" <<'PYEOF'
 import json, os, sys
 ctr_dir = sys.argv[1]
@@ -619,11 +655,14 @@ for name in sorted(os.listdir(ctr_dir)):
     if not name.endswith('.json'):
         continue
     path = os.path.join(ctr_dir, name)
-    try:
-        d = json.load(open(path))
-    except (json.JSONDecodeError, OSError):
+    if os.path.islink(path):
         continue
-    pid = d.get('pid', 0)
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        pid = int(d.get('pid', 0))
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        continue
     try:
         os.kill(pid, 0)
         status = "running"
@@ -653,14 +692,66 @@ if [[ "${1:-}" == "stop" ]]; then
         echo "oci2bin stop: invalid name '$1'" >&2
         exit 1
     fi
-    STATE_FILE="$HOME/.cache/oci2bin/containers/$1.json"
+    STATE_DIR="$(container_state_dir_or_die)"
+    STATE_FILE="$STATE_DIR/$1.json"
     if [[ ! -f "$STATE_FILE" ]]; then
         echo "oci2bin stop: no container named '$1'" >&2
         exit 1
     fi
-    STOP_PID="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('pid',0))" "$STATE_FILE")"
+    if [[ -L "$STATE_FILE" ]]; then
+        echo "oci2bin stop: refusing symlinked state file '$STATE_FILE'" >&2
+        exit 1
+    fi
+    mapfile -t STOP_INFO < <(python3 - "$STATE_FILE" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+print(data.get("pid", 0))
+print(data.get("binary", ""))
+print(data.get("start_ticks", 0))
+PYEOF
+)
+    STOP_PID="${STOP_INFO[0]:-0}"
+    STOP_BINARY="${STOP_INFO[1]:-}"
+    STOP_START_TICKS="${STOP_INFO[2]:-0}"
     if ! [[ "$STOP_PID" =~ ^[0-9]+$ ]]; then
         echo "oci2bin stop: invalid PID in state file" >&2
+        rm -f "$STATE_FILE"
+        exit 1
+    fi
+    if ! [[ "$STOP_START_TICKS" =~ ^[0-9]+$ ]] || [[ -z "$STOP_BINARY" ]]; then
+        echo "oci2bin stop: state file is missing process identity fields" >&2
+        exit 1
+    fi
+    state_matches_process() {
+        local proc_exe proc_ticks
+        proc_exe="$(readlink "/proc/$STOP_PID/exe" 2>/dev/null || true)"
+        [[ "$proc_exe" == "$STOP_BINARY" ]] || return 1
+        proc_ticks="$(python3 - "$STOP_PID" <<'PYEOF'
+import sys
+try:
+    with open(f"/proc/{sys.argv[1]}/stat", encoding="utf-8") as f:
+        raw = f.read().strip()
+except OSError:
+    sys.exit(1)
+rparen = raw.rfind(")")
+if rparen < 0:
+    sys.exit(1)
+fields = raw[rparen + 2:].split()
+if len(fields) <= 19:
+    sys.exit(1)
+print(fields[19])
+PYEOF
+)" || return 1
+        [[ "$proc_ticks" == "$STOP_START_TICKS" ]]
+    }
+    if ! kill -0 "$STOP_PID" 2>/dev/null; then
+        rm -f "$STATE_FILE"
+        echo "oci2bin stop: '$1' is not running; stale state removed" >&2
+        exit 0
+    fi
+    if ! state_matches_process; then
+        echo "oci2bin stop: state file no longer matches PID $STOP_PID; refusing to signal" >&2
         rm -f "$STATE_FILE"
         exit 1
     fi
@@ -672,6 +763,11 @@ if [[ "${1:-}" == "stop" ]]; then
             sleep 1
         done
         if kill -0 "$STOP_PID" 2>/dev/null; then
+            if ! state_matches_process; then
+                echo "oci2bin stop: PID $STOP_PID changed identity before SIGKILL; aborting hard kill" >&2
+                rm -f "$STATE_FILE"
+                exit 1
+            fi
             echo "oci2bin stop: sending SIGKILL to PID $STOP_PID..." >&2
             kill -KILL "$STOP_PID" 2>/dev/null || true
         fi
@@ -696,15 +792,24 @@ if [[ "${1:-}" == "logs" ]]; then
         echo "oci2bin logs: invalid name '$1'" >&2
         exit 1
     fi
-    STATE_FILE="$HOME/.cache/oci2bin/containers/$1.json"
+    STATE_DIR="$(container_state_dir_or_die)"
+    STATE_FILE="$STATE_DIR/$1.json"
     if [[ ! -f "$STATE_FILE" ]]; then
         echo "oci2bin logs: no container named '$1'" >&2
         exit 1
     fi
+    if [[ -L "$STATE_FILE" ]]; then
+        echo "oci2bin logs: refusing symlinked state file '$STATE_FILE'" >&2
+        exit 1
+    fi
     # Log path is always deterministic — reconstruct rather than read from JSON.
-    LOG_FILE="$HOME/.cache/oci2bin/containers/$1.log"
+    LOG_FILE="$STATE_DIR/$1.log"
     if [[ ! -f "$LOG_FILE" ]]; then
         echo "oci2bin logs: log file not found for '$1'" >&2
+        exit 1
+    fi
+    if [[ -L "$LOG_FILE" ]]; then
+        echo "oci2bin logs: refusing symlinked log file '$LOG_FILE'" >&2
         exit 1
     fi
     if [[ "$LOGS_FOLLOW" -eq 1 ]]; then
@@ -989,14 +1094,15 @@ if [[ "${1:-}" == "top" ]]; then
                 ;;
         esac
     done
-    exec python3 - "$TOP_ONCE" "$TOP_INTERVAL" <<'PYEOF'
+    TOP_STATE_DIR="$(container_state_dir_or_die)"
+    exec python3 - "$TOP_ONCE" "$TOP_INTERVAL" "$TOP_STATE_DIR" <<'PYEOF'
 import json
 import os
 import sys
 import time
 from pathlib import Path
 
-STATE_DIR = Path.home() / ".cache" / "oci2bin" / "containers"
+STATE_DIR = Path(sys.argv[3])
 CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 PAGESIZE = os.sysconf("SC_PAGE_SIZE")
 CPU_COUNT = max(1, os.cpu_count() or 1)
@@ -1062,6 +1168,8 @@ def snapshot():
     if not STATE_DIR.is_dir():
         return rows
     for state in sorted(STATE_DIR.glob("*.json")):
+        if state.is_symlink():
+            continue
         try:
             info = json.loads(state.read_text(encoding="utf-8"))
             pid = int(info.get("pid", 0))

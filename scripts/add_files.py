@@ -125,8 +125,11 @@ def add_files(input_tar, output_tar, files, dirs):
         if 'rootfs' in config:
             config['rootfs'].setdefault('diff_ids', []).append(layer_digest)
 
+        new_config_bytes = json.dumps(config).encode()
+        new_config_sha = hashlib.sha256(new_config_bytes).hexdigest()
+        new_config_name = f'blobs/sha256/{new_config_sha}'
+        manifest[0]['Config'] = new_config_name
         new_manifest_bytes = json.dumps(manifest).encode()
-        new_config_bytes   = json.dumps(config).encode()
 
         with tarfile.open(output_tar, 'w') as out_tf:
             for m in members:
@@ -139,7 +142,7 @@ def add_files(input_tar, output_tar, files, dirs):
                     info.mtime = m.mtime
                     out_tf.addfile(info, io.BytesIO(new_manifest_bytes))
                 elif m.name == config_name:
-                    info = tarfile.TarInfo(name=config_name)
+                    info = tarfile.TarInfo(name=new_config_name)
                     info.size  = len(new_config_bytes)
                     info.mode  = m.mode
                     info.mtime = m.mtime
