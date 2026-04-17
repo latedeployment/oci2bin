@@ -65,9 +65,13 @@ See below [How it works](#how-it-works).
   - [push](#push)
   - [sbom](#sbom)
   - [update](#update)
+  - [run](#run)
+  - [systemd](#systemd)
+  - [healthcheck](#healthcheck)
   - [ps](#ps)
   - [stop](#stop)
   - [logs](#logs)
+  - [top](#top)
 - [Testing](#testing)
 - [How it works](#how-it-works)
 - [References](#references)
@@ -301,6 +305,10 @@ oci2bin: image digest: redis@sha256:abc123...
 ```
 
 When `--cache` is active, the cache key includes the digest so that `redis:latest` updates produce a fresh cache entry rather than reusing a stale binary. If the image has no registry origin (locally built), the digest lookup is skipped with a warning and the tag-only key is used.
+
+`--self-update-url URL` embeds the URL of a signed update manifest into the binary metadata. At runtime, `--check-update` and `--self-update` fetch that manifest, verify its detached signature with the user-supplied `--verify-key`, and then compare versions and hashes before replacing the binary.
+
+`--pin-digest auto` keeps the legacy SHA-256 behavior. Stronger hashes are also supported with an explicit prefix such as `--pin-digest sha512:auto` or `--pin-digest sha512:<hex>`. On startup, the loader recomputes the canonical digest (with the digest field zeroed before hashing) before extraction and aborts if it does not match. This is most useful together with signatures: the digest gives a stable integrity assertion, while the external key provides the trust anchor.
 
 ### VM-mode binaries (oci2vm)
 
@@ -982,7 +990,10 @@ openssl ec -in signing.key -pubout -out signing.pub
 
 # Sign a binary (in-place or to a new file)
 oci2bin sign --key signing.key --in ./redis_7-alpine
-oci2bin sign --key signing.key --in ./redis_7-alpine --out ./redis_7-alpine.signed
+oci2bin sign --key signing.key --hash-algorithm sha512 --in ./redis_7-alpine --out ./redis_7-alpine.signed
+
+# Sign a detached update manifest or checksum file
+oci2bin sign-file --key signing.key --hash-algorithm sha512 --in ./update.json --out ./update.json.sig
 ```
 
 ### Verifying
@@ -994,11 +1005,28 @@ echo $?   # 0 = OK, 1 = not signed, 2 = invalid
 
 # Loader-side verification: abort before any write if signature is wrong
 ./redis_7-alpine --verify-key /etc/oci2bin/trusted.pub
+
+# Verify a detached manifest signature
+oci2bin verify-file --key signing.pub --in ./update.json --sig ./update.json.sig
 ```
+
+`oci2bin sign` and `oci2bin sign-file` accept `--hash-algorithm sha256|sha512` and default to `sha512`. `verify` and `verify-file` auto-detect the hash from the stored signature metadata, while still accepting legacy SHA-256 signatures.
 
 `--verify-key` checks the signature at startup, before any rootfs extraction.
 If verification fails the process exits immediately without writing a single byte
 to disk.
+
+For self-updating binaries, point `--self-update-url` at a JSON manifest and sign that manifest with `sign-file`. The manifest format is:
+
+```json
+{
+  "version": "1.4.2",
+  "url": "https://example.com/releases/mybinary",
+  "digest": "sha512:abc123..."
+}
+```
+
+`digest` accepts `sha256` or `sha512`. Legacy manifests with a top-level `sha256` field are still accepted for compatibility. Store the detached signature next to it as `update.json.sig`. Runtime update checks require `--verify-key /path/to/vendor.pub`.
 
 ---
 
@@ -1159,6 +1187,47 @@ oci2bin update ./redis_7-alpine
 
 Reads the embedded image name from the binary's metadata block, pulls the latest version of that image, rebuilds the polyglot, and atomically replaces the original file. Useful for updating binaries when the upstream image is refreshed.
 
+`--check` performs the comparison only:
+
+```bash
+oci2bin update --check ./redis_7-alpine
+```
+
+If the binary was built with `--self-update-url`, `oci2bin update --check --verify-key PUBKEY BINARY` delegates to the embedded signed-manifest flow instead of Docker digest comparison.
+
+### run
+
+Build and execute an image in one step without keeping the generated binary:
+
+```bash
+oci2bin run alpine:latest -- /bin/sh -c 'echo hello'
+oci2bin run --strip redis:7-alpine -- redis-server --version
+```
+
+Build options come before `IMAGE`. Everything after `IMAGE` is passed to the temporary binary as runtime arguments.
+
+### systemd
+
+Generate a ready-to-use systemd unit file for a binary:
+
+```bash
+oci2bin systemd ./redis_7-alpine --restart always > redis_7-alpine.service
+oci2bin systemd ./vaultwarden --user > ~/.config/systemd/user/vaultwarden.service
+```
+
+The generated unit derives its description and name from embedded metadata and OCI labels when available, uses the current user for system units, and defaults to `Restart=on-failure`.
+
+### healthcheck
+
+Run the embedded OCI `HEALTHCHECK` command:
+
+```bash
+oci2bin healthcheck ./redis_7-alpine
+oci2bin healthcheck ./redis_7-alpine --pid 12345
+```
+
+Without `--pid`, the healthcheck runs in a fresh container execution. With `--pid`, `oci2bin` uses `nsenter` to run the check inside the namespaces of an already-running container process.
+
 ### ps
 
 List named containers that were started with `--detach --name`:
@@ -1192,6 +1261,17 @@ oci2bin logs myredis          # print all logs
 oci2bin logs -f myredis       # follow (tail -f)
 oci2bin logs --follow myredis
 ```
+
+### top
+
+Show a live view of named running containers:
+
+```bash
+oci2bin top
+oci2bin top --once
+```
+
+The display reports CPU percentage, memory, PID count, uptime, and binary name for each running container listed under `~/.cache/oci2bin/containers/`. When a cgroup v2 path is visible for the process, `top` reads memory and PID counts from that cgroup; otherwise it falls back to `/proc`.
 
 ---
 

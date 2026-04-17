@@ -203,6 +203,10 @@ struct container_opts
     /* --verify-key PATH  (verify binary signature before execution) */
     char* verify_key;
 
+    /* --self-update / --check-update (signed manifest flow before extraction) */
+    int self_update;
+    int check_update;
+
     /* --debug (print verbose runtime diagnostics for troubleshooting) */
     int debug;
 
@@ -5295,6 +5299,9 @@ static void usage(const char* prog)
             " via cgroup v2\n"
             "  --verify-key PATH   Verify binary signature before extraction;"
             " abort if invalid\n"
+            "  --check-update      Check the embedded signed update manifest and exit\n"
+            "  --self-update       Download and atomically replace the binary if"
+            " a newer signed update exists\n"
             "  --env-file FILE     Load KEY=VALUE pairs from FILE\n"
             "  --tmpfs PATH        Mount a fresh tmpfs at PATH inside the container\n"
             "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
@@ -6267,6 +6274,14 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             }
             opts->verify_key = argv[i];
         }
+        else if (strcmp(argv[i], "--self-update") == 0)
+        {
+            opts->self_update = 1;
+        }
+        else if (strcmp(argv[i], "--check-update") == 0)
+        {
+            opts->check_update = 1;
+        }
         else if (strcmp(argv[i], "--cap-drop") == 0)
         {
             if (i + 1 >= argc)
@@ -6520,40 +6535,66 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
  * Never uses a shell. Returns 0 on success, -1 on failure.
  * Aborts the process on invalid signature.
  */
-static int verify_signature(const char* key_path)
+static int open_verifier_script_fd(char* fd_path, size_t fd_path_size)
 {
-    /* Resolve SCRIPTS_DIR relative to /proc/self/exe */
     char self_path[PATH_MAX];
     ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
     if (len < 0)
     {
-        perror("oci2bin: --verify-key: readlink /proc/self/exe");
+        perror("oci2bin: verifier: readlink /proc/self/exe");
         return -1;
     }
     self_path[len] = '\0';
 
-    /* scripts dir = dirname(self_path) + "/../scripts" resolved via dirname */
     char scripts_dir[PATH_MAX];
     char* slash = strrchr(self_path, '/');
     if (!slash)
     {
-        fprintf(stderr,
-                "oci2bin: --verify-key: cannot determine script dir\n");
+        fprintf(stderr, "oci2bin: verifier: cannot determine script dir\n");
         return -1;
     }
     size_t dir_len = (size_t)(slash - self_path);
-    /* Build: <dir>/../scripts/sign_binary.py */
     int n = snprintf(scripts_dir, sizeof(scripts_dir),
                      "%.*s/../scripts/sign_binary.py",
                      (int)dir_len, self_path);
     if (n < 0 || n >= (int)sizeof(scripts_dir))
     {
-        fprintf(stderr,
-                "oci2bin: --verify-key: scripts path truncated\n");
+        fprintf(stderr, "oci2bin: verifier: scripts path truncated\n");
         return -1;
     }
+    int script_fd = open(scripts_dir, O_RDONLY | O_NOFOLLOW);
+    if (script_fd < 0)
+    {
+        fprintf(stderr, "oci2bin: verifier: cannot open verifier script\n");
+        return -1;
+    }
+    struct stat vst;
+    if (fstat(script_fd, &vst) < 0)
+    {
+        fprintf(stderr, "oci2bin: verifier: cannot stat verifier script\n");
+        close(script_fd);
+        return -1;
+    }
+    if (vst.st_mode & (S_IWGRP | S_IWOTH))
+    {
+        fprintf(stderr,
+                "oci2bin: verifier: verifier script is group/world "
+                "writable — refusing to execute\n");
+        close(script_fd);
+        return -1;
+    }
+    n = snprintf(fd_path, fd_path_size, "/proc/self/fd/%d", script_fd);
+    if (n < 0 || n >= (int)fd_path_size)
+    {
+        fprintf(stderr, "oci2bin: verifier: fd path truncated\n");
+        close(script_fd);
+        return -1;
+    }
+    return script_fd;
+}
 
-    /* Validate key_path: must not contain '..' */
+static int verify_signature(const char* self_path, const char* key_path)
+{
     if (path_has_dotdot_component(key_path))
     {
         fprintf(stderr,
@@ -6562,41 +6603,19 @@ static int verify_signature(const char* key_path)
         return -1;
     }
 
-    /* Open the script fd first so stat and exec refer to the same inode,
-     * eliminating the TOCTOU race between permission check and execution. */
-    int script_fd = open(scripts_dir, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    char fd_path[32];
+    int script_fd = open_verifier_script_fd(fd_path, sizeof(fd_path));
     if (script_fd < 0)
     {
-        fprintf(stderr, "oci2bin: --verify-key: cannot open verifier script\n");
         return -1;
     }
-    struct stat vst;
-    if (fstat(script_fd, &vst) < 0)
-    {
-        fprintf(stderr, "oci2bin: --verify-key: cannot stat verifier script\n");
-        close(script_fd);
-        return -1;
-    }
-    if (vst.st_mode & (S_IWGRP | S_IWOTH))
-    {
-        fprintf(stderr,
-                "oci2bin: --verify-key: verifier script is group/world "
-                "writable — refusing to execute\n");
-        close(script_fd);
-        return -1;
-    }
-
-    /* Pass the already-open fd to python3 so the executed file is exactly
-     * the one we checked — no window for a rename() swap. */
-    char fd_path[32];
-    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", script_fd);
     char* args[] =
     {
         "/usr/bin/python3",
         fd_path,
         "verify",
         "--key", (char*)key_path,
-        "--in", self_path,
+        "--in", (char*)self_path,
         NULL
     };
     int rc = run_cmd(args);
@@ -6609,6 +6628,175 @@ static int verify_signature(const char* key_path)
         return -1;
     }
     return 0;
+}
+
+static int run_python_helper(const char* script, const char* arg1,
+                             const char* arg2, const char* arg3,
+                             const char* arg4)
+{
+    char* args[9];
+    int ai = 0;
+    args[ai++] = "/usr/bin/python3";
+    args[ai++] = "-c";
+    args[ai++] = (char*)script;
+    args[ai++] = (char*)arg1;
+    if (arg2)
+    {
+        args[ai++] = (char*)arg2;
+    }
+    if (arg3)
+    {
+        args[ai++] = (char*)arg3;
+    }
+    if (arg4)
+    {
+        args[ai++] = (char*)arg4;
+    }
+    args[ai] = NULL;
+    return run_cmd(args);
+}
+
+static int verify_pinned_digest(const char* self_path)
+{
+    static const char script[] =
+        "import hashlib,json,re,struct,sys\n"
+        "MAGIC=b'OCI2BIN_META\\x00'\n"
+        "TRAILER=b'OCI2BIN_SIG_END\\x00'\n"
+        "SUPPORTED={'sha256':64,'sha512':128}\n"
+        "path=sys.argv[1]\n"
+        "data=open(path,'rb').read()\n"
+        "if len(data)>=20 and data[-20:-4]==TRAILER:\n"
+        " t=struct.unpack('>I',data[-4:])[0]\n"
+        " data=data[:-t] if 0<t<=len(data) else data\n"
+        "m=data.rfind(MAGIC)\n"
+        "sys.exit(0) if m<4 else None\n"
+        "tot=struct.unpack_from('<I',data,m-4)[0]\n"
+        "js=m+len(MAGIC)\n"
+        "je=(m-4)+tot\n"
+        "sys.exit(0) if je>len(data) or je<=js else None\n"
+        "meta=json.loads(data[js:je].rstrip(b'\\x00'))\n"
+        "pin=meta.get('pin_digest','')\n"
+        "sys.exit(0) if not pin else None\n"
+        "algo,want=('sha256',pin)\n"
+        "if ':' in pin:\n"
+        " algo,want=pin.split(':',1)\n"
+        " algo=algo.lower()\n"
+        " if algo not in SUPPORTED:\n"
+        "  print('oci2bin: unsupported pin_digest algorithm',"
+        "file=sys.stderr)\n"
+        "  sys.exit(1)\n"
+        "if len(want)!=SUPPORTED[algo] or not re.fullmatch(r'[0-9a-fA-F]+',want):\n"
+        " print('oci2bin: invalid pin_digest value',file=sys.stderr)\n"
+        " sys.exit(1)\n"
+        "want=want.lower()\n"
+        "needle=(f'\\\"pin_digest\\\":\\\"{pin}\\\"').encode()\n"
+        "idx=data.find(needle)\n"
+        "sys.exit(1) if idx<0 else None\n"
+        "place=('0'*SUPPORTED[algo]) if algo=='sha256' else "
+        "f'{algo}:{\"0\"*SUPPORTED[algo]}'\n"
+        "repl=(f'\\\"pin_digest\\\":\\\"{place}\\\"').encode()\n"
+        "buf=data[:idx]+repl+data[idx+len(needle):]\n"
+        "calc=hashlib.new(algo,buf).hexdigest()\n"
+        "ok=(calc==want)\n"
+        "print('oci2bin: pinned digest mismatch',file=sys.stderr) if not ok else None\n"
+        "sys.exit(0 if ok else 1)\n";
+    return run_python_helper(script, self_path, NULL, NULL, NULL);
+}
+
+static int run_self_update(const char* self_path, const char* key_path,
+                           int apply_update, const char* helper_path)
+{
+    static const char script[] =
+        "import hashlib,importlib.machinery,importlib.util,json,os,re,struct,subprocess,sys,tempfile,urllib.request\n"
+        "MAGIC=b'OCI2BIN_META\\x00'\n"
+        "path,key,mode,helper=sys.argv[1:5]\n"
+        "try:\n"
+        " loader=importlib.machinery.SourceFileLoader("
+        "'oci2bin_sign_binary',helper)\n"
+        " spec=importlib.util.spec_from_loader('oci2bin_sign_binary',loader)\n"
+        " mod=importlib.util.module_from_spec(spec)\n"
+        " loader.exec_module(mod)\n"
+        "except Exception as exc:\n"
+        " print(f'oci2bin: failed to load verifier helper: {exc}',"
+        "file=sys.stderr)\n"
+        " sys.exit(1)\n"
+        "data=open(path,'rb').read()\n"
+        "m=data.rfind(MAGIC)\n"
+        "sys.exit(1) if m<4 else None\n"
+        "tot=struct.unpack_from('<I',data,m-4)[0]\n"
+        "js=m+len(MAGIC)\n"
+        "je=(m-4)+tot\n"
+        "sys.exit(1) if je>len(data) or je<=js else None\n"
+        "meta=json.loads(data[js:je].rstrip(b'\\x00'))\n"
+        "url=meta.get('self_update_url','')\n"
+        "cur=meta.get('version','0')\n"
+        "sys.exit(1) if not url else None\n"
+        "fdnum=int(helper.rsplit('/',1)[1])\n"
+        "v=lambda s:[int(x) for x in re.findall(r'\\d+',s)] or [0]\n"
+        "with tempfile.TemporaryDirectory(prefix='oci2bin-update-') as td:\n"
+        " mp=os.path.join(td,'manifest.json')\n"
+        " sp=os.path.join(td,'manifest.json.sig')\n"
+        " with urllib.request.urlopen(url, timeout=30) as r, open(mp,'wb') as f:\n"
+        "  f.write(r.read())\n"
+        " with urllib.request.urlopen(url + '.sig', timeout=30) as r, open(sp,'wb') as f:\n"
+        "  f.write(r.read())\n"
+        " vr=subprocess.run([sys.executable,helper,'verify-file','--key',key,"
+        " '--in',mp,'--sig',sp],capture_output=True,text=True,"
+        "pass_fds=(fdnum,))\n"
+        " if vr.returncode!=0:\n"
+        "  err=(vr.stderr or vr.stdout or '').strip()\n"
+        "  print(err,file=sys.stderr) if err else None\n"
+        "  print('oci2bin: update manifest signature verification failed',"
+        "file=sys.stderr)\n"
+        "  sys.exit(1)\n"
+        " manifest=json.load(open(mp,'r',encoding='utf-8'))\n"
+        " nxt=manifest.get('version','')\n"
+        " burl=manifest.get('url','')\n"
+        " want_spec=manifest.get('digest') or manifest.get('sha256','')\n"
+        " if not nxt or not burl or not want_spec:\n"
+        "  print('oci2bin: update manifest missing version/url/digest',"
+        "file=sys.stderr)\n"
+        "  sys.exit(1)\n"
+        " try:\n"
+        "  algo,want=mod._parse_digest_spec(want_spec)\n"
+        " except ValueError as exc:\n"
+        "  print(f'oci2bin: update manifest has invalid digest: {exc}',"
+        "file=sys.stderr)\n"
+        "  sys.exit(1)\n"
+        " if v(nxt)<v(cur):\n"
+        "  print('oci2bin: refusing rollback update manifest',file=sys.stderr)\n"
+        "  sys.exit(1)\n"
+        " if v(nxt)==v(cur):\n"
+        "  print(f'oci2bin: already up to date ({cur})',file=sys.stderr)\n"
+        "  sys.exit(0)\n"
+        " if mode=='check':\n"
+        "  print(f'oci2bin: update available {cur} -> {nxt}',file=sys.stderr)\n"
+        "  sys.exit(10)\n"
+        " out_fd,out_path=tempfile.mkstemp(prefix='.oci2bin-update.',"
+        "dir=os.path.dirname(path) or '.')\n"
+        " os.close(out_fd)\n"
+        " try:\n"
+        "  h=hashlib.new(algo)\n"
+        "  with urllib.request.urlopen(burl, timeout=30) as r, open(out_path,'wb') as f:\n"
+        "   while True:\n"
+        "    chunk=r.read(65536)\n"
+        "    if not chunk:\n"
+        "     break\n"
+        "    h.update(chunk)\n"
+        "    f.write(chunk)\n"
+        "  got=h.hexdigest()\n"
+        "  if got!=want:\n"
+        "   print(f'oci2bin: downloaded update {algo} mismatch',"
+        "file=sys.stderr)\n"
+        "   sys.exit(1)\n"
+        "  os.chmod(out_path, os.stat(out_path).st_mode | 0o111)\n"
+        "  os.replace(out_path, path)\n"
+        "  print(f'oci2bin: updated to {nxt}',file=sys.stderr)\n"
+        " finally:\n"
+        "  if os.path.exists(out_path):\n"
+        "   os.unlink(out_path)\n";
+    return run_python_helper(script, self_path, key_path,
+                             apply_update ? "apply" : "check", helper_path);
 }
 
 /* ── cgroup v2 resource limits ───────────────────────────────────────────── */
@@ -7856,10 +8044,37 @@ int main(int argc, char* argv[])
     /* 3a. Verify binary signature before any extraction */
     if (opts.verify_key)
     {
-        if (verify_signature(opts.verify_key) < 0)
+        if (verify_signature(self_path, opts.verify_key) < 0)
         {
             return 1;
         }
+    }
+
+    if (verify_pinned_digest(self_path) != 0)
+    {
+        return 1;
+    }
+
+    if (opts.check_update || opts.self_update)
+    {
+        if (!opts.verify_key)
+        {
+            fprintf(stderr,
+                    "oci2bin: --check-update/--self-update require "
+                    "--verify-key PATH\n");
+            return 1;
+        }
+        char helper_fd_path[32];
+        int helper_fd = open_verifier_script_fd(helper_fd_path,
+                                                sizeof(helper_fd_path));
+        if (helper_fd < 0)
+        {
+            return 1;
+        }
+        int update_rc = run_self_update(self_path, opts.verify_key,
+                                        opts.self_update, helper_fd_path);
+        close(helper_fd);
+        return update_rc;
     }
 
     /* 4. Extract OCI image into rootfs */

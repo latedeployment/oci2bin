@@ -252,12 +252,15 @@ test-python:
 	@echo "=== Python unit tests ==="
 	@mkdir -p $(TEST_TMPDIR)
 	$(TEST_ENV) python3 -m unittest discover -s tests -p 'test_build.py' -v
+	$(TEST_ENV) python3 -m unittest tests.test_build_meta -v
 	@echo "=== Polyglot structure tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
 	@echo "=== Embed loader unit tests (no Docker) ==="
 	$(TEST_ENV) python3 -m unittest \
 		tests.test_embed_loader.TestEmbedLoaderLayer \
 		tests.test_embed_loader.TestEmbedLoaderLabels -v
+	@echo "=== CLI feature unit tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_cli_features -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

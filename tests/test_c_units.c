@@ -246,6 +246,26 @@ static void test_parse_opts(void)
         ASSERT_INT_EQ(opts.debug, 1, "parse_opts: --debug sets debug=1");
     }
 
+    /* --self-update */
+    {
+        char* argv[] = {"prog", "--self-update", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --self-update returns 0");
+        ASSERT_INT_EQ(opts.self_update, 1,
+                      "parse_opts: --self-update sets self_update=1");
+    }
+
+    /* --check-update */
+    {
+        char* argv[] = {"prog", "--check-update", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --check-update returns 0");
+        ASSERT_INT_EQ(opts.check_update, 1,
+                      "parse_opts: --check-update sets check_update=1");
+    }
+
     /* CMD positional args */
     {
         char* argv[] = {"prog", "/bin/ls", "-la", NULL};

@@ -403,10 +403,77 @@ def get_oci_tar(image_name, output_path):
 
 
 META_MAGIC = b'OCI2BIN_META\x00'
-OCI2BIN_VERSION = '0.2.0'
+OCI2BIN_VERSION = '0.9.0'
+HASH_ALGORITHM_HEX_LENGTHS = {
+    'sha256': 64,
+    'sha512': 128,
+}
+DEFAULT_PIN_DIGEST_ALGORITHM = 'sha256'
+PIN_DIGEST_PLACEHOLDER = '0' * HASH_ALGORITHM_HEX_LENGTHS['sha256']
 
 
-def build_meta_block(image_name, digest=None):
+def _validate_hash_algorithm(name):
+    algo = (name or '').lower()
+    if algo not in HASH_ALGORITHM_HEX_LENGTHS:
+        supported = ', '.join(sorted(HASH_ALGORITHM_HEX_LENGTHS))
+        raise ValueError(f'unsupported hash algorithm {name!r}; use {supported}')
+    return algo
+
+
+def _format_digest_value(algorithm, hex_digest):
+    if algorithm == DEFAULT_PIN_DIGEST_ALGORITHM:
+        return hex_digest.lower()
+    return f'{algorithm}:{hex_digest.lower()}'
+
+
+def _parse_digest_value(value, *, allow_auto=False):
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        raise ValueError('digest value must be a string')
+    if value == 'auto':
+        if not allow_auto:
+            raise ValueError('digest value must not be "auto" here')
+        return DEFAULT_PIN_DIGEST_ALGORITHM, 'auto'
+
+    algorithm = DEFAULT_PIN_DIGEST_ALGORITHM
+    digest_value = value
+    if ':' in value:
+        algorithm, digest_value = value.split(':', 1)
+        algorithm = _validate_hash_algorithm(algorithm)
+        if digest_value == 'auto':
+            if not allow_auto:
+                raise ValueError('digest value must not be "auto" here')
+            return algorithm, 'auto'
+    expected_len = HASH_ALGORITHM_HEX_LENGTHS[algorithm]
+    if len(digest_value) != expected_len:
+        raise ValueError(
+            f'digest for {algorithm} must be {expected_len} hex chars'
+        )
+    try:
+        int(digest_value, 16)
+    except ValueError as exc:
+        raise ValueError(
+            f'digest for {algorithm} must be valid hexadecimal'
+        ) from exc
+    return algorithm, digest_value.lower()
+
+
+def validate_pin_digest(pin_digest):
+    """Validate a pin-digest value accepted by the builder."""
+    if pin_digest is None:
+        return None
+    try:
+        return _parse_digest_value(pin_digest, allow_auto=True)
+    except ValueError as exc:
+        raise ValueError(
+            'pin-digest must be "auto", 64 hex chars, or ALGO:HEX/ALGO:auto '
+            f'({exc})'
+        ) from exc
+
+
+def build_meta_block(image_name, digest=None, self_update_url=None,
+                     pin_digest=None):
     """
     Build the OCI2BIN_META block appended to the end of the output binary.
     Format: uint32_le(total_size) + META_MAGIC + json_bytes + b'\\x00'
@@ -419,9 +486,80 @@ def build_meta_block(image_name, digest=None):
     }
     if digest:
         meta['digest'] = digest
-    json_bytes = json.dumps(meta).encode() + b'\x00'
+    if self_update_url:
+        meta['self_update_url'] = self_update_url
+    if pin_digest:
+        algorithm, digest_value = validate_pin_digest(pin_digest)
+        if digest_value == 'auto':
+            placeholder = '0' * HASH_ALGORITHM_HEX_LENGTHS[algorithm]
+            meta['pin_digest'] = _format_digest_value(algorithm, placeholder)
+        else:
+            meta['pin_digest'] = _format_digest_value(algorithm, digest_value)
+    json_bytes = json.dumps(meta, separators=(',', ':')).encode() + b'\x00'
     total_size = 4 + len(META_MAGIC) + len(json_bytes)
     return struct.pack('<I', total_size) + META_MAGIC + json_bytes
+
+
+def patch_auto_pin_digest(output_path):
+    """Replace the zero-filled pin_digest placeholder with the file digest."""
+    with open(output_path, 'r+b') as f:
+        file_size = os.fstat(f.fileno()).st_size
+        tail_size = min(file_size, 65536)
+        f.seek(file_size - tail_size)
+        tail = f.read(tail_size)
+        magic_off = tail.rfind(META_MAGIC)
+        if magic_off < 4:
+            print('error: metadata block not found for pin_digest patch',
+                  file=sys.stderr)
+            sys.exit(1)
+        meta_start = file_size - tail_size + magic_off - 4
+        total_size = struct.unpack('<I', tail[magic_off - 4:magic_off])[0]
+        if total_size < 4 + len(META_MAGIC) + 2:
+            print('error: invalid metadata block size for pin_digest patch',
+                  file=sys.stderr)
+            sys.exit(1)
+        if meta_start < 0 or meta_start + total_size > file_size:
+            print('error: truncated metadata block for pin_digest patch',
+                  file=sys.stderr)
+            sys.exit(1)
+        f.seek(meta_start)
+        meta_block = f.read(total_size)
+        if len(meta_block) != total_size:
+            print('error: short metadata read during pin_digest patch',
+                  file=sys.stderr)
+            sys.exit(1)
+        json_start = 4 + len(META_MAGIC)
+        meta = json.loads(meta_block[json_start:].rstrip(b'\x00'))
+        stored_pin = meta.get('pin_digest')
+        if not stored_pin:
+            print('error: pin_digest metadata missing during patch',
+                  file=sys.stderr)
+            sys.exit(1)
+        algorithm, _ = _parse_digest_value(stored_pin)
+        needle = f'"pin_digest":"{stored_pin}"'.encode('ascii')
+        needle_off = meta_block.find(needle)
+        if needle_off < 0:
+            print('error: pin_digest placeholder not found in metadata block',
+                  file=sys.stderr)
+            sys.exit(1)
+        digest = hashlib.new(algorithm)
+        replacement_value = None
+        f.seek(0)
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+
+        replacement_value = _format_digest_value(algorithm, digest.hexdigest())
+        repl = f'"pin_digest":"{replacement_value}"'.encode('ascii')
+        if len(repl) != len(needle):
+            print('error: pin_digest replacement length mismatch',
+                  file=sys.stderr)
+            sys.exit(1)
+
+        f.seek(meta_start + needle_off)
+        f.write(repl)
 
 
 def _repack_oci_tar(orig_data, replacements, extra_entries):
@@ -623,7 +761,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    embed_loader_layer=False, embed_loader_labels=False,
                    label_chunk_bytes=DEFAULT_LABEL_CHUNK_BYTES,
                    loader_dir=DEFAULT_LOADER_DIR,
-                   label_prefix=DEFAULT_LABEL_PREFIX):
+                   label_prefix=DEFAULT_LABEL_PREFIX,
+                   self_update_url=None, pin_digest=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -851,10 +990,15 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
 
     # 10. Write output (polyglot + metadata block)
     meta_image = image_name_for_meta if image_name_for_meta else image_name
-    meta_block = build_meta_block(meta_image, digest)
+    meta_block = build_meta_block(meta_image, digest,
+                                  self_update_url=self_update_url,
+                                  pin_digest=pin_digest)
     with open(output_path, 'wb') as f:
         f.write(polyglot)
         f.write(meta_block)
+
+    if pin_digest and validate_pin_digest(pin_digest)[1] == 'auto':
+        patch_auto_pin_digest(output_path)
 
     os.chmod(output_path, 0o755)
 
@@ -901,6 +1045,11 @@ def main():
     parser.add_argument('--digest', default=None,
                         help='Image digest to embed in metadata block '
                              '(e.g. redis@sha256:abc123...)')
+    parser.add_argument('--self-update-url', default=None,
+                        help='Signed update manifest URL to embed in metadata')
+    parser.add_argument('--pin-digest', default=None,
+                        help='Embed a pinned digest for canonical self-checking '
+                             '("auto", 64 hex chars, or ALGO:HEX/ALGO:auto)')
     parser.add_argument('--kernel', default=None,
                         help='Path to vmlinux blob to embed (cloud-hypervisor path)')
     parser.add_argument('--initramfs', default=None,
@@ -963,6 +1112,17 @@ def main():
         print(f"Initramfs not found: {args.initramfs}", file=sys.stderr)
         sys.exit(1)
 
+    if args.self_update_url is not None and not args.self_update_url:
+        print('self-update URL must not be empty', file=sys.stderr)
+        sys.exit(1)
+
+    if args.pin_digest is not None:
+        try:
+            validate_pin_digest(args.pin_digest)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            sys.exit(1)
+
     image_name_for_meta = args.image_name if args.image_name else (args.image or 'unknown')
     build_polyglot(args.loader, args.image or '', args.output,
                    tar_path=args.tar,
@@ -974,7 +1134,9 @@ def main():
                    embed_loader_labels=args.embed_loader_labels,
                    label_chunk_bytes=args.label_chunk_size,
                    loader_dir=args.loader_dir,
-                   label_prefix=args.label_prefix)
+                   label_prefix=args.label_prefix,
+                   self_update_url=args.self_update_url,
+                   pin_digest=args.pin_digest)
 
 
 if __name__ == '__main__':

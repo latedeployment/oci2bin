@@ -8,7 +8,13 @@
 #   oci2bin inspect <binary>
 #   oci2bin sign   --key KEY.pem  --in BINARY [--out BINARY]
 #   oci2bin verify --key PUB.pem  --in BINARY
+#   oci2bin sign-file --key KEY.pem --in FILE --out SIG
+#   oci2bin verify-file --key PUB.pem --in FILE --sig SIG
 #   oci2bin pod run [--net shared] [--ipc shared] BINARY [BINARY ...]
+#   oci2bin run [BUILD_OPTS...] IMAGE [-- RUNTIME_ARGS...]
+#   oci2bin systemd BINARY [--user] [--restart always|on-failure|no]
+#   oci2bin healthcheck BINARY [--pid PID]
+#   oci2bin top [--once] [--interval SEC]
 #   oci2bin list [--json]
 #   oci2bin prune [--dry-run]
 #   oci2bin diff <binary1> <binary2>
@@ -52,6 +58,9 @@
 #                         (default: .oci2bin; applies to --embed-loader-layer)
 #   --label-prefix PREFIX Label key prefix for all embed metadata labels
 #                         (default: oci2bin.loader; change to avoid naming conflicts)
+#   --self-update-url URL Embed a signed update-manifest URL into the binary
+#   --pin-digest DIGEST|ALGO:auto
+#                         Embed a pinned canonical digest for runtime integrity checks
 #
 # Runtime options (passed directly to the output binary):
 #   -v HOST:CONTAINER     Bind mount a host path into the container
@@ -102,6 +111,10 @@
 #   list [--json]         List all cached binaries with image name, size, date
 #   prune [--dry-run]     Remove outdated cache entries (keep newest per image)
 #   diff <b1> <b2>        Show filesystem diff between two oci2bin binaries
+#   run IMAGE [...]       Build to a temp file and execute it once
+#   systemd BINARY        Emit a ready-to-use systemd unit file
+#   healthcheck BINARY    Run the embedded OCI HEALTHCHECK command
+#   top                   Live stats for named running containers
 #   reconstruct <src>     Rebuild polyglot from an image built with
 #                         --embed-loader-layer or --embed-loader-labels;
 #                         <src> is a Docker image name or a .tar/.img file
@@ -205,6 +218,18 @@ fi
 if [[ "${1:-}" == "verify" ]]; then
     shift
     exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" verify "$@"
+fi
+
+# ── detached file signing subcommands ──────────────────────────────────────
+
+if [[ "${1:-}" == "sign-file" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" sign-file "$@"
+fi
+
+if [[ "${1:-}" == "verify-file" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" verify-file "$@"
 fi
 
 # ── list subcommand ───────────────────────────────────────────────────────
@@ -456,8 +481,26 @@ fi
 
 if [[ "${1:-}" == "update" ]]; then
     shift
+    UPDATE_CHECK_ONLY=0
+    UPDATE_VERIFY_KEY=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check)
+                UPDATE_CHECK_ONLY=1
+                shift
+                ;;
+            --verify-key)
+                [[ $# -lt 2 ]] && { echo "oci2bin update: --verify-key requires PATH" >&2; exit 1; }
+                UPDATE_VERIFY_KEY="$2"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
     if [[ $# -lt 1 ]]; then
-        echo "Usage: oci2bin update BINARY" >&2
+        echo "Usage: oci2bin update [--check] [--verify-key PATH] BINARY" >&2
         exit 1
     fi
     UPDATE_BINARY="$1"
@@ -467,7 +510,7 @@ if [[ "${1:-}" == "update" ]]; then
     fi
 
     # Read image name from embedded metadata block
-    IMAGE_NAME="$(python3 - "$UPDATE_BINARY" "$OCI2BIN_HOME" <<'PYEOF'
+    META_JSON="$(python3 - "$UPDATE_BINARY" "$OCI2BIN_HOME" <<'PYEOF'
 import sys, os
 binary = sys.argv[1]
 home = sys.argv[2]
@@ -478,21 +521,66 @@ spec = importlib.util.spec_from_file_location(
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 meta = mod.read_meta_block(binary) or {}
-image = meta.get('image', '')
-if not image:
+if 'image' not in meta or not meta.get('image'):
     try:
         oci = mod.read_oci_data(binary)
         tags, _, _ = mod.parse_config(oci)
-        image = tags[0] if tags else ''
+        meta['image'] = tags[0] if tags else ''
     except SystemExit:
-        image = ''
-print(image)
+        meta['image'] = ''
+import json
+print(json.dumps(meta))
+PYEOF
+)"
+
+    IMAGE_NAME="$(python3 - "$META_JSON" <<'PYEOF'
+import json, sys
+meta = json.loads(sys.argv[1])
+print(meta.get("image",""))
 PYEOF
 )"
 
     if [[ -z "$IMAGE_NAME" ]]; then
         echo "oci2bin update: could not read image name from $UPDATE_BINARY" >&2
         exit 1
+    fi
+
+    SELF_UPDATE_URL="$(python3 - "$META_JSON" <<'PYEOF'
+import json, sys
+meta = json.loads(sys.argv[1])
+print(meta.get("self_update_url",""))
+PYEOF
+)"
+
+    if [[ "$UPDATE_CHECK_ONLY" -eq 1 && -n "$SELF_UPDATE_URL" ]]; then
+        SELF_ARGS=(--check-update)
+        [[ -n "$UPDATE_VERIFY_KEY" ]] && SELF_ARGS+=(--verify-key "$UPDATE_VERIFY_KEY")
+        exec "$UPDATE_BINARY" "${SELF_ARGS[@]}"
+    fi
+
+    CURRENT_DIGEST="$(python3 - "$META_JSON" <<'PYEOF'
+import json, sys
+meta = json.loads(sys.argv[1])
+print(meta.get("digest",""))
+PYEOF
+)"
+
+    if [[ "$UPDATE_CHECK_ONLY" -eq 1 ]]; then
+        need docker
+        docker pull "$IMAGE_NAME" >/dev/null 2>&1 || true
+        NEW_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_NAME" 2>/dev/null || true)"
+        if [[ -z "$CURRENT_DIGEST" || -z "$NEW_DIGEST" ]]; then
+            echo "oci2bin update: unable to compare digests for $IMAGE_NAME" >&2
+            exit 1
+        fi
+        if [[ "$CURRENT_DIGEST" == "$NEW_DIGEST" ]]; then
+            echo "oci2bin update: $UPDATE_BINARY is up to date ($NEW_DIGEST)" >&2
+            exit 0
+        fi
+        echo "oci2bin update: update available" >&2
+        echo "  current: $CURRENT_DIGEST" >&2
+        echo "  latest:  $NEW_DIGEST" >&2
+        exit 10
     fi
 
     echo "oci2bin update: rebuilding from $IMAGE_NAME..." >&2
@@ -624,6 +712,425 @@ if [[ "${1:-}" == "logs" ]]; then
     else
         exec cat "$LOG_FILE"
     fi
+fi
+
+# ── run subcommand ─────────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "run" ]]; then
+    shift
+    BUILD_ARGS=()
+    RUN_IMAGE=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest)
+                [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
+                BUILD_ARGS+=("$1" "$2")
+                shift 2
+                ;;
+            --cache|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash)
+                BUILD_ARGS+=("$1")
+                shift
+                ;;
+            --)
+                echo "oci2bin run: IMAGE is required before --" >&2
+                exit 1
+                ;;
+            -*)
+                echo "oci2bin run: unknown build option before IMAGE: $1" >&2
+                exit 1
+                ;;
+            *)
+                RUN_IMAGE="$1"
+                shift
+                break
+                ;;
+        esac
+    done
+
+    if [[ -z "$RUN_IMAGE" ]]; then
+        echo "Usage: oci2bin run [BUILD_OPTS...] IMAGE [-- RUNTIME_ARGS...]" >&2
+        exit 1
+    fi
+
+    [[ "${1:-}" == "--" ]] && shift
+
+    RUN_TMPDIR="$(mktemp -d)"
+    RUN_BINARY="$RUN_TMPDIR/oci2bin-run"
+    cleanup_run_tmp() {
+        rm -rf "$RUN_TMPDIR"
+    }
+    trap cleanup_run_tmp EXIT
+
+    "$0" "${BUILD_ARGS[@]}" "$RUN_IMAGE" "$RUN_BINARY"
+    set +e
+    "$RUN_BINARY" "$@"
+    RC=$?
+    set -e
+    cleanup_run_tmp
+    trap - EXIT
+    exit "$RC"
+fi
+
+# ── systemd subcommand ─────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "systemd" ]]; then
+    shift
+    SYSTEMD_USER=0
+    SYSTEMD_RESTART="on-failure"
+    SYSTEMD_BINARY=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user)
+                SYSTEMD_USER=1
+                shift
+                ;;
+            --restart)
+                [[ $# -lt 2 ]] && { echo "oci2bin systemd: --restart requires a value" >&2; exit 1; }
+                case "$2" in
+                    always|on-failure|no) SYSTEMD_RESTART="$2" ;;
+                    *) echo "oci2bin systemd: --restart must be always, on-failure, or no" >&2; exit 1 ;;
+                esac
+                shift 2
+                ;;
+            -*)
+                echo "oci2bin systemd: unknown option: $1" >&2
+                exit 1
+                ;;
+            *)
+                if [[ -n "$SYSTEMD_BINARY" ]]; then
+                    echo "oci2bin systemd: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                SYSTEMD_BINARY="$1"
+                shift
+                ;;
+        esac
+    done
+    if [[ -z "$SYSTEMD_BINARY" ]]; then
+        echo "Usage: oci2bin systemd BINARY [--user] [--restart always|on-failure|no]" >&2
+        exit 1
+    fi
+    exec python3 - "$SYSTEMD_BINARY" "$SYSTEMD_USER" "$SYSTEMD_RESTART" "$USER" "$OCI2BIN_HOME" <<'PYEOF'
+import importlib.util
+import os
+import re
+import sys
+
+binary = os.path.abspath(sys.argv[1])
+user_mode = sys.argv[2] == "1"
+restart = sys.argv[3]
+username = sys.argv[4] or os.environ.get("USER", "")
+home = sys.argv[5]
+
+spec = importlib.util.spec_from_file_location(
+    "inspect_image", os.path.join(home, "scripts", "inspect_image.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+def sanitize_unit_value(value):
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def quote_exec_arg(value):
+    value = str(value)
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+    if any(ch.isspace() for ch in value) or any(ch in value for ch in '\\"'):
+        return f'"{escaped}"'
+    return escaped
+
+
+meta = mod.read_meta_block(binary) or {}
+oci = mod.read_oci_data(binary)
+repo_tags, _, config = mod.parse_config(oci)
+cfg = config.get("config", config)
+labels = cfg.get("Labels") or config.get("Labels") or {}
+
+name_candidates = [
+    labels.get("oci2bin.name"),
+    labels.get("io.oci2bin.name"),
+    labels.get("org.opencontainers.image.title"),
+    os.path.splitext(os.path.basename(binary))[0],
+]
+unit_name = next((n for n in name_candidates if n), "oci2bin-service")
+unit_name = re.sub(r"[^A-Za-z0-9_.@-]+", "-", unit_name).strip("-") or "oci2bin-service"
+description = sanitize_unit_value(
+    meta.get("image") or (repo_tags[0] if repo_tags else unit_name)
+)
+
+lines = [
+    "[Unit]",
+    f"Description=oci2bin {description}",
+    "After=network-online.target",
+    "Wants=network-online.target",
+    "",
+    "[Service]",
+    "Type=simple",
+    f"ExecStart={quote_exec_arg(binary)}",
+    "Restart=" + restart,
+]
+if not user_mode and username:
+    lines.append(f"User={sanitize_unit_value(username)}")
+lines.extend([
+    "",
+    "[Install]",
+    "WantedBy=default.target" if user_mode else "WantedBy=multi-user.target",
+])
+
+sys.stdout.write("\n".join(lines) + "\n")
+PYEOF
+fi
+
+# ── healthcheck subcommand ─────────────────────────────────────────────────
+
+if [[ "${1:-}" == "healthcheck" ]]; then
+    shift
+    HEALTH_PID=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pid)
+                [[ $# -lt 2 ]] && { echo "oci2bin healthcheck: --pid requires PID" >&2; exit 1; }
+                HEALTH_PID="$2"
+                shift 2
+                ;;
+            -*)
+                echo "oci2bin healthcheck: unknown option: $1" >&2
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin healthcheck BINARY [--pid PID]" >&2
+        exit 1
+    fi
+    exec python3 - "$1" "$HEALTH_PID" "$OCI2BIN_HOME" <<'PYEOF'
+import importlib.util
+import os
+import subprocess
+import sys
+
+binary = os.path.abspath(sys.argv[1])
+target_pid = sys.argv[2]
+home = sys.argv[3]
+
+spec = importlib.util.spec_from_file_location(
+    "inspect_image", os.path.join(home, "scripts", "inspect_image.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+oci = mod.read_oci_data(binary)
+_, _, config = mod.parse_config(oci)
+cfg = config.get("config", config)
+hc = cfg.get("Healthcheck") or {}
+test = hc.get("Test") or []
+if not test:
+    print("oci2bin healthcheck: no HEALTHCHECK configured", file=sys.stderr)
+    sys.exit(1)
+if len(test) == 1 and test[0] == "NONE":
+    print("oci2bin healthcheck: HEALTHCHECK NONE", file=sys.stderr)
+    sys.exit(0)
+
+if test[0] == "CMD":
+    argv = test[1:]
+elif test[0] == "CMD-SHELL":
+    argv = ["/bin/sh", "-ec", test[1] if len(test) > 1 else ""]
+else:
+    argv = test
+
+if not argv:
+    print("oci2bin healthcheck: empty healthcheck command", file=sys.stderr)
+    sys.exit(1)
+
+if target_pid and (not target_pid.isdigit() or int(target_pid) <= 0):
+    print("oci2bin healthcheck: --pid must be a positive integer",
+          file=sys.stderr)
+    sys.exit(1)
+
+if target_pid:
+    cmd = [
+        "nsenter", "--target", target_pid,
+        "--user", "--mount", "--pid", "--uts", "--ipc", "--net",
+        "--preserve-credentials", "--",
+    ] + argv
+else:
+    cmd = [binary, "--"] + argv
+
+result = subprocess.run(cmd)
+sys.exit(result.returncode)
+PYEOF
+fi
+
+# ── top subcommand ─────────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "top" ]]; then
+    shift
+    TOP_ONCE=0
+    TOP_INTERVAL=1.0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --once)
+                TOP_ONCE=1
+                shift
+                ;;
+            --interval)
+                [[ $# -lt 2 ]] && { echo "oci2bin top: --interval requires SEC" >&2; exit 1; }
+                TOP_INTERVAL="$2"
+                shift 2
+                ;;
+            *)
+                echo "oci2bin top: unknown option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+    exec python3 - "$TOP_ONCE" "$TOP_INTERVAL" <<'PYEOF'
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".cache" / "oci2bin" / "containers"
+CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+PAGESIZE = os.sysconf("SC_PAGE_SIZE")
+CPU_COUNT = max(1, os.cpu_count() or 1)
+
+
+def read_stat(pid):
+    with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+    rparen = raw.rfind(")")
+    fields = raw[rparen + 2:].split()
+    utime = int(fields[11])
+    stime = int(fields[12])
+    starttime = int(fields[19])
+    rss = int(fields[21]) * PAGESIZE
+    return utime + stime, starttime, rss
+
+
+def cgroup_relpath(pid):
+    try:
+        with open(f"/proc/{pid}/cgroup", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[0] == "0":
+                    return parts[2]
+    except OSError:
+        return None
+    return None
+
+
+def cgroup_read(relpath, name):
+    if not relpath:
+        return None
+    path = Path("/sys/fs/cgroup") / relpath.lstrip("/") / name
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def format_bytes(value):
+    value = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024.0
+
+
+def format_uptime(seconds):
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if days:
+        return f"{days}d{hours:02}h"
+    if hours:
+        return f"{hours}h{minutes:02}m"
+    return f"{minutes}m{seconds:02}s"
+
+
+def snapshot():
+    boot = time.time() - float(Path("/proc/uptime").read_text().split()[0])
+    rows = []
+    if not STATE_DIR.is_dir():
+        return rows
+    for state in sorted(STATE_DIR.glob("*.json")):
+        try:
+            info = json.loads(state.read_text(encoding="utf-8"))
+            pid = int(info.get("pid", 0))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if pid <= 0 or not Path(f"/proc/{pid}").exists():
+            continue
+        try:
+            cpu_ticks, starttime, rss = read_stat(pid)
+        except OSError:
+            continue
+        relpath = cgroup_relpath(pid)
+        mem = cgroup_read(relpath, "memory.current")
+        pids_current = cgroup_read(relpath, "pids.current")
+        rows.append({
+            "name": info.get("name", state.stem),
+            "pid": pid,
+            "binary": os.path.basename(info.get("binary", "?")),
+            "cpu_ticks": cpu_ticks,
+            "memory": int(mem) if mem and mem.isdigit() else rss,
+            "pids": int(pids_current) if pids_current and pids_current.isdigit()
+                    else len(os.listdir(f"/proc/{pid}/task")),
+            "uptime": time.time() - (boot + (starttime / CLK_TCK)),
+        })
+    return rows
+
+
+def render(rows, prev_rows, interval, once):
+    lines = []
+    lines.append("NAME                 PID    CPU%   MEMORY     PIDS  UPTIME   BINARY")
+    lines.append("-" * 76)
+    prev_map = {row["pid"]: row for row in prev_rows}
+    for row in rows:
+        prev = prev_map.get(row["pid"])
+        cpu_pct = 0.0
+        if prev:
+            delta = row["cpu_ticks"] - prev["cpu_ticks"]
+            cpu_pct = max(0.0, (delta / CLK_TCK) / interval * 100.0)
+        lines.append(
+            f"{row['name'][:20]:20} {row['pid']:6d} {cpu_pct:6.1f} "
+            f"{format_bytes(row['memory']):>9} {row['pids']:5d} "
+            f"{format_uptime(row['uptime']):>8}   {row['binary'][:20]}"
+        )
+    if once:
+        print("\n".join(lines))
+    else:
+        sys.stdout.write("\x1b[H\x1b[2J" + "\n".join(lines) + "\n")
+        sys.stdout.flush()
+
+
+once = sys.argv[1] == "1"
+try:
+    interval = float(sys.argv[2])
+except ValueError:
+    print("oci2bin top: --interval must be a positive number", file=sys.stderr)
+    sys.exit(1)
+if interval <= 0:
+    print("oci2bin top: --interval must be a positive number", file=sys.stderr)
+    sys.exit(1)
+prev = snapshot()
+if once:
+    render(prev, [], interval, True)
+    sys.exit(0)
+while True:
+    time.sleep(interval)
+    cur = snapshot()
+    render(cur, prev, interval, False)
+    prev = cur
+PYEOF
 fi
 
 # ── pod subcommand ────────────────────────────────────────────────────────
@@ -769,6 +1276,8 @@ EMBED_LOADER_LABELS=0
 LABEL_CHUNK_SIZE=""
 LOADER_DIR=""
 LABEL_PREFIX=""
+SELF_UPDATE_URL=""
+PIN_DIGEST=""
 VERIFY_COSIGN=0
 REQUIRE_COSIGN=0
 COSIGN_KEY=""
@@ -876,6 +1385,16 @@ while [[ $# -gt 0 ]]; do
         --label-prefix)
             [[ $# -lt 2 ]] && { echo "oci2bin: --label-prefix requires a PREFIX argument" >&2; exit 1; }
             LABEL_PREFIX="$2"
+            shift 2
+            ;;
+        --self-update-url)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --self-update-url requires a URL argument" >&2; exit 1; }
+            SELF_UPDATE_URL="$2"
+            shift 2
+            ;;
+        --pin-digest)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --pin-digest requires DIGEST or ALGO:auto" >&2; exit 1; }
+            PIN_DIGEST="$2"
             shift 2
             ;;
         --verify-cosign)
@@ -1230,6 +1749,8 @@ EMBED_LOADER_ARG=()
 [[ -n "$LABEL_CHUNK_SIZE" ]] && EMBED_LOADER_ARG+=(--label-chunk-size "$LABEL_CHUNK_SIZE")
 [[ -n "$LOADER_DIR"       ]] && EMBED_LOADER_ARG+=(--loader-dir "$LOADER_DIR")
 [[ -n "$LABEL_PREFIX"     ]] && EMBED_LOADER_ARG+=(--label-prefix "$LABEL_PREFIX")
+[[ -n "$SELF_UPDATE_URL"  ]] && EMBED_LOADER_ARG+=(--self-update-url "$SELF_UPDATE_URL")
+[[ -n "$PIN_DIGEST"       ]] && EMBED_LOADER_ARG+=(--pin-digest "$PIN_DIGEST")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
