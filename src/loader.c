@@ -7494,6 +7494,49 @@ static int run_self_update(const char* self_path, const char* key_path,
                              apply_update ? "apply" : "check", helper_path);
 }
 
+/* ── mseal: memory-seal loader text/rodata (Linux 6.10+) ─────────────────── */
+
+/*
+ * Walk /proc/self/maps and call mseal() on every r-xp and r--p segment.
+ * This prevents any future mprotect/mmap from changing these ranges, hardening
+ * the loader against self-modification attacks from a compromised container.
+ * Silently no-ops on kernels < 6.10 (ENOSYS) or if /proc/self/maps is absent.
+ */
+#ifdef __NR_mseal
+static void seal_loader_rodata(void)
+{
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps)
+    {
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), maps))
+    {
+        unsigned long start, end;
+        char perms[8];
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3)
+        {
+            continue;
+        }
+        /* Only seal executable (r-xp) and read-only data (r--p) segments.
+         * Skip writable or shared mappings — mseal rejects them anyway. */
+        if ((strcmp(perms, "r-xp") != 0) && (strcmp(perms, "r--p") != 0))
+        {
+            continue;
+        }
+        size_t len = end - start;
+        if (len == 0)
+        {
+            continue;
+        }
+        long rc = syscall(__NR_mseal, (void*)start, len, 0UL);
+        (void)rc; /* ENOSYS on < 6.10, EPERM if already sealed — both OK */
+    }
+    fclose(maps);
+}
+#endif
+
 /* ── cgroup v2 resource limits ───────────────────────────────────────────── */
 
 /*
@@ -8767,6 +8810,12 @@ int main(int argc, char* argv[])
         g_debug = 1;
     }
     debug_dump_opts(&opts);
+
+    /* Seal loader text/rodata against future mmap/mprotect (Linux 6.10+).
+     * Must run after argv parsing (opts complete) and before any fork(). */
+#ifdef __NR_mseal
+    seal_loader_rodata();
+#endif
 
     debug_log("main.oci_blob", "offset=0x%lx size=0x%lx",
               OCI_DATA_OFFSET, OCI_DATA_SIZE);
