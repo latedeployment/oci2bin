@@ -83,6 +83,9 @@
 #   --no-seccomp          Disable the default seccomp syscall filter
 #   --seccomp-profile FILE
 #                         Apply a Docker-compatible JSON seccomp profile
+#   --gen-seccomp FILE    Trace syscalls during a run and write a minimal
+#                         Docker-compatible allowlist JSON to FILE; use the
+#                         result with --seccomp-profile for hardened runs
 #   --no-auto-tmpfs       Do not auto-mount /run as tmpfs with --read-only
 #   --security-opt apparmor=PROFILE
 #                         Apply AppArmor profile (build with -DHAVE_APPARMOR)
@@ -1791,11 +1794,13 @@ if [[ "$DO_STRIP" -eq 1 ]]; then
     fi
     STRIPPED_TAR="${BUILD_TAR_ARG%.tar}_stripped.tar"
     echo "oci2bin: stripping docs/man/locale from image..."
+    STRIP_AUTO_ARG=()
+    [[ "$STRIP_AUTO" -eq 1 ]] && STRIP_AUTO_ARG=(--autodetect)
     python3 "$OCI2BIN_HOME/scripts/strip_image.py" \
         --input  "$BUILD_TAR_ARG" \
         --output "$STRIPPED_TAR" \
         "${STRIP_PREFIX_ARGS[@]+"${STRIP_PREFIX_ARGS[@]}"}" \
-        $([[ "$STRIP_AUTO" -eq 1 ]] && echo "--autodetect")
+        "${STRIP_AUTO_ARG[@]+"${STRIP_AUTO_ARG[@]}"}"
     BUILD_TAR_ARG="$STRIPPED_TAR"
 fi
 

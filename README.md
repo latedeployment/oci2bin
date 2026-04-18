@@ -49,6 +49,7 @@ See below [How it works](#how-it-works).
   - [Read-only containers](#read-only-containers)
   - [Capabilities](#capabilities)
   - [Seccomp filter](#seccomp-filter)
+    - [Generating a minimal seccomp profile](#generating-a-minimal-seccomp-profile)
   - [Running as non-root](#running-as-non-root)
   - [Custom hostname](#custom-hostname)
   - [Exposing host devices](#exposing-host-devices)
@@ -75,6 +76,7 @@ See below [How it works](#how-it-works).
   - [logs](#logs)
   - [top](#top)
 - [Testing](#testing)
+  - [Security linting](#security-linting)
 - [How it works](#how-it-works)
 - [References](#references)
 
@@ -848,6 +850,30 @@ The profile format is a subset of Docker's seccomp schema:
 
 `defaultAction` must be `SCMP_ACT_ALLOW`, `SCMP_ACT_ERRNO`, or `SCMP_ACT_KILL`. When `defaultAction` is `ALLOW`, listed syscalls with non-ALLOW actions are blocked. When `defaultAction` is `ERRNO` or `KILL`, only the listed ALLOW syscalls are permitted. If the profile cannot be parsed, oci2bin falls back to the built-in default filter and prints a warning.
 
+#### Generating a minimal seccomp profile
+
+`--gen-seccomp FILE` traces the container's syscalls via ptrace and writes a
+tight Docker-compatible allowlist JSON to `FILE`. Use this to produce a
+least-privilege profile for production runs:
+
+```bash
+# Step 1: run the container through its normal workload while tracing
+./redis_7-alpine --gen-seccomp redis.seccomp.json
+
+# Step 2: use the generated profile in production
+./redis_7-alpine --seccomp-profile redis.seccomp.json
+```
+
+The generated profile has `defaultAction: SCMP_ACT_ERRNO` and a single
+`SCMP_ACT_ALLOW` entry listing every unique syscall observed during the trace
+run. Forked and cloned child processes are traced automatically. Syscall names
+are resolved using the loader's built-in name table, so no external tools are
+required.
+
+> **Tip:** Run the tracer against a representative workload — startup, warm-up
+> requests, graceful shutdown — to ensure all syscalls are captured before
+> locking down the profile.
+
 #### AppArmor and SELinux confinement
 
 Apply an AppArmor profile or SELinux exec label with `--security-opt`:
@@ -1284,11 +1310,34 @@ make test-unit               # unit tests only, no Docker required (~5s)
 make test                    # full suite, requires Docker and a built image
 make test-c                  # C unit tests (TAP, x86_64)
 make test-python             # Python unit tests
+make test-shellcheck         # shellcheck on all shell scripts
 make test-integration        # all integration tests (runtime, build, Redis, nginx)
 make test-integration-redis  # Redis PING/SET/GET smoke test
 make test-integration-nginx  # nginx HTTP 200 smoke test
 make test-integration-services  # Redis (container+VM) + 5 service images (container+VM)
 ```
+
+### Security linting
+
+```bash
+make lint                # run all linters in sequence
+make lint-clang          # clang extended warnings (-Wall -Wextra -Werror + security flags)
+make lint-scan-build     # clang static analyzer (null-deref, memory leaks, POSIX API misuse)
+make lint-shellcheck     # shellcheck on oci2bin and all .sh scripts
+make lint-semgrep        # semgrep OWASP / security-audit rules (requires semgrep)
+```
+
+`make lint-scan-build` uses `clang --analyze` with interprocedural analysis. The
+`DeprecatedOrUnsafeBufferHandling` checker is disabled because the C11 Annex K
+`*_s` functions are not available in glibc; all other security checkers are
+enabled. Additional tools useful for one-off audits:
+
+| Tool | Purpose |
+|---|---|
+| `cppcheck --enable=all src/loader.c` | Static analysis, value-flow, style |
+| `flawfinder src/loader.c` | Dangerous C function scanner with CWE refs |
+| `bandit -r scripts/` | Python security linter |
+| `checksec --file=build/loader-x86_64` | Binary hardening flags (NX, stack canary, RELRO) |
 
 `test-integration-services` validates:
 - `redis:7-alpine` (SET/GET in both container mode and `--vm`)

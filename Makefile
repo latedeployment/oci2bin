@@ -56,10 +56,13 @@ VMLINUX_OUT    = build/vmlinux
         loader-libkrun kernel doc install uninstall test test-unit \
         test-unit-aarch64 test-integration test-integration-redis \
         test-integration-nginx test-integration-services \
-        test-c test-c-aarch64 test-python \
+        test-c test-c-aarch64 test-python test-shellcheck \
         test-vm-unit test-vm \
-        lint lint-clang lint-semgrep lint-scan-build \
+        lint lint-clang lint-semgrep lint-scan-build lint-shellcheck \
         fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-clean
+
+SHELLCHECK       ?= shellcheck
+SHELLCHECK_FLAGS  = -S warning
 
 all: polyglot
 
@@ -172,7 +175,7 @@ clean-all: clean
 # ── Lint targets ───────────────────────────────────────────────────────────────
 
 # Run all linters in sequence.
-lint: lint-clang lint-scan-build lint-semgrep
+lint: lint-clang lint-scan-build lint-shellcheck lint-semgrep
 
 # clang: compile with an extended warning set; -Werror makes CI fail on any hit.
 # Flags chosen to catch real bugs without false-positive noise:
@@ -233,11 +236,25 @@ lint-semgrep:
 	$(SEMGREP) $(SEMGREP_CONFIGS) --error src/loader.c
 	@echo "semgrep: OK"
 
+# shellcheck: POSIX/bash static analysis for shell scripts.
+# Checks the main CLI wrapper and all helper/test shell scripts.
+SHELL_SOURCES = oci2bin \
+                scripts/style.sh scripts/fetch_kernel.sh scripts/fuzz_run.sh \
+                tests/test_integration_redis.sh tests/test_integration_nginx.sh \
+                tests/test_runtime.sh tests/test_vm_integration.sh
+
+lint-shellcheck:
+	@echo "=== shellcheck ==="
+	$(SHELLCHECK) $(SHELLCHECK_FLAGS) $(SHELL_SOURCES)
+	@echo "shellcheck: OK"
+
+test-shellcheck: lint-shellcheck
+
 # ── Test targets ──────────────────────────────────────────────────────────────
 
 test: test-unit test-integration
 
-test-unit: test-c test-python test-vm-unit
+test-unit: test-c test-python test-vm-unit test-shellcheck
 
 test-unit-aarch64: test-c-aarch64 test-python
 

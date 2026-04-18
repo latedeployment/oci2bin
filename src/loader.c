@@ -10,10 +10,12 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 #include <ftw.h>
 #include <poll.h>
@@ -23,6 +25,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <linux/audit.h>
+#include <linux/elf.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <time.h>
@@ -236,6 +239,9 @@ struct container_opts
     int allocate_tty;
     /* -i / --interactive: keep stdin open even if not a TTY */
     int interactive;
+
+    /* --gen-seccomp FILE  (trace syscalls and emit a Docker-compatible profile) */
+    char* gen_seccomp;
 };
 
 static int argv_has_debug_flag(int argc, char* argv[])
@@ -1718,7 +1724,7 @@ static int run_cmd(char* const argv[])
 {
     if (g_debug && argv && argv[0])
     {
-        for (int i = 0; argv[i] && i < 32; i++)
+        for (int i = 0; i < 32 && argv[i]; i++)
         {
             debug_log("run_cmd.arg", "index=%d value=%s", i, argv[i]);
         }
@@ -2852,7 +2858,6 @@ static int run_as_init(char** exec_args,
     }
     return 1;
 }
-
 /* ── seccomp ─────────────────────────────────────────────────────────────── */
 
 /*
@@ -3806,6 +3811,260 @@ static int syscall_name_to_nr(const char* name)
     }
     return -1;
 }
+
+/* ── --gen-seccomp: ptrace-based syscall profiler ────────────────────────── */
+
+/*
+ * Per-PID in-syscall toggle.  ptrace delivers entry and exit stops alternately;
+ * we only record the entry stop.  Track up to 256 concurrent PIDs — more than
+ * enough for typical container workloads.
+ */
+#define GEN_SECCOMP_MAX_PIDS 256
+
+struct gs_pid_state
+{
+    pid_t pid;
+    int   in_syscall; /* 1 after entry stop, 0 after exit stop */
+};
+
+static int gs_pid_in_syscall(struct gs_pid_state* states, int* n,
+                             pid_t pid)
+{
+    for (int i = 0; i < *n; i++)
+    {
+        if (states[i].pid == pid)
+        {
+            return states[i].in_syscall;
+        }
+    }
+    /* New PID — not yet in table; starts at entry (0) */
+    if (*n < GEN_SECCOMP_MAX_PIDS)
+    {
+        states[(*n)].pid        = pid;
+        states[(*n)].in_syscall = 0;
+        (*n)++;
+    }
+    return 0;
+}
+
+static void gs_pid_toggle(struct gs_pid_state* states, int n, pid_t pid)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (states[i].pid == pid)
+        {
+            states[i].in_syscall ^= 1;
+            return;
+        }
+    }
+}
+
+/*
+ * Run exec_args under ptrace, collect every unique syscall number the workload
+ * makes, then write a Docker-compatible JSON allowlist to out_path.
+ * Returns the child's exit code (or 1 on tracer error).
+ */
+static int do_gen_seccomp(const char* out_path, char* const* exec_args)
+{
+    /* Bitset: seen[nr/8] bit (nr%8) = syscall nr was observed */
+    unsigned char seen[64];
+    memset(seen, 0, sizeof(seen));
+
+    fprintf(stderr,
+            "oci2bin: --gen-seccomp: tracing container (output → %s)\n",
+            out_path);
+    fprintf(stderr,
+            "oci2bin: --gen-seccomp: run the container workload normally,"
+            " then exit\n");
+
+    pid_t child = fork();
+    if (child < 0)
+    {
+        perror("oci2bin: --gen-seccomp: fork");
+        return 1;
+    }
+
+    if (child == 0)
+    {
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0)
+        {
+            perror("oci2bin: --gen-seccomp: ptrace TRACEME");
+            _exit(1);
+        }
+        execvp(exec_args[0], exec_args);
+        perror(exec_args[0]);
+        _exit(127);
+    }
+
+    /* Wait for the initial SIGTRAP raised by the kernel on exec */
+    int status;
+    if (waitpid(child, &status, 0) < 0)
+    {
+        perror("oci2bin: --gen-seccomp: waitpid");
+        return 1;
+    }
+
+    /* TRACESYSGOOD: syscall stops get SIGTRAP|0x80 so we can distinguish them
+     * from real SIGTRAPs.  TRACEFORK/CLONE: auto-attach forked children. */
+    long opts = PTRACE_O_TRACESYSGOOD |
+                PTRACE_O_TRACEFORK    |
+                PTRACE_O_TRACEVFORK   |
+                PTRACE_O_TRACECLONE   |
+                PTRACE_O_TRACEEXEC;
+    if (ptrace(PTRACE_SETOPTIONS, child, NULL, (void*)opts) < 0)
+    {
+        perror("oci2bin: --gen-seccomp: PTRACE_SETOPTIONS");
+    }
+    ptrace(PTRACE_SYSCALL, child, NULL, NULL);
+
+    struct gs_pid_state pid_states[GEN_SECCOMP_MAX_PIDS];
+    int n_pid_states = 0;
+    int child_exit   = 0;
+
+    for (;;)
+    {
+        pid_t stopped = waitpid(-1, &status, 0);
+        if (stopped < 0)
+        {
+            break;
+        }
+
+        if (WIFEXITED(status))
+        {
+            if (stopped == child)
+            {
+                child_exit = WEXITSTATUS(status);
+                break;
+            }
+            continue;
+        }
+        if (WIFSIGNALED(status))
+        {
+            if (stopped == child)
+            {
+                child_exit = 1;
+                break;
+            }
+            continue;
+        }
+        if (!WIFSTOPPED(status))
+        {
+            continue;
+        }
+
+        int  sig          = WSTOPSIG(status);
+        int  ptrace_event = (status >> 16) & 0xff;
+
+        if (ptrace_event != 0)
+        {
+            /* fork/clone/exec event; new tracee is already attached */
+            ptrace(PTRACE_SYSCALL, stopped, NULL, NULL);
+            continue;
+        }
+
+        if (sig == (SIGTRAP | 0x80))
+        {
+            /* Syscall entry or exit stop */
+            int was_in = gs_pid_in_syscall(pid_states, &n_pid_states, stopped);
+            gs_pid_toggle(pid_states, n_pid_states, stopped);
+
+            if (!was_in)
+            {
+                /* Entry stop — read the syscall number */
+                long nr = -1;
+#ifdef __aarch64__
+                struct iovec iov;
+                struct user_pt_regs aregs;
+                iov.iov_base = &aregs;
+                iov.iov_len  = sizeof(aregs);
+                if (ptrace(PTRACE_GETREGSET, stopped,
+                           (void*)(long)NT_PRSTATUS, &iov) == 0)
+                {
+                    nr = (long)aregs.regs[8]; /* x8 = syscall nr on aarch64 */
+                }
+#else
+                struct user_regs_struct regs;
+                if (ptrace(PTRACE_GETREGS, stopped, NULL, &regs) == 0)
+                {
+                    nr = (long)regs.orig_rax;
+                }
+#endif
+                if (nr >= 0 && nr < (long)(sizeof(seen) * 8))
+                {
+                    seen[nr / 8] |= (unsigned char)(1u << (nr % 8));
+                }
+            }
+            ptrace(PTRACE_SYSCALL, stopped, NULL, NULL);
+        }
+        else if (sig == SIGTRAP)
+        {
+            /* Exec-stop or other SIGTRAP — don't forward SIGTRAP */
+            ptrace(PTRACE_SYSCALL, stopped, NULL, NULL);
+        }
+        else
+        {
+            /* Real signal — deliver it to the tracee */
+            ptrace(PTRACE_SYSCALL, stopped, NULL, (void*)(long)sig);
+        }
+    }
+
+    /* Map observed syscall numbers to names via g_syscall_table */
+    const char* names[512];
+    int         n_names = 0;
+
+    for (int nr = 0; nr < (int)(sizeof(seen) * 8); nr++)
+    {
+        if (!(seen[nr / 8] & (1u << (nr % 8))))
+        {
+            continue;
+        }
+        for (int i = 0; i < g_syscall_table_size; i++)
+        {
+            if (g_syscall_table[i].nr == nr)
+            {
+                if (n_names < (int)(sizeof(names) / sizeof(names[0])))
+                {
+                    names[n_names++] = g_syscall_table[i].name;
+                }
+                break;
+            }
+        }
+    }
+
+    /* Emit Docker-compatible JSON seccomp profile */
+    FILE* f = fopen(out_path, "w");
+    if (!f)
+    {
+        fprintf(stderr, "oci2bin: --gen-seccomp: cannot write %s: %s\n",
+                out_path, strerror(errno));
+        return child_exit;
+    }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"defaultAction\": \"SCMP_ACT_ERRNO\",\n");
+    fprintf(f, "  \"syscalls\": [\n");
+    fprintf(f, "    {\n");
+    fprintf(f, "      \"names\": [\n");
+    for (int i = 0; i < n_names; i++)
+    {
+        fprintf(f, "        \"%s\"%s\n", names[i],
+                i < n_names - 1 ? "," : "");
+    }
+    fprintf(f, "      ],\n");
+    fprintf(f, "      \"action\": \"SCMP_ACT_ALLOW\"\n");
+    fprintf(f, "    }\n");
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+    fclose(f);
+
+    fprintf(stderr,
+            "oci2bin: --gen-seccomp: %d syscalls observed → %s\n"
+            "oci2bin: --gen-seccomp: use with: --seccomp-profile %s\n",
+            n_names, out_path, out_path);
+    return child_exit;
+}
+
+
 
 /*
  * Parse a JSON string array value: ["a","b","c"].
@@ -5253,6 +5512,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     }
 #endif
 
+    /* --gen-seccomp: trace the workload instead of exec'ing directly */
+    if (opts->gen_seccomp)
+    {
+        return do_gen_seccomp(opts->gen_seccomp, exec_args);
+    }
+
     /* Exec the entrypoint */
     debug_log("container.exec", "path=%s argc=%d", safe_str(exec_args[0]),
               exec_argc);
@@ -5421,6 +5686,10 @@ static void usage(const char* prog)
             "  --seccomp-profile FILE\n"
             "                      Apply a Docker-compatible JSON seccomp profile\n"
             "                      instead of the built-in default filter\n"
+            "  --gen-seccomp FILE  Run container, trace all syscalls via ptrace,\n"
+            "                      and write a minimal Docker-compatible allowlist\n"
+            "                      JSON to FILE. Use the output with\n"
+            "                      --seccomp-profile for hardened production runs.\n"
             "  --security-opt apparmor=PROFILE\n"
             "                      Apply AppArmor profile before exec\n"
             "                      (requires -DHAVE_APPARMOR at build time)\n"
@@ -6163,6 +6432,24 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->seccomp_profile = argv[i];
+        }
+        else if (strcmp(argv[i], "--gen-seccomp") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --gen-seccomp requires a FILE argument\n");
+                return -1;
+            }
+            i++;
+            if (path_has_dotdot_component(argv[i]))
+            {
+                fprintf(stderr,
+                        "oci2bin: --gen-seccomp: path must not"
+                        " contain '..'\n");
+                return -1;
+            }
+            opts->gen_seccomp = argv[i];
         }
         else if (strcmp(argv[i], "--add-host") == 0)
         {
@@ -8151,13 +8438,14 @@ int main(int argc, char* argv[])
 
     /* 1b. oci2vm mode: if invoked as "oci2vm", prepend --vm to argv so VM
      * mode is the default without requiring an explicit flag. */
+    char** vm_argv = NULL;
     {
         const char* base0 = strrchr(argv[0], '/');
         base0 = base0 ? base0 + 1 : argv[0];
         if (strcmp(base0, "oci2vm") == 0)
         {
             int vm_argc = 0;
-            char** vm_argv = inject_vm_flag(argc, argv, &vm_argc);
+            vm_argv = inject_vm_flag(argc, argv, &vm_argc);
             if (!vm_argv)
             {
                 return 1;
@@ -8173,6 +8461,13 @@ int main(int argc, char* argv[])
      * then called exactly once on the merged argv. */
     int    merged_argc = 0;
     char** merged_argv = build_merged_argv(argc, argv, &merged_argc);
+    /* Free the vm_argv injection array if build_merged_argv allocated a new
+     * merged array (--config path); if no --config, merged_argv == argv == vm_argv
+     * so we must not double-free. */
+    if (vm_argv && merged_argv != vm_argv)
+    {
+        free(vm_argv);
+    }
     if (!merged_argv)
     {
         return 1;
