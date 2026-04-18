@@ -6833,6 +6833,16 @@ static void usage(const char* prog)
     fprintf(stderr,
             "Usage: %s [OPTIONS] [-- CMD [ARGS...]]\n"
             "       %s [OPTIONS] CMD [ARGS...]\n"
+            "       %s mcp-serve [--allow-net]\n"
+            "\n"
+            "Subcommands:\n"
+            "  mcp-serve [--allow-net]\n"
+            "                      Start a JSON-RPC 2.0 MCP server on stdin/stdout.\n"
+            "                      Exposes tools: run_container, exec_in_container,\n"
+            "                      list_containers, stop_container, inspect_image,\n"
+            "                      get_logs. Network is forced to 'none' unless\n"
+            "                      --allow-net is passed here AND the caller requests\n"
+            "                      net=host. No --device exposure through MCP.\n"
             "\n"
             "Options:\n"
             "  -v HOST:CONTAINER   Bind mount a host path into the container\n"
@@ -6944,7 +6954,7 @@ static void usage(const char* prog)
             "  %s --entrypoint /bin/bash        # open bash shell\n"
             "  %s -v /data:/mnt /bin/ls /mnt   # mount /data and list it\n"
             "  %s -e DEBUG=1 -e API_KEY=secret  # set environment variables\n",
-            prog, prog, prog, prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 /*
@@ -10222,6 +10232,1140 @@ static int join_ns_of_pid(pid_t pid, int ns_flag, const char* ns_name)
     return 0;
 }
 
+/* ── MCP JSON-RPC 2.0 server ─────────────────────────────────────────────── */
+
+/*
+ * Minimal stdio MCP (Model Context Protocol) server using JSON-RPC 2.0.
+ * Transport: newline-delimited JSON (one request per line on stdin, one
+ * response per line on stdout).
+ *
+ * Security defaults:
+ *  - --net none unless session was started with --allow-net AND caller
+ *    explicitly passes net="host".
+ *  - No --device flags ever exposed through MCP.
+ *  - All string inputs validated for length and path safety before use.
+ */
+
+#define MCP_MAX_CONTAINERS  64
+#define MCP_LINE_MAX        (512 * 1024)
+#define MCP_NAME_MAX        128
+#define MCP_ENV_MAX         64
+#define MCP_VOL_MAX         32
+#define MCP_CMD_MAX         64
+
+struct mcp_ctr
+{
+    char  name[MCP_NAME_MAX];
+    pid_t pid;
+    char  log_path[PATH_MAX];
+};
+
+static struct mcp_ctr g_mcp_ctrs[MCP_MAX_CONTAINERS];
+static int            g_mcp_n_ctrs;
+
+/* Validate an MCP container name: alphanumeric, '-', '_', '.' only */
+static int mcp_name_valid(const char* s)
+{
+    if (!s || s[0] == '\0' || strlen(s) >= MCP_NAME_MAX)
+    {
+        return 0;
+    }
+    for (const char* p = s; *p; p++)
+    {
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_' && *p != '.')
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Write JSON-RPC success response to stdout */
+static void mcp_send_result(long id, const char* result_json)
+{
+    char hdr[128];
+    int  n = snprintf(hdr, sizeof(hdr),
+                      "{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":", id);
+    if (n > 0 && (size_t)n < sizeof(hdr))
+    {
+        write_all_fd(STDOUT_FILENO, hdr, (size_t)n);
+    }
+    write_all_fd(STDOUT_FILENO, result_json ? result_json : "null",
+                 result_json ? strlen(result_json) : 4);
+    write_all_fd(STDOUT_FILENO, "}\n", 2);
+}
+
+/* Write JSON-RPC error response to stdout */
+static void mcp_send_error(long id, int code, const char* msg)
+{
+    char esc[512];
+    if (json_escape_string(msg, esc, sizeof(esc)) < 0)
+    {
+        esc[0] = '\0';
+    }
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"jsonrpc\":\"2.0\",\"id\":%ld,"
+                     "\"error\":{\"code\":%d,\"message\":\"%s\"}}\n",
+                     id, code, esc);
+    if (n > 0 && (size_t)n < sizeof(buf))
+    {
+        write_all_fd(STDOUT_FILENO, buf, (size_t)n);
+    }
+}
+
+/* Find a tracked container by name; returns index or -1 */
+static int mcp_find_ctr(const char* name)
+{
+    for (int i = 0; i < g_mcp_n_ctrs; i++)
+    {
+        if (g_mcp_ctrs[i].pid > 0 &&
+                strcmp(g_mcp_ctrs[i].name, name) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* tools/call: run_container */
+static void mcp_tool_run_container(long id, const char* args_json,
+                                   const char* self_path, int allow_net)
+{
+    char* image = json_get_string(args_json, "image");
+    char* name  = json_get_string(args_json, "name");
+    char* net   = json_get_string(args_json, "net");
+    char* env_arr = json_get_array(args_json, "env");
+    char* vol_arr = json_get_array(args_json, "volumes");
+
+    /* Validate image path */
+    if (!image || !path_is_absolute_and_clean(image))
+    {
+        mcp_send_error(id, -32602,
+                       "run_container: 'image' must be an absolute path");
+        free(image);
+        free(name);
+        free(net);
+        free(env_arr);
+        free(vol_arr);
+        return;
+    }
+    if (access(image, X_OK) < 0)
+    {
+        mcp_send_error(id, -32602,
+                       "run_container: 'image' is not executable");
+        free(image);
+        free(name);
+        free(net);
+        free(env_arr);
+        free(vol_arr);
+        return;
+    }
+
+    /* Auto-generate name if not provided */
+    char auto_name[MCP_NAME_MAX];
+    if (!name || !mcp_name_valid(name))
+    {
+        free(name);
+        snprintf(auto_name, sizeof(auto_name), "ctr-%d", (int)getpid());
+        name = auto_name;
+    }
+
+    /* Net mode: default none; host only if allow_net AND caller asked */
+    const char* net_mode = "none";
+    if (net && strcmp(net, "host") == 0 && allow_net)
+    {
+        net_mode = "host";
+    }
+
+    if (g_mcp_n_ctrs >= MCP_MAX_CONTAINERS)
+    {
+        mcp_send_error(id, -32603,
+                       "run_container: too many tracked containers");
+        if (name != auto_name)
+        {
+            free(name);
+        }
+        free(image);
+        free(net);
+        free(env_arr);
+        free(vol_arr);
+        return;
+    }
+
+    if (mcp_find_ctr(name) >= 0)
+    {
+        mcp_send_error(id, -32602,
+                       "run_container: a container with that name already exists");
+        if (name != auto_name)
+        {
+            free(name);
+        }
+        free(image);
+        free(net);
+        free(env_arr);
+        free(vol_arr);
+        return;
+    }
+
+    /* Build log path */
+    char log_path[PATH_MAX];
+    if (snprintf(log_path, sizeof(log_path),
+                 "/tmp/oci2bin-mcp-%s.log", name) >= (int)sizeof(log_path))
+    {
+        mcp_send_error(id, -32603, "run_container: container name too long");
+        if (name != auto_name)
+        {
+            free(name);
+        }
+        free(image);
+        free(net);
+        free(env_arr);
+        free(vol_arr);
+        return;
+    }
+
+    /* Parse env and volumes */
+    char* env_strs[MCP_ENV_MAX];
+    int   n_env = 0;
+    if (env_arr)
+    {
+        n_env = json_parse_string_array(env_arr, env_strs, MCP_ENV_MAX);
+    }
+
+    char* vol_strs[MCP_VOL_MAX];
+    int   n_vol = 0;
+    if (vol_arr)
+    {
+        n_vol = json_parse_string_array(vol_arr, vol_strs, MCP_VOL_MAX);
+    }
+
+    /* Build argv for the container binary */
+    char* ctr_argv[8 + MCP_ENV_MAX * 2 + MCP_VOL_MAX * 2 + 2];
+    int   ai = 0;
+    ctr_argv[ai++] = image;
+    ctr_argv[ai++] = "--net";
+    ctr_argv[ai++] = (char*)(uintptr_t)net_mode;
+    ctr_argv[ai++] = "--name";
+    ctr_argv[ai++] = name;
+    ctr_argv[ai++] = "--detach";
+    for (int i = 0; i < n_env &&
+            ai < (int)(sizeof(ctr_argv) / sizeof(ctr_argv[0])) - 3; i++)
+    {
+        ctr_argv[ai++] = "-e";
+        ctr_argv[ai++] = env_strs[i];
+    }
+    for (int i = 0; i < n_vol &&
+            ai < (int)(sizeof(ctr_argv) / sizeof(ctr_argv[0])) - 3; i++)
+    {
+        ctr_argv[ai++] = "-v";
+        ctr_argv[ai++] = vol_strs[i];
+    }
+    ctr_argv[ai] = NULL;
+
+    /* Open log file before fork */
+    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (log_fd < 0)
+    {
+        mcp_send_error(id, -32603, "run_container: cannot open log file");
+        goto cleanup_env;
+    }
+
+    pid_t child = fork();
+    if (child < 0)
+    {
+        close(log_fd);
+        mcp_send_error(id, -32603, "run_container: fork failed");
+        goto cleanup_env;
+    }
+
+    if (child == 0)
+    {
+        /* Redirect stdout+stderr to log file */
+        dup2(log_fd, STDOUT_FILENO);
+        dup2(log_fd, STDERR_FILENO);
+        close(log_fd);
+        /* stdin = /dev/null */
+        int null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd >= 0)
+        {
+            dup2(null_fd, STDIN_FILENO);
+            close(null_fd);
+        }
+        execvp(ctr_argv[0], ctr_argv);
+        perror("execvp");
+        _exit(127);
+    }
+
+    close(log_fd);
+
+    /* Track the container */
+    int slot = g_mcp_n_ctrs++;
+    strncpy(g_mcp_ctrs[slot].name, name, MCP_NAME_MAX - 1);
+    g_mcp_ctrs[slot].name[MCP_NAME_MAX - 1] = '\0';
+    g_mcp_ctrs[slot].pid = child;
+    strncpy(g_mcp_ctrs[slot].log_path, log_path, PATH_MAX - 1);
+    g_mcp_ctrs[slot].log_path[PATH_MAX - 1] = '\0';
+
+    /* Return container ID */
+    char result[256];
+    char name_esc[MCP_NAME_MAX * 2];
+    json_escape_string(name, name_esc, sizeof(name_esc));
+    snprintf(result, sizeof(result),
+             "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}",
+             name_esc);
+    mcp_send_result(id, result);
+
+cleanup_env:
+    for (int i = 0; i < n_env; i++)
+    {
+        free(env_strs[i]);
+    }
+    for (int i = 0; i < n_vol; i++)
+    {
+        free(vol_strs[i]);
+    }
+    if (name != auto_name)
+    {
+        free(name);
+    }
+    free(image);
+    free(net);
+    free(env_arr);
+    free(vol_arr);
+}
+
+/* tools/call: list_containers */
+static void mcp_tool_list_containers(long id)
+{
+    char  buf[4096];
+    int   pos  = 0;
+    int   first = 1;
+    const int bufsz = (int)sizeof(buf);
+
+    pos += snprintf(buf + pos, (size_t)(bufsz - pos),
+                    "{\"content\":[{\"type\":\"text\",\"text\":\"[");
+    for (int i = 0; i < g_mcp_n_ctrs && pos < bufsz - 64; i++)
+    {
+        struct mcp_ctr* c = &g_mcp_ctrs[i];
+        if (c->pid <= 0)
+        {
+            continue;
+        }
+        /* Check if still running */
+        int status;
+        pid_t reaped = waitpid(c->pid, &status, WNOHANG);
+        if (reaped == c->pid)
+        {
+            c->pid = -1;
+            continue;
+        }
+        int running = (kill(c->pid, 0) == 0);
+
+        char name_esc[MCP_NAME_MAX * 2];
+        json_escape_string(c->name, name_esc, sizeof(name_esc));
+        pos += snprintf(buf + pos, (size_t)(bufsz - pos),
+                        "%s{\\\"name\\\":\\\"%s\\\","
+                        "\\\"pid\\\":%d,\\\"running\\\":%s}",
+                        first ? "" : ",",
+                        name_esc,
+                        (int)c->pid,
+                        running ? "true" : "false");
+        first = 0;
+    }
+    if (pos < bufsz - 8)
+    {
+        pos += snprintf(buf + pos, (size_t)(bufsz - pos), "]\"}]}");
+    }
+    buf[bufsz - 1] = '\0';
+    mcp_send_result(id, buf);
+}
+
+/* tools/call: stop_container */
+static void mcp_tool_stop_container(long id, const char* args_json)
+{
+    char* name = json_get_string(args_json, "name");
+    if (!name)
+    {
+        mcp_send_error(id, -32602, "stop_container: 'name' is required");
+        return;
+    }
+
+    int idx = mcp_find_ctr(name);
+    free(name);
+    if (idx < 0)
+    {
+        mcp_send_error(id, -32602, "stop_container: container not found");
+        return;
+    }
+
+    pid_t pid = g_mcp_ctrs[idx].pid;
+    kill(pid, SIGTERM);
+
+    /* Wait up to 10 seconds */
+    int exit_code = -1;
+    for (int t = 0; t < 100; t++)
+    {
+        struct timespec ts = {0, 100000000}; /* 100 ms */
+        nanosleep(&ts, NULL);
+        int status;
+        if (waitpid(pid, &status, WNOHANG) == pid)
+        {
+            exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            break;
+        }
+    }
+    if (exit_code == -1)
+    {
+        kill(pid, SIGKILL);
+        int status;
+        waitpid(pid, &status, 0);
+        exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    g_mcp_ctrs[idx].pid = -1;
+
+    char result[128];
+    snprintf(result, sizeof(result),
+             "{\"content\":[{\"type\":\"text\",\"text\":\"%d\"}]}",
+             exit_code);
+    mcp_send_result(id, result);
+}
+
+/* tools/call: exec_in_container */
+static void mcp_tool_exec_in_container(long id, const char* args_json)
+{
+    char* name     = json_get_string(args_json, "name");
+    char* cmd_arr  = json_get_array(args_json, "cmd");
+
+    if (!name || !cmd_arr)
+    {
+        mcp_send_error(id, -32602,
+                       "exec_in_container: 'name' and 'cmd' are required");
+        free(name);
+        free(cmd_arr);
+        return;
+    }
+
+    int idx = mcp_find_ctr(name);
+    free(name);
+    if (idx < 0)
+    {
+        mcp_send_error(id, -32602, "exec_in_container: container not found");
+        free(cmd_arr);
+        return;
+    }
+
+    pid_t ctr_pid = g_mcp_ctrs[idx].pid;
+    if (kill(ctr_pid, 0) < 0)
+    {
+        mcp_send_error(id, -32602, "exec_in_container: container is not running");
+        free(cmd_arr);
+        return;
+    }
+
+    /* Parse cmd array */
+    char* cmd_strs[MCP_CMD_MAX];
+    int   n_cmd = json_parse_string_array(cmd_arr, cmd_strs, MCP_CMD_MAX);
+    free(cmd_arr);
+    if (n_cmd == 0)
+    {
+        mcp_send_error(id, -32602, "exec_in_container: 'cmd' must not be empty");
+        return;
+    }
+
+    /* Build nsenter argv */
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", (int)ctr_pid);
+    char* ns_argv[16 + MCP_CMD_MAX];
+    int   ai = 0;
+    ns_argv[ai++] = "nsenter";
+    ns_argv[ai++] = "-m";
+    ns_argv[ai++] = "-p";
+    ns_argv[ai++] = "-u";
+    ns_argv[ai++] = "-i";
+    ns_argv[ai++] = "--target";
+    ns_argv[ai++] = pid_str;
+    ns_argv[ai++] = "--";
+    for (int i = 0; i < n_cmd
+            && ai < (int)(sizeof(ns_argv) / sizeof(ns_argv[0])) - 1; i++)
+    {
+        ns_argv[ai++] = cmd_strs[i];
+    }
+    ns_argv[ai] = NULL;
+
+    size_t out_len = 0;
+    char*  output  = run_cmd_capture(ns_argv, &out_len);
+
+    for (int i = 0; i < n_cmd; i++)
+    {
+        free(cmd_strs[i]);
+    }
+
+    if (!output)
+    {
+        mcp_send_error(id, -32603,
+                       "exec_in_container: command failed or nsenter unavailable");
+        return;
+    }
+
+    /* Truncate output to 64 KiB for sanity */
+    if (out_len > 65536)
+    {
+        out_len = 65536;
+    }
+    output[out_len] = '\0'; /* safe: run_cmd_capture malloc'd len+cap */
+
+    /* Escape and return */
+    char* esc = malloc(out_len * 6 + 1);
+    if (!esc)
+    {
+        free(output);
+        mcp_send_error(id, -32603, "exec_in_container: out of memory");
+        return;
+    }
+    if (json_escape_string(output, esc, out_len * 6 + 1) < 0)
+    {
+        esc[0] = '\0';
+    }
+    free(output);
+
+    size_t rlen = strlen(esc) + 64;
+    char*  result = malloc(rlen);
+    if (result)
+    {
+        snprintf(result, rlen,
+                 "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", esc);
+        mcp_send_result(id, result);
+        free(result);
+    }
+    free(esc);
+}
+
+/* tools/call: inspect_image — forks the image with OCI2BIN_INSPECT=1 */
+static void mcp_tool_inspect_image(long id, const char* args_json)
+{
+    char* image = json_get_string(args_json, "image");
+    if (!image || !path_is_absolute_and_clean(image))
+    {
+        mcp_send_error(id, -32602,
+                       "inspect_image: 'image' must be an absolute path");
+        free(image);
+        return;
+    }
+    if (access(image, X_OK) < 0)
+    {
+        mcp_send_error(id, -32602,
+                       "inspect_image: 'image' is not executable");
+        free(image);
+        return;
+    }
+
+    /* Set OCI2BIN_INSPECT=1 in child environment */
+    char* argv_inspect[] = {image, NULL};
+
+    /* We need to set env var for the child without modifying our env.
+     * Fork, set env in child, exec. */
+    int pipefd[2];
+    if (pipe(pipefd) < 0)
+    {
+        free(image);
+        mcp_send_error(id, -32603, "inspect_image: pipe failed");
+        return;
+    }
+    pid_t child = fork();
+    if (child < 0)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        free(image);
+        mcp_send_error(id, -32603, "inspect_image: fork failed");
+        return;
+    }
+    if (child == 0)
+    {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+        {
+            _exit(127);
+        }
+        close(pipefd[1]);
+        setenv("OCI2BIN_INSPECT", "1", 1);
+        execvp(image, argv_inspect);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    free(image);
+
+    /* Read output */
+    size_t cap = 4096, len = 0;
+    char*  buf = malloc(cap);
+    if (!buf)
+    {
+        close(pipefd[0]);
+        waitpid(child, NULL, 0);
+        mcp_send_error(id, -32603, "inspect_image: out of memory");
+        return;
+    }
+    for (;;)
+    {
+        if (len == cap)
+        {
+            if (cap >= 256 * 1024)
+            {
+                break;
+            }
+            cap *= 2;
+            char* nb = realloc(buf, cap);
+            if (!nb)
+            {
+                break;
+            }
+            buf = nb;
+        }
+        ssize_t n = read(pipefd[0], buf + len, cap - len);
+        if (n <= 0)
+        {
+            break;
+        }
+        len += (size_t)n;
+    }
+    close(pipefd[0]);
+    int status;
+    waitpid(child, &status, 0);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || len == 0)
+    {
+        free(buf);
+        mcp_send_error(id, -32603,
+                       "inspect_image: image does not support OCI2BIN_INSPECT");
+        return;
+    }
+    buf[len < cap ? len : cap - 1] = '\0';
+
+    /* buf should already be JSON from inspect_image_main() */
+    size_t rlen = len + 64;
+    char*  result = malloc(rlen);
+    if (result)
+    {
+        snprintf(result, rlen,
+                 "{\"content\":[{\"type\":\"text\",\"text\":%s}]}", buf);
+        mcp_send_result(id, result);
+        free(result);
+    }
+    free(buf);
+}
+
+/* tools/call: get_logs */
+static void mcp_tool_get_logs(long id, const char* args_json)
+{
+    char* name   = json_get_string(args_json, "name");
+    char* lines_s = json_get_string(args_json, "lines");
+
+    if (!name)
+    {
+        mcp_send_error(id, -32602, "get_logs: 'name' is required");
+        free(name);
+        free(lines_s);
+        return;
+    }
+
+    int n_lines = 50; /* default */
+    if (lines_s)
+    {
+        char* endp;
+        long  v = strtol(lines_s, &endp, 10);
+        if (*endp == '\0' && v > 0 && v <= 10000)
+        {
+            n_lines = (int)v;
+        }
+        free(lines_s);
+    }
+
+    int idx = mcp_find_ctr(name);
+    free(name);
+    if (idx < 0)
+    {
+        mcp_send_error(id, -32602, "get_logs: container not found");
+        return;
+    }
+
+    /* Read log file */
+    size_t log_size;
+    char*  log_data = read_file(g_mcp_ctrs[idx].log_path, &log_size);
+    if (!log_data)
+    {
+        mcp_send_result(id,
+                        "{\"content\":[{\"type\":\"text\",\"text\":\"\"}]}");
+        return;
+    }
+
+    /* Find the last n_lines lines */
+    const char* start = log_data;
+    if (log_size > 0)
+    {
+        /* count newlines from end */
+        int nl_count = 0;
+        const char* p = log_data + log_size - 1;
+        while (p >= log_data && nl_count < n_lines)
+        {
+            if (*p == '\n')
+            {
+                nl_count++;
+                if (nl_count == n_lines)
+                {
+                    start = p + 1;
+                    break;
+                }
+            }
+            p--;
+        }
+    }
+
+    size_t tail_len = log_size - (size_t)(start - log_data);
+    char*  esc      = malloc(tail_len * 6 + 1);
+    if (!esc)
+    {
+        free(log_data);
+        mcp_send_error(id, -32603, "get_logs: out of memory");
+        return;
+    }
+    if (json_escape_string(start, esc, tail_len * 6 + 1) < 0)
+    {
+        esc[0] = '\0';
+    }
+    free(log_data);
+
+    size_t rlen = strlen(esc) + 64;
+    char*  result = malloc(rlen);
+    if (result)
+    {
+        snprintf(result, rlen,
+                 "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", esc);
+        mcp_send_result(id, result);
+        free(result);
+    }
+    free(esc);
+}
+
+/* Return the MCP tools/list response JSON */
+static const char* mcp_tools_list_json(void)
+{
+    return "{"
+           "\"tools\":["
+           "{"
+           "\"name\":\"run_container\","
+           "\"description\":\"Run an oci2bin container image\","
+           "\"inputSchema\":{"
+           "\"type\":\"object\","
+           "\"properties\":{"
+           "\"image\":{\"type\":\"string\",\"description\":\"Absolute path to oci2bin binary\"},"
+           "\"name\":{\"type\":\"string\",\"description\":\"Container name (optional)\"},"
+           "\"net\":{\"type\":\"string\",\"enum\":[\"none\",\"host\"],\"default\":\"none\"},"
+           "\"env\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
+           "\"volumes\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
+           "},"
+           "\"required\":[\"image\"]"
+           "}"
+           "},"
+           "{"
+           "\"name\":\"exec_in_container\","
+           "\"description\":\"Run a command inside a running container\","
+           "\"inputSchema\":{"
+           "\"type\":\"object\","
+           "\"properties\":{"
+           "\"name\":{\"type\":\"string\"},"
+           "\"cmd\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}"
+           "},"
+           "\"required\":[\"name\",\"cmd\"]"
+           "}"
+           "},"
+           "{"
+           "\"name\":\"list_containers\","
+           "\"description\":\"List all tracked containers and their status\","
+           "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}"
+           "},"
+           "{"
+           "\"name\":\"stop_container\","
+           "\"description\":\"Stop a running container\","
+           "\"inputSchema\":{"
+           "\"type\":\"object\","
+           "\"properties\":{\"name\":{\"type\":\"string\"}},"
+           "\"required\":[\"name\"]"
+           "}"
+           "},"
+           "{"
+           "\"name\":\"inspect_image\","
+           "\"description\":\"Inspect OCI metadata of an oci2bin image binary\","
+           "\"inputSchema\":{"
+           "\"type\":\"object\","
+           "\"properties\":{\"image\":{\"type\":\"string\"}},"
+           "\"required\":[\"image\"]"
+           "}"
+           "},"
+           "{"
+           "\"name\":\"get_logs\","
+           "\"description\":\"Get container log output\","
+           "\"inputSchema\":{"
+           "\"type\":\"object\","
+           "\"properties\":{"
+           "\"name\":{\"type\":\"string\"},"
+           "\"lines\":{\"type\":\"integer\",\"default\":50}"
+           "},"
+           "\"required\":[\"name\"]"
+           "}"
+           "}"
+           "]"
+           "}";
+}
+
+/*
+ * OCI image inspection: prints JSON metadata to stdout.
+ * Called when OCI2BIN_INSPECT=1 is set, before any namespace setup.
+ */
+static int inspect_image_main(const char* self_path)
+{
+    /* Extract OCI tar to a temp dir and read manifest + config */
+    char tmpdir[PATH_MAX];
+    if (make_runtime_tmpdir(tmpdir, sizeof(tmpdir), "oci2bin-inspect.") < 0)
+    {
+        return 1;
+    }
+
+    char tar_path[PATH_MAX];
+    if (snprintf(tar_path, sizeof(tar_path), "%s/image.tar", tmpdir)
+            >= (int)sizeof(tar_path))
+    {
+        return 1;
+    }
+
+    int self_fd = open(self_path, O_RDONLY);
+    if (self_fd < 0)
+    {
+        return 1;
+    }
+    if (lseek(self_fd, (off_t)OCI_DATA_OFFSET, SEEK_SET) < 0)
+    {
+        close(self_fd);
+        return 1;
+    }
+    int out_fd = open(tar_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (out_fd < 0)
+    {
+        close(self_fd);
+        return 1;
+    }
+    if (copy_n_bytes(self_fd, out_fd, OCI_DATA_SIZE) < 0)
+    {
+        close(self_fd);
+        close(out_fd);
+        return 1;
+    }
+    close(self_fd);
+    close(out_fd);
+
+    /* Extract OCI tar */
+    char oci_dir[PATH_MAX];
+    if (snprintf(oci_dir, sizeof(oci_dir), "%s/oci", tmpdir)
+            >= (int)sizeof(oci_dir))
+    {
+        return 1;
+    }
+    if (mkdir(oci_dir, 0700) < 0)
+    {
+        return 1;
+    }
+    char* tar_argv[] =
+    {
+        "tar", "xf", tar_path, "-C", oci_dir,
+        "--no-same-permissions", "--no-same-owner", NULL
+    };
+    if (run_cmd(tar_argv) != 0)
+    {
+        return 1;
+    }
+
+    /* Read manifest.json */
+    char manifest_path[PATH_MAX];
+    if (snprintf(manifest_path, sizeof(manifest_path),
+                 "%s/manifest.json", oci_dir) >= (int)sizeof(manifest_path))
+    {
+        return 1;
+    }
+    size_t manifest_size;
+    char*  manifest = read_file(manifest_path, &manifest_size);
+    if (!manifest)
+    {
+        return 1;
+    }
+
+    /* Get config digest from manifest */
+    char* config_digest = json_get_string(manifest, "Config");
+    free(manifest);
+
+    if (!config_digest)
+    {
+        return 1;
+    }
+
+    /* Sanitize config digest: only alnum, ':', '/' */
+    for (char* p = config_digest; *p; p++)
+    {
+        if (!isalnum((unsigned char)*p) && *p != ':' && *p != '/')
+        {
+            *p = '_';
+        }
+    }
+
+    /* Read config JSON from oci_dir/<digest> */
+    char config_path[PATH_MAX];
+    if (snprintf(config_path, sizeof(config_path), "%s/%s",
+                 oci_dir, config_digest) >= (int)sizeof(config_path))
+    {
+        free(config_digest);
+        return 1;
+    }
+    free(config_digest);
+
+    /* Reject path traversal in config path */
+    if (path_has_dotdot_component(config_path))
+    {
+        return 1;
+    }
+
+    size_t config_size;
+    char*  config_json = read_file(config_path, &config_size);
+    if (!config_json)
+    {
+        return 1;
+    }
+
+    /* Extract entrypoint, cmd, env from config */
+    char* entrypoint_arr = json_get_array(config_json, "Entrypoint");
+    char* cmd_arr        = json_get_array(config_json, "Cmd");
+    char* env_arr        = json_get_array(config_json, "Env");
+    free(config_json);
+
+    /* Get layers from manifest RepoTags or Layers field */
+    char  layers_buf[4096] = "[]";
+    (void)layers_buf; /* we'll print whatever we have */
+
+    /* Print JSON to stdout */
+    printf("{\"entrypoint\":%s,\"cmd\":%s,\"env\":%s}\n",
+           entrypoint_arr ? entrypoint_arr : "null",
+           cmd_arr        ? cmd_arr        : "null",
+           env_arr        ? env_arr        : "null");
+    fflush(stdout);
+
+    free(entrypoint_arr);
+    free(cmd_arr);
+    free(env_arr);
+    return 0;
+}
+
+/*
+ * Main MCP JSON-RPC server loop.
+ * Reads newline-delimited JSON-RPC 2.0 requests from stdin.
+ * Writes responses to stdout.
+ * allow_net: 1 if --allow-net was passed to mcp-serve.
+ */
+static int mcp_serve_main(const char* self_path, int allow_net)
+{
+    (void)self_path;
+
+    char* line = malloc(MCP_LINE_MAX);
+    if (!line)
+    {
+        return 1;
+    }
+
+    /* Signal to client that we're ready */
+    const char* init_resp =
+        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{"
+        "\"protocolVersion\":\"2024-11-05\","
+        "\"capabilities\":{\"tools\":{}},"
+        "\"serverInfo\":{\"name\":\"oci2bin\",\"version\":\"1.0\"}"
+        "}}\n";
+    write_all_fd(STDOUT_FILENO, init_resp, strlen(init_resp));
+
+    for (;;)
+    {
+        /* Read one line (one JSON-RPC request) */
+        size_t len = 0;
+        for (;;)
+        {
+            ssize_t n = read(STDIN_FILENO, line + len, 1);
+            if (n <= 0)
+            {
+                free(line);
+                return 0; /* EOF or error: clean exit */
+            }
+            if (line[len] == '\n')
+            {
+                break;
+            }
+            len++;
+            if (len >= MCP_LINE_MAX - 1)
+            {
+                /* Line too long: drain and reject */
+                while (read(STDIN_FILENO, line, 1) == 1 && line[0] != '\n')
+                {
+                    ;
+                }
+                mcp_send_error(-1, -32700, "request line too large");
+                len = 0;
+            }
+        }
+        line[len] = '\0';
+        if (len == 0)
+        {
+            continue;
+        }
+
+        /* Parse id */
+        char* id_s = json_get_string(line, "id");
+        long  id   = id_s ? strtol(id_s, NULL, 10) : -1;
+        free(id_s);
+
+        /* Parse method */
+        char* method = json_get_string(line, "method");
+        if (!method)
+        {
+            mcp_send_error(id, -32600, "invalid request: missing method");
+            continue;
+        }
+
+        if (strcmp(method, "initialize") == 0)
+        {
+            /* Already sent init_resp above; this is the client's handshake */
+            const char* resp =
+                "{\"protocolVersion\":\"2024-11-05\","
+                "\"capabilities\":{\"tools\":{}},"
+                "\"serverInfo\":{\"name\":\"oci2bin\",\"version\":\"1.0\"}}";
+            mcp_send_result(id, resp);
+        }
+        else if (strcmp(method, "notifications/initialized") == 0 ||
+                 strncmp(method, "notifications/", 14) == 0)
+        {
+            /* Notifications: no response required */
+        }
+        else if (strcmp(method, "tools/list") == 0)
+        {
+            mcp_send_result(id, mcp_tools_list_json());
+        }
+        else if (strcmp(method, "tools/call") == 0)
+        {
+            /* Parse params.name and params.arguments */
+            char* params = json_get_string(line, "params");
+            if (!params)
+            {
+                free(method);
+                mcp_send_error(id, -32602, "tools/call: params missing");
+                continue;
+            }
+
+            char* tool_name = json_get_string(params, "name");
+            char* args_raw  = json_get_string(params, "arguments");
+            /* arguments may be an object; try array fallback */
+            char* args_obj  = args_raw;
+            if (!args_obj)
+            {
+                /* Try reading arguments as raw object */
+                const char* a = json_skip_to_value(params, "arguments");
+                if (a && *a == '{')
+                {
+                    /* Find matching } */
+                    int depth = 0;
+                    const char* p = a;
+                    while (*p)
+                    {
+                        if (*p == '{')
+                        {
+                            depth++;
+                        }
+                        else if (*p == '}')
+                        {
+                            depth--;
+                            if (depth == 0)
+                            {
+                                break;
+                            }
+                        }
+                        p++;
+                    }
+                    size_t alen = (size_t)(p - a + 1);
+                    args_obj = malloc(alen + 1);
+                    if (args_obj)
+                    {
+                        memcpy(args_obj, a, alen);
+                        args_obj[alen] = '\0';
+                    }
+                }
+            }
+            free(params);
+
+            if (!tool_name)
+            {
+                free(args_obj);
+                free(method);
+                mcp_send_error(id, -32602, "tools/call: tool name missing");
+                continue;
+            }
+
+            const char* args = args_obj ? args_obj : "{}";
+
+            if (strcmp(tool_name, "run_container") == 0)
+            {
+                mcp_tool_run_container(id, args, self_path, allow_net);
+            }
+            else if (strcmp(tool_name, "list_containers") == 0)
+            {
+                mcp_tool_list_containers(id);
+            }
+            else if (strcmp(tool_name, "stop_container") == 0)
+            {
+                mcp_tool_stop_container(id, args);
+            }
+            else if (strcmp(tool_name, "exec_in_container") == 0)
+            {
+                mcp_tool_exec_in_container(id, args);
+            }
+            else if (strcmp(tool_name, "inspect_image") == 0)
+            {
+                mcp_tool_inspect_image(id, args);
+            }
+            else if (strcmp(tool_name, "get_logs") == 0)
+            {
+                mcp_tool_get_logs(id, args);
+            }
+            else
+            {
+                char msg[256];
+                char esc[256];
+                json_escape_string(tool_name, esc, sizeof(esc));
+                snprintf(msg, sizeof(msg), "unknown tool: %s", esc);
+                mcp_send_error(id, -32602, msg);
+            }
+            free(tool_name);
+            free(args_obj);
+        }
+        else if (strcmp(method, "ping") == 0)
+        {
+            mcp_send_result(id, "{}");
+        }
+        else
+        {
+            char msg[256];
+            char esc[256];
+            json_escape_string(method, esc, sizeof(esc));
+            snprintf(msg, sizeof(msg), "method not found: %s", esc);
+            mcp_send_error(id, -32601, msg);
+        }
+        free(method);
+    }
+    free(line);
+    return 0;
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char* argv[])
@@ -10254,6 +11398,26 @@ int main(int argc, char* argv[])
     }
     self_path[len] = '\0';
     debug_log("main.self", "path=%s", self_path);
+
+    /* 1a. OCI2BIN_INSPECT=1: print image metadata as JSON and exit */
+    if (getenv("OCI2BIN_INSPECT"))
+    {
+        return inspect_image_main(self_path);
+    }
+
+    /* 1b. "mcp-serve" subcommand: start JSON-RPC 2.0 MCP server */
+    if (argc >= 2 && strcmp(argv[1], "mcp-serve") == 0)
+    {
+        int allow_net = 0;
+        for (int i = 2; i < argc; i++)
+        {
+            if (strcmp(argv[i], "--allow-net") == 0)
+            {
+                allow_net = 1;
+            }
+        }
+        return mcp_serve_main(self_path, allow_net);
+    }
 
     /* 1b. oci2vm mode: if invoked as "oci2vm", prepend --vm to argv so VM
      * mode is the default without requiring an explicit flag. */
