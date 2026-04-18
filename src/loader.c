@@ -5681,6 +5681,17 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     }
 #endif
 
+    /* Block host-side ptrace and /proc/<pid>/mem access.  After execvp the
+     * container process runs as uid 0 inside its own user namespace; without
+     * this, the host root can still attach via ptrace or read /proc/<pid>/mem.
+     * Errors are non-fatal but logged so the operator can see if the kernel
+     * refuses the call. */
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+    {
+        fprintf(stderr, "oci2bin: warning: PR_SET_DUMPABLE 0 failed: %s\n",
+                strerror(errno));
+    }
+
     /* --gen-seccomp: trace the workload instead of exec'ing directly */
     if (opts->gen_seccomp)
     {
