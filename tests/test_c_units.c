@@ -2220,6 +2220,43 @@ static void test_build_exec_args_extended(void)
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
+/* ── test_mcp_helpers ─────────────────────────────────────────────────────── */
+
+static void test_mcp_helpers(void)
+{
+    /* mcp_name_valid: accepts alnum + allowed chars */
+    ASSERT_INT_EQ(mcp_name_valid("myapp"), 1,
+                  "mcp_helpers: valid name accepted");
+    ASSERT_INT_EQ(mcp_name_valid("my-app_1.2"), 1,
+                  "mcp_helpers: name with dash/underscore/dot accepted");
+    ASSERT_INT_EQ(mcp_name_valid(""), 0,
+                  "mcp_helpers: empty name rejected");
+    ASSERT_INT_EQ(mcp_name_valid(NULL), 0,
+                  "mcp_helpers: NULL name rejected");
+    ASSERT_INT_EQ(mcp_name_valid("bad/name"), 0,
+                  "mcp_helpers: slash in name rejected");
+    ASSERT_INT_EQ(mcp_name_valid("bad name"), 0,
+                  "mcp_helpers: space in name rejected");
+
+    /* mcp container tracking */
+    g_mcp_n_ctrs = 0;
+    memset(g_mcp_ctrs, 0, sizeof(g_mcp_ctrs));
+    ASSERT_INT_EQ(mcp_find_ctr("missing"), -1,
+                  "mcp_helpers: find_ctr returns -1 for unknown name");
+
+    /* add a fake container */
+    strncpy(g_mcp_ctrs[0].name, "test-ctr", MCP_NAME_MAX - 1);
+    g_mcp_ctrs[0].pid = 99999; /* fake PID */
+    g_mcp_n_ctrs = 1;
+    ASSERT_INT_EQ(mcp_find_ctr("test-ctr"), 0,
+                  "mcp_helpers: find_ctr finds tracked container");
+    ASSERT_INT_EQ(mcp_find_ctr("other"), -1,
+                  "mcp_helpers: find_ctr misses different name");
+
+    /* reset */
+    g_mcp_n_ctrs = 0;
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -2251,6 +2288,7 @@ int main(void)
     test_parse_opts_caps();
     test_parse_opts_ulimit();
     test_parse_opts_misc_flags();
+    test_mcp_helpers();
 
     printf("1..%d\n", tap_test_num);
 

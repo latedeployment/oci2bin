@@ -1593,6 +1593,51 @@ When subordinate-ID remapping is unavailable, oci2bin falls back to a single-ID 
 
 ---
 
+## MCP server (AI tool integration)
+
+`oci2bin` binaries expose a [Model Context Protocol](https://modelcontextprotocol.io/) server for AI tools via the `mcp-serve` subcommand:
+
+```bash
+./my-app mcp-serve [--allow-net]
+```
+
+The server reads newline-delimited JSON-RPC 2.0 requests from stdin and writes responses to stdout. It exposes six tools:
+
+| Tool | Description |
+|------|-------------|
+| `run_container` | Start a container from a local oci2bin binary |
+| `exec_in_container` | Run a command inside a running container (via `nsenter`) |
+| `list_containers` | List all tracked containers and their status |
+| `stop_container` | Stop a container (SIGTERM then SIGKILL) |
+| `inspect_image` | Return OCI metadata (entrypoint, env) for an image binary |
+| `get_logs` | Tail the container's log output |
+
+**Security defaults enforced in MCP mode:**
+
+- Network is forced to `--net none` unless `--allow-net` was passed to `mcp-serve` **and** the caller explicitly requests `net="host"`.
+- `--device` flags are never exposed through MCP.
+- Container names are validated: only `[a-zA-Z0-9._-]` characters allowed.
+- Image paths must be absolute and clean (no `..` components).
+
+**Inspect support:**
+
+Any oci2bin binary supports `OCI2BIN_INSPECT=1` in its environment: it prints a JSON object with `entrypoint`, `cmd`, and `env` from the embedded OCI config to stdout, then exits. The `inspect_image` MCP tool uses this mechanism.
+
+**Example (connect from Claude Desktop):**
+
+```json
+{
+  "mcpServers": {
+    "oci2bin": {
+      "command": "/path/to/my-app",
+      "args": ["mcp-serve"]
+    }
+  }
+}
+```
+
+---
+
 ## References
 
 - [OCI Image Layout Specification](https://github.com/opencontainers/image-spec/blob/main/image-layout.md)
