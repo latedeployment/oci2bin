@@ -4476,7 +4476,13 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     char  image_user_buf[256] = {0};
     if (oci_cfg.user && oci_cfg.user[0])
     {
-        snprintf(image_user_buf, sizeof(image_user_buf), "%s", oci_cfg.user);
+        int _un = snprintf(image_user_buf, sizeof(image_user_buf), "%s",
+                           oci_cfg.user);
+        if (_un < 0 || (size_t)_un >= sizeof(image_user_buf))
+        {
+            fprintf(stderr, "oci2bin: User field too long; ignoring\n");
+            image_user_buf[0] = '\0';
+        }
     }
     char* image_user = image_user_buf;
     oci_cfg.env_json = NULL;
