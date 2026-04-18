@@ -1398,6 +1398,46 @@ static int write_file_beneath(int rootfs_fd, const char* rel_path,
     return rc;
 }
 
+static char* read_file_beneath(int rootfs_fd, const char* rel_path,
+                               size_t* out_size)
+{
+    int fd = openat_beneath(rootfs_fd, rel_path, O_RDONLY, 0);
+    if (fd < 0)
+    {
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0)
+    {
+        close(fd);
+        return NULL;
+    }
+    if (st.st_size < 0 || st.st_size > (off_t)256 * 1024 * 1024)
+    {
+        close(fd);
+        return NULL;
+    }
+    char* buf = malloc((size_t)st.st_size + 1);
+    if (!buf)
+    {
+        close(fd);
+        return NULL;
+    }
+    ssize_t n = read_all_fd(fd, buf, (size_t)st.st_size);
+    close(fd);
+    if (n < 0)
+    {
+        free(buf);
+        return NULL;
+    }
+    buf[n] = '\0';
+    if (out_size)
+    {
+        *out_size = (size_t)n;
+    }
+    return buf;
+}
+
 /*
  * Resolve a username to numeric UID:GID using rootfs/etc/passwd.
  * Stores "uid:gid" in out (at least 32 bytes).  Returns 0 on success.
@@ -1419,15 +1459,70 @@ static int resolve_user_in_rootfs(const char* rootfs, const char* spec,
         }
         return 0;
     }
-    char passwd_path[PATH_MAX];
-    if (snprintf(passwd_path, sizeof(passwd_path), "%s/etc/passwd",
-                 rootfs) >= (int)sizeof(passwd_path))
+    int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfs_fd < 0)
     {
         return -1;
     }
+    int passwd_fd = openat_beneath(rootfs_fd, "etc/passwd", O_RDONLY, 0);
+    close(rootfs_fd);
+    if (passwd_fd < 0)
+    {
+        return -1;
+    }
+    FILE* f = fdopen(passwd_fd, "r");
+    if (!f)
+    {
+        close(passwd_fd);
+        return -1;
+    }
+    char line[1024];
     uid_t uid = 0;
     gid_t gid = 0;
-    if (lookup_passwd_user(passwd_path, spec, &uid, &gid) < 0)
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f))
+    {
+        char* user = line;
+        char* passwd = strchr(user, ':');
+        if (!passwd)
+        {
+            continue;
+        }
+        *passwd++ = '\0';
+        char* uid_field = strchr(passwd, ':');
+        if (!uid_field)
+        {
+            continue;
+        }
+        *uid_field++ = '\0';
+        char* gid_field = strchr(uid_field, ':');
+        if (!gid_field)
+        {
+            continue;
+        }
+        *gid_field++ = '\0';
+        char* tail = strchr(gid_field, ':');
+        if (!tail)
+        {
+            continue;
+        }
+        *tail = '\0';
+        if (strcmp(user, spec) == 0)
+        {
+            long uid_val = 0, gid_val = 0;
+            if (parse_id_value(uid_field, 65534, &uid_val) < 0 ||
+                    parse_id_value(gid_field, 65534, &gid_val) < 0)
+            {
+                fclose(f);
+                return -1;
+            }
+            uid = (uid_t)uid_val;
+            gid = (gid_t)gid_val;
+            found = 1;
+        }
+    }
+    fclose(f);
+    if (!found)
     {
         return -1;
     }
@@ -2090,12 +2185,11 @@ static int setup_uid_map(uid_t real_uid, gid_t real_gid)
  * Fixes the double-newline bug: trailing '\n' is stripped before reassembly.
  */
 static void rewrite_id_fields(int rootfs_fd, const char* rel_path,
-                              const char* full_path,
                               int n_fields,
                               const int* remap_indices)
 {
     size_t file_sz;
-    char*  data = read_file(full_path, &file_sz);
+    char*  data = read_file_beneath(rootfs_fd, rel_path, &file_sz);
     if (!data)
     {
         return;
@@ -2211,24 +2305,14 @@ static void patch_rootfs_ids(const char* rootfs)
 
     /* ── /etc/passwd ── remap uid (field 2) and gid (field 3) to 0 ── */
     {
-        char path[PATH_MAX];
-        int n = snprintf(path, sizeof(path), "%s/etc/passwd", rootfs);
-        if (n > 0 && (size_t)n < sizeof(path))
-        {
-            static const int remap[] = {2, 3, -1};
-            rewrite_id_fields(rootfs_fd, "etc/passwd", path, 7, remap);
-        }
+        static const int remap[] = {2, 3, -1};
+        rewrite_id_fields(rootfs_fd, "etc/passwd", 7, remap);
     }
 
     /* ── /etc/group ── remap gid (field 2) to 0 ── */
     {
-        char path[PATH_MAX];
-        int n = snprintf(path, sizeof(path), "%s/etc/group", rootfs);
-        if (n > 0 && (size_t)n < sizeof(path))
-        {
-            static const int remap[] = {2, -1};
-            rewrite_id_fields(rootfs_fd, "etc/group", path, 4, remap);
-        }
+        static const int remap[] = {2, -1};
+        rewrite_id_fields(rootfs_fd, "etc/group", 4, remap);
     }
 
     /* ── apt sandbox ── belt-and-suspenders for Debian/Ubuntu images ── */
