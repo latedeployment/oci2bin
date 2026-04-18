@@ -86,6 +86,9 @@
 #   --gen-seccomp FILE    Trace syscalls during a run and write a minimal
 #                         Docker-compatible allowlist JSON to FILE; use the
 #                         result with --seccomp-profile for hardened runs
+#   --gdb                 Launch gdb inside the container with the image
+#                         entrypoint as the debuggee; host gdb is bind-mounted
+#                         in automatically if missing. Disables seccomp.
 #   --no-auto-tmpfs       Do not auto-mount /run as tmpfs with --read-only
 #   --security-opt apparmor=PROFILE
 #                         Apply AppArmor profile (build with -DHAVE_APPARMOR)

@@ -242,6 +242,9 @@ struct container_opts
 
     /* --gen-seccomp FILE  (trace syscalls and emit a Docker-compatible profile) */
     char* gen_seccomp;
+
+    /* --gdb  (bind-mount host gdb into container and exec it as debugger) */
+    int gdb;
 };
 
 static int argv_has_debug_flag(int argc, char* argv[])
@@ -2411,6 +2414,95 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
             fprintf(stderr, "oci2bin: mounted %s -> %s\n",
                     host_path, opts->vol_ctr[i]);
         }
+    }
+}
+
+/*
+ * If the container does not have gdb at the standard paths, bind-mount the
+ * host gdb binary (and ld-linux interpreter if the container is musl/static)
+ * at /usr/bin/gdb inside the rootfs.  Called pre-chroot when --gdb is set.
+ */
+static void setup_gdb_in_rootfs(const char* rootfs)
+{
+    /* Check if the container already has gdb */
+    static const char* ctr_paths[] =
+    {
+        "/usr/bin/gdb", "/usr/local/bin/gdb", "/bin/gdb", NULL
+    };
+    for (int i = 0; ctr_paths[i]; i++)
+    {
+        char full[PATH_MAX];
+        int n = snprintf(full, sizeof(full), "%s%s", rootfs, ctr_paths[i]);
+        if (n < 0 || (size_t)n >= sizeof(full))
+        {
+            continue;
+        }
+        if (access(full, X_OK) == 0)
+        {
+            return; /* already present */
+        }
+    }
+
+    /* Find gdb on the host */
+    static const char* host_paths[] =
+    {
+        "/usr/bin/gdb", "/usr/local/bin/gdb", "/bin/gdb", NULL
+    };
+    const char* host_gdb = NULL;
+    for (int i = 0; host_paths[i]; i++)
+    {
+        if (access(host_paths[i], X_OK) == 0)
+        {
+            host_gdb = host_paths[i];
+            break;
+        }
+    }
+    if (!host_gdb)
+    {
+        fprintf(stderr,
+                "oci2bin: --gdb: gdb not found on host; "
+                "install it with your package manager\n");
+        return;
+    }
+
+    /* Ensure /usr/bin exists in the container */
+    char usr_bin[PATH_MAX];
+    int n = snprintf(usr_bin, sizeof(usr_bin), "%s/usr/bin", rootfs);
+    if (n < 0 || (size_t)n >= sizeof(usr_bin))
+    {
+        return;
+    }
+    mkdir(usr_bin, 0755); /* best-effort; may already exist */
+
+    char dst[PATH_MAX];
+    n = snprintf(dst, sizeof(dst), "%s/usr/bin/gdb", rootfs);
+    if (n < 0 || (size_t)n >= sizeof(dst))
+    {
+        return;
+    }
+
+    /* Create an empty file as bind-mount target */
+    int fd = open(dst, O_CREAT | O_WRONLY | O_EXCL, 0755);
+    if (fd < 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "oci2bin: --gdb: cannot create %s: %s\n",
+                dst, strerror(errno));
+        return;
+    }
+    if (fd >= 0)
+    {
+        close(fd);
+    }
+
+    if (mount(host_gdb, dst, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
+    {
+        fprintf(stderr, "oci2bin: --gdb: bind-mount %s → %s: %s\n",
+                host_gdb, dst, strerror(errno));
+    }
+    else
+    {
+        fprintf(stderr, "oci2bin: --gdb: bind-mounted host %s into container\n",
+                host_gdb);
     }
 }
 
@@ -4762,6 +4854,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     /* Set up volume bind mounts BEFORE chroot (host paths still reachable) */
     setup_volumes(rootfs, opts);
     setup_secrets(rootfs, opts);
+    if (opts->gdb)
+    {
+        setup_gdb_in_rootfs(rootfs);
+    }
 
     /* Append --add-host entries to /etc/hosts before chroot */
     install_extra_hosts(rootfs, opts->add_hosts, opts->n_add_hosts);
@@ -5328,8 +5424,14 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         apply_capabilities(opts);
     }
 
-    /* Apply seccomp filter (must be before fork so child inherits it) */
-    if (!opts->no_seccomp)
+    /* Apply seccomp filter (must be before fork so child inherits it).
+     * --gdb disables seccomp entirely: gdb needs ptrace and many syscalls. */
+    if (opts->gdb)
+    {
+        fprintf(stderr,
+                "oci2bin: --gdb: seccomp disabled to allow ptrace\n");
+    }
+    if (!opts->no_seccomp && !opts->gdb)
     {
         if (opts->seccomp_profile)
         {
@@ -5518,6 +5620,38 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         return do_gen_seccomp(opts->gen_seccomp, exec_args);
     }
 
+    /* --gdb: launch gdb with the container entrypoint as the debuggee.
+     * Build argv: gdb --args <exec_args[0]> [exec_args[1]...] */
+    if (opts->gdb)
+    {
+        /* Count exec_args */
+        int na = 0;
+        while (exec_args[na])
+        {
+            na++;
+        }
+        /* gdb --args <exec_args...> NULL  = na + 3 slots */
+        char** gdb_argv = malloc((size_t)(na + 3) * sizeof(char*));
+        if (!gdb_argv)
+        {
+            perror("oci2bin: --gdb: malloc");
+            return 1;
+        }
+        gdb_argv[0] = "gdb";
+        gdb_argv[1] = "--args";
+        for (int gi = 0; gi < na; gi++)
+        {
+            gdb_argv[gi + 2] = exec_args[gi];
+        }
+        gdb_argv[na + 2] = NULL;
+        debug_log("container.exec", "gdb --args %s argc=%d",
+                  safe_str(exec_args[0]), na);
+        execvp("gdb", gdb_argv);
+        perror("oci2bin: --gdb: execvp gdb");
+        free(gdb_argv);
+        return 1;
+    }
+
     /* Exec the entrypoint */
     debug_log("container.exec", "path=%s argc=%d", safe_str(exec_args[0]),
               exec_argc);
@@ -5690,6 +5824,10 @@ static void usage(const char* prog)
             "                      and write a minimal Docker-compatible allowlist\n"
             "                      JSON to FILE. Use the output with\n"
             "                      --seccomp-profile for hardened production runs.\n"
+            "  --gdb               Launch gdb inside the container with the image\n"
+            "                      entrypoint as the debuggee (host gdb bind-mounted\n"
+            "                      in if not present). Disables seccomp to allow\n"
+            "                      ptrace.\n"
             "  --security-opt apparmor=PROFILE\n"
             "                      Apply AppArmor profile before exec\n"
             "                      (requires -DHAVE_APPARMOR at build time)\n"
@@ -6450,6 +6588,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->gen_seccomp = argv[i];
+        }
+        else if (strcmp(argv[i], "--gdb") == 0)
+        {
+            opts->gdb = 1;
         }
         else if (strcmp(argv[i], "--add-host") == 0)
         {

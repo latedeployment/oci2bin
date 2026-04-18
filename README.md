@@ -50,6 +50,7 @@ See below [How it works](#how-it-works).
   - [Capabilities](#capabilities)
   - [Seccomp filter](#seccomp-filter)
     - [Generating a minimal seccomp profile](#generating-a-minimal-seccomp-profile)
+  - [Debugging with gdb](#debugging-with-gdb)
   - [Running as non-root](#running-as-non-root)
   - [Custom hostname](#custom-hostname)
   - [Exposing host devices](#exposing-host-devices)
@@ -873,6 +874,34 @@ required.
 > **Tip:** Run the tracer against a representative workload — startup, warm-up
 > requests, graceful shutdown — to ensure all syscalls are captured before
 > locking down the profile.
+
+### Debugging with gdb
+
+`--gdb` launches `gdb` inside the container with the image entrypoint as the
+debuggee — no manual `nsenter`, PID tracking, or custom debug images needed.
+
+```bash
+./my-app --gdb
+# gdb is started with:  gdb --args <entrypoint> [args...]
+
+# Override entrypoint to debug a specific binary:
+./my-app --gdb --entrypoint /usr/bin/my-server -- --config /etc/my-server.conf
+```
+
+**What happens automatically:**
+
+1. If `gdb` is not present in the container, the host's `/usr/bin/gdb` (or
+   `/usr/local/bin/gdb`) is bind-mounted read-only at `/usr/bin/gdb` inside
+   the rootfs.
+2. seccomp is disabled for the session (gdb needs `ptrace` and many ancillary
+   syscalls to operate). A notice is printed to stderr.
+3. The loader execs `gdb --args <entrypoint> [args...]` inside the fully
+   configured namespace — all volumes, secrets, environment variables, and
+   networking are set up exactly as they would be for a normal run.
+
+**Requirements:** `gdb` must be installed on the host (e.g. `dnf install gdb`
+or `apt install gdb`). The container runs without seccomp, so use only in
+development or trusted environments.
 
 #### AppArmor and SELinux confinement
 
