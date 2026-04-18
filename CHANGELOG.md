@@ -2,6 +2,87 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.10.0] - 2026-04-18
+
+### Added
+
+- **`oci2bin run IMAGE [-- ARGS]`** — build to a temp file and execute once;
+  temp directory is cleaned up on exit.
+
+- **`oci2bin systemd BINARY`** — emit a ready-to-use systemd unit file.
+  Supports `--user` and `--restart always|on-failure|no`. Unit name derived
+  from OCI labels (`oci2bin.name`, `org.opencontainers.image.title`) with
+  safe character sanitisation.
+
+- **`oci2bin healthcheck BINARY [--pid PID]`** — run the embedded OCI
+  `HEALTHCHECK` command. With `--pid`, enters the container's namespaces via
+  `nsenter`; without it, execs the command through the binary itself.
+
+- **`oci2bin top [--once] [--interval SEC]`** — live stats table for all
+  named running containers: CPU%, RSS/cgroup memory, PID count, uptime.
+
+- **`oci2bin update --check [--verify-key KEY]`** — check whether a newer
+  image or signed update manifest is available without rebuilding.
+
+- **`oci2bin sign-file` / `oci2bin verify-file`** — detached ECDSA signing
+  and verification for arbitrary files, using the same key format as binary
+  signing. Supports `--hash-algorithm sha256|sha512`.
+
+- **`--self-update-url URL`** — embed a signed update-manifest URL in the
+  binary. At runtime `--check-update` fetches the manifest, verifies its
+  ECDSA signature, and reports whether a newer version is available;
+  `--self-update` downloads, hash-verifies, and atomically replaces the
+  binary. Rollback manifests (lower version) are rejected.
+
+- **`--pin-digest DIGEST|ALGO:auto`** — embed a canonical SHA-256 or SHA-512
+  digest of the binary in the metadata block. At startup the binary verifies
+  its own hash and refuses to run if it has been tampered with. `auto`
+  computes and patches the digest at build time.
+
+- **PyPI packaging** — `uv pip install oci2bin` / `pip install oci2bin`
+  installs the `oci2bin` and `oci2vm` entry points. No Python runtime
+  dependencies; requires `gcc` and `docker` at use time.
+
+### Fixed
+
+- **Signature verification bypass in `--self-update`** — `sign_binary.py` was
+  opened via `SourceFileLoader` before being passed to the verifier subprocess
+  as an fd path; the fd cursor was at EOF so the grandchild always read zero
+  bytes and exited 0, accepting any manifest regardless of signature. Fixed by
+  `os.lseek(fd, 0, 0)` before `subprocess.run`.
+
+- **Unbounded manifest download** — `--self-update` fetched the manifest and
+  `.sig` files with `r.read()` and no size cap; a hostile server could exhaust
+  memory. Both downloads are now capped at 1 MiB.
+
+- **`oci2bin top` crash on process exit** — `read_stat()` accessed
+  `fields[21]` without a length guard; a process exiting between the
+  `/proc/<pid>` existence check and the `stat` read caused an uncaught
+  `IndexError` that crashed the display loop. Now raises `OSError` so the
+  caller's `except OSError: continue` handles it.
+
+- **PID-reuse hardening** — `stop` reads `start_ticks` (field 22 of
+  `/proc/<pid>/stat`) from the container state JSON and re-verifies it before
+  SIGTERM and before SIGKILL escalation, preventing signalling an unrelated
+  process that reused the PID.
+
+- **Symlink-safe state directory** — `container_state_dir_or_die()` validates
+  that `$HOME` is absolute and that no component of the state path is a
+  symlink before reading or writing state files.
+
+- **`make install` missing scripts** — only `build_polyglot.py` and
+  `reconstruct.py` were installed; `sign_binary.py`, `inspect_image.py`, and
+  seven other helpers required by subcommands were missing. All 11 scripts are
+  now installed.
+
+### Tests
+
+- `test_cli_features.py`: systemd unit emission, healthcheck short-circuit,
+  sign/verify-file roundtrip, `top --once` output, `stop` PID-reuse rejection,
+  signed update manifest check.
+- `test_add_files.py`: layer injection via `add_files.py`.
+- `test_build_meta.py`: metadata block embedding and `--pin-digest` patching.
+
 ## [0.9.0] - 2026-04-17
 
 ### Added
