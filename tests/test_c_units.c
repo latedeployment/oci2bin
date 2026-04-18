@@ -1271,6 +1271,15 @@ static void test_parse_opts_misc_flags(void)
                       "parse_opts: --no-seccomp sets flag");
     }
 
+    /* --lazy */
+    {
+        char* argv[] = {"prog", "--lazy", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --lazy returns 0");
+        ASSERT_INT_EQ(opts.lazy, 1, "parse_opts: --lazy sets flag");
+    }
+
     /* --init */
     {
         char* argv[] = {"prog", "--init", NULL};
@@ -1650,6 +1659,25 @@ static void test_kernel_feature_runtime_detection(void)
                   KERNEL_FEATURE_SUPPORTED :
                   KERNEL_FEATURE_UNSUPPORTED,
                   "kernel feature: mseal probe result cached");
+
+    /* userfaultfd probe */
+    kernel_set_feature_state(KERNEL_FEATURE_UFFD, KERNEL_FEATURE_UNSUPPORTED);
+    ASSERT_INT_EQ(kernel_supports_uffd(), 0,
+                  "kernel feature: uffd cached unsupported");
+    kernel_set_feature_state(KERNEL_FEATURE_UFFD, KERNEL_FEATURE_SUPPORTED);
+    ASSERT_INT_EQ(kernel_supports_uffd(), 1,
+                  "kernel feature: uffd cached supported");
+
+    kernel_set_feature_state(KERNEL_FEATURE_UFFD, KERNEL_FEATURE_UNKNOWN);
+    {
+        int uffd_live = kernel_supports_uffd();
+        ASSERT_INT_EQ(uffd_live == 0 || uffd_live == 1, 1,
+                      "kernel feature: uffd runtime probe returns 0 or 1");
+        ASSERT_INT_EQ(g_kernel_feature_state[KERNEL_FEATURE_UFFD],
+                      uffd_live ? KERNEL_FEATURE_SUPPORTED :
+                      KERNEL_FEATURE_UNSUPPORTED,
+                      "kernel feature: uffd probe result cached");
+    }
 }
 
 static void test_audit_logging_helpers(void)
