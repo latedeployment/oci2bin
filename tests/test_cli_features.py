@@ -3,6 +3,8 @@ import importlib.util
 import io
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -12,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 OCI2BIN = ROOT / "oci2bin"
+BASH = shutil.which("bash") or "/bin/bash"
 
 
 def _load_module(name, path):
@@ -99,6 +102,16 @@ class TestCliFeatures(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertTrue(os.access(out_path, os.X_OK))
         return out_path
+
+    def _fake_tool_path(self, tool_dir):
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        for tool in ("python3", "readlink", "dirname", "basename", "mkdir"):
+            tool_path = shutil.which(tool)
+            self.assertIsNotNone(tool_path)
+            tool_link = tool_dir / tool
+            if not tool_link.exists():
+                tool_link.symlink_to(tool_path)
+        return str(tool_dir)
 
     def test_systemd_emits_unit_with_label_name(self):
         binary = self._build_binary(
@@ -294,6 +307,85 @@ class TestCliFeatures(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 10, msg=result.stderr)
         self.assertIn("update available", result.stderr)
+
+    def test_checkpoint_requires_criu_when_missing(self):
+        env = os.environ.copy()
+        env["HOME"] = str(self.tmpdir / "home-no-criu")
+        env["PATH"] = self._fake_tool_path(self.tmpdir / "tools-no-criu")
+        result = subprocess.run(
+            [BASH, str(OCI2BIN), "checkpoint", "demo"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("criu", result.stderr)
+        self.assertIn("not found in PATH", result.stderr)
+
+    def test_checkpoint_and_restore_invoke_criu(self):
+        home = self.tmpdir / "home-criu"
+        ctr_dir = home / ".cache" / "oci2bin" / "containers"
+        ctr_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(f"/proc/{os.getpid()}/stat", encoding="utf-8") as f:
+            raw = f.read().strip()
+        rparen = raw.rfind(")")
+        start_ticks = raw[rparen + 2:].split()[19]
+
+        state = ctr_dir / "demo.json"
+        state.write_text(json.dumps({
+            "name": "demo",
+            "pid": os.getpid(),
+            "binary": os.readlink("/proc/self/exe"),
+            "started_at": "2026-04-18T12:00:00Z",
+            "start_ticks": int(start_ticks),
+        }), encoding="utf-8")
+
+        tool_dir = Path(self._fake_tool_path(self.tmpdir / "tools-criu"))
+        criu_log = self.tmpdir / "criu.log"
+        criu = tool_dir / "criu"
+        criu.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$*\" >> {shlex.quote(str(criu_log))}\n",
+            encoding="utf-8",
+        )
+        criu.chmod(0o755)
+
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["PATH"] = str(tool_dir)
+
+        checkpoint = subprocess.run(
+            [BASH, str(OCI2BIN), "checkpoint", "demo"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        self.assertEqual(checkpoint.returncode, 0, msg=checkpoint.stderr)
+
+        checkpoint_dir = home / ".local" / "share" / "oci2bin" / "checkpoints" / "demo"
+        self.assertTrue(checkpoint_dir.is_dir())
+
+        restore = subprocess.run(
+            [BASH, str(OCI2BIN), "restore", "demo"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        self.assertEqual(restore.returncode, 0, msg=restore.stderr)
+
+        logged = criu_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            logged[0],
+            f"dump --tree {os.getpid()} --images-dir {checkpoint_dir}",
+        )
+        self.assertEqual(
+            logged[1],
+            f"restore --images-dir {checkpoint_dir} --shell-job",
+        )
 
 
 if __name__ == "__main__":

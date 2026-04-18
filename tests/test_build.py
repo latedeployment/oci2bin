@@ -5,9 +5,16 @@ Runs standalone with:  python3 -m unittest tests.test_build -v
 """
 
 import importlib.util
+import hashlib
+import io
+import json
+import os
 import struct
 import sys
+import tarfile
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # ── Load build_polyglot without mutating sys.path ────────────────────────────
@@ -274,6 +281,90 @@ class TestTarPad(unittest.TestCase):
         result = bp.tar_pad(data)
         self.assertEqual(len(result), 512)
         self.assertEqual(result[-1:], b'\x00')
+
+
+class TestLayerCache(unittest.TestCase):
+    @staticmethod
+    def _make_oci_tar(layers):
+        manifest = [{
+            'Config': 'config.json',
+            'RepoTags': ['example:latest'],
+            'Layers': [name for name, _ in layers],
+        }]
+        config = {
+            'rootfs': {
+                'type': 'layers',
+                'diff_ids': [
+                    f'sha256:{hashlib.sha256(data).hexdigest()}'
+                    for _, data in layers
+                ],
+            },
+            'config': {},
+        }
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:') as tf:
+            manifest_raw = json.dumps(manifest, separators=(',', ':')).encode()
+            manifest_info = tarfile.TarInfo('manifest.json')
+            manifest_info.size = len(manifest_raw)
+            tf.addfile(manifest_info, io.BytesIO(manifest_raw))
+
+            config_raw = json.dumps(config, separators=(',', ':')).encode()
+            config_info = tarfile.TarInfo('config.json')
+            config_info.size = len(config_raw)
+            tf.addfile(config_info, io.BytesIO(config_raw))
+
+            for name, data in layers:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    def test_warm_layer_cache_populates_and_hits(self):
+        layers = [
+            ('layer0/layer.tar', b'layer-zero'),
+            ('layer1/layer.tar', b'layer-one'),
+        ]
+        oci_data = self._make_oci_tar(layers)
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
+            stats = bp.warm_layer_cache(oci_data, use_cache=True)
+            self.assertEqual(stats, {'hits': 0, 'misses': 2})
+
+            cache_root = Path(bp.get_layer_cache_root())
+            for _, data in layers:
+                digest = hashlib.sha256(data).hexdigest()
+                self.assertEqual((cache_root / f'{digest}.tar').read_bytes(), data)
+
+            stats = bp.warm_layer_cache(oci_data, use_cache=True)
+            self.assertEqual(stats, {'hits': 2, 'misses': 0})
+
+    def test_warm_layer_cache_refreshes_corrupt_entry(self):
+        layers = [('layer0/layer.tar', b'layer-zero')]
+        oci_data = self._make_oci_tar(layers)
+        digest = hashlib.sha256(layers[0][1]).hexdigest()
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
+            cache_root = Path(bp.get_layer_cache_root())
+            cache_root.mkdir(parents=True, exist_ok=True)
+            (cache_root / f'{digest}.tar').write_bytes(b'corrupt')
+
+            stats = bp.warm_layer_cache(oci_data, use_cache=True)
+            self.assertEqual(stats, {'hits': 0, 'misses': 1})
+            self.assertEqual((cache_root / f'{digest}.tar').read_bytes(),
+                             layers[0][1])
+
+    def test_warm_layer_cache_no_cache_bypass(self):
+        layers = [('layer0/layer.tar', b'layer-zero')]
+        oci_data = self._make_oci_tar(layers)
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
+            stats = bp.warm_layer_cache(oci_data, use_cache=False)
+            self.assertEqual(stats, {'hits': 0, 'misses': 0})
+            self.assertFalse(Path(bp.get_layer_cache_root()).exists())
 
 
 if __name__ == '__main__':

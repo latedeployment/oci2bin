@@ -14,6 +14,8 @@
 #   oci2bin run [BUILD_OPTS...] IMAGE [-- RUNTIME_ARGS...]
 #   oci2bin systemd BINARY [--user] [--restart always|on-failure|no]
 #   oci2bin healthcheck BINARY [--pid PID]
+#   oci2bin checkpoint NAME
+#   oci2bin restore NAME
 #   oci2bin top [--once] [--interval SEC]
 #   oci2bin list [--json]
 #   oci2bin prune [--dry-run]
@@ -32,6 +34,8 @@
 #                         Cross-compilation requires the matching cross-
 #                         compiler (aarch64-linux-gnu-gcc) to be in PATH.
 #   --cache               Cache the output binary; skip rebuild if already built
+#   --no-cache            Disable the per-layer OCI tar cache used while
+#                         assembling the image into a polyglot
 #   --layer IMAGE         Merge additional image layers on top of the base image
 #                         (may be repeated; layers are applied in order)
 #   --strip               Remove docs/man/locale/cache from the image before packaging
@@ -120,6 +124,9 @@
 #   run IMAGE [...]       Build to a temp file and execute it once
 #   systemd BINARY        Emit a ready-to-use systemd unit file
 #   healthcheck BINARY    Run the embedded OCI HEALTHCHECK command
+#   checkpoint NAME       Dump a named detached container with CRIU into
+#                         ~/.local/share/oci2bin/checkpoints/NAME
+#   restore NAME          Restore a CRIU checkpoint from the same directory
 #   top                   Live stats for named running containers
 #   reconstruct <src>     Rebuild polyglot from an image built with
 #                         --embed-loader-layer or --embed-loader-labels;
@@ -145,13 +152,27 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+need() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "oci2bin: '$1' not found in PATH" >&2
+        exit 1
+    }
+}
+
+case "${BASH_SOURCE[0]}" in
+    */*)
+        SCRIPT_DIR="$(cd "${BASH_SOURCE[0]%/*}" && pwd)"
+        ;;
+    *)
+        SCRIPT_DIR="$(pwd)"
+        ;;
+esac
 OCI2BIN_HOME="${OCI2BIN_HOME:-$SCRIPT_DIR}"
 
 # ── oci2vm mode ───────────────────────────────────────────────────────────
 # When invoked as "oci2vm" the output binary is named oci2vm_<image> so that
 # the loader's own basename check fires and VM mode is the runtime default.
-_OCI2BIN_BASENAME="$(basename "$0")"
+_OCI2BIN_BASENAME="${0##*/}"
 OCI2VM_MODE=0
 if [[ "$_OCI2BIN_BASENAME" == "oci2vm" ]]; then
     OCI2VM_MODE=1
@@ -196,6 +217,69 @@ for part in parts:
 
 print(state_dir)
 PYEOF
+}
+
+checkpoints_dir_or_die() {
+    python3 - "${HOME:-}" <<'PYEOF'
+import os
+import sys
+
+home = sys.argv[1]
+if not home or not os.path.isabs(home):
+    print("oci2bin: HOME must be an absolute path", file=sys.stderr)
+    sys.exit(1)
+
+home_parts = [part for part in home.split("/") if part]
+if any(part == ".." for part in home_parts):
+    print("oci2bin: HOME must not contain '..' components", file=sys.stderr)
+    sys.exit(1)
+
+checkpoint_dir = os.path.join(home, ".local", "share", "oci2bin", "checkpoints")
+parts = [part for part in checkpoint_dir.split("/") if part]
+cur = "/"
+for part in parts:
+    cur = os.path.join(cur, part)
+    try:
+        os.lstat(cur)
+    except FileNotFoundError:
+        continue
+    except OSError as exc:
+        print(f"oci2bin: lstat {cur}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if os.path.islink(cur):
+        print(f"oci2bin: checkpoint path contains symlink component: {cur}",
+              file=sys.stderr)
+        sys.exit(1)
+
+print(checkpoint_dir)
+PYEOF
+}
+
+valid_named_container() {
+    [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]
+}
+
+state_matches_process_identity() {
+    local pid="$1" binary="$2" start_ticks="$3" proc_exe proc_ticks
+    proc_exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    [[ "$proc_exe" == "$binary" ]] || return 1
+    proc_ticks="$(python3 - "$pid" <<'PYEOF'
+import sys
+try:
+    with open(f"/proc/{sys.argv[1]}/stat", encoding="utf-8") as f:
+        raw = f.read().strip()
+except OSError:
+    sys.exit(1)
+rparen = raw.rfind(")")
+if rparen < 0:
+    sys.exit(1)
+fields = raw[rparen + 2:].split()
+if len(fields) <= 19:
+    sys.exit(1)
+print(fields[19])
+PYEOF
+)" || return 1
+    [[ "$proc_ticks" == "$start_ticks" ]]
 }
 
 # ── exec subcommand ──────────────────────────────────────────────────────
@@ -685,6 +769,89 @@ PYEOF
     exit 0
 fi
 
+# ── checkpoint subcommand ─────────────────────────────────────────────────
+
+if [[ "${1:-}" == "checkpoint" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin checkpoint NAME" >&2
+        exit 1
+    fi
+    if ! valid_named_container "$1"; then
+        echo "oci2bin checkpoint: invalid name '$1'" >&2
+        exit 1
+    fi
+    need criu
+    STATE_DIR="$(container_state_dir_or_die)"
+    STATE_FILE="$STATE_DIR/$1.json"
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "oci2bin checkpoint: no container named '$1'" >&2
+        exit 1
+    fi
+    if [[ -L "$STATE_FILE" ]]; then
+        echo "oci2bin checkpoint: refusing symlinked state file '$STATE_FILE'" >&2
+        exit 1
+    fi
+    mapfile -t CHECKPOINT_INFO < <(python3 - "$STATE_FILE" <<'PYEOF'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+print(data.get("pid", 0))
+print(data.get("binary", ""))
+print(data.get("start_ticks", 0))
+PYEOF
+)
+    CHECKPOINT_PID="${CHECKPOINT_INFO[0]:-0}"
+    CHECKPOINT_BINARY="${CHECKPOINT_INFO[1]:-}"
+    CHECKPOINT_START_TICKS="${CHECKPOINT_INFO[2]:-0}"
+    if ! [[ "$CHECKPOINT_PID" =~ ^[0-9]+$ ]]; then
+        echo "oci2bin checkpoint: invalid PID in state file" >&2
+        exit 1
+    fi
+    if ! [[ "$CHECKPOINT_START_TICKS" =~ ^[0-9]+$ ]] || [[ -z "$CHECKPOINT_BINARY" ]]; then
+        echo "oci2bin checkpoint: state file is missing process identity fields" >&2
+        exit 1
+    fi
+    if ! kill -0 "$CHECKPOINT_PID" 2>/dev/null; then
+        echo "oci2bin checkpoint: '$1' is not running" >&2
+        exit 1
+    fi
+    if ! state_matches_process_identity "$CHECKPOINT_PID" "$CHECKPOINT_BINARY" "$CHECKPOINT_START_TICKS"; then
+        echo "oci2bin checkpoint: state file no longer matches PID $CHECKPOINT_PID; refusing to dump" >&2
+        exit 1
+    fi
+    CHECKPOINT_ROOT="$(checkpoints_dir_or_die)"
+    CHECKPOINT_DIR="$CHECKPOINT_ROOT/$1"
+    mkdir -p "$CHECKPOINT_DIR"
+    exec criu dump --tree "$CHECKPOINT_PID" --images-dir "$CHECKPOINT_DIR"
+fi
+
+# ── restore subcommand ────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "restore" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin restore NAME" >&2
+        exit 1
+    fi
+    if ! valid_named_container "$1"; then
+        echo "oci2bin restore: invalid name '$1'" >&2
+        exit 1
+    fi
+    need criu
+    CHECKPOINT_ROOT="$(checkpoints_dir_or_die)"
+    CHECKPOINT_DIR="$CHECKPOINT_ROOT/$1"
+    if [[ ! -d "$CHECKPOINT_DIR" ]]; then
+        echo "oci2bin restore: checkpoint not found: $CHECKPOINT_DIR" >&2
+        exit 1
+    fi
+    if [[ -L "$CHECKPOINT_DIR" ]]; then
+        echo "oci2bin restore: refusing symlinked checkpoint dir '$CHECKPOINT_DIR'" >&2
+        exit 1
+    fi
+    exec criu restore --images-dir "$CHECKPOINT_DIR" --shell-job
+fi
+
 # ── stop subcommand ───────────────────────────────────────────────────────
 
 if [[ "${1:-}" == "stop" ]]; then
@@ -693,8 +860,7 @@ if [[ "${1:-}" == "stop" ]]; then
         echo "Usage: oci2bin stop NAME" >&2
         exit 1
     fi
-    # Validate name: alphanumeric + hyphens + underscores only
-    if ! [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+    if ! valid_named_container "$1"; then
         echo "oci2bin stop: invalid name '$1'" >&2
         exit 1
     fi
@@ -729,34 +895,12 @@ PYEOF
         echo "oci2bin stop: state file is missing process identity fields" >&2
         exit 1
     fi
-    state_matches_process() {
-        local proc_exe proc_ticks
-        proc_exe="$(readlink "/proc/$STOP_PID/exe" 2>/dev/null || true)"
-        [[ "$proc_exe" == "$STOP_BINARY" ]] || return 1
-        proc_ticks="$(python3 - "$STOP_PID" <<'PYEOF'
-import sys
-try:
-    with open(f"/proc/{sys.argv[1]}/stat", encoding="utf-8") as f:
-        raw = f.read().strip()
-except OSError:
-    sys.exit(1)
-rparen = raw.rfind(")")
-if rparen < 0:
-    sys.exit(1)
-fields = raw[rparen + 2:].split()
-if len(fields) <= 19:
-    sys.exit(1)
-print(fields[19])
-PYEOF
-)" || return 1
-        [[ "$proc_ticks" == "$STOP_START_TICKS" ]]
-    }
     if ! kill -0 "$STOP_PID" 2>/dev/null; then
         rm -f "$STATE_FILE"
         echo "oci2bin stop: '$1' is not running; stale state removed" >&2
         exit 0
     fi
-    if ! state_matches_process; then
+    if ! state_matches_process_identity "$STOP_PID" "$STOP_BINARY" "$STOP_START_TICKS"; then
         echo "oci2bin stop: state file no longer matches PID $STOP_PID; refusing to signal" >&2
         rm -f "$STATE_FILE"
         exit 1
@@ -769,7 +913,7 @@ PYEOF
             sleep 1
         done
         if kill -0 "$STOP_PID" 2>/dev/null; then
-            if ! state_matches_process; then
+            if ! state_matches_process_identity "$STOP_PID" "$STOP_BINARY" "$STOP_START_TICKS"; then
                 echo "oci2bin stop: PID $STOP_PID changed identity before SIGKILL; aborting hard kill" >&2
                 rm -f "$STATE_FILE"
                 exit 1
@@ -793,8 +937,7 @@ if [[ "${1:-}" == "logs" ]]; then
         echo "Usage: oci2bin logs [-f] NAME" >&2
         exit 1
     fi
-    # Validate name
-    if ! [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+    if ! valid_named_container "$1"; then
         echo "oci2bin logs: invalid name '$1'" >&2
         exit 1
     fi
@@ -1380,6 +1523,7 @@ fi
 HOST_ARCH="$(uname -m)"
 TARGET_ARCH="$HOST_ARCH"
 USE_CACHE=0
+NO_LAYER_CACHE=0
 LAYER_IMAGES=()
 DO_STRIP=0
 STRIP_PREFIX_ARGS=()
@@ -1421,6 +1565,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --cache)
             USE_CACHE=1
+            shift
+            ;;
+        --no-cache)
+            NO_LAYER_CACHE=1
             shift
             ;;
         --layer)
@@ -1627,9 +1775,6 @@ fi
 
 # ── dependency checks ─────────────────────────────────────────────────────
 
-need() {
-    command -v "$1" >/dev/null 2>&1 || { echo "oci2bin: '$1' not found in PATH" >&2; exit 1; }
-}
 need "$CC_CROSS"
 need python3
 need docker
@@ -1871,6 +2016,7 @@ EMBED_LOADER_ARG=()
 [[ -n "$LABEL_PREFIX"     ]] && EMBED_LOADER_ARG+=(--label-prefix "$LABEL_PREFIX")
 [[ -n "$SELF_UPDATE_URL"  ]] && EMBED_LOADER_ARG+=(--self-update-url "$SELF_UPDATE_URL")
 [[ -n "$PIN_DIGEST"       ]] && EMBED_LOADER_ARG+=(--pin-digest "$PIN_DIGEST")
+[[ "$NO_LAYER_CACHE" -eq 1 ]] && EMBED_LOADER_ARG+=(--no-cache)
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \

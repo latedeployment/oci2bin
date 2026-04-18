@@ -43,6 +43,7 @@ See below [How it works](#how-it-works).
   - [SSH agent forwarding](#ssh-agent-forwarding)
   - [Extra tmpfs mounts](#extra-tmpfs-mounts)
   - [Resource limits](#resource-limits)
+  - [Prometheus metrics socket](#prometheus-metrics-socket)
   - [Exit codes](#exit-codes)
 - [Isolation and security](#isolation-and-security)
   - [Networking](#networking)
@@ -52,6 +53,7 @@ See below [How it works](#how-it-works).
     - [Generating a minimal seccomp profile](#generating-a-minimal-seccomp-profile)
   - [Debugging with gdb](#debugging-with-gdb)
   - [Clock offset (time namespace)](#clock-offset-time-namespace)
+  - [Audit logging](#audit-logging)
   - [Running as non-root](#running-as-non-root)
   - [Custom hostname](#custom-hostname)
   - [Exposing host devices](#exposing-host-devices)
@@ -76,6 +78,8 @@ See below [How it works](#how-it-works).
   - [ps](#ps)
   - [stop](#stop)
   - [logs](#logs)
+  - [checkpoint](#checkpoint)
+  - [restore](#restore)
   - [top](#top)
 - [Testing](#testing)
   - [Security linting](#security-linting)
@@ -302,6 +306,8 @@ oci2bin --cache alpine:latest   # returns cached binary immediately
 
 The cache key includes the first 12 hex characters of the image's sha256 digest, so tag updates are detected. See [list](#list), [prune](#prune) for cache management.
 
+Separately, the builder keeps a per-layer tar cache under `~/.cache/oci2bin/layers/` (or `$XDG_CACHE_HOME/oci2bin/layers/` when set). Layer blobs are keyed by their `rootfs.diff_ids`, so repeated builds can skip re-extracting unchanged layers from the saved OCI tar. Pass `--no-cache` to disable that per-layer cache for a single build; this does not disable the top-level `--cache` output-binary cache.
+
 ### Reproducible builds and digest pinning
 
 After pulling, oci2bin prints the content-addressed digest to stderr:
@@ -524,6 +530,37 @@ v2 is unavailable, a warning is printed and the container runs unconstrained.
 The loader creates `/sys/fs/cgroup/oci2bin-<pid>/`, moves itself in, sets the
 limits, then calls `unshare(CLONE_NEWCGROUP)` so the container only sees its
 own cgroup subtree. The cgroup dir is removed on exit.
+
+### Prometheus metrics socket
+
+`--metrics-socket PATH` starts a small Unix-domain socket server that exports
+Prometheus text metrics for the container cgroup. The socket accepts one
+connection at a time, writes the current sample, and closes the connection.
+Samples are refreshed every 5 seconds while the container is running.
+
+```bash
+./my-app --metrics-socket /tmp/my-app.metrics.sock
+python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/tmp/my-app.metrics.sock")
+print(s.recv(65535).decode(), end="")
+PY
+```
+
+The exported metrics come from cgroup v2:
+
+- `oci2bin_cpu_usage_usec`
+- `oci2bin_cpu_user_usec`
+- `oci2bin_cpu_system_usec`
+- `oci2bin_cpu_nr_periods`
+- `oci2bin_cpu_nr_throttled`
+- `oci2bin_cpu_throttled_usec`
+- `oci2bin_memory_current`
+- `oci2bin_pids_current`
+
+This feature requires cgroup v2 and a writable cgroup subtree. If the socket
+cannot be created, container startup fails with an error.
 
 ### Exit codes
 
@@ -922,6 +959,32 @@ anything that reads `CLOCK_MONOTONIC` or `CLOCK_BOOTTIME`. A warning is
 printed and the container runs normally if the kernel does not support
 `CLONE_NEWTIME`.
 
+### Audit logging
+
+`--audit-log FILE` appends one JSON object per lifecycle event to `FILE`. Pass
+`-` to write the audit stream to stderr instead of a file.
+
+```bash
+./my-app --audit-log /var/log/my-app.audit.jsonl
+./my-app --audit-log - /bin/true 2>audit.log
+```
+
+The loader emits newline-delimited JSON for these events: `start`, `mount`,
+`cap_set`, `exec`, `exit`, and `stop`. Timestamps are generated from
+`clock_gettime(CLOCK_REALTIME)` and written in UTC ISO-8601 form.
+
+Example lines:
+
+```json
+{"event":"start","time":"2026-04-18T18:40:12Z","pid":12345,"image":"/home/user/my-app","name":"","net":"host","caps":"0x0"}
+{"event":"cap_set","time":"2026-04-18T18:40:12Z","pid":1,"caps":"0xa80425fb","drop_all":false,"drop_mask":"0x0","add_mask":"0x0"}
+{"event":"exit","time":"2026-04-18T18:40:14Z","pid":12345,"exit_code":0}
+{"event":"stop","time":"2026-04-18T18:40:14Z","pid":12345,"exit_code":0}
+```
+
+`exit` records either `exit_code` or `signal`, depending on how the workload
+finished. `stop` records the final container stop status after cleanup.
+
 #### AppArmor and SELinux confinement
 
 Apply an AppArmor profile or SELinux exec label with `--security-opt`:
@@ -941,6 +1004,10 @@ By default the container process runs as UID 0 inside the user namespace. Use `-
 ./my-app --user 1000          # run as UID 1000, GID 1000
 ./my-app --user 1000:2000     # run as UID 1000, GID 2000
 ```
+
+On rootless runs, oci2bin first tries to install a full `0-65535` container UID/GID range by calling `newuidmap` and `newgidmap` with the current user's ranges from `/etc/subuid` and `/etc/subgid`. When that succeeds, normal in-container user switching works without rewriting `/etc/passwd` or `/etc/group`.
+
+If the helpers or subordinate ID ranges are unavailable, oci2bin falls back to the older single-ID user namespace where only container UID/GID `0` is mapped to the invoking host user. In that mode it patches the extracted rootfs so common privilege-dropping tools keep working. Pass `--no-userns-remap` to force that fallback even when subordinate ranges are configured.
 
 Only numeric UIDs/GIDs are accepted. Values must be ≤ 65534. If any of `setgroups`, `setgid`, or `setuid` fail, the container exits immediately.
 
@@ -1338,6 +1405,26 @@ oci2bin logs -f myredis       # follow (tail -f)
 oci2bin logs --follow myredis
 ```
 
+### checkpoint
+
+Create a CRIU checkpoint for a named detached container:
+
+```bash
+oci2bin checkpoint myredis
+```
+
+This runs `criu dump --tree <PID> --images-dir ~/.local/share/oci2bin/checkpoints/myredis` after verifying that the saved state file still matches the running process. The `criu` binary must be installed. `checkpoint` operates on containers started with `--detach --name`.
+
+### restore
+
+Restore a CRIU checkpoint created with `oci2bin checkpoint`:
+
+```bash
+oci2bin restore myredis
+```
+
+This runs `criu restore --images-dir ~/.local/share/oci2bin/checkpoints/myredis --shell-job`. The checkpoint directory must already exist, and `criu` must be installed.
+
 ### top
 
 Show a live view of named running containers:
@@ -1447,17 +1534,18 @@ The loader binary is stored as tar entry #1, whose "filename" is the 64-byte ELF
 1. Opens itself via `/proc/self/exe` and reads the embedded OCI tar from the patched offset
 2. Parses `manifest.json` and the image config to find the layer list and runtime settings
 3. Extracts each layer tar in order into a temporary rootfs under `/tmp`, applying whiteout deletions
-4. Patches the rootfs for single-UID namespace compatibility
-5. Enters a user namespace (UID mapped to host UID)
-6. Enters mount, PID, and UTS namespaces
-7. Applies volume bind mounts before `chroot`
-8. `chroot`s into the rootfs and `exec`s the entrypoint
+4. Plans the user namespace mapping: subordinate `0-65535` remap when `newuidmap`/`newgidmap` and `/etc/subuid`/`/etc/subgid` are available, otherwise the single-ID fallback
+5. Applies the compatibility rootfs patch only for the single-ID fallback or microVM mode
+6. Enters the user namespace and installs the chosen UID/GID mapping
+7. Enters mount, PID, and UTS namespaces
+8. Applies volume bind mounts before `chroot`
+9. `chroot`s into the rootfs and `exec`s the entrypoint
 
-The only runtime dependency on the target machine is `tar`.
+The only mandatory runtime dependency on the target machine is `tar`. Rootless subordinate-ID remapping additionally uses `newuidmap` and `newgidmap` when they are installed, but falls back cleanly when they are absent.
 
-**Rootfs patching for single-UID namespaces:**
+**Rootfs patching for the single-ID fallback:**
 
-An unprivileged user namespace allows exactly one UID mapping. Container UID 0 maps to the invoking user's UID on the host. Tools that attempt to change to a different UID (such as `apt`'s `_apt` sandbox user) would receive `EPERM`. The loader rewrites:
+When subordinate-ID remapping is unavailable, oci2bin falls back to a single-ID user namespace. Container UID 0 maps to the invoking user's UID on the host, and other container IDs are unmapped. Tools that attempt to change to a different UID (such as `apt`'s `_apt` sandbox user) would otherwise receive `EPERM`. In that fallback mode the loader rewrites:
 
 | File | Modification | Reason |
 |---|---|---|
@@ -1465,7 +1553,7 @@ An unprivileged user namespace allows exactly one UID mapping. Container UID 0 m
 | `/etc/group` | All GIDs set to `0` (except `65534`) | Same for GID operations |
 | `/etc/apt/apt.conf.d/99oci2bin` | `APT::Sandbox::User "root";` | Disables the apt sandbox |
 | `/etc/resolv.conf` | Replaced with host resolver content | Symlink target not present in chroot |
-| `/usr/bin/setpriv` | Replaced with no-op shim (skips flags, execs command) | `setpriv --reuid` fails in single-UID namespace |
+| `/usr/bin/setpriv` | Replaced with no-op shim (skips flags, execs command) | `setpriv --reuid` fails in the single-ID fallback |
 | `gosu`, `su-exec` | Replaced with no-op shim (skips user arg, execs command) | Same — user switching is impossible |
 
 **Security properties:**

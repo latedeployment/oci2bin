@@ -11,6 +11,7 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -20,6 +21,7 @@
 #include <ftw.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/un.h>
 #include <termios.h>
 #include <grp.h>
 #include <sys/resource.h>
@@ -30,6 +32,46 @@
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <time.h>
+#ifdef __aarch64__
+#include <asm/ptrace.h>
+#endif
+
+/*
+ * Newer kernels can support these syscalls even when the build headers are
+ * older.  Define the numbers we need on the two supported arches so runtime
+ * probing can decide feature availability instead of the preprocessor alone.
+ */
+#ifndef __NR_clone3
+#if defined(__x86_64__) || defined(__aarch64__)
+#define __NR_clone3 435
+#endif
+#endif
+
+#ifndef __NR_openat2
+#if defined(__x86_64__) || defined(__aarch64__)
+#define __NR_openat2 437
+#endif
+#endif
+
+#ifndef __NR_faccessat2
+#if defined(__x86_64__) || defined(__aarch64__)
+#define __NR_faccessat2 439
+#endif
+#endif
+
+#ifndef __NR_mseal
+#if defined(__x86_64__) || defined(__aarch64__)
+#define __NR_mseal 462
+#endif
+#endif
+
+#ifndef CLONE_NEWTIME
+#define CLONE_NEWTIME 0x00000080
+#endif
+
+#ifndef CLONE_INTO_CGROUP
+#define CLONE_INTO_CGROUP 0x200000000ULL
+#endif
 
 /*
  * These markers get patched by the polyglot builder.
@@ -58,6 +100,13 @@ static volatile unsigned long INITRAMFS_DATA_PATCHED = 0x6B6B6B6B6B6B6B6BUL;
 #define MAX_ARGS      64
 #define MAX_ENV       64
 #define BUF_SIZE    65536
+#define USERNS_REMAP_CONTAINER_IDS 65535UL
+#ifndef CAP_SETGID
+#define CAP_SETGID 6
+#endif
+#ifndef CAP_SETUID
+#define CAP_SETUID 7
+#endif
 
 /* VM defaults — overridable at build time via -DDEFAULT_VM_CPUS=N etc. */
 #ifndef DEFAULT_VM_CPUS
@@ -69,6 +118,193 @@ static volatile unsigned long INITRAMFS_DATA_PATCHED = 0x6B6B6B6B6B6B6B6BUL;
 
 /* Debug logging toggle (set by --debug). */
 static int g_debug = 0;
+
+/* Audit log fd: -1 = disabled, STDERR_FILENO = --audit-log -, else a file fd */
+static int g_audit_fd = -1;
+
+enum kernel_feature_id
+{
+    KERNEL_FEATURE_CLONE3 = 0,
+    KERNEL_FEATURE_MSEAL,
+    KERNEL_FEATURE_MAX,
+};
+
+enum kernel_feature_state
+{
+    KERNEL_FEATURE_UNKNOWN = 0,
+    KERNEL_FEATURE_UNSUPPORTED = -1,
+    KERNEL_FEATURE_SUPPORTED = 1,
+};
+
+static signed char g_kernel_feature_state[KERNEL_FEATURE_MAX];
+
+static int write_all_fd(int fd, const char* data, size_t len);
+static int json_escape_string(const char* src, char* dst, size_t dstsz);
+static unsigned long long current_effective_caps(void);
+
+static int kernel_feature_state_from_syscall(long rc, int err)
+{
+    if (rc >= 0 || err != ENOSYS)
+    {
+        return KERNEL_FEATURE_SUPPORTED;
+    }
+    return KERNEL_FEATURE_UNSUPPORTED;
+}
+
+static void kernel_set_feature_state(enum kernel_feature_id feature, int state)
+{
+    if (feature >= 0 && feature < KERNEL_FEATURE_MAX)
+    {
+        g_kernel_feature_state[feature] = (signed char)state;
+    }
+}
+
+static int probe_clone3_support(void)
+{
+#ifdef __NR_clone3
+    errno = 0;
+    return kernel_feature_state_from_syscall(
+               syscall(__NR_clone3, NULL, 0UL), errno) ==
+           KERNEL_FEATURE_SUPPORTED;
+#else
+    return 0;
+#endif
+}
+
+static int probe_mseal_support(void)
+{
+#ifdef __NR_mseal
+    errno = 0;
+    return kernel_feature_state_from_syscall(
+               syscall(__NR_mseal, NULL, 0UL, 0UL), errno) ==
+           KERNEL_FEATURE_SUPPORTED;
+#else
+    return 0;
+#endif
+}
+
+static int kernel_feature_supported(enum kernel_feature_id feature)
+{
+    int state;
+
+    if (feature < 0 || feature >= KERNEL_FEATURE_MAX)
+    {
+        return 0;
+    }
+
+    state = g_kernel_feature_state[feature];
+    if (state == KERNEL_FEATURE_UNKNOWN)
+    {
+        switch (feature)
+        {
+            case KERNEL_FEATURE_CLONE3:
+                state = probe_clone3_support() ?
+                        KERNEL_FEATURE_SUPPORTED :
+                        KERNEL_FEATURE_UNSUPPORTED;
+                break;
+            case KERNEL_FEATURE_MSEAL:
+                state = probe_mseal_support() ?
+                        KERNEL_FEATURE_SUPPORTED :
+                        KERNEL_FEATURE_UNSUPPORTED;
+                break;
+            default:
+                state = KERNEL_FEATURE_UNSUPPORTED;
+                break;
+        }
+        kernel_set_feature_state(feature, state);
+    }
+
+    return state == KERNEL_FEATURE_SUPPORTED;
+}
+
+static int kernel_supports_clone3(void)
+{
+    return kernel_feature_supported(KERNEL_FEATURE_CLONE3);
+}
+
+static int kernel_supports_mseal(void)
+{
+    return kernel_feature_supported(KERNEL_FEATURE_MSEAL);
+}
+
+/*
+ * Emit one JSON audit event line to g_audit_fd.
+ * Format: {"event":"<ev>","time":"<ISO8601>","pid":<n>,<extra>}
+ * extra is a pre-formatted JSON fragment (without leading comma) or "".
+ * Thread-unsafe but the loader is single-threaded before exec.
+ */
+static void audit_escape_string(const char* src, char* dst, size_t dstsz)
+{
+    if (!src)
+    {
+        src = "";
+    }
+    if (json_escape_string(src, dst, dstsz) < 0 && dstsz > 0)
+    {
+        snprintf(dst, dstsz, "<truncated>");
+    }
+}
+
+static void audit_emit_pid(const char* event, pid_t pid, const char* extra)
+{
+    if (g_audit_fd < 0)
+    {
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    /* ISO8601 UTC: "2006-01-02T15:04:05Z" */
+    time_t t = ts.tv_sec;
+    struct tm tm_buf;
+    gmtime_r(&t, &tm_buf);
+    char timebuf[32];
+    strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+
+    char line[1024];
+    int n;
+    if (extra && extra[0])
+    {
+        n = snprintf(line, sizeof(line),
+                     "{\"event\":\"%s\",\"time\":\"%s\",\"pid\":%d,%s}\n",
+                     event, timebuf, (int)pid, extra);
+    }
+    else
+    {
+        n = snprintf(line, sizeof(line),
+                     "{\"event\":\"%s\",\"time\":\"%s\",\"pid\":%d}\n",
+                     event, timebuf, (int)pid);
+    }
+    if (n > 0 && n < (int)sizeof(line))
+    {
+        write_all_fd(g_audit_fd, line, (size_t)n);
+    }
+}
+
+static void audit_emit(const char* event, const char* extra)
+{
+    audit_emit_pid(event, getpid(), extra);
+}
+
+static void audit_emit_wait_status(const char* event, pid_t pid, int status)
+{
+    char extra[96];
+
+    if (WIFEXITED(status))
+    {
+        snprintf(extra, sizeof(extra), "\"exit_code\":%d",
+                 WEXITSTATUS(status));
+    }
+    else if (WIFSIGNALED(status))
+    {
+        snprintf(extra, sizeof(extra), "\"signal\":%d",
+                 WTERMSIG(status));
+    }
+    else
+    {
+        snprintf(extra, sizeof(extra), "\"status_raw\":%d", status);
+    }
+    audit_emit_pid(event, pid, extra);
+}
 
 static const char* safe_str(const char* s)
 {
@@ -250,7 +486,53 @@ struct container_opts
     /* --clock-offset SECS  (shift monotonic+boottime clocks, Linux 5.6+) */
     long clock_offset_secs;
     int  has_clock_offset;
+
+    /* --audit-log FILE  (structured JSON audit log; "-" = stderr) */
+    char* audit_log;
+
+    /* --metrics-socket PATH  (Prometheus text over Unix socket) */
+    char* metrics_socket;
+
+    /* --no-userns-remap  (force single-ID user namespace fallback) */
+    int no_userns_remap;
 };
+
+struct userns_map_plan
+{
+    int           use_subid_remap;
+    unsigned long subuid_start;
+    unsigned long subgid_start;
+    char          newuidmap_path[PATH_MAX];
+    char          newgidmap_path[PATH_MAX];
+};
+
+static void audit_emit_start_event(const char* image_path,
+                                   const struct container_opts* opts)
+{
+    char image[PATH_MAX];
+    char name[256];
+    char net[64];
+    char extra[1024];
+
+    audit_escape_string(image_path, image, sizeof(image));
+    audit_escape_string(opts->name ? opts->name : "", name, sizeof(name));
+    audit_escape_string(opts->net ? opts->net : "host", net, sizeof(net));
+    snprintf(extra, sizeof(extra),
+             "\"image\":\"%s\",\"name\":\"%s\",\"net\":\"%s\","
+             "\"caps\":\"0x%llx\"",
+             image, name, net, (unsigned long long)opts->cap_add_mask);
+    audit_emit("start", extra);
+}
+
+static void audit_emit_exec_event(const char* path)
+{
+    char escaped[PATH_MAX];
+    char extra[PATH_MAX + 32];
+
+    audit_escape_string(path, escaped, sizeof(escaped));
+    snprintf(extra, sizeof(extra), "\"path\":\"%s\"", escaped);
+    audit_emit("exec", extra);
+}
 
 static int argv_has_debug_flag(int argc, char* argv[])
 {
@@ -277,7 +559,7 @@ static void debug_dump_opts(const struct container_opts* opts)
 {
     debug_log("opts.summary",
               "vm=%d vmm=%s net=%s ipc_join_pid=%d read_only=%d detach=%d "
-              "no_seccomp=%d debug=%d",
+              "no_seccomp=%d no_userns_remap=%d debug=%d",
               opts->use_vm,
               opts->vmm ? opts->vmm : "(default)",
               opts_net_mode(opts),
@@ -285,6 +567,7 @@ static void debug_dump_opts(const struct container_opts* opts)
               opts->read_only,
               opts->detach,
               opts->no_seccomp,
+              opts->no_userns_remap,
               opts->debug);
     debug_log("opts.resources",
               "memory_bytes=%lld cpus_quota=%ld vm_cpus=%.3f pids=%ld",
@@ -2154,33 +2437,6 @@ static char* extract_oci_rootfs(const char* self_path)
 
 /* ── namespace + container entry ─────────────────────────────────────────── */
 
-static int setup_uid_map(uid_t real_uid, gid_t real_gid)
-{
-    char map[64];
-
-    /* Deny setgroups first (required before gid_map for unprivileged users) */
-    if (write_proc("/proc/self/setgroups", "deny", 4) < 0)
-    {
-        /* May fail on older kernels, non-fatal */
-    }
-
-    snprintf(map, sizeof(map), "0 %d 1\n", real_uid);
-    if (write_proc("/proc/self/uid_map", map, strlen(map)) < 0)
-    {
-        perror("write uid_map");
-        return -1;
-    }
-
-    snprintf(map, sizeof(map), "0 %d 1\n", real_gid);
-    if (write_proc("/proc/self/gid_map", map, strlen(map)) < 0)
-    {
-        perror("write gid_map");
-        return -1;
-    }
-
-    return 0;
-}
-
 /*
  * Rewrite a colon-delimited identity file (/etc/passwd or /etc/group),
  * mapping the fields at remap_indices[] to "0" whenever their numeric value
@@ -2291,7 +2547,8 @@ static void rewrite_id_fields(int rootfs_fd, const char* rel_path,
 
 /*
  * Patch the extracted rootfs so that tools which try to drop privileges
- * (e.g. apt's _apt sandbox) succeed inside a single-UID user namespace.
+ * (e.g. apt's _apt sandbox) succeed inside the single-ID user namespace
+ * fallback or microVM mode.
  */
 static void patch_rootfs_ids(const char* rootfs)
 {
@@ -2341,10 +2598,10 @@ static void patch_rootfs_ids(const char* rootfs)
 
     /* ── user-switching wrappers ── replace setpriv/gosu/su-exec with
      * no-op shims so entrypoints that try to drop privileges don't fail
-     * in the single-UID user namespace (only UID 0 is mapped). */
+     * in the single-ID user namespace fallback (only UID 0 is mapped). */
     static const char setpriv_shim[] =
         "#!/bin/sh\n"
-        "# oci2bin shim: in a single-UID namespace, privilege changes\n"
+        "# oci2bin shim: in a single-ID namespace, privilege changes\n"
         "# are impossible.  For -d/--dump, report no capabilities so\n"
         "# entrypoints that check has_cap skip the priv-drop path.\n"
         "# For exec mode, strip all flags and run the command directly.\n"
@@ -2365,7 +2622,7 @@ static void patch_rootfs_ids(const char* rootfs)
         "  esac\n"
         "done\n"
         "exec \"$@\"\n";
-    /* gosu/su-exec shim: we cannot change uid in a single-UID namespace, so
+    /* gosu/su-exec shim: we cannot change uid in a single-ID namespace, so
      * just exec the command.  Two invocation patterns exist:
      *
      *   Pattern A: gosu user command [args...]
@@ -2387,11 +2644,11 @@ static void patch_rootfs_ids(const char* rootfs)
         "export OCI2BIN_GOSU_DEPTH=$(( ${OCI2BIN_GOSU_DEPTH:-0} + 1 ))\n"
         "exec \"$@\"\n";
     /* chown shim: virtiofs passes host UIDs through untranslated, so
-     * chown inside a microVM (or single-UID user namespace) always fails
+     * chown inside a microVM (or single-ID user namespace fallback) always fails
      * with EPERM.  Replace the binary with a no-op that exits 0. */
     static const char chown_shim[] =
         "#!/bin/sh\n"
-        "# oci2bin shim: ownership changes are impossible in a single-UID\n"
+        "# oci2bin shim: ownership changes are impossible in a single-ID\n"
         "# environment; silently succeed so entrypoint scripts continue.\n"
         "exit 0\n";
     static const struct
@@ -2450,6 +2707,446 @@ static void patch_rootfs_ids(const char* rootfs)
     install_resolv_conf(rootfs);
 }
 
+static int current_has_cap(int cap_num)
+{
+    unsigned long long caps;
+
+    if (cap_num < 0 || cap_num >= 64)
+    {
+        return 0;
+    }
+    caps = current_effective_caps();
+    return ((caps >> cap_num) & 1ULL) != 0;
+}
+
+static int find_helper_binary(const char* name, char* out, size_t outsz)
+{
+    static const char* dirs[] =
+    {
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    };
+
+    if (!name || !out || outsz == 0)
+    {
+        return -1;
+    }
+
+    out[0] = '\0';
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+    {
+        int n = snprintf(out, outsz, "%s/%s", dirs[i], name);
+        if (n < 0 || (size_t)n >= outsz)
+        {
+            continue;
+        }
+        if (access(out, X_OK) == 0)
+        {
+            return 0;
+        }
+    }
+
+    out[0] = '\0';
+    return -1;
+}
+
+static int parse_subid_line(const char* line,
+                            const char* owner_name,
+                            const char* owner_uid_text,
+                            unsigned long* start_out,
+                            unsigned long* count_out)
+{
+    char buf[256];
+    char* owner;
+    char* start_text;
+    char* count_text;
+    char* extra;
+    char* endp = NULL;
+    unsigned long start;
+    unsigned long count;
+
+    if (!line || !owner_uid_text || !start_out || !count_out)
+    {
+        return -1;
+    }
+
+    if (snprintf(buf, sizeof(buf), "%s", line) >= (int)sizeof(buf))
+    {
+        return -1;
+    }
+
+    owner = buf;
+    while (*owner == ' ' || *owner == '\t')
+    {
+        owner++;
+    }
+    if (*owner == '\0' || *owner == '#')
+    {
+        return -1;
+    }
+
+    start_text = strchr(owner, ':');
+    if (!start_text)
+    {
+        return -1;
+    }
+    *start_text++ = '\0';
+
+    count_text = strchr(start_text, ':');
+    if (!count_text)
+    {
+        return -1;
+    }
+    *count_text++ = '\0';
+
+    extra = strchr(count_text, ':');
+    if (extra)
+    {
+        return -1;
+    }
+
+    for (char* p = count_text; *p; p++)
+    {
+        if (*p == '\n' || *p == '\r')
+        {
+            *p = '\0';
+            break;
+        }
+    }
+
+    if ((!owner_name || strcmp(owner, owner_name) != 0) &&
+            strcmp(owner, owner_uid_text) != 0)
+    {
+        return -1;
+    }
+
+    errno = 0;
+    start = strtoul(start_text, &endp, 10);
+    if (errno != 0 || !endp || *endp != '\0')
+    {
+        return -1;
+    }
+
+    errno = 0;
+    count = strtoul(count_text, &endp, 10);
+    if (errno != 0 || !endp || *endp != '\0' || count == 0)
+    {
+        return -1;
+    }
+
+    *start_out = start;
+    *count_out = count;
+    return 0;
+}
+
+static int lookup_subid_range_in_file(const char* path,
+                                      const char* owner_name,
+                                      uid_t owner_uid,
+                                      unsigned long min_count,
+                                      unsigned long* start_out,
+                                      unsigned long* count_out)
+{
+    FILE* fp;
+    char line[256];
+    char owner_uid_text[32];
+
+    if (!path || !start_out || !count_out)
+    {
+        return -1;
+    }
+
+    if (snprintf(owner_uid_text, sizeof(owner_uid_text), "%u",
+                 (unsigned)owner_uid) >= (int)sizeof(owner_uid_text))
+    {
+        return -1;
+    }
+
+    fp = fopen(path, "r");
+    if (!fp)
+    {
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp))
+    {
+        unsigned long start;
+        unsigned long count;
+
+        if (parse_subid_line(line, owner_name, owner_uid_text,
+                             &start, &count) < 0)
+        {
+            continue;
+        }
+        if (count < min_count)
+        {
+            continue;
+        }
+        fclose(fp);
+        *start_out = start;
+        *count_out = count;
+        return 0;
+    }
+
+    fclose(fp);
+    return -1;
+}
+
+static void warn_userns_single_id_fallback(const char* reason)
+{
+    if (!reason || !reason[0])
+    {
+        reason = "no reason provided";
+    }
+    fprintf(stderr,
+            "oci2bin: rootless subordinate ID remap unavailable (%s);"
+            " using single-ID user namespace. Install newuidmap/newgidmap"
+            " and configure /etc/subuid,/etc/subgid, or pass"
+            " --no-userns-remap.\n",
+            reason);
+}
+
+static int lookup_user_name_from_passwd(uid_t uid, char* out, size_t outsz)
+{
+    FILE* fp;
+    char line[512];
+
+    if (!out || outsz == 0)
+    {
+        return -1;
+    }
+
+    out[0] = '\0';
+    fp = fopen("/etc/passwd", "r");
+    if (!fp)
+    {
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp))
+    {
+        char* name = line;
+        char* passwd = strchr(name, ':');
+        char* uid_text;
+        char* gid_text;
+        char* endp = NULL;
+        unsigned long parsed_uid;
+
+        if (!passwd)
+        {
+            continue;
+        }
+        *passwd++ = '\0';
+
+        uid_text = strchr(passwd, ':');
+        if (!uid_text)
+        {
+            continue;
+        }
+        *uid_text++ = '\0';
+
+        gid_text = strchr(uid_text, ':');
+        if (!gid_text)
+        {
+            continue;
+        }
+        *gid_text++ = '\0';
+
+        errno = 0;
+        parsed_uid = strtoul(uid_text, &endp, 10);
+        if (errno != 0 || !endp || *endp != '\0')
+        {
+            continue;
+        }
+        if ((uid_t)parsed_uid != uid)
+        {
+            continue;
+        }
+        if (snprintf(out, outsz, "%s", name) >= (int)outsz)
+        {
+            fclose(fp);
+            return -1;
+        }
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    return -1;
+}
+
+static void plan_userns_map(const struct container_opts* opts,
+                            uid_t real_uid,
+                            struct userns_map_plan* plan)
+{
+    char user_name[256];
+    const char* owner_name = NULL;
+    unsigned long uid_count;
+    unsigned long gid_count;
+
+    memset(plan, 0, sizeof(*plan));
+
+    if (opts->no_userns_remap)
+    {
+        debug_log("userns.plan", "mode=single reason=no_userns_remap");
+        return;
+    }
+
+    if (current_has_cap(CAP_SETUID) && current_has_cap(CAP_SETGID))
+    {
+        debug_log("userns.plan", "mode=single reason=have_cap_setid");
+        return;
+    }
+
+    user_name[0] = '\0';
+    if (lookup_user_name_from_passwd(real_uid, user_name,
+                                     sizeof(user_name)) == 0)
+    {
+        owner_name = user_name;
+    }
+
+    if (find_helper_binary("newuidmap", plan->newuidmap_path,
+                           sizeof(plan->newuidmap_path)) < 0 ||
+            find_helper_binary("newgidmap", plan->newgidmap_path,
+                               sizeof(plan->newgidmap_path)) < 0)
+    {
+        warn_userns_single_id_fallback("missing newuidmap/newgidmap");
+        return;
+    }
+
+    if (lookup_subid_range_in_file("/etc/subuid", owner_name, real_uid,
+                                   USERNS_REMAP_CONTAINER_IDS,
+                                   &plan->subuid_start, &uid_count) < 0)
+    {
+        warn_userns_single_id_fallback("missing /etc/subuid range");
+        return;
+    }
+
+    if (lookup_subid_range_in_file("/etc/subgid", owner_name, real_uid,
+                                   USERNS_REMAP_CONTAINER_IDS,
+                                   &plan->subgid_start, &gid_count) < 0)
+    {
+        warn_userns_single_id_fallback("missing /etc/subgid range");
+        return;
+    }
+
+    plan->use_subid_remap = 1;
+    debug_log("userns.plan",
+              "mode=subid uid_start=%lu uid_count=%lu gid_start=%lu"
+              " gid_count=%lu uid_helper=%s gid_helper=%s",
+              plan->subuid_start,
+              uid_count,
+              plan->subgid_start,
+              gid_count,
+              plan->newuidmap_path,
+              plan->newgidmap_path);
+}
+
+static int setup_single_uid_map(uid_t real_uid, gid_t real_gid)
+{
+    char map[64];
+
+    /* Deny setgroups first (required before gid_map for unprivileged users) */
+    if (write_proc("/proc/self/setgroups", "deny", 4) < 0)
+    {
+        /* May fail on older kernels, non-fatal */
+    }
+
+    snprintf(map, sizeof(map), "0 %d 1\n", real_uid);
+    if (write_proc("/proc/self/uid_map", map, strlen(map)) < 0)
+    {
+        perror("write uid_map");
+        return -1;
+    }
+
+    snprintf(map, sizeof(map), "0 %d 1\n", real_gid);
+    if (write_proc("/proc/self/gid_map", map, strlen(map)) < 0)
+    {
+        perror("write gid_map");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int run_newidmap(const char* helper_path,
+                        pid_t target_pid,
+                        unsigned long host_root_id,
+                        unsigned long subid_start)
+{
+    char pid_text[32];
+    char host_root_text[32];
+    char subid_text[32];
+    char subcount_text[32];
+    char* argv[9];
+    int rc;
+
+    if (snprintf(pid_text, sizeof(pid_text), "%d", (int)target_pid) >=
+            (int)sizeof(pid_text) ||
+            snprintf(host_root_text, sizeof(host_root_text), "%lu",
+                     host_root_id) >= (int)sizeof(host_root_text) ||
+            snprintf(subid_text, sizeof(subid_text), "%lu",
+                     subid_start) >= (int)sizeof(subid_text) ||
+            snprintf(subcount_text, sizeof(subcount_text), "%lu",
+                     USERNS_REMAP_CONTAINER_IDS) >= (int)sizeof(subcount_text))
+    {
+        fprintf(stderr, "oci2bin: user namespace mapping argument overflow\n");
+        return -1;
+    }
+
+    argv[0] = (char*)helper_path;
+    argv[1] = pid_text;
+    argv[2] = "0";
+    argv[3] = host_root_text;
+    argv[4] = "1";
+    argv[5] = "1";
+    argv[6] = subid_text;
+    argv[7] = subcount_text;
+    argv[8] = NULL;
+
+    rc = run_cmd(argv);
+    if (rc != 0)
+    {
+        fprintf(stderr, "oci2bin: %s failed with exit status %d\n",
+                helper_path, rc);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int setup_uid_map(uid_t real_uid,
+                         gid_t real_gid,
+                         const struct userns_map_plan* plan)
+{
+    if (!plan || !plan->use_subid_remap)
+    {
+        return setup_single_uid_map(real_uid, real_gid);
+    }
+
+    if (write_proc("/proc/self/setgroups", "deny", 4) < 0)
+    {
+        /* May fail on older kernels, non-fatal */
+    }
+
+    if (run_newidmap(plan->newuidmap_path, getpid(),
+                     (unsigned long)real_uid,
+                     plan->subuid_start) < 0)
+    {
+        return -1;
+    }
+
+    if (run_newidmap(plan->newgidmap_path, getpid(),
+                     (unsigned long)real_gid,
+                     plan->subgid_start) < 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
 /*
  * Set up volume bind mounts.  Called inside container_main() after chroot,
  * so paths are relative to the container rootfs (i.e. / is the rootfs).
@@ -2503,6 +3200,12 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
             fprintf(stderr, "oci2bin: mounted %s -> %s\n",
                     host_path, opts->vol_ctr[i]);
         }
+    }
+    /* Emit a single mount audit event summarising volume count */
+    {
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"volumes\":%d", opts->n_vols);
+        audit_emit("mount", extra);
     }
 }
 
@@ -2725,6 +3428,38 @@ struct cap_data
     uint32_t inheritable;
 };
 
+static unsigned long long current_effective_caps(void)
+{
+    struct cap_header hdr;
+    struct cap_data   data[2];
+
+    memset(&hdr, 0, sizeof(hdr));
+    memset(data, 0, sizeof(data));
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid     = 0;
+    if (syscall(SYS_capget, &hdr, data) < 0)
+    {
+        return 0;
+    }
+    return ((unsigned long long)data[1].effective << 32) |
+           (unsigned long long)data[0].effective;
+}
+
+static void audit_emit_cap_set_event(const struct container_opts* opts)
+{
+    char extra[192];
+    unsigned long long caps = current_effective_caps();
+
+    snprintf(extra, sizeof(extra),
+             "\"caps\":\"0x%llx\",\"drop_all\":%s,"
+             "\"drop_mask\":\"0x%llx\",\"add_mask\":\"0x%llx\"",
+             caps,
+             opts->cap_drop_all ? "true" : "false",
+             (unsigned long long)opts->cap_drop_mask,
+             (unsigned long long)opts->cap_add_mask);
+    audit_emit("cap_set", extra);
+}
+
 /*
  * Map a capability name (case-insensitive, with or without "CAP_" prefix)
  * to its number (0-40). Returns -1 if unknown.
@@ -2917,6 +3652,8 @@ static void apply_capabilities(const struct container_opts* opts)
             }
         }
     }
+
+    audit_emit_cap_set_event(opts);
 }
 
 /* ── init reaper ─────────────────────────────────────────────────────────── */
@@ -3014,12 +3751,15 @@ static int run_as_init(char** exec_args,
 
     if (WIFEXITED(child_status))
     {
+        audit_emit_wait_status("exit", child, child_status);
         return WEXITSTATUS(child_status);
     }
     if (WIFSIGNALED(child_status))
     {
+        audit_emit_wait_status("exit", child, child_status);
         return 128 + WTERMSIG(child_status);
     }
+    audit_emit_wait_status("exit", child, child_status);
     return 1;
 }
 /* ── seccomp ─────────────────────────────────────────────────────────────── */
@@ -5738,6 +6478,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     /* Exec the entrypoint */
     debug_log("container.exec", "path=%s argc=%d", safe_str(exec_args[0]),
               exec_argc);
+    audit_emit_exec_event(exec_args[0]);
     execvp(exec_args[0], exec_args);
 
     /* If exec failed, try /bin/sh as fallback */
@@ -5914,6 +6655,10 @@ static void usage(const char* prog)
             "  --clock-offset SECS Shift the container's monotonic and boottime clocks\n"
             "                      by SECS seconds (Linux 5.6+, CLONE_NEWTIME).\n"
             "                      Useful for replay testing and timestamp freezing.\n"
+            "  --audit-log FILE    Append structured JSON lifecycle events to FILE\n"
+            "                      (use '-' to write the audit stream to stderr)\n"
+            "  --metrics-socket PATH\n"
+            "                      Serve Prometheus metrics over a Unix socket at PATH\n"
             "  --security-opt apparmor=PROFILE\n"
             "                      Apply AppArmor profile before exec\n"
             "                      (requires -DHAVE_APPARMOR at build time)\n"
@@ -5923,6 +6668,8 @@ static void usage(const char* prog)
             "  --no-host-dev       Skip bind-mounting host /dev nodes (null, zero, "
             "random, tty)\n"
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
+            "  --no-userns-remap   Disable subordinate UID/GID remapping and use\n"
+            "                      the single-ID user namespace fallback\n"
             "  --hostname NAME     Set the hostname inside the container\n"
             "  --cap-drop CAP      Drop a capability (or 'all' to drop all)\n"
             "  --cap-add CAP       Add an ambient capability (use after --cap-drop all)\n"
@@ -6699,6 +7446,35 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             }
             opts->has_clock_offset = 1;
         }
+        else if (strcmp(argv[i], "--audit-log") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --audit-log requires FILE argument\n");
+                return -1;
+            }
+            opts->audit_log = argv[++i];
+        }
+        else if (strcmp(argv[i], "--metrics-socket") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --metrics-socket requires PATH argument\n");
+                return -1;
+            }
+            i++;
+            if (!path_is_absolute_and_clean(argv[i]))
+            {
+                fprintf(stderr,
+                        "oci2bin: --metrics-socket path must be absolute"
+                        " and clean: %s\n",
+                        argv[i]);
+                return -1;
+            }
+            opts->metrics_socket = argv[i];
+        }
         else if (strcmp(argv[i], "--add-host") == 0)
         {
             if (i + 1 >= argc)
@@ -7142,6 +7918,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             }
             opts->has_user = 1;
         }
+        else if (strcmp(argv[i], "--no-userns-remap") == 0)
+        {
+            opts->no_userns_remap = 1;
+        }
         else if (strcmp(argv[i], "-t") == 0
                  || strcmp(argv[i], "--tty") == 0)
         {
@@ -7494,17 +8274,19 @@ static int run_self_update(const char* self_path, const char* key_path,
                              apply_update ? "apply" : "check", helper_path);
 }
 
-/* ── mseal: memory-seal loader text/rodata (Linux 6.10+) ─────────────────── */
-
-/*
- * Walk /proc/self/maps and call mseal() on every r-xp and r--p segment.
- * This prevents any future mprotect/mmap from changing these ranges, hardening
- * the loader against self-modification attacks from a compromised container.
- * Silently no-ops on kernels < 6.10 (ENOSYS) or if /proc/self/maps is absent.
- */
-#ifdef __NR_mseal
 static void seal_loader_rodata(void)
 {
+#ifdef __NR_mseal
+    /*
+     * Walk /proc/self/maps and call mseal() on every r-xp and r--p segment.
+     * This prevents any future mprotect/mmap from changing these ranges,
+     * hardening the loader against self-modification attacks from a
+     * compromised container.
+     */
+    if (!kernel_supports_mseal())
+    {
+        return;
+    }
     FILE* maps = fopen("/proc/self/maps", "r");
     if (!maps)
     {
@@ -7531,11 +8313,16 @@ static void seal_loader_rodata(void)
             continue;
         }
         long rc = syscall(__NR_mseal, (void*)start, len, 0UL);
-        (void)rc; /* ENOSYS on < 6.10, EPERM if already sealed — both OK */
+        if (rc < 0 && errno == ENOSYS)
+        {
+            kernel_set_feature_state(KERNEL_FEATURE_MSEAL,
+                                     KERNEL_FEATURE_UNSUPPORTED);
+            break;
+        }
     }
     fclose(maps);
-}
 #endif
+}
 
 /* ── cgroup v2 resource limits ───────────────────────────────────────────── */
 
@@ -7566,6 +8353,411 @@ static int cg_write(const char* path, const char* value)
 
 static char g_cgroup_dir[PATH_MAX]; /* global so atexit can clean up */
 static int  g_cgroup_fd = -1;       /* open O_DIRECTORY fd to g_cgroup_dir */
+
+struct metrics_snapshot
+{
+    unsigned long long cpu_usage_usec;
+    unsigned long long cpu_user_usec;
+    unsigned long long cpu_system_usec;
+    unsigned long long cpu_nr_periods;
+    unsigned long long cpu_nr_throttled;
+    unsigned long long cpu_throttled_usec;
+    unsigned long long memory_current;
+    unsigned long long pids_current;
+};
+
+static volatile sig_atomic_t g_metrics_stop = 0;
+
+static void metrics_stop_signal(int sig)
+{
+    (void)sig;
+    g_metrics_stop = 1;
+}
+
+static int read_text_file_at(int dirfd, const char* relpath,
+                             char* buf, size_t buf_sz)
+{
+    if (!buf || buf_sz == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int fd = openat(dirfd, relpath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    size_t total = 0;
+    while (total + 1 < buf_sz)
+    {
+        ssize_t nr = read(fd, buf + total, buf_sz - total - 1);
+        if (nr < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
+        if (nr == 0)
+        {
+            break;
+        }
+        total += (size_t)nr;
+    }
+    buf[total] = '\0';
+    close(fd);
+    return 0;
+}
+
+static int parse_u64_text(const char* text, unsigned long long* out)
+{
+    char* endp = NULL;
+    unsigned long long value;
+
+    if (!text || !out)
+    {
+        return -1;
+    }
+
+    errno = 0;
+    value = strtoull(text, &endp, 10);
+    if (errno != 0 || endp == text)
+    {
+        return -1;
+    }
+    while (*endp == '\n' || *endp == ' ' || *endp == '\t')
+    {
+        endp++;
+    }
+    if (*endp != '\0')
+    {
+        return -1;
+    }
+    *out = value;
+    return 0;
+}
+
+static int parse_cpu_stat_text(const char* text, struct metrics_snapshot* snap)
+{
+    char buf[512];
+    char* saveptr = NULL;
+    char* line;
+
+    if (!text || !snap)
+    {
+        return -1;
+    }
+    if (snprintf(buf, sizeof(buf), "%s", text) >= (int)sizeof(buf))
+    {
+        return -1;
+    }
+
+    line = strtok_r(buf, "\n", &saveptr);
+    while (line)
+    {
+        char key[64];
+        unsigned long long value;
+        if (sscanf(line, "%63s %llu", key, &value) == 2)
+        {
+            if (strcmp(key, "usage_usec") == 0)
+            {
+                snap->cpu_usage_usec = value;
+            }
+            else if (strcmp(key, "user_usec") == 0)
+            {
+                snap->cpu_user_usec = value;
+            }
+            else if (strcmp(key, "system_usec") == 0)
+            {
+                snap->cpu_system_usec = value;
+            }
+            else if (strcmp(key, "nr_periods") == 0)
+            {
+                snap->cpu_nr_periods = value;
+            }
+            else if (strcmp(key, "nr_throttled") == 0)
+            {
+                snap->cpu_nr_throttled = value;
+            }
+            else if (strcmp(key, "throttled_usec") == 0)
+            {
+                snap->cpu_throttled_usec = value;
+            }
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+    return 0;
+}
+
+static int read_metrics_snapshot(int dirfd, struct metrics_snapshot* snap)
+{
+    char buf[512];
+
+    if (!snap)
+    {
+        return -1;
+    }
+    memset(snap, 0, sizeof(*snap));
+
+    if (read_text_file_at(dirfd, "cpu.stat", buf, sizeof(buf)) < 0)
+    {
+        return -1;
+    }
+    if (parse_cpu_stat_text(buf, snap) < 0)
+    {
+        return -1;
+    }
+    if (read_text_file_at(dirfd, "memory.current", buf, sizeof(buf)) < 0 ||
+            parse_u64_text(buf, &snap->memory_current) < 0)
+    {
+        return -1;
+    }
+    if (read_text_file_at(dirfd, "pids.current", buf, sizeof(buf)) < 0 ||
+            parse_u64_text(buf, &snap->pids_current) < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static int format_metrics_text(const struct metrics_snapshot* snap,
+                               char* buf, size_t buf_sz)
+{
+    int n = snprintf(
+                buf, buf_sz,
+                "# HELP oci2bin_cpu_usage_usec Total CPU time used by the"
+                " container in microseconds.\n"
+                "# TYPE oci2bin_cpu_usage_usec counter\n"
+                "oci2bin_cpu_usage_usec %llu\n"
+                "# HELP oci2bin_cpu_user_usec User CPU time used by the"
+                " container in microseconds.\n"
+                "# TYPE oci2bin_cpu_user_usec counter\n"
+                "oci2bin_cpu_user_usec %llu\n"
+                "# HELP oci2bin_cpu_system_usec System CPU time used by the"
+                " container in microseconds.\n"
+                "# TYPE oci2bin_cpu_system_usec counter\n"
+                "oci2bin_cpu_system_usec %llu\n"
+                "# HELP oci2bin_cpu_nr_periods Number of elapsed CFS periods.\n"
+                "# TYPE oci2bin_cpu_nr_periods counter\n"
+                "oci2bin_cpu_nr_periods %llu\n"
+                "# HELP oci2bin_cpu_nr_throttled Number of throttled CFS periods.\n"
+                "# TYPE oci2bin_cpu_nr_throttled counter\n"
+                "oci2bin_cpu_nr_throttled %llu\n"
+                "# HELP oci2bin_cpu_throttled_usec Total throttled CPU time in"
+                " microseconds.\n"
+                "# TYPE oci2bin_cpu_throttled_usec counter\n"
+                "oci2bin_cpu_throttled_usec %llu\n"
+                "# HELP oci2bin_memory_current Current memory usage in bytes.\n"
+                "# TYPE oci2bin_memory_current gauge\n"
+                "oci2bin_memory_current %llu\n"
+                "# HELP oci2bin_pids_current Current number of tasks in the"
+                " container cgroup.\n"
+                "# TYPE oci2bin_pids_current gauge\n"
+                "oci2bin_pids_current %llu\n",
+                snap->cpu_usage_usec,
+                snap->cpu_user_usec,
+                snap->cpu_system_usec,
+                snap->cpu_nr_periods,
+                snap->cpu_nr_throttled,
+                snap->cpu_throttled_usec,
+                snap->memory_current,
+                snap->pids_current);
+    if (n < 0 || (size_t)n >= buf_sz)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static pid_t start_metrics_helper(const char* socket_path)
+{
+    int sync_pipe[2];
+    if (pipe(sync_pipe) < 0)
+    {
+        perror("oci2bin: metrics pipe");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("oci2bin: metrics fork");
+        close(sync_pipe[0]);
+        close(sync_pipe[1]);
+        return -1;
+    }
+    if (pid == 0)
+    {
+        close(sync_pipe[0]);
+        g_metrics_stop = 0;
+
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = metrics_stop_signal;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
+
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s",
+                     socket_path) >= (int)sizeof(addr.sun_path))
+        {
+            fprintf(stderr, "oci2bin: --metrics-socket path too long: %s\n",
+                    socket_path);
+            (void)write(sync_pipe[1], "0", 1);
+            close(sync_pipe[1]);
+            _exit(1);
+        }
+
+        struct stat st;
+        if (lstat(socket_path, &st) == 0)
+        {
+            if (!S_ISSOCK(st.st_mode))
+            {
+                fprintf(stderr,
+                        "oci2bin: --metrics-socket exists and is not a socket:"
+                        " %s\n",
+                        socket_path);
+                (void)write(sync_pipe[1], "0", 1);
+                close(sync_pipe[1]);
+                _exit(1);
+            }
+            if (unlink(socket_path) < 0)
+            {
+                fprintf(stderr, "oci2bin: --metrics-socket unlink %s: %s\n",
+                        socket_path, strerror(errno));
+                (void)write(sync_pipe[1], "0", 1);
+                close(sync_pipe[1]);
+                _exit(1);
+            }
+        }
+        else if (errno != ENOENT)
+        {
+            fprintf(stderr, "oci2bin: --metrics-socket stat %s: %s\n",
+                    socket_path, strerror(errno));
+            (void)write(sync_pipe[1], "0", 1);
+            close(sync_pipe[1]);
+            _exit(1);
+        }
+
+        int listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (listen_fd < 0)
+        {
+            perror("oci2bin: metrics socket");
+            (void)write(sync_pipe[1], "0", 1);
+            close(sync_pipe[1]);
+            _exit(1);
+        }
+        if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+        {
+            fprintf(stderr, "oci2bin: --metrics-socket bind %s: %s\n",
+                    socket_path, strerror(errno));
+            close(listen_fd);
+            (void)write(sync_pipe[1], "0", 1);
+            close(sync_pipe[1]);
+            _exit(1);
+        }
+        if (listen(listen_fd, 1) < 0)
+        {
+            fprintf(stderr, "oci2bin: --metrics-socket listen %s: %s\n",
+                    socket_path, strerror(errno));
+            unlink(socket_path);
+            close(listen_fd);
+            (void)write(sync_pipe[1], "0", 1);
+            close(sync_pipe[1]);
+            _exit(1);
+        }
+
+        struct metrics_snapshot snap;
+        memset(&snap, 0, sizeof(snap));
+        if (read_metrics_snapshot(g_cgroup_fd, &snap) < 0)
+        {
+            fprintf(stderr, "oci2bin: metrics initial read failed: %s\n",
+                    strerror(errno));
+        }
+        (void)write(sync_pipe[1], "1", 1);
+        close(sync_pipe[1]);
+
+        char metrics[2048];
+        while (!g_metrics_stop)
+        {
+            struct pollfd pfd;
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.fd = listen_fd;
+            pfd.events = POLLIN;
+
+            int prc = poll(&pfd, 1, 5000);
+            if (prc < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                break;
+            }
+            if (prc == 0)
+            {
+                if (read_metrics_snapshot(g_cgroup_fd, &snap) < 0)
+                {
+                    fprintf(stderr, "oci2bin: metrics read failed: %s\n",
+                            strerror(errno));
+                }
+                continue;
+            }
+            if (!(pfd.revents & POLLIN))
+            {
+                continue;
+            }
+
+            int client_fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+            if (client_fd < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                break;
+            }
+            if (read_metrics_snapshot(g_cgroup_fd, &snap) < 0)
+            {
+                fprintf(stderr, "oci2bin: metrics read failed: %s\n",
+                        strerror(errno));
+            }
+            if (format_metrics_text(&snap, metrics, sizeof(metrics)) == 0)
+            {
+                write_all_fd(client_fd, metrics, strlen(metrics));
+            }
+            close(client_fd);
+        }
+
+        unlink(socket_path);
+        close(listen_fd);
+        _exit(0);
+    }
+
+    close(sync_pipe[1]);
+    char ready = '0';
+    ssize_t nr;
+    do
+    {
+        nr = read(sync_pipe[0], &ready, 1);
+    }
+    while (nr < 0 && errno == EINTR);
+    close(sync_pipe[0]);
+    if (nr != 1 || ready != '1')
+    {
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+    return pid;
+}
 
 /* Write a formatted value to a cgroup knob under g_cgroup_dir.
  * Non-fatal: prints a warning on any failure. */
@@ -7613,7 +8805,8 @@ static void cleanup_cgroup(void)
  */
 static int setup_cgroup(const struct container_opts* opts)
 {
-    if (!opts->cg_memory_bytes && !opts->cg_cpu_quota && !opts->cg_pids)
+    if (!opts->cg_memory_bytes && !opts->cg_cpu_quota &&
+            !opts->cg_pids && !opts->metrics_socket)
     {
         return 0;
     }
@@ -7700,22 +8893,30 @@ static int setup_cgroup(const struct container_opts* opts)
  */
 static pid_t fork_into_cgroup(void)
 {
-#ifdef __NR_clone3
-    if (g_cgroup_fd >= 0)
+    if (g_cgroup_fd >= 0 && kernel_supports_clone3())
     {
+#ifdef __NR_clone3
         struct clone_args args;
         memset(&args, 0, sizeof(args));
         args.flags = CLONE_INTO_CGROUP;
         args.cgroup = (uint64_t)g_cgroup_fd;
         args.exit_signal = SIGCHLD;
         pid_t pid = (pid_t)syscall(__NR_clone3, &args, sizeof(args));
-        if (pid >= 0 || errno != ENOSYS)
+        if (pid >= 0)
         {
             return pid;
         }
-        /* ENOSYS: kernel older than 5.7, fall through to fork() path */
-    }
+        if (errno == ENOSYS)
+        {
+            kernel_set_feature_state(KERNEL_FEATURE_CLONE3,
+                                     KERNEL_FEATURE_UNSUPPORTED);
+        }
+        else if (errno != EINVAL)
+        {
+            return pid;
+        }
 #endif
+    }
     pid_t pid = fork();
     if (pid == 0 && g_cgroup_fd >= 0)
     {
@@ -8811,11 +10012,29 @@ int main(int argc, char* argv[])
     }
     debug_dump_opts(&opts);
 
-    /* Seal loader text/rodata against future mmap/mprotect (Linux 6.10+).
+    /* Seal loader text/rodata against future mmap/mprotect when supported.
      * Must run after argv parsing (opts complete) and before any fork(). */
-#ifdef __NR_mseal
     seal_loader_rodata();
-#endif
+
+    /* Open audit log if requested */
+    if (opts.audit_log)
+    {
+        if (strcmp(opts.audit_log, "-") == 0)
+        {
+            g_audit_fd = STDERR_FILENO;
+        }
+        else
+        {
+            g_audit_fd = open(opts.audit_log,
+                              O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                              0640);
+            if (g_audit_fd < 0)
+            {
+                fprintf(stderr, "oci2bin: --audit-log %s: %s\n",
+                        opts.audit_log, strerror(errno));
+            }
+        }
+    }
 
     debug_log("main.oci_blob", "offset=0x%lx size=0x%lx",
               OCI_DATA_OFFSET, OCI_DATA_SIZE);
@@ -8865,6 +10084,9 @@ int main(int argc, char* argv[])
         return update_rc;
     }
 
+    /* Emit audit start event now that opts are fully resolved */
+    audit_emit_start_event(self_path, &opts);
+
     /* 4. Extract OCI image into rootfs */
     char* rootfs = extract_oci_rootfs(self_path);
     if (!rootfs)
@@ -8874,13 +10096,12 @@ int main(int argc, char* argv[])
     }
     debug_log("main.rootfs", "path=%s", rootfs);
 
-    /* 5. Patch rootfs so privilege-dropping tools work in a single-UID namespace
-     * (container mode) or microVM where real setpriv/chown may fail. */
-    patch_rootfs_ids(rootfs);
-
     /* 4b. VM dispatch: after rootfs extraction so rootfs is available */
     if (opts.use_vm)
     {
+        /* MicroVM mode still needs the compatibility shims because ownership
+         * changes operate on host IDs through virtiofs. */
+        patch_rootfs_ids(rootfs);
         char vm_tmpdir[PATH_MAX];
         if (make_runtime_tmpdir(vm_tmpdir, sizeof(vm_tmpdir),
                                 "oci2bin-vm.") < 0)
@@ -8902,10 +10123,28 @@ int main(int argc, char* argv[])
     /* 6. Capture real UID/GID before entering user namespace */
     uid_t real_uid = getuid();
     gid_t real_gid = getgid();
+    struct userns_map_plan userns_plan;
     debug_log("main.identity", "uid=%d gid=%d", (int)real_uid, (int)real_gid);
+
+    plan_userns_map(&opts, real_uid, &userns_plan);
+
+    /* Single-ID fallback needs passwd/group rewrites and privilege-drop shims.
+     * Full subordinate-ID remap exposes the container's normal 0-65535 range,
+     * so keep the image metadata intact in that mode. */
+    if (!userns_plan.use_subid_remap)
+    {
+        patch_rootfs_ids(rootfs);
+    }
 
     /* 6a. Set up cgroup v2 resource limits (before unshare, uses host cgroupfs) */
     int cg_did_setup = setup_cgroup(&opts);
+    if (opts.metrics_socket && !cg_did_setup)
+    {
+        fprintf(stderr,
+                "oci2bin: --metrics-socket requires cgroup v2 support"
+                " and a writable cgroup subtree\n");
+        return 1;
+    }
     debug_log("main.cgroup", "enabled=%d dir=%s", cg_did_setup,
               g_cgroup_dir[0] ? g_cgroup_dir : "(none)");
 
@@ -8918,7 +10157,7 @@ int main(int argc, char* argv[])
     }
 
     /* 8. Map UID/GID */
-    if (setup_uid_map(real_uid, real_gid) < 0)
+    if (setup_uid_map(real_uid, real_gid, &userns_plan) < 0)
     {
         return 1;
     }
@@ -8962,18 +10201,27 @@ int main(int argc, char* argv[])
         debug_log("main.unshare", "flags=0x%x", ns_flags);
     }
 
-    /* 10c. Time namespace: shift monotonic and boottime clocks (Linux 5.6+).
-     * Must happen after CLONE_NEWUSER (needs CAP_SYS_TIME in user ns) and
-     * before fork so the child inherits the shifted namespace. */
-#ifdef CLONE_NEWTIME
+    /* 10c. Time namespace: shift monotonic and boottime clocks when
+     * supported. Must happen after CLONE_NEWUSER (needs CAP_SYS_TIME in
+     * user ns) and before fork so the child inherits the shifted namespace. */
     if (opts.has_clock_offset)
     {
         if (unshare(CLONE_NEWTIME) < 0)
         {
-            fprintf(stderr,
-                    "oci2bin: --clock-offset: CLONE_NEWTIME not supported"
-                    " by this kernel (need 5.6+): %s\n",
-                    strerror(errno));
+            if (errno == EINVAL || errno == ENOSYS)
+            {
+                fprintf(stderr,
+                        "oci2bin: --clock-offset: CLONE_NEWTIME not"
+                        " supported by this kernel (need 5.6+): %s\n",
+                        strerror(errno));
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: --clock-offset: unshare(CLONE_NEWTIME):"
+                        " %s\n",
+                        strerror(errno));
+            }
         }
         else
         {
@@ -9008,7 +10256,6 @@ int main(int argc, char* argv[])
             }
         }
     }
-#endif
 
     /* 10b. For slirp/pasta modes: fork a net helper AFTER CLONE_NEWNET.
      * The net helper will exec slirp4netns or pasta, targeting our new
@@ -9216,6 +10463,22 @@ int main(int argc, char* argv[])
     }
     debug_log("main.child", "pid=%d", (int)child);
 
+    pid_t metrics_pid = -1;
+    if (opts.metrics_socket)
+    {
+        metrics_pid = start_metrics_helper(opts.metrics_socket);
+        if (metrics_pid < 0)
+        {
+            kill(child, SIGTERM);
+            waitpid(child, NULL, 0);
+            if (saved_termios_ok)
+            {
+                tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
+            }
+            return 1;
+        }
+    }
+
     /* Parent: close slave end — only the child needs it */
     if (opts.pty_slave_fd >= 0)
     {
@@ -9264,6 +10527,17 @@ int main(int argc, char* argv[])
         int helper_status;
         waitpid(net_helper_pid, &helper_status, 0);
     }
+    if (metrics_pid > 0)
+    {
+        kill(metrics_pid, SIGTERM);
+        waitpid(metrics_pid, NULL, 0);
+    }
+
+    if (!opts.use_init)
+    {
+        audit_emit_wait_status("exit", child, status);
+    }
+    audit_emit_wait_status("stop", child, status);
 
     /* Cleanup: remove the whole tmpdir without forking.
      * rootfs = tmpdir + "/rootfs"; strip the last component to get tmpdir.

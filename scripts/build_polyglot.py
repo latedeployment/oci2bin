@@ -58,6 +58,14 @@ SUPPORTED_MACHINES = {
 VADDR_BASE = 0x400000
 
 
+def get_layer_cache_root():
+    """Return the on-disk cache directory for OCI layer tar blobs."""
+    base = os.environ.get('XDG_CACHE_HOME')
+    if not base:
+        base = os.path.join(os.path.expanduser('~'), '.cache')
+    return os.path.join(base, 'oci2bin', 'layers')
+
+
 def build_elf64_header(entry, phoff, phnum, e_machine=EM_X86_64):
     """Build a 64-byte ELF64 header."""
     e_ident = (
@@ -400,6 +408,125 @@ def get_oci_tar(image_name, output_path):
     if result.returncode != 0:
         print(f"docker save failed: {result.stderr}", file=sys.stderr)
         sys.exit(1)
+
+
+def _parse_sha256_hex(value):
+    if not isinstance(value, str):
+        return None
+    digest = value.lower()
+    if digest.startswith('sha256:'):
+        digest = digest.split(':', 1)[1]
+    if len(digest) != 64:
+        return None
+    try:
+        int(digest, 16)
+    except ValueError:
+        return None
+    return digest
+
+
+def _layer_cache_path(cache_root, digest_hex):
+    return os.path.join(cache_root, f'{digest_hex}.tar')
+
+
+def _read_cached_layer(cache_root, digest_hex):
+    cache_path = _layer_cache_path(cache_root, digest_hex)
+    if not os.path.isfile(cache_path):
+        return None
+    with open(cache_path, 'rb') as f:
+        data = f.read()
+    if hashlib.sha256(data).hexdigest() != digest_hex:
+        try:
+            os.unlink(cache_path)
+        except OSError:
+            pass
+        return None
+    return data
+
+
+def _write_cached_layer(cache_root, digest_hex, data):
+    os.makedirs(cache_root, exist_ok=True)
+    cache_path = _layer_cache_path(cache_root, digest_hex)
+    tmp_path = f'{cache_path}.tmp.{os.getpid()}'
+    with open(tmp_path, 'wb') as f:
+        f.write(data)
+    os.replace(tmp_path, cache_path)
+
+
+def warm_layer_cache(oci_data, use_cache=True):
+    """
+    Populate and reuse the layer tar cache for an OCI/docker-save tar.
+
+    Layers are keyed by config.rootfs.diff_ids (sha256 of the uncompressed
+    layer tar bytes). On a cache hit we skip extracting that layer from the
+    input tar. On a miss we extract, verify the digest, and store it.
+    """
+    if not use_cache:
+        return {'hits': 0, 'misses': 0}
+
+    try:
+        manifest, _, config, _ = _parse_oci_manifest_and_config(oci_data)
+    except (KeyError, json.JSONDecodeError, tarfile.TarError):
+        return {'hits': 0, 'misses': 0}
+
+    if not manifest:
+        return {'hits': 0, 'misses': 0}
+
+    layers = manifest[0].get('Layers', [])
+    diff_ids = config.get('rootfs', {}).get('diff_ids', [])
+    if not isinstance(layers, list) or not isinstance(diff_ids, list):
+        return {'hits': 0, 'misses': 0}
+    if len(layers) != len(diff_ids):
+        return {'hits': 0, 'misses': 0}
+
+    layer_digests = {}
+    for layer_name, diff_id in zip(layers, diff_ids):
+        digest_hex = _parse_sha256_hex(diff_id)
+        if digest_hex is None:
+            return {'hits': 0, 'misses': 0}
+        layer_digests[layer_name] = digest_hex
+
+    cache_root = get_layer_cache_root()
+    hits = 0
+    misses = 0
+
+    with tarfile.open(fileobj=io.BytesIO(oci_data), mode='r:*') as tf:
+        for layer_name, digest_hex in layer_digests.items():
+            cached = _read_cached_layer(cache_root, digest_hex)
+            if cached is not None:
+                hits += 1
+                continue
+
+            try:
+                member = tf.getmember(layer_name)
+            except KeyError:
+                print(f'error: OCI layer missing from tar: {layer_name}',
+                      file=sys.stderr)
+                sys.exit(1)
+
+            fobj = tf.extractfile(member)
+            if fobj is None:
+                print(f'error: OCI layer is not a regular file: {layer_name}',
+                      file=sys.stderr)
+                sys.exit(1)
+
+            layer_data = fobj.read()
+            actual = hashlib.sha256(layer_data).hexdigest()
+            if actual != digest_hex:
+                print(
+                    f'error: OCI layer digest mismatch for {layer_name}: '
+                    f'expected sha256:{digest_hex}, got sha256:{actual}',
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            _write_cached_layer(cache_root, digest_hex, layer_data)
+            misses += 1
+
+    if hits or misses:
+        print(f'  Layer cache: {hits} hit(s), {misses} miss(es)',
+              file=sys.stderr)
+    return {'hits': hits, 'misses': misses}
 
 
 META_MAGIC = b'OCI2BIN_META\x00'
@@ -762,7 +889,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    label_chunk_bytes=DEFAULT_LABEL_CHUNK_BYTES,
                    loader_dir=DEFAULT_LOADER_DIR,
                    label_prefix=DEFAULT_LABEL_PREFIX,
-                   self_update_url=None, pin_digest=None):
+                   self_update_url=None, pin_digest=None,
+                   use_layer_cache=True):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -798,6 +926,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
 
             with open(oci_tar_path, 'rb') as f:
                 oci_data = f.read()
+
+    warm_layer_cache(oci_data, use_cache=use_layer_cache)
 
     # 2a. Optionally embed loader binary into the OCI image for reconstruction
     arch_name = SUPPORTED_MACHINES[loader['e_machine']]
@@ -1039,6 +1169,9 @@ def main():
                         help='Output polyglot file path')
     parser.add_argument('--tar', default=None,
                         help='Path to a pre-saved OCI tar (skips docker save)')
+    parser.add_argument('--no-cache', action='store_true', default=False,
+                        help='Disable the per-layer OCI tar cache '
+                             f'under {get_layer_cache_root()!r}')
     parser.add_argument('--image-name', default=None,
                         help='Image name/tag to embed in metadata block '
                              '(defaults to --image value)')
@@ -1136,7 +1269,8 @@ def main():
                    loader_dir=args.loader_dir,
                    label_prefix=args.label_prefix,
                    self_update_url=args.self_update_url,
-                   pin_digest=args.pin_digest)
+                   pin_digest=args.pin_digest,
+                   use_layer_cache=not args.no_cache)
 
 
 if __name__ == '__main__':

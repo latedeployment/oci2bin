@@ -246,6 +246,25 @@ static void test_parse_opts(void)
         ASSERT_INT_EQ(opts.debug, 1, "parse_opts: --debug sets debug=1");
     }
 
+    /* --audit-log */
+    {
+        char* argv[] = {"prog", "--audit-log", "-", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --audit-log returns 0");
+        ASSERT_STR_EQ(opts.audit_log, "-", "parse_opts: --audit-log value");
+    }
+
+    /* --metrics-socket */
+    {
+        char* argv[] = {"prog", "--metrics-socket", "/tmp/metrics.sock", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --metrics-socket returns 0");
+        ASSERT_STR_EQ(opts.metrics_socket, "/tmp/metrics.sock",
+                      "parse_opts: --metrics-socket value");
+    }
+
     /* --self-update */
     {
         char* argv[] = {"prog", "--self-update", NULL};
@@ -318,6 +337,23 @@ static void test_parse_opts(void)
         memset(&opts, 0, sizeof(opts));
         int r = parse_opts(2, argv, &opts);
         ASSERT_INT_EQ(r, -1, "parse_opts: --entrypoint missing arg returns -1");
+    }
+
+    /* --audit-log missing arg */
+    {
+        char* argv[] = {"prog", "--audit-log", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --audit-log missing arg returns -1");
+    }
+
+    /* --metrics-socket missing arg */
+    {
+        char* argv[] = {"prog", "--metrics-socket", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --metrics-socket missing arg returns -1");
     }
 
     /* -e KEY=VALUE */
@@ -1121,6 +1157,16 @@ static void test_parse_opts_misc_flags(void)
                       "parse_opts: --hostname missing arg returns -1");
     }
 
+    /* --no-userns-remap */
+    {
+        char* argv[] = {"prog", "--no-userns-remap", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --no-userns-remap returns 0");
+        ASSERT_INT_EQ(opts.no_userns_remap, 1,
+                      "parse_opts: --no-userns-remap sets flag");
+    }
+
     /* --workdir */
     {
         char arg[] = "/app";
@@ -1431,6 +1477,16 @@ static void test_parse_opts_path_validation(void)
         ASSERT_INT_EQ(r, -1,
                       "parse_opts: --tmpfs path with '..' component rejected");
     }
+
+    /* --metrics-socket: relative path must be rejected */
+    {
+        char arg[] = "metrics.sock";
+        char* argv[] = {"prog", "--metrics-socket", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --metrics-socket relative path rejected");
+    }
 }
 
 /* ── test_json_escape_string ──────────────────────────────────────────────── */
@@ -1470,6 +1526,265 @@ static void test_json_escape_string(void)
     char tiny[3];
     ASSERT_INT_EQ(json_escape_string("a\"b", tiny, 3), -1,
                   "json_escape_string: buffer too small returns -1");
+}
+
+static int raw_probe_clone3_expected(void)
+{
+#ifdef __NR_clone3
+    errno = 0;
+    return (syscall(__NR_clone3, NULL, 0UL) >= 0 || errno != ENOSYS) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+static int raw_probe_mseal_expected(void)
+{
+#ifdef __NR_mseal
+    errno = 0;
+    return (syscall(__NR_mseal, NULL, 0UL, 0UL) >= 0 ||
+            errno != ENOSYS) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+static void test_kernel_feature_runtime_detection(void)
+{
+    memset(g_kernel_feature_state, 0, sizeof(g_kernel_feature_state));
+
+    ASSERT_INT_EQ(kernel_feature_state_from_syscall(-1, ENOSYS),
+                  KERNEL_FEATURE_UNSUPPORTED,
+                  "kernel feature: ENOSYS maps to unsupported");
+    ASSERT_INT_EQ(kernel_feature_state_from_syscall(-1, EINVAL),
+                  KERNEL_FEATURE_SUPPORTED,
+                  "kernel feature: non-ENOSYS error maps to supported");
+    ASSERT_INT_EQ(kernel_feature_state_from_syscall(0, 0),
+                  KERNEL_FEATURE_SUPPORTED,
+                  "kernel feature: successful syscall maps to supported");
+
+    kernel_set_feature_state(KERNEL_FEATURE_CLONE3,
+                             KERNEL_FEATURE_UNSUPPORTED);
+    ASSERT_INT_EQ(kernel_supports_clone3(), 0,
+                  "kernel feature: clone3 cached unsupported");
+    kernel_set_feature_state(KERNEL_FEATURE_CLONE3,
+                             KERNEL_FEATURE_SUPPORTED);
+    ASSERT_INT_EQ(kernel_supports_clone3(), 1,
+                  "kernel feature: clone3 cached supported");
+
+    kernel_set_feature_state(KERNEL_FEATURE_MSEAL,
+                             KERNEL_FEATURE_UNSUPPORTED);
+    ASSERT_INT_EQ(kernel_supports_mseal(), 0,
+                  "kernel feature: mseal cached unsupported");
+    kernel_set_feature_state(KERNEL_FEATURE_MSEAL,
+                             KERNEL_FEATURE_SUPPORTED);
+    ASSERT_INT_EQ(kernel_supports_mseal(), 1,
+                  "kernel feature: mseal cached supported");
+
+    kernel_set_feature_state(KERNEL_FEATURE_CLONE3, KERNEL_FEATURE_UNKNOWN);
+    ASSERT_INT_EQ(kernel_supports_clone3(), raw_probe_clone3_expected(),
+                  "kernel feature: clone3 runtime probe matches raw syscall");
+    ASSERT_INT_EQ(g_kernel_feature_state[KERNEL_FEATURE_CLONE3],
+                  raw_probe_clone3_expected() ?
+                  KERNEL_FEATURE_SUPPORTED :
+                  KERNEL_FEATURE_UNSUPPORTED,
+                  "kernel feature: clone3 probe result cached");
+
+    kernel_set_feature_state(KERNEL_FEATURE_MSEAL, KERNEL_FEATURE_UNKNOWN);
+    ASSERT_INT_EQ(kernel_supports_mseal(), raw_probe_mseal_expected(),
+                  "kernel feature: mseal runtime probe matches raw syscall");
+    ASSERT_INT_EQ(g_kernel_feature_state[KERNEL_FEATURE_MSEAL],
+                  raw_probe_mseal_expected() ?
+                  KERNEL_FEATURE_SUPPORTED :
+                  KERNEL_FEATURE_UNSUPPORTED,
+                  "kernel feature: mseal probe result cached");
+}
+
+static void test_audit_logging_helpers(void)
+{
+    char path[] = "/tmp/oci2bin-audit-test-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT(fd >= 0, "audit helpers: mkstemp succeeds");
+    if (fd < 0)
+    {
+        return;
+    }
+
+    int saved_audit_fd = g_audit_fd;
+    g_audit_fd = fd;
+
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.name = "svc\"name";
+    opts.net = "slirp\"mode";
+    opts.cap_add_mask = 0x2aULL;
+
+    audit_emit_start_event("/tmp/bin\"name", &opts);
+    audit_emit_exec_event("/bin/echo\"quoted");
+    audit_emit_wait_status("exit", 42, (7 << 8));
+    audit_emit_wait_status("stop", 42, SIGTERM);
+
+    ASSERT_INT_EQ(lseek(fd, 0, SEEK_SET), 0,
+                  "audit helpers: rewind temp file");
+    char buf[2048];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    ASSERT(n > 0, "audit helpers: read log output");
+    if (n > 0)
+    {
+        buf[n] = '\0';
+        ASSERT(strstr(buf, "\"event\":\"start\"") != NULL,
+               "audit helpers: start event emitted");
+        ASSERT(strstr(buf, "\"image\":\"/tmp/bin\\\"name\"") != NULL,
+               "audit helpers: image path escaped");
+        ASSERT(strstr(buf, "\"name\":\"svc\\\"name\"") != NULL,
+               "audit helpers: container name escaped");
+        ASSERT(strstr(buf, "\"net\":\"slirp\\\"mode\"") != NULL,
+               "audit helpers: network mode escaped");
+        ASSERT(strstr(buf, "\"caps\":\"0x2a\"") != NULL,
+               "audit helpers: start caps field emitted");
+        ASSERT(strstr(buf, "\"event\":\"exec\"") != NULL,
+               "audit helpers: exec event emitted");
+        ASSERT(strstr(buf, "\"path\":\"/bin/echo\\\"quoted\"") != NULL,
+               "audit helpers: exec path escaped");
+        ASSERT(strstr(buf, "\"event\":\"exit\",\"time\":") != NULL,
+               "audit helpers: exit event emitted");
+        ASSERT(strstr(buf, "\"pid\":42,\"exit_code\":7") != NULL,
+               "audit helpers: exit code emitted");
+        ASSERT(strstr(buf, "\"event\":\"stop\",\"time\":") != NULL,
+               "audit helpers: stop event emitted");
+        ASSERT(strstr(buf, "\"pid\":42,\"signal\":15") != NULL,
+               "audit helpers: signal emitted");
+    }
+
+    close(fd);
+    unlink(path);
+    g_audit_fd = saved_audit_fd;
+}
+
+static void test_metrics_helpers(void)
+{
+    struct metrics_snapshot snap;
+    memset(&snap, 0, sizeof(snap));
+
+    const char* cpu_stat =
+        "usage_usec 1234\n"
+        "user_usec 1200\n"
+        "system_usec 34\n"
+        "nr_periods 10\n"
+        "nr_throttled 2\n"
+        "throttled_usec 55\n";
+    ASSERT_INT_EQ(parse_cpu_stat_text(cpu_stat, &snap), 0,
+                  "metrics helpers: parse_cpu_stat_text returns 0");
+    ASSERT_INT_EQ((int)snap.cpu_usage_usec, 1234,
+                  "metrics helpers: usage_usec parsed");
+    ASSERT_INT_EQ((int)snap.cpu_user_usec, 1200,
+                  "metrics helpers: user_usec parsed");
+    ASSERT_INT_EQ((int)snap.cpu_system_usec, 34,
+                  "metrics helpers: system_usec parsed");
+    ASSERT_INT_EQ((int)snap.cpu_nr_periods, 10,
+                  "metrics helpers: nr_periods parsed");
+    ASSERT_INT_EQ((int)snap.cpu_nr_throttled, 2,
+                  "metrics helpers: nr_throttled parsed");
+    ASSERT_INT_EQ((int)snap.cpu_throttled_usec, 55,
+                  "metrics helpers: throttled_usec parsed");
+
+    snap.memory_current = 4096;
+    snap.pids_current = 7;
+
+    char buf[2048];
+    ASSERT_INT_EQ(format_metrics_text(&snap, buf, sizeof(buf)), 0,
+                  "metrics helpers: format_metrics_text returns 0");
+    ASSERT(strstr(buf, "oci2bin_cpu_usage_usec 1234\n") != NULL,
+           "metrics helpers: cpu usage metric emitted");
+    ASSERT(strstr(buf, "oci2bin_cpu_nr_throttled 2\n") != NULL,
+           "metrics helpers: throttled periods metric emitted");
+    ASSERT(strstr(buf, "oci2bin_memory_current 4096\n") != NULL,
+           "metrics helpers: memory metric emitted");
+    ASSERT(strstr(buf, "oci2bin_pids_current 7\n") != NULL,
+           "metrics helpers: pids metric emitted");
+}
+
+static void test_userns_subid_helpers(void)
+{
+    unsigned long start = 0;
+    unsigned long count = 0;
+
+    ASSERT_INT_EQ(parse_subid_line("omer:524288:65536\n", "omer", "1000",
+                                   &start, &count),
+                  0,
+                  "userns subid: parse_subid_line accepts matching name");
+    ASSERT(start == 524288UL,
+           "userns subid: parse_subid_line stores start");
+    ASSERT(count == 65536UL,
+           "userns subid: parse_subid_line stores count");
+
+    ASSERT_INT_EQ(parse_subid_line("1000:600000:70000\n", "omer", "1000",
+                                   &start, &count),
+                  0,
+                  "userns subid: parse_subid_line accepts numeric owner");
+    ASSERT(start == 600000UL,
+           "userns subid: parse_subid_line numeric owner start");
+    ASSERT(count == 70000UL,
+           "userns subid: parse_subid_line numeric owner count");
+
+    ASSERT_INT_EQ(parse_subid_line("other:1:2\n", "omer", "1000",
+                                   &start, &count),
+                  -1,
+                  "userns subid: parse_subid_line rejects other owners");
+    ASSERT_INT_EQ(parse_subid_line("omer:bad:65536\n", "omer", "1000",
+                                   &start, &count),
+                  -1,
+                  "userns subid: parse_subid_line rejects bad start");
+    ASSERT_INT_EQ(parse_subid_line("omer:1:2:3\n", "omer", "1000",
+                                   &start, &count),
+                  -1,
+                  "userns subid: parse_subid_line rejects extra fields");
+
+    char path[] = "/tmp/oci2bin-subid-test-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT(fd >= 0, "userns subid: mkstemp succeeds");
+    if (fd < 0)
+    {
+        return;
+    }
+
+    const char* file_data =
+        "ignored\n"
+        "omer:700000:65536\n"
+        "1001:800000:70000\n"
+        "tiny:900000:16\n";
+    ASSERT_INT_EQ(write_all_fd(fd, file_data, strlen(file_data)),
+                  0,
+                  "userns subid: write temp file succeeds");
+    close(fd);
+
+    ASSERT_INT_EQ(lookup_subid_range_in_file(path, "omer", 1000,
+                                             USERNS_REMAP_CONTAINER_IDS,
+                                             &start, &count),
+                  0,
+                  "userns subid: lookup_subid_range_in_file finds named range");
+    ASSERT(start == 700000UL,
+           "userns subid: named lookup start");
+    ASSERT(count == 65536UL,
+           "userns subid: named lookup count");
+
+    ASSERT_INT_EQ(lookup_subid_range_in_file(path, NULL, 1001,
+                                             USERNS_REMAP_CONTAINER_IDS,
+                                             &start, &count),
+                  0,
+                  "userns subid: lookup_subid_range_in_file finds numeric owner");
+    ASSERT(start == 800000UL,
+           "userns subid: numeric lookup start");
+    ASSERT(count == 70000UL,
+           "userns subid: numeric lookup count");
+
+    ASSERT_INT_EQ(lookup_subid_range_in_file(path, "tiny", 1002,
+                                             USERNS_REMAP_CONTAINER_IDS,
+                                             &start, &count),
+                  -1,
+                  "userns subid: lookup_subid_range_in_file rejects short ranges");
+
+    unlink(path);
 }
 
 /* ── test_parse_id_value ──────────────────────────────────────────────────── */
@@ -1835,6 +2150,10 @@ int main(void)
     test_json_get_array();
     test_json_parse_string_array();
     test_json_escape_string();
+    test_kernel_feature_runtime_detection();
+    test_audit_logging_helpers();
+    test_metrics_helpers();
+    test_userns_subid_helpers();
     test_path_has_dotdot_component();
     test_path_has_dotdot_extra();
     test_path_is_absolute_and_clean();
