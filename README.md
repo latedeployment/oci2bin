@@ -547,11 +547,10 @@ Two backends are supported:
 
 | Backend | When to use | Kernel required? | Extra requirements |
 |---|---|---|---|
-| **libkrun** (default when available) | macOS (HVF) or Linux (KVM) | **No** — libkrun bundles its own kernel internally | `libkrun-dev` at build time |
+| **libkrun** (default when available) | Linux (KVM) | **No** — libkrun bundles its own kernel internally | `libkrun-dev` at build time |
 | **cloud-hypervisor** | Linux (KVM); full VM control | **Yes** — you must embed a vmlinux (see below) | `cloud-hypervisor` in `$PATH`, embedded kernel |
 
-`--vm` requires `/dev/kvm` on Linux. On macOS, libkrun uses the Hypervisor
-framework (HVF) — no KVM is needed.
+`--vm` requires `/dev/kvm`.
 
 ### Building with libkrun
 
