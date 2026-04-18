@@ -1479,6 +1479,28 @@ make test-integration-nginx  # nginx HTTP 200 smoke test
 make test-integration-services  # Redis (container+VM) + 5 service images (container+VM)
 ```
 
+### Fuzzing
+
+libFuzzer harnesses target the JSON helpers and MCP JSON-RPC parser. Requires clang with `-fsanitize=fuzzer`.
+
+```bash
+make fuzz-json       # fuzz JSON helpers (json_get_string, json_get_array, etc.)
+make fuzz-seccomp    # fuzz seccomp profile parser
+make fuzz-parse-opts # fuzz parse_opts + load_env_file
+make fuzz-mcp        # fuzz MCP JSON-RPC parser (mcp-serve input surface)
+make fuzz-all        # build all harnesses
+```
+
+Run a harness against the seed corpus:
+
+```bash
+./build/fuzz_mcp_jsonrpc tests/fuzz/corpus/mcp -max_len=65536 -jobs=4
+```
+
+Seed inputs for the MCP fuzzer live in `tests/fuzz/corpus/mcp/` and cover:
+empty input, truncated JSON, deeply nested objects, oversized strings, null bytes
+mid-string, invalid UTF-8, and method names at maximum length.
+
 ### Security linting
 
 ```bash

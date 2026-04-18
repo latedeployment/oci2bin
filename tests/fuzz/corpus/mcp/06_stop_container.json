@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"stop_container","arguments":{"name":"test-ctr"}}}

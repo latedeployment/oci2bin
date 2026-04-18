@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_container","arguments":{"image":"/usr/local/bin/myapp","name":"test-ctr","net":"none","env":["KEY=VAL","FOO=BAR"],"volumes":["/data:/mnt"]}}}

@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exec_in_container","arguments":{"name":"test-ctr","cmd":["ls","-la","/"]}}}
