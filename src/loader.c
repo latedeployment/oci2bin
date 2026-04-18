@@ -246,6 +246,10 @@ struct container_opts
 
     /* --gdb  (bind-mount host gdb into container and exec it as debugger) */
     int gdb;
+
+    /* --clock-offset SECS  (shift monotonic+boottime clocks, Linux 5.6+) */
+    long clock_offset_secs;
+    int  has_clock_offset;
 };
 
 static int argv_has_debug_flag(int argc, char* argv[])
@@ -5907,6 +5911,9 @@ static void usage(const char* prog)
             "                      entrypoint as the debuggee (host gdb bind-mounted\n"
             "                      in if not present). Disables seccomp to allow\n"
             "                      ptrace.\n"
+            "  --clock-offset SECS Shift the container's monotonic and boottime clocks\n"
+            "                      by SECS seconds (Linux 5.6+, CLONE_NEWTIME).\n"
+            "                      Useful for replay testing and timestamp freezing.\n"
             "  --security-opt apparmor=PROFILE\n"
             "                      Apply AppArmor profile before exec\n"
             "                      (requires -DHAVE_APPARMOR at build time)\n"
@@ -6671,6 +6678,26 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--gdb") == 0)
         {
             opts->gdb = 1;
+        }
+        else if (strcmp(argv[i], "--clock-offset") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --clock-offset requires SECS argument\n");
+                return -1;
+            }
+            i++;
+            char* endp = NULL;
+            opts->clock_offset_secs = strtol(argv[i], &endp, 10);
+            if (!endp || *endp != '\0')
+            {
+                fprintf(stderr,
+                        "oci2bin: --clock-offset: invalid number '%s'\n",
+                        argv[i]);
+                return -1;
+            }
+            opts->has_clock_offset = 1;
         }
         else if (strcmp(argv[i], "--add-host") == 0)
         {
@@ -8885,6 +8912,54 @@ int main(int argc, char* argv[])
         }
         debug_log("main.unshare", "flags=0x%x", ns_flags);
     }
+
+    /* 10c. Time namespace: shift monotonic and boottime clocks (Linux 5.6+).
+     * Must happen after CLONE_NEWUSER (needs CAP_SYS_TIME in user ns) and
+     * before fork so the child inherits the shifted namespace. */
+#ifdef CLONE_NEWTIME
+    if (opts.has_clock_offset)
+    {
+        if (unshare(CLONE_NEWTIME) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --clock-offset: CLONE_NEWTIME not supported"
+                    " by this kernel (need 5.6+): %s\n",
+                    strerror(errno));
+        }
+        else
+        {
+            /* Write offsets to /proc/self/timens_offsets before forking.
+             * Format: "<clock_id> <offset_secs> <offset_nsecs>" */
+            int tfd = open("/proc/self/timens_offsets", O_WRONLY | O_CLOEXEC);
+            if (tfd < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --clock-offset: open timens_offsets: %s\n",
+                        strerror(errno));
+            }
+            else
+            {
+                char buf[128];
+                int n;
+                n = snprintf(buf, sizeof(buf), "monotonic %ld 0\n",
+                             opts.clock_offset_secs);
+                if (n > 0 && n < (int)sizeof(buf))
+                {
+                    write_all_fd(tfd, buf, (size_t)n);
+                }
+                n = snprintf(buf, sizeof(buf), "boottime %ld 0\n",
+                             opts.clock_offset_secs);
+                if (n > 0 && n < (int)sizeof(buf))
+                {
+                    write_all_fd(tfd, buf, (size_t)n);
+                }
+                close(tfd);
+                debug_log("main.timens", "offset=%ld secs",
+                          opts.clock_offset_secs);
+            }
+        }
+    }
+#endif
 
     /* 10b. For slirp/pasta modes: fork a net helper AFTER CLONE_NEWNET.
      * The net helper will exec slirp4netns or pasta, targeting our new

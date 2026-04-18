@@ -51,6 +51,7 @@ See below [How it works](#how-it-works).
   - [Seccomp filter](#seccomp-filter)
     - [Generating a minimal seccomp profile](#generating-a-minimal-seccomp-profile)
   - [Debugging with gdb](#debugging-with-gdb)
+  - [Clock offset (time namespace)](#clock-offset-time-namespace)
   - [Running as non-root](#running-as-non-root)
   - [Custom hostname](#custom-hostname)
   - [Exposing host devices](#exposing-host-devices)
@@ -901,6 +902,25 @@ debuggee — no manual `nsenter`, PID tracking, or custom debug images needed.
 **Requirements:** `gdb` must be installed on the host (e.g. `dnf install gdb`
 or `apt install gdb`). The container runs without seccomp, so use only in
 development or trusted environments.
+
+### Clock offset (time namespace)
+
+`--clock-offset SECS` shifts the container's monotonic and boottime clocks by
+the given number of seconds using a Linux time namespace (`CLONE_NEWTIME`,
+kernel 5.6+). The wall clock is unaffected.
+
+```bash
+# Run as if the system started 3600 seconds ago (1 hour earlier)
+./my-app --clock-offset -3600
+
+# Freeze-test time-sensitive logic by shifting far into the future
+./my-app --clock-offset 86400
+```
+
+Useful for deterministic replay testing, license-expiry simulations, and
+anything that reads `CLOCK_MONOTONIC` or `CLOCK_BOOTTIME`. A warning is
+printed and the container runs normally if the kernel does not support
+`CLONE_NEWTIME`.
 
 #### AppArmor and SELinux confinement
 
