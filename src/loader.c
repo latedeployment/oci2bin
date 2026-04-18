@@ -27,6 +27,7 @@
 #include <linux/audit.h>
 #include <linux/elf.h>
 #include <linux/filter.h>
+#include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <time.h>
 
@@ -7494,6 +7495,7 @@ static int cg_write(const char* path, const char* value)
 }
 
 static char g_cgroup_dir[PATH_MAX]; /* global so atexit can clean up */
+static int  g_cgroup_fd = -1;       /* open O_DIRECTORY fd to g_cgroup_dir */
 
 /* Write a formatted value to a cgroup knob under g_cgroup_dir.
  * Non-fatal: prints a warning on any failure. */
@@ -7522,6 +7524,11 @@ static void cg_set(const char* knob, const char* fmt, ...)
 
 static void cleanup_cgroup(void)
 {
+    if (g_cgroup_fd >= 0)
+    {
+        close(g_cgroup_fd);
+        g_cgroup_fd = -1;
+    }
     if (g_cgroup_dir[0])
     {
         rmdir(g_cgroup_dir);
@@ -7597,36 +7604,66 @@ static int setup_cgroup(const struct container_opts* opts)
         cg_set("pids.max", "%ld\n", opts->cg_pids);
     }
 
-    /* Move ourselves into the leaf cgroup */
+    /* Open the cgroup directory fd for use with clone3(CLONE_INTO_CGROUP).
+     * The container child will be spawned directly into this cgroup without
+     * the parent ever joining it, eliminating the parent's resource usage
+     * from the container's accounting and closing the post-fork write race. */
+    g_cgroup_fd = open(g_cgroup_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (g_cgroup_fd < 0)
     {
-        char path[PATH_MAX];
-        n = snprintf(path, sizeof(path), "%s/cgroup.procs", g_cgroup_dir);
-        if (n < 0 || n >= (int)sizeof(path))
-        {
-            fprintf(stderr, "oci2bin: cgroup.procs path truncated\n");
-            rmdir(g_cgroup_dir);
-            g_cgroup_dir[0] = '\0';
-            return 0;
-        }
-        char pid_str[16];
-        int pn = snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());
-        if (pn < 0 || pn >= (int)sizeof(pid_str))
-        {
-            fprintf(stderr, "oci2bin: pid string truncated\n");
-            rmdir(g_cgroup_dir);
-            g_cgroup_dir[0] = '\0';
-            return 0;
-        }
-        if (cg_write(path, pid_str) < 0)
-        {
-            rmdir(g_cgroup_dir);
-            g_cgroup_dir[0] = '\0';
-            return 0;
-        }
+        fprintf(stderr, "oci2bin: cgroup open %s: %s\n",
+                g_cgroup_dir, strerror(errno));
+        rmdir(g_cgroup_dir);
+        g_cgroup_dir[0] = '\0';
+        return 0;
     }
 
     atexit(cleanup_cgroup);
     return 1; /* caller should unshare(CLONE_NEWCGROUP) */
+}
+
+/*
+ * Fork a child into the pre-created cgroup (g_cgroup_fd) using
+ * clone3(CLONE_INTO_CGROUP) when available (Linux 5.7+).  Falls back
+ * to plain fork() followed by writing the child's PID to cgroup.procs.
+ * Returns the child PID (>0 in parent, 0 in child) or -1 on error.
+ */
+static pid_t fork_into_cgroup(void)
+{
+#ifdef __NR_clone3
+    if (g_cgroup_fd >= 0)
+    {
+        struct clone_args args;
+        memset(&args, 0, sizeof(args));
+        args.flags = CLONE_INTO_CGROUP;
+        args.cgroup = (uint64_t)g_cgroup_fd;
+        args.exit_signal = SIGCHLD;
+        pid_t pid = (pid_t)syscall(__NR_clone3, &args, sizeof(args));
+        if (pid >= 0 || errno != ENOSYS)
+        {
+            return pid;
+        }
+        /* ENOSYS: kernel older than 5.7, fall through to fork() path */
+    }
+#endif
+    pid_t pid = fork();
+    if (pid == 0 && g_cgroup_fd >= 0)
+    {
+        /* Child: write own PID to cgroup.procs (fallback path only) */
+        char pid_str[16];
+        int n = snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());
+        if (n > 0 && n < (int)sizeof(pid_str))
+        {
+            int procs_fd = openat(g_cgroup_fd, "cgroup.procs",
+                                  O_WRONLY | O_CLOEXEC);
+            if (procs_fd >= 0)
+            {
+                write_all_fd(procs_fd, pid_str, (size_t)n);
+                close(procs_fd);
+            }
+        }
+    }
+    return pid;
 }
 
 /* ── tmpdir cleanup ──────────────────────────────────────────────────────── */
@@ -9026,8 +9063,11 @@ int main(int argc, char* argv[])
         }
     }
 
-    /* 12. Fork for PID namespace (child becomes PID 1) */
-    pid_t child = fork();
+    /* 12. Fork for PID namespace (child becomes PID 1).
+     * Use clone3(CLONE_INTO_CGROUP) when cgroup limits are active so the
+     * child lands directly in the cgroup without the parent joining it.
+     * Falls back to fork() + cgroup.procs write on older kernels. */
+    pid_t child = fork_into_cgroup();
     if (child < 0)
     {
         perror("fork");
