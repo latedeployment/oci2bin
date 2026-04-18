@@ -1,0 +1,1 @@
+../../scripts/sign_binary.py

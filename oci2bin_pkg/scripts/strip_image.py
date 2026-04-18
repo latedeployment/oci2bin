@@ -1,0 +1,1 @@
+../../scripts/strip_image.py

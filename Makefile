@@ -129,8 +129,17 @@ install: build/loader-$(ARCH)
 	install -d $(PREFIX)/share/oci2bin/src
 	install -m 755 oci2bin $(PREFIX)/bin/oci2bin
 	ln -sf $(PREFIX)/bin/oci2bin $(PREFIX)/bin/oci2vm
-	install -m 644 scripts/build_polyglot.py $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/reconstruct.py $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/add_files.py        $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/build_polyglot.py   $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/diff_images.py      $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/inspect_image.py    $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/merge_layers.py     $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/oci_layout_to_tar.py $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/reconstruct.py      $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/sbom_generate.py    $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/sign_binary.py      $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/squash_layers.py    $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/strip_image.py      $(PREFIX)/share/oci2bin/scripts/
 	install -m 644 src/loader.c $(PREFIX)/share/oci2bin/src/
 	[ -f build/loader-x86_64  ] && install -m 755 build/loader-x86_64  $(PREFIX)/share/oci2bin/build/ || true
 	[ -f build/loader-aarch64 ] && install -m 755 build/loader-aarch64 $(PREFIX)/share/oci2bin/build/ || true

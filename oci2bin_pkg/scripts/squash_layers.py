@@ -1,0 +1,1 @@
+../../scripts/squash_layers.py

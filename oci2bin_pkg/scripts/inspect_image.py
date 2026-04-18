@@ -1,0 +1,1 @@
+../../scripts/inspect_image.py

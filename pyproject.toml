@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+# oci2bin is Linux-only; skip any platform-specific resolution elsewhere.
+environments = ["sys_platform == 'linux'"]
+
+[project]
+name = "oci2bin"
+version = "0.9.0"
+description = "Convert OCI/Docker images into self-contained ELF executables"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["docker", "oci", "container", "linux", "rootless"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
+# No Python runtime dependencies — stdlib only.
+# Runtime system requirements: gcc, docker (documented in README).
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/latedeployment/oci2bin"
+Changelog = "https://github.com/latedeployment/oci2bin/blob/main/CHANGELOG.md"
+
+[project.scripts]
+oci2bin = "oci2bin_pkg._entry:main"
+oci2vm  = "oci2bin_pkg._entry:main"
+
+[tool.setuptools.packages.find]
+include = ["oci2bin_pkg*"]
+
+[tool.setuptools.package-data]
+"oci2bin_pkg" = [
+    "oci2bin.bash",
+    "scripts/*.py",
+    "src/loader.c",
+]

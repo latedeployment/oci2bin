@@ -1,0 +1,1 @@
+../../scripts/diff_images.py
