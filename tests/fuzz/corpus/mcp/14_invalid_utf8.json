@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"run_container","arguments":{"image":"/\xff\xfe\xfd","name":"x"}}}
