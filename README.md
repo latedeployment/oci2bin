@@ -479,6 +479,21 @@ Use `--` to terminate option parsing when a command argument starts with `-`:
 
 If the remount read-only step fails, the secret is not mounted at all.
 
+#### TPM2-sealed secrets via systemd-creds
+
+`--secret tpm2:CREDENTIAL_NAME[:CONTAINER_PATH]` decrypts a TPM2-sealed credential at container start and places the plaintext inside the container. The credential is decrypted using `systemd-creds decrypt` (from systemd ≥ 250) and written as a mode-0400 file on the container's tmpfs. The plaintext is zeroed in memory immediately after writing.
+
+```bash
+# Seal a secret with the TPM2 at image build time
+systemd-creds encrypt --name=dbpass /dev/stdin /etc/credstore/dbpass.cred
+
+# Unseal and inject at container start (no plaintext on disk)
+./my-app --secret tpm2:dbpass                        # → /run/secrets/dbpass
+./my-app --secret tpm2:dbpass:/run/secrets/db_pass   # custom path
+```
+
+**Requirements:** `systemd-creds` must be in `PATH`; the host must have a reachable TPM2 device. The credential name may contain only alphanumeric characters, `-`, `_`, and `.`.
+
 ### SSH agent forwarding
 
 `--ssh-agent` forwards the host `SSH_AUTH_SOCK` Unix socket into the container at `/run/ssh-agent.sock` and sets `SSH_AUTH_SOCK` accordingly:
