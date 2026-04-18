@@ -2465,38 +2465,21 @@ static void setup_gdb_in_rootfs(const char* rootfs)
         return;
     }
 
-    /* Ensure /usr/bin exists in the container */
-    char usr_bin[PATH_MAX];
-    int n = snprintf(usr_bin, sizeof(usr_bin), "%s/usr/bin", rootfs);
-    if (n < 0 || (size_t)n >= sizeof(usr_bin))
-    {
-        return;
-    }
-    mkdir(usr_bin, 0755); /* best-effort; may already exist */
-
     char dst[PATH_MAX];
-    n = snprintf(dst, sizeof(dst), "%s/usr/bin/gdb", rootfs);
+    int n = snprintf(dst, sizeof(dst), "%s/usr/bin/gdb", rootfs);
     if (n < 0 || (size_t)n >= sizeof(dst))
     {
         return;
     }
 
-    /* Create an empty file as bind-mount target */
-    int fd = open(dst, O_CREAT | O_WRONLY | O_EXCL, 0755);
-    if (fd < 0 && errno != EEXIST)
+    if (ensure_bind_mount_target(host_gdb, dst, "--gdb") < 0)
     {
-        fprintf(stderr, "oci2bin: --gdb: cannot create %s: %s\n",
-                dst, strerror(errno));
         return;
-    }
-    if (fd >= 0)
-    {
-        close(fd);
     }
 
     if (mount(host_gdb, dst, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
     {
-        fprintf(stderr, "oci2bin: --gdb: bind-mount %s → %s: %s\n",
+        fprintf(stderr, "oci2bin: --gdb: bind-mount %s -> %s: %s\n",
                 host_gdb, dst, strerror(errno));
     }
     else
@@ -7417,6 +7400,31 @@ static int cg_write(const char* path, const char* value)
 
 static char g_cgroup_dir[PATH_MAX]; /* global so atexit can clean up */
 
+/* Write a formatted value to a cgroup knob under g_cgroup_dir.
+ * Non-fatal: prints a warning on any failure. */
+__attribute__((format(printf, 2, 3)))
+static void cg_set(const char* knob, const char* fmt, ...)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s", g_cgroup_dir, knob);
+    if (n < 0 || n >= (int)sizeof(path))
+    {
+        fprintf(stderr, "oci2bin: cgroup %s path truncated\n", knob);
+        return;
+    }
+    char val[64];
+    va_list ap;
+    va_start(ap, fmt);
+    int vn = vsnprintf(val, sizeof(val), fmt, ap);
+    va_end(ap);
+    if (vn < 0 || vn >= (int)sizeof(val))
+    {
+        fprintf(stderr, "oci2bin: cgroup %s value out of range\n", knob);
+        return;
+    }
+    cg_write(path, val);
+}
+
 static void cleanup_cgroup(void)
 {
     if (g_cgroup_dir[0])
@@ -7481,79 +7489,17 @@ static int setup_cgroup(const struct container_opts* opts)
         }
     }
 
-    /* memory.max */
     if (opts->cg_memory_bytes > 0)
     {
-        char path[PATH_MAX];
-        n = snprintf(path, sizeof(path), "%s/memory.max", g_cgroup_dir);
-        if (n < 0 || n >= (int)sizeof(path))
-        {
-            fprintf(stderr, "oci2bin: cgroup memory.max path truncated\n");
-        }
-        else
-        {
-            char val[32];
-            int vn = snprintf(val, sizeof(val), "%lld\n",
-                              opts->cg_memory_bytes);
-            if (vn < 0 || vn >= (int)sizeof(val))
-            {
-                fprintf(stderr,
-                        "oci2bin: memory value out of range\n");
-            }
-            else
-            {
-                cg_write(path, val);
-            }
-        }
+        cg_set("memory.max", "%lld\n", opts->cg_memory_bytes);
     }
-
-    /* cpu.max — format: "QUOTA PERIOD\n" */
     if (opts->cg_cpu_quota > 0)
     {
-        char path[PATH_MAX];
-        n = snprintf(path, sizeof(path), "%s/cpu.max", g_cgroup_dir);
-        if (n < 0 || n >= (int)sizeof(path))
-        {
-            fprintf(stderr, "oci2bin: cgroup cpu.max path truncated\n");
-        }
-        else
-        {
-            char val[64];
-            int vn = snprintf(val, sizeof(val), "%ld 100000\n",
-                              opts->cg_cpu_quota);
-            if (vn < 0 || vn >= (int)sizeof(val))
-            {
-                fprintf(stderr, "oci2bin: cpu quota value out of range\n");
-            }
-            else
-            {
-                cg_write(path, val);
-            }
-        }
+        cg_set("cpu.max", "%ld 100000\n", opts->cg_cpu_quota);
     }
-
-    /* pids.max */
     if (opts->cg_pids > 0)
     {
-        char path[PATH_MAX];
-        n = snprintf(path, sizeof(path), "%s/pids.max", g_cgroup_dir);
-        if (n < 0 || n >= (int)sizeof(path))
-        {
-            fprintf(stderr, "oci2bin: cgroup pids.max path truncated\n");
-        }
-        else
-        {
-            char val[32];
-            int vn = snprintf(val, sizeof(val), "%ld\n", opts->cg_pids);
-            if (vn < 0 || vn >= (int)sizeof(val))
-            {
-                fprintf(stderr, "oci2bin: pids value out of range\n");
-            }
-            else
-            {
-                cg_write(path, val);
-            }
-        }
+        cg_set("pids.max", "%ld\n", opts->cg_pids);
     }
 
     /* Move ourselves into the leaf cgroup */
@@ -8545,6 +8491,43 @@ static char** inject_vm_flag(int argc, char* argv[], int* out_argc)
     return merged;
 }
 
+/* ── namespace helpers ───────────────────────────────────────────────────── */
+
+/*
+ * Open /proc/<pid>/ns/<ns_name> and call setns(fd, ns_flag).
+ * Returns 0 on success, -1 on failure (message already printed).
+ */
+static int join_ns_of_pid(pid_t pid, int ns_flag, const char* ns_name)
+{
+    char ns_path[PATH_MAX];
+    int n = snprintf(ns_path, sizeof(ns_path),
+                     "/proc/%d/ns/%s", (int)pid, ns_name);
+    if (n < 0 || n >= (int)sizeof(ns_path))
+    {
+        fprintf(stderr, "oci2bin: %s ns path truncated\n", ns_name);
+        return -1;
+    }
+    int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        fprintf(stderr, "oci2bin: open %s namespace: %s\n",
+                ns_name, strerror(errno));
+        return -1;
+    }
+    if (setns(fd, ns_flag) < 0)
+    {
+        fprintf(stderr, "oci2bin: setns(%s): %s\n"
+                        "oci2bin: joining another container's %s namespace requires\n"
+                        "oci2bin: the target to share the same user namespace owner,"
+                        " or root privileges\n",
+                ns_name, strerror(errno), ns_name);
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char* argv[])
@@ -8736,62 +8719,15 @@ int main(int argc, char* argv[])
      * Must happen after CLONE_NEWUSER so we have CAP_SYS_ADMIN in our user
      * namespace; must happen before unshare() so we don't create new
      * namespaces for the ones we are joining instead. */
-    if (opts.net_join_pid > 0)
+    if (opts.net_join_pid > 0 &&
+            join_ns_of_pid(opts.net_join_pid, CLONE_NEWNET, "net") < 0)
     {
-        char ns_path[PATH_MAX];
-        int n = snprintf(ns_path, sizeof(ns_path),
-                         "/proc/%d/ns/net", (int)opts.net_join_pid);
-        if (n < 0 || n >= (int)sizeof(ns_path))
-        {
-            fprintf(stderr, "oci2bin: net ns path truncated\n");
-            return 1;
-        }
-        int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-        {
-            perror("oci2bin: open net namespace");
-            return 1;
-        }
-        if (setns(fd, CLONE_NEWNET) < 0)
-        {
-            perror("oci2bin: setns(CLONE_NEWNET)");
-            fprintf(stderr,
-                    "oci2bin: joining another container's network namespace\n"
-                    "oci2bin: requires the target to share the same user"
-                    " namespace owner, or root privileges\n");
-            close(fd);
-            return 1;
-        }
-        close(fd);
+        return 1;
     }
-
-    if (opts.ipc_join_pid > 0)
+    if (opts.ipc_join_pid > 0 &&
+            join_ns_of_pid(opts.ipc_join_pid, CLONE_NEWIPC, "ipc") < 0)
     {
-        char ns_path[PATH_MAX];
-        int n = snprintf(ns_path, sizeof(ns_path),
-                         "/proc/%d/ns/ipc", (int)opts.ipc_join_pid);
-        if (n < 0 || n >= (int)sizeof(ns_path))
-        {
-            fprintf(stderr, "oci2bin: ipc ns path truncated\n");
-            return 1;
-        }
-        int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
-        if (fd < 0)
-        {
-            perror("oci2bin: open ipc namespace");
-            return 1;
-        }
-        if (setns(fd, CLONE_NEWIPC) < 0)
-        {
-            perror("oci2bin: setns(CLONE_NEWIPC)");
-            fprintf(stderr,
-                    "oci2bin: joining another container's IPC namespace\n"
-                    "oci2bin: requires the target to share the same user"
-                    " namespace owner, or root privileges\n");
-            close(fd);
-            return 1;
-        }
-        close(fd);
+        return 1;
     }
 
     /* 10. Enter mount + PID + UTS namespaces; optionally network/cgroup ns.
