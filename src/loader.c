@@ -27,6 +27,9 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <linux/audit.h>
+#ifdef __NR_userfaultfd
+#include <linux/userfaultfd.h>
+#endif
 #include <linux/elf.h>
 #include <linux/filter.h>
 #include <linux/sched.h>
@@ -127,6 +130,7 @@ enum kernel_feature_id
 {
     KERNEL_FEATURE_CLONE3 = 0,
     KERNEL_FEATURE_MSEAL,
+    KERNEL_FEATURE_UFFD,
     KERNEL_FEATURE_MAX,
 };
 
@@ -184,6 +188,31 @@ static int probe_mseal_support(void)
 #endif
 }
 
+/*
+ * Probe userfaultfd availability by opening an fd and performing UFFD_API
+ * negotiation.  Returns 1 if the kernel supports userfaultfd with the
+ * expected API version, 0 otherwise.
+ */
+static int probe_uffd_support(void)
+{
+#ifdef __NR_userfaultfd
+    int fd = (int)syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0)
+    {
+        return 0;
+    }
+    struct uffdio_api api;
+    api.api      = UFFD_API;
+    api.features = 0;
+    api.ioctls   = 0;
+    int ok = (ioctl(fd, UFFDIO_API, &api) == 0 && api.api == UFFD_API);
+    close(fd);
+    return ok;
+#else
+    return 0;
+#endif
+}
+
 static int kernel_feature_supported(enum kernel_feature_id feature)
 {
     int state;
@@ -208,6 +237,11 @@ static int kernel_feature_supported(enum kernel_feature_id feature)
                         KERNEL_FEATURE_SUPPORTED :
                         KERNEL_FEATURE_UNSUPPORTED;
                 break;
+            case KERNEL_FEATURE_UFFD:
+                state = probe_uffd_support() ?
+                        KERNEL_FEATURE_SUPPORTED :
+                        KERNEL_FEATURE_UNSUPPORTED;
+                break;
             default:
                 state = KERNEL_FEATURE_UNSUPPORTED;
                 break;
@@ -226,6 +260,11 @@ static int kernel_supports_clone3(void)
 static int kernel_supports_mseal(void)
 {
     return kernel_feature_supported(KERNEL_FEATURE_MSEAL);
+}
+
+static int kernel_supports_uffd(void)
+{
+    return kernel_feature_supported(KERNEL_FEATURE_UFFD);
 }
 
 /*
@@ -498,6 +537,9 @@ struct container_opts
 
     /* --no-userns-remap  (force single-ID user namespace fallback) */
     int no_userns_remap;
+
+    /* --lazy  (experimental: attempt userfaultfd-based on-demand rootfs paging) */
+    int lazy;
 };
 
 struct userns_map_plan
@@ -6861,6 +6903,9 @@ static void usage(const char* prog)
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
             "  --no-userns-remap   Disable subordinate UID/GID remapping and use\n"
             "                      the single-ID user namespace fallback\n"
+            "  --lazy              [EXPERIMENTAL] Attempt userfaultfd-based on-demand\n"
+            "                      rootfs paging (Linux 4.3+); falls back to full\n"
+            "                      extraction if unsupported\n"
             "  --hostname NAME     Set the hostname inside the container\n"
             "  --cap-drop CAP      Drop a capability (or 'all' to drop all)\n"
             "  --cap-add CAP       Add an ambient capability (use after --cap-drop all)\n"
@@ -8163,6 +8208,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-userns-remap") == 0)
         {
             opts->no_userns_remap = 1;
+        }
+        else if (strcmp(argv[i], "--lazy") == 0)
+        {
+            opts->lazy = 1;
         }
         else if (strcmp(argv[i], "-t") == 0
                  || strcmp(argv[i], "--tty") == 0)
@@ -10330,6 +10379,32 @@ int main(int argc, char* argv[])
     audit_emit_start_event(self_path, &opts);
 
     /* 4. Extract OCI image into rootfs */
+#ifdef __NR_userfaultfd
+    if (opts.lazy)
+    {
+        if (kernel_supports_uffd())
+        {
+            fprintf(stderr,
+                    "oci2bin: --lazy: userfaultfd available (Linux ≥4.3);"
+                    " lazy rootfs paging is experimental — falling back to"
+                    " full extraction\n");
+        }
+        else
+        {
+            fprintf(stderr,
+                    "oci2bin: --lazy: userfaultfd not supported by this"
+                    " kernel — falling back to full extraction\n");
+        }
+    }
+#else
+    if (opts.lazy)
+    {
+        fprintf(stderr,
+                "oci2bin: --lazy: built without userfaultfd support"
+                " (#ifdef __NR_userfaultfd not set) — falling back to"
+                " full extraction\n");
+    }
+#endif
     char* rootfs = extract_oci_rootfs(self_path);
     if (!rootfs)
     {
