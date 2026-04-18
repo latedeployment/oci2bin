@@ -1137,6 +1137,58 @@ static void test_parse_opts_misc_flags(void)
                       "parse_opts: --secret CTR split");
     }
 
+    /* --secret tpm2:CRED (no container path) */
+    {
+        char arg[] = "tpm2:mydb";
+        char* argv[] = {"prog", "--secret", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --secret tpm2 no ctr path returns 0");
+        ASSERT_INT_EQ(opts.n_secrets, 1,
+                      "parse_opts: --secret tpm2 n_secrets=1");
+        ASSERT_STR_EQ(opts.secret_cred[0], "mydb",
+                      "parse_opts: --secret tpm2 cred stored");
+        ASSERT_NULL(opts.secret_host[0],
+                    "parse_opts: --secret tpm2 host=NULL");
+        ASSERT_NULL(opts.secret_ctr[0],
+                    "parse_opts: --secret tpm2 ctr=NULL");
+    }
+
+    /* --secret tpm2:CRED:/ctr/path */
+    {
+        char arg[] = "tpm2:mydb:/run/secrets/db";
+        char* argv[] = {"prog", "--secret", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --secret tpm2 with ctr path returns 0");
+        ASSERT_STR_EQ(opts.secret_cred[0], "mydb",
+                      "parse_opts: --secret tpm2 cred name");
+        ASSERT_STR_EQ(opts.secret_ctr[0], "/run/secrets/db",
+                      "parse_opts: --secret tpm2 ctr path");
+    }
+
+    /* --secret tpm2 with invalid char in cred name */
+    {
+        char arg[] = "tpm2:my/bad";
+        char* argv[] = {"prog", "--secret", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --secret tpm2 slash in cred rejected");
+    }
+
+    /* --secret tpm2 with empty cred name */
+    {
+        char arg[] = "tpm2:";
+        char* argv[] = {"prog", "--secret", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --secret tpm2 empty cred rejected");
+    }
+
     /* --hostname */
     {
         char arg[] = "mycontainer";

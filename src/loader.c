@@ -31,6 +31,7 @@
 #include <linux/filter.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
+#include <ctype.h>
 #include <time.h>
 #ifdef __aarch64__
 #include <asm/ptrace.h>
@@ -340,9 +341,11 @@ struct container_opts
     char* vol_ctr[MAX_VOLUMES];
     int   n_vols;
 
-    /* --secret HOST_FILE[:CONTAINER_PATH]  (read-only file mounts) */
-    char* secret_host[MAX_SECRETS];
-    char* secret_ctr[MAX_SECRETS];    /* NULL → /run/secrets/<basename> */
+    /* --secret HOST_FILE[:CONTAINER_PATH]  (read-only file mounts)
+     * --secret tpm2:CRED_NAME[:CONTAINER_PATH]  (TPM2-sealed via systemd-creds) */
+    char* secret_host[MAX_SECRETS]; /* host path OR NULL for tpm2 secrets */
+    char* secret_ctr[MAX_SECRETS];  /* NULL → /run/secrets/<basename> */
+    char* secret_cred[MAX_SECRETS]; /* NULL = plain file; non-NULL = tpm2 cred name */
     int   n_secrets;
 
     /* --entrypoint /path  (overrides OCI Entrypoint) */
@@ -2142,6 +2145,119 @@ static int run_cmd(char* const argv[])
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+/*
+ * Run a command, capturing its stdout into a malloc'd buffer.
+ * *out_len receives the number of bytes read.
+ * Caller must free() the returned pointer.
+ * Returns NULL on error (fork/pipe/exec failure or non-zero exit).
+ */
+static char* run_cmd_capture(char* const argv[], size_t* out_len)
+{
+    int pipefd[2];
+    if (pipe(pipefd) < 0)
+    {
+        perror("oci2bin: pipe");
+        return NULL;
+    }
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("oci2bin: fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return NULL;
+    }
+    if (pid == 0)
+    {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+        {
+            _exit(127);
+        }
+        close(pipefd[1]);
+        execvp(argv[0], argv);
+        perror("execvp");
+        _exit(127);
+    }
+    close(pipefd[1]);
+
+    /* Read all output into a growable buffer */
+    size_t   cap  = 4096;
+    size_t   len  = 0;
+    char*    buf  = malloc(cap);
+    if (!buf)
+    {
+        close(pipefd[0]);
+        waitpid(pid, NULL, 0);
+        return NULL;
+    }
+    for (;;)
+    {
+        if (len == cap)
+        {
+            if (cap > 64 * 1024 * 1024)
+            {
+                /* Refuse to buffer more than 64 MiB of secret data */
+                fprintf(stderr, "oci2bin: systemd-creds output too large\n");
+                free(buf);
+                close(pipefd[0]);
+                waitpid(pid, NULL, 0);
+                return NULL;
+            }
+            cap *= 2;
+            char* nb = realloc(buf, cap);
+            if (!nb)
+            {
+                free(buf);
+                close(pipefd[0]);
+                waitpid(pid, NULL, 0);
+                return NULL;
+            }
+            buf = nb;
+        }
+        ssize_t n = read(pipefd[0], buf + len, cap - len);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            perror("oci2bin: read pipe");
+            free(buf);
+            close(pipefd[0]);
+            waitpid(pid, NULL, 0);
+            return NULL;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+        len += (size_t)n;
+    }
+    close(pipefd[0]);
+
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        perror("oci2bin: waitpid");
+        free(buf);
+        return NULL;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    {
+        fprintf(stderr, "oci2bin: command exited with status %d\n",
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        free(buf);
+        return NULL;
+    }
+    *out_len = len;
+    return buf;
+}
+
 /* Fork a daemon: exec argv[0] without waiting (child runs for the caller's
  * lifetime).  Returns the child pid, or -1 on error. */
 static pid_t spawn_daemon(char* const argv[])
@@ -3286,6 +3402,61 @@ static void setup_gdb_in_rootfs(const char* rootfs)
  * Each secret is a single file; if no container path is given,
  * it lands at /run/secrets/<basename>.  Called pre-chroot.
  */
+/*
+ * Decrypt a TPM2-sealed credential via systemd-creds and write the plaintext
+ * to dst_path (on the rootfs tmpfs) with mode 0400.
+ * Returns 0 on success, -1 on error.
+ */
+static int install_tpm2_secret(const char* cred_name, const char* dst_path)
+{
+    char creds_bin[PATH_MAX];
+    if (find_helper_binary("systemd-creds", creds_bin,
+                           sizeof(creds_bin)) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --secret tpm2:%s requires 'systemd-creds'"
+                " (from systemd) but it was not found in PATH\n",
+                cred_name);
+        return -1;
+    }
+
+    char* const argv[] =
+    {
+        creds_bin, "decrypt", "--name", (char*)(uintptr_t)cred_name,
+        "-", "-", NULL
+    };
+    size_t len = 0;
+    char*  plaintext = run_cmd_capture(argv, &len);
+    if (!plaintext)
+    {
+        fprintf(stderr,
+                "oci2bin: systemd-creds decrypt failed for credential '%s'\n",
+                cred_name);
+        return -1;
+    }
+
+    int fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0400);
+    if (fd < 0)
+    {
+        fprintf(stderr, "oci2bin: cannot create secret file %s: %s\n",
+                dst_path, strerror(errno));
+        explicit_bzero(plaintext, len);
+        free(plaintext);
+        return -1;
+    }
+    int rc = 0;
+    if (write_all_fd(fd, plaintext, len) < 0)
+    {
+        fprintf(stderr, "oci2bin: write secret %s failed: %s\n",
+                dst_path, strerror(errno));
+        rc = -1;
+    }
+    close(fd);
+    explicit_bzero(plaintext, len);
+    free(plaintext);
+    return rc;
+}
+
 static void setup_secrets(const char* rootfs, struct container_opts *opts)
 {
     if (opts->n_secrets == 0)
@@ -3316,46 +3487,41 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
 
     for (int i = 0; i < opts->n_secrets; i++)
     {
+        const char* cred = opts->secret_cred[i]; /* non-NULL = TPM2 path */
         const char* src  = opts->secret_host[i];
         const char* ctr  = opts->secret_ctr[i]; /* may be NULL */
 
-        /* Validate src is absolute and has no '..' */
-        if (!path_is_absolute_and_clean(src))
-        {
-            fprintf(stderr,
-                    "oci2bin: --secret host path must be absolute and clean: %s\n",
-                    src);
-            continue;
-        }
-
-        /* Derive container path */
+        /* Derive container path for both plain-file and tpm2 secrets */
         char ctr_buf[PATH_MAX];
         if (ctr)
         {
             if (!path_is_absolute_and_clean(ctr))
             {
                 fprintf(stderr,
-                        "oci2bin: --secret container path must be absolute and clean: %s\n",
-                        ctr);
+                        "oci2bin: --secret container path must be absolute"
+                        " and clean: %s\n", ctr);
                 continue;
             }
         }
         else
         {
-            /* Default: /run/secrets/<basename of src> */
-            const char* base = strrchr(src, '/');
-            base = base ? base + 1 : src;
-            if (base[0] == '\0')
+            /* Default: /run/secrets/<cred name or src basename> */
+            const char* base = cred ? cred : strrchr(src, '/');
+            if (!cred)
             {
-                fprintf(stderr, "oci2bin: --secret cannot derive basename from: %s\n",
-                        src);
+                base = base ? base + 1 : src;
+            }
+            if (!base || base[0] == '\0')
+            {
+                fprintf(stderr,
+                        "oci2bin: --secret cannot derive basename\n");
                 continue;
             }
             int n = snprintf(ctr_buf, sizeof(ctr_buf), "/run/secrets/%s", base);
             if (n < 0 || (size_t)n >= sizeof(ctr_buf))
             {
-                fprintf(stderr, "oci2bin: --secret container path too long for: %s\n",
-                        src);
+                fprintf(stderr,
+                        "oci2bin: --secret container path too long\n");
                 continue;
             }
             ctr = ctr_buf;
@@ -3368,6 +3534,27 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         {
             fprintf(stderr, "oci2bin: --secret destination path too long: %s%s\n",
                     rootfs, ctr);
+            continue;
+        }
+
+        if (cred)
+        {
+            /* TPM2-sealed secret: decrypt via systemd-creds and write to rootfs */
+            if (install_tpm2_secret(cred, dst) == 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: tpm2 secret '%s' -> %s (read-only)\n",
+                        cred, ctr);
+            }
+            continue;
+        }
+
+        /* Plain-file secret: validate and bind-mount read-only */
+        if (!path_is_absolute_and_clean(src))
+        {
+            fprintf(stderr,
+                    "oci2bin: --secret host path must be absolute and clean: %s\n",
+                    src);
             continue;
         }
 
@@ -6612,8 +6799,12 @@ static void usage(const char* prog)
             "                      Publish a container port to the host via slirp\n"
             "                      (may be repeated; implies --net slirp)\n"
             "  --secret HOST_FILE[:CONTAINER_PATH]\n"
-            "                      Bind mount a host file read-only; defaults to\n"
-            "                      /run/secrets/<basename> (may be repeated)\n"
+            "                      Bind mount a host file read-only into the container;\n"
+            "                      defaults to /run/secrets/<basename> (may be repeated)\n"
+            "  --secret tpm2:CRED_NAME[:CONTAINER_PATH]\n"
+            "                      Decrypt a TPM2-sealed credential via systemd-creds\n"
+            "                      and place it in the container at CONTAINER_PATH\n"
+            "                      (or /run/secrets/CRED_NAME by default)\n"
             "  -e KEY=VALUE        Set an environment variable inside the container\n"
             "  -e KEY              Pass KEY from host environment (skip if unset)\n"
             "                      (may be repeated; overrides built-in defaults)\n"
@@ -7022,41 +7213,92 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             if (i + 1 >= argc)
             {
                 fprintf(stderr,
-                        "oci2bin: --secret requires a HOST_FILE[:CONTAINER_PATH] argument\n");
+                        "oci2bin: --secret requires a HOST_FILE[:CONTAINER_PATH]"
+                        " or tpm2:CRED_NAME[:CONTAINER_PATH] argument\n");
                 return -1;
             }
             if (opts->n_secrets >= MAX_SECRETS)
             {
-                fprintf(stderr, "oci2bin: too many --secret flags (max %d)\n", MAX_SECRETS);
+                fprintf(stderr, "oci2bin: too many --secret flags (max %d)\n",
+                        MAX_SECRETS);
                 return -1;
             }
             i++;
-            char* spec   = argv[i];
-            char* colon  = strchr(spec, ':');
-            if (!path_is_absolute_and_clean(spec))
+            char* spec = argv[i];
+            opts->secret_cred[opts->n_secrets] = NULL;
+
+            if (strncmp(spec, "tpm2:", 5) == 0)
             {
-                fprintf(stderr,
-                        "oci2bin: --secret host path must be absolute"
-                        " and clean: %s\n", spec);
-                return -1;
-            }
-            opts->secret_host[opts->n_secrets] = spec;
-            if (colon)
-            {
-                *colon = '\0';
-                if (!path_is_absolute_and_clean(colon + 1))
+                /* TPM2 path: tpm2:CRED_NAME[:CONTAINER_PATH] */
+                char* cred_start = spec + 5;
+                char* ctr_sep    = strchr(cred_start, ':');
+                if (ctr_sep)
+                {
+                    *ctr_sep = '\0';
+                    const char* ctr_path = ctr_sep + 1;
+                    if (!path_is_absolute_and_clean(ctr_path))
+                    {
+                        fprintf(stderr,
+                                "oci2bin: --secret tpm2 container path must"
+                                " be absolute and clean: %s\n", ctr_path);
+                        return -1;
+                    }
+                    opts->secret_ctr[opts->n_secrets] = ctr_sep + 1;
+                }
+                else
+                {
+                    opts->secret_ctr[opts->n_secrets] = NULL;
+                }
+                /* Validate credential name: only alnum, '-', '_', '.' */
+                for (const char* p = cred_start; *p; p++)
+                {
+                    if (!isalnum((unsigned char)*p) && *p != '-' &&
+                            *p != '_' && *p != '.')
+                    {
+                        fprintf(stderr,
+                                "oci2bin: --secret tpm2 credential name"
+                                " contains invalid character '%c'\n", *p);
+                        return -1;
+                    }
+                }
+                if (cred_start[0] == '\0')
                 {
                     fprintf(stderr,
-                            "oci2bin: --secret container path must be"
-                            " absolute and clean: %s\n", colon + 1);
+                            "oci2bin: --secret tpm2: credential name"
+                            " must not be empty\n");
                     return -1;
                 }
-                opts->secret_ctr[opts->n_secrets] = colon + 1;
+                opts->secret_cred[opts->n_secrets] = cred_start;
+                opts->secret_host[opts->n_secrets] = NULL;
             }
             else
             {
-                opts->secret_ctr[opts->n_secrets] =
-                    NULL; /* default to /run/secrets/<basename> */
+                /* Plain-file path: HOST_FILE[:CONTAINER_PATH] */
+                char* colon = strchr(spec, ':');
+                if (!path_is_absolute_and_clean(spec))
+                {
+                    fprintf(stderr,
+                            "oci2bin: --secret host path must be absolute"
+                            " and clean: %s\n", spec);
+                    return -1;
+                }
+                opts->secret_host[opts->n_secrets] = spec;
+                if (colon)
+                {
+                    *colon = '\0';
+                    if (!path_is_absolute_and_clean(colon + 1))
+                    {
+                        fprintf(stderr,
+                                "oci2bin: --secret container path must be"
+                                " absolute and clean: %s\n", colon + 1);
+                        return -1;
+                    }
+                    opts->secret_ctr[opts->n_secrets] = colon + 1;
+                }
+                else
+                {
+                    opts->secret_ctr[opts->n_secrets] = NULL;
+                }
             }
             opts->n_secrets++;
         }
