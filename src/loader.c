@@ -2237,7 +2237,7 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len)
     {
         if (len == cap)
         {
-            if (cap > 64 * 1024 * 1024)
+            if (cap >= 64 * 1024 * 1024)
             {
                 /* Refuse to buffer more than 64 MiB of secret data */
                 fprintf(stderr, "oci2bin: systemd-creds output too large\n");
