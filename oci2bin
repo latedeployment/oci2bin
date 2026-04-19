@@ -140,10 +140,13 @@
 #                                  -- [BUILD_OPTIONS...]
 #   build-dockerfile [F]  Build a binary from a Dockerfile (no Docker daemon)
 #                         Supports: FROM scratch/<oci-dir>/<image>, COPY, ADD,
-#                                   RUN, ENV, ENTRYPOINT, CMD, WORKDIR, LABEL,
+#                                   RUN [--mount=type=bind|secret|ssh|cache|tmpfs],
+#                                   ENV, ENTRYPOINT, CMD, WORKDIR, LABEL,
 #                                   USER, EXPOSE, ARG
 #                         Options: -o OUTPUT, -f FILE, --context DIR,
-#                                  --build-arg KEY=VAL, --arch amd64|arm64
+#                                  --build-arg KEY=VAL,
+#                                  --build-secret id=<id>,src=<path>,
+#                                  --arch amd64|arm64
 #                                  -- [BUILD_OPTIONS...]
 #
 # Examples:
@@ -1633,6 +1636,9 @@ if [[ "${1:-}" == "build-dockerfile" ]]; then
             --build-arg)
                 [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: --build-arg requires KEY=VAL" >&2; exit 1; }
                 BDF_PY_ARGS+=(--build-arg "$2"); shift 2 ;;
+            --build-secret|--secret)
+                [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: --build-secret requires id=<id>,src=<path>" >&2; exit 1; }
+                BDF_PY_ARGS+=(--build-secret "$2"); shift 2 ;;
             --arch)
                 [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: --arch requires amd64|arm64" >&2; exit 1; }
                 BDF_PY_ARGS+=(--arch "$2"); shift 2 ;;

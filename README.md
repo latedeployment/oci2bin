@@ -1200,6 +1200,154 @@ For self-updating binaries, point `--self-update-url` at a JSON manifest and sig
 
 ---
 
+## Building without Docker
+
+### from-chroot
+
+Build a self-contained binary directly from a chroot directory — no Docker daemon required. The directory is packed into a single OCI image layer and processed by the standard build pipeline.
+
+```bash
+oci2bin from-chroot /path/to/rootfs -o myapp.bin
+oci2bin from-chroot /path/to/rootfs \
+    --entrypoint /usr/bin/myapp --serve \
+    --env PORT=8080 \
+    --workdir /app \
+    --arch arm64 \
+    -o myapp-arm64.bin
+```
+
+Options:
+
+| Flag | Description |
+|------|-------------|
+| `-o PATH` | Output binary path (default: `<dirname>.bin`) |
+| `--entrypoint CMD [ARGS...]` | Container entrypoint |
+| `--cmd CMD [ARGS...]` | Default command arguments |
+| `--env KEY=VAL` | Environment variable (repeatable) |
+| `--workdir PATH` | Working directory inside the container |
+| `--arch amd64\|arm64` | Target CPU architecture |
+| `--user UID[:GID]` | Default user |
+| `--label KEY=VAL` | Image label (repeatable) |
+| `-- [BUILD_OPTIONS]` | Extra flags passed to the build pipeline |
+
+The chroot directory may contain any Linux rootfs. The builder strips setuid/setgid bits and skips `proc`, `sys`, and `dev` (they are created at runtime).
+
+### build-dockerfile
+
+Build a self-contained binary from a Dockerfile — no Docker daemon required. Supports a BuildKit-compatible subset of Dockerfile syntax including `RUN --mount`.
+
+```bash
+oci2bin build-dockerfile                     # uses ./Dockerfile, output <dir>.bin
+oci2bin build-dockerfile -o redis.bin        # explicit output name
+oci2bin build-dockerfile -f myapp.dockerfile --context ./src -o myapp.bin
+
+# Pass secrets and build args
+oci2bin build-dockerfile \
+    --build-secret id=npmrc,src=$HOME/.npmrc \
+    --build-arg VERSION=1.2.3 \
+    -o myapp.bin
+```
+
+#### Supported instructions
+
+| Instruction | Notes |
+|-------------|-------|
+| `FROM scratch` | Empty rootfs |
+| `FROM <oci-layout-dir>` | Local OCI image layout directory |
+| `FROM <image>` | Docker pull (requires `docker` in PATH) |
+| `COPY [--chown=] <src...> <dst>` | Copy from build context |
+| `ADD <src> <dst>` | Same as COPY for local sources |
+| `RUN [--mount=...] <cmd>` | Execute via `unshare + chroot` (no daemon) |
+| `ENV KEY=VAL` | Set environment variable |
+| `ENTRYPOINT ["cmd","arg"]` | JSON array or shell form |
+| `CMD ["cmd","arg"]` | JSON array or shell form |
+| `WORKDIR /path` | Set working directory (created if absent) |
+| `LABEL key=value` | Image label |
+| `USER uid[:gid]` | Default user |
+| `EXPOSE port` | Informational; not enforced |
+| `ARG NAME[=default]` | Build-time variable |
+
+#### RUN --mount types
+
+Mount options are applied inside a private mount namespace for the duration of the `RUN` step and do not appear in the final image layer.
+
+**`type=secret`** — inject a host secret file (not baked into the layer):
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+    npm install
+```
+
+```bash
+oci2bin build-dockerfile --build-secret id=npmrc,src=$HOME/.npmrc -o app.bin
+```
+
+**`type=ssh`** — forward the host SSH agent (`$SSH_AUTH_SOCK`):
+
+```dockerfile
+RUN --mount=type=ssh \
+    git clone git@github.com:example/private-repo.git /app
+```
+
+**`type=cache`** — persistent cache directory across builds:
+
+```dockerfile
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y build-essential
+```
+
+Cache is stored at `~/.cache/oci2bin/build-cache/<id>`.
+
+**`type=bind`** — bind-mount from build context (read-only by default):
+
+```dockerfile
+RUN --mount=type=bind,source=scripts,target=/scripts,rw \
+    /scripts/configure.sh
+```
+
+**`type=tmpfs`** — in-memory scratch space:
+
+```dockerfile
+RUN --mount=type=tmpfs,target=/tmp/scratch \
+    ./build.sh
+```
+
+#### Snap-like distribution
+
+Once built, the binary is fully self-contained:
+
+```bash
+# Build once
+oci2bin build-dockerfile -o myapp
+
+# Distribute and run anywhere
+scp myapp remote-host:
+ssh remote-host ./myapp
+```
+
+---
+
+## Secure secrets at runtime
+
+When `--secret` is used at runtime, oci2bin attempts to back the secret with
+`memfd_secret(2)` (Linux ≥ 5.14, `CONFIG_SECRETMEM=y`). The secret data is
+placed in a memory region that is excluded from the kernel's direct mapping,
+crash dumps, and swap. The container sees a normal file path
+(`/run/secrets/<name>`) via bind-mount of `/proc/self/fd/<n>`.
+
+On older kernels, oci2bin falls back transparently to a read-only bind-mount of
+the host file. The log line indicates which path was taken:
+
+```
+oci2bin: secret /run/secrets/mykey -> /run/secrets/mykey (memfd_secret)
+oci2bin: secret /run/secrets/mykey -> /run/secrets/mykey (read-only)
+```
+
+TPM2-sealed secrets (decrypted via `systemd-creds`) also use `memfd_secret` when
+available, so the decrypted plaintext never enters the page cache.
+
+---
+
 ## Subcommands
 
 ### exec
