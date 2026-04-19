@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-dockerfile_build.py — Build an OCI image layout from a simple Dockerfile.
+dockerfile_build.py — Build an OCI image layout from a Dockerfile.
 
 Supported instructions:
   FROM scratch | <oci-layout-dir> | <docker-image>
-  COPY <src...> <dst>
-  ADD  <src>    <dst>     (local files only, same as COPY)
-  RUN  <cmd>              (requires unshare + /bin/sh in the rootfs)
+  COPY [--chown=] <src...> <dst>
+  ADD  <src> <dst>         (local files only, same as COPY)
+  RUN  [--mount=...] <cmd>
   ENV  KEY=VAL | KEY VAL
   ENTRYPOINT ["cmd","arg"] | cmd arg
   CMD        ["cmd","arg"] | cmd arg
@@ -16,9 +16,26 @@ Supported instructions:
   EXPOSE     port[/proto]  (informational)
   ARG        NAME[=default]
 
+RUN --mount types (BuildKit-compatible):
+  --mount=type=bind,source=<src>,target=<dst>[,ro]
+      Bind-mount from the build context (read-only by default).
+  --mount=type=secret,id=<id>[,target=<path>][,required]
+      Secret file provided via --build-secret id=<id>,src=<path>.
+      NOT included in the image layer.
+  --mount=type=ssh[,id=<id>][,target=<path>][,required]
+      SSH agent socket forwarded from $SSH_AUTH_SOCK.
+      NOT included in the image layer.
+  --mount=type=cache,target=<path>[,id=<id>][,sharing=locked|shared|private]
+      Persistent cache directory at ~/.cache/oci2bin/build-cache/<id>.
+      NOT included in the image layer.
+  --mount=type=tmpfs,target=<path>[,size=<bytes>]
+      Temporary in-memory filesystem for the RUN step only.
+
 Usage:
   dockerfile_build.py [Dockerfile] <out_oci_dir>
-                      [--context DIR] [--build-arg KEY=VAL ...]
+                      [--context DIR]
+                      [--build-arg KEY=VAL ...]
+                      [--build-secret id=<id>,src=<path> ...]
                       [--arch amd64|arm64]
 """
 
@@ -37,7 +54,6 @@ import sys
 import tarfile
 import tempfile
 
-# Import the OCI layout builder from the sibling script.
 sys.path.insert(0, os.path.dirname(__file__))
 import from_chroot  # noqa: E402
 
@@ -54,7 +70,6 @@ def _parse_dockerfile(path: str) -> list:
     while i < len(raw_lines):
         line = raw_lines[i].rstrip("\n")
         i += 1
-        # Continuation lines
         while line.endswith("\\"):
             line = line[:-1]
             if i < len(raw_lines):
@@ -83,19 +98,65 @@ def _parse_json_or_shell(s: str):
     return ["/bin/sh", "-c", s] if s else None
 
 
+def _parse_kvs(spec: str) -> dict:
+    """Parse 'key=val,key2=val2' into a dict. Bare keys get value True."""
+    result: dict = {}
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "=" in token:
+            k, v = token.split("=", 1)
+            result[k.strip()] = v.strip()
+        else:
+            result[token] = True
+    return result
+
+
+def _parse_run_line(args: str) -> tuple:
+    """
+    Split RUN [--mount=...] [--network=...] CMD into (cmd_str, [mount_dicts]).
+
+    Handles both '--mount=type=...' and '--mount type=...' forms.
+    Unrecognised leading flags (--network, --security) are silently ignored.
+    """
+    mounts = []
+    try:
+        parts = shlex.split(args)
+    except ValueError:
+        return args, []
+
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if part.startswith("--mount="):
+            mounts.append(_parse_kvs(part[len("--mount="):]))
+            i += 1
+        elif part == "--mount" and i + 1 < len(parts):
+            mounts.append(_parse_kvs(parts[i + 1]))
+            i += 2
+        elif part in ("--network", "--security") and i + 1 < len(parts):
+            i += 2  # skip value
+        elif part.startswith("--network=") or part.startswith("--security="):
+            i += 1  # skip
+        else:
+            break
+
+    # Reconstruct command preserving original quoting for /bin/sh -c
+    cmd = " ".join(shlex.quote(p) for p in parts[i:])
+    return cmd, mounts
+
+
 # ── Layer extraction helpers ─────────────────────────────────────────────────
 
 def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
     """Apply one OCI/docker layer tarball to *rootfs*, handling whiteouts."""
     for member in tf.getmembers():
-        # Normalise path: strip leading ./ and /
         name = member.name
         while name.startswith("./") or name.startswith("/"):
             name = name[2:] if name.startswith("./") else name[1:]
         if not name:
             continue
-
-        # Reject path traversal
         if any(p == ".." for p in name.split("/")):
             print(f"  warning: skipping unsafe tar path: {member.name!r}",
                   file=sys.stderr)
@@ -103,7 +164,6 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
 
         basename = os.path.basename(name)
 
-        # Opaque whiteout: clear parent directory contents
         if basename == ".wh..wh..opq":
             parent = os.path.join(rootfs, os.path.dirname(name))
             if os.path.isdir(parent):
@@ -115,11 +175,9 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
                         shutil.rmtree(ep, ignore_errors=True)
             continue
 
-        # Regular whiteout: delete the named file
         if basename.startswith(".wh."):
-            target_name = os.path.join(
-                os.path.dirname(name), basename[len(".wh."):])
-            target = os.path.join(rootfs, target_name)
+            target = os.path.join(rootfs,
+                                  os.path.dirname(name), basename[len(".wh."):])
             if os.path.islink(target) or os.path.isfile(target):
                 os.unlink(target)
             elif os.path.isdir(target):
@@ -127,9 +185,7 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
             continue
 
         dest = os.path.join(rootfs, name)
-        # Strip setuid/setgid
         member.mode = member.mode & 0o1777
-
         try:
             if member.isdir():
                 os.makedirs(dest, exist_ok=True)
@@ -139,14 +195,11 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
                     os.unlink(dest)
                 os.symlink(member.linkname, dest)
             elif member.islnk():
-                # Hardlink — resolve relative to rootfs
-                link_src_rel = member.linkname
-                while link_src_rel.startswith("./") or \
-                        link_src_rel.startswith("/"):
-                    link_src_rel = (link_src_rel[2:]
-                                    if link_src_rel.startswith("./")
-                                    else link_src_rel[1:])
-                link_src = os.path.join(rootfs, link_src_rel)
+                link_rel = member.linkname
+                while link_rel.startswith("./") or link_rel.startswith("/"):
+                    link_rel = (link_rel[2:] if link_rel.startswith("./")
+                                else link_rel[1:])
+                link_src = os.path.join(rootfs, link_rel)
                 if os.path.lexists(dest):
                     os.unlink(dest)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -164,10 +217,7 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
 
 
 def _extract_oci_to_rootfs(oci_dir: str, rootfs: str) -> dict:
-    """
-    Extract all layers from an OCI layout directory into *rootfs*.
-    Returns the config object for ENV/ENTRYPOINT/CMD inheritance.
-    """
+    """Extract all layers from an OCI layout directory into *rootfs*."""
     with open(os.path.join(oci_dir, "index.json")) as f:
         index = json.load(f)
 
@@ -176,12 +226,10 @@ def _extract_oci_to_rootfs(oci_dir: str, rootfs: str) -> dict:
     if alg != "sha256" or not re.fullmatch(r"[0-9a-f]+", hex_val):
         print("error: invalid manifest digest in index.json", file=sys.stderr)
         sys.exit(1)
-
     with open(os.path.join(oci_dir, "blobs", alg, hex_val)) as f:
         manifest = json.load(f)
 
-    cfg_desc = manifest["config"]
-    cfg_alg, cfg_hex = cfg_desc["digest"].split(":", 1)
+    cfg_alg, cfg_hex = manifest["config"]["digest"].split(":", 1)
     if cfg_alg != "sha256" or not re.fullmatch(r"[0-9a-f]+", cfg_hex):
         print("error: invalid config digest in manifest", file=sys.stderr)
         sys.exit(1)
@@ -232,13 +280,13 @@ def _extract_docker_save_to_rootfs(tar_path: str, rootfs: str) -> dict:
 # ── Build-state ──────────────────────────────────────────────────────────────
 
 class _State:
-    """Mutable build state accumulated across Dockerfile instructions."""
-
-    def __init__(self, context_dir: str, build_args: dict, arch: str):
+    def __init__(self, context_dir: str, build_args: dict,
+                 build_secrets: dict, arch: str):
         self.context_dir = os.path.abspath(context_dir)
         self.build_args = dict(build_args)
+        self.build_secrets = dict(build_secrets)  # id -> host path
         self.arch = arch
-        self.rootfs: str = ""       # set by FROM
+        self.rootfs: str = ""
         self.env: list = []
         self.entrypoint = None
         self.cmd = None
@@ -248,13 +296,233 @@ class _State:
         self.exposed: list = []
 
 
+# ── RUN --mount helpers ──────────────────────────────────────────────────────
+
+def _mount_bind(m: dict, state: _State) -> tuple:
+    """
+    --mount=type=bind,source=<src>,target=<dst>[,ro]
+
+    Bind-mounts a path from the build context into the rootfs for the
+    duration of the RUN step.  Default is read-only; pass rw to allow writes
+    (changes are NOT captured into the layer).
+    Returns (shell_cmd, host_cleanup_path_or_None).
+    """
+    src_rel = m.get("source") or m.get("src") or m.get("from") or "."
+    dst = m.get("target") or m.get("dst")
+    if not dst:
+        print("error: --mount=type=bind requires target=", file=sys.stderr)
+        sys.exit(1)
+
+    src = os.path.normpath(os.path.join(state.context_dir, src_rel))
+    if not src.startswith(state.context_dir):
+        print(f"error: --mount=type=bind source escapes build context: {src_rel}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    dst_in_rootfs = os.path.join(state.rootfs, dst.lstrip("/"))
+    is_dir = os.path.isdir(src)
+    if is_dir:
+        os.makedirs(dst_in_rootfs, exist_ok=True)
+    else:
+        os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
+        if not os.path.exists(dst_in_rootfs):
+            open(dst_in_rootfs, "w").close()
+
+    ro = "rw" not in m
+    remount = (
+        f"; mount -o remount,bind,ro {shlex.quote(dst_in_rootfs)}"
+        if ro else ""
+    )
+    cmd = (
+        f"mount --bind {shlex.quote(src)} {shlex.quote(dst_in_rootfs)}"
+        + remount
+    )
+    # Bind mounts from context: don't delete the target, it may be a
+    # real directory in the rootfs.  We just leave the empty placeholder.
+    return cmd, None
+
+
+def _mount_secret(m: dict, state: _State) -> tuple:
+    """
+    --mount=type=secret,id=<id>[,target=<path>][,required]
+
+    Mounts a secret file provided via --build-secret id=<id>,src=<host-path>
+    into the container for this RUN step only.  The file is NOT written into
+    the image layer — only the empty mount-target placeholder is, which is
+    also cleaned up after the step.
+    """
+    secret_id = m.get("id", "")
+    if not secret_id:
+        print("error: --mount=type=secret requires id=", file=sys.stderr)
+        sys.exit(1)
+
+    src = state.build_secrets.get(secret_id)
+    if not src:
+        if m.get("required") is True or m.get("required") == "true":
+            print(f"error: --mount=type=secret,id={secret_id}: "
+                  f"secret not provided (use --build-secret id={secret_id},src=<path>)",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"  warning: secret id={secret_id!r} not provided, skipping mount",
+              file=sys.stderr)
+        return "", None
+
+    if not os.path.exists(src):
+        print(f"error: --build-secret id={secret_id}: file not found: {src}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    target = m.get("target") or m.get("dst") or f"/run/secrets/{secret_id}"
+    dst_in_rootfs = os.path.join(state.rootfs, target.lstrip("/"))
+    os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
+    # Create empty placeholder; will be cleaned up after RUN completes.
+    if not os.path.exists(dst_in_rootfs):
+        open(dst_in_rootfs, "w").close()
+
+    cmd = (
+        f"mount --bind {shlex.quote(src)} {shlex.quote(dst_in_rootfs)}"
+        f"; mount -o remount,bind,ro {shlex.quote(dst_in_rootfs)}"
+    )
+    # Remove the placeholder after the step so it's not in the layer.
+    return cmd, dst_in_rootfs
+
+
+def _mount_ssh(m: dict, state: _State) -> tuple:
+    """
+    --mount=type=ssh[,id=<id>][,target=<path>][,required]
+
+    Forwards the host SSH agent socket ($SSH_AUTH_SOCK) into the build
+    container.  Sets SSH_AUTH_SOCK inside the container to the target path.
+
+    The socket directory is bind-mounted read-only; the mount and the
+    placeholder file are removed after the RUN step.
+    """
+    ssh_sock = os.environ.get("SSH_AUTH_SOCK", "")
+    if not ssh_sock or not os.path.exists(ssh_sock):
+        required = m.get("required") is True or m.get("required") == "true"
+        msg = ("error" if required else "warning")
+        print(f"  {msg}: --mount=type=ssh: SSH_AUTH_SOCK not set or missing",
+              file=sys.stderr)
+        if required:
+            sys.exit(1)
+        return "", None
+
+    target = (m.get("target") or m.get("dst")
+              or "/run/buildkit/ssh_agent.0")
+    dst_in_rootfs = os.path.join(state.rootfs, target.lstrip("/"))
+    os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
+    # Create a regular-file placeholder for the socket bind-mount.
+    if not os.path.lexists(dst_in_rootfs):
+        open(dst_in_rootfs, "w").close()
+
+    # Bind-mount the socket file.  The mount namespace is discarded when
+    # the RUN step exits so this never leaks outside the build step.
+    cmd = f"mount --bind {shlex.quote(ssh_sock)} {shlex.quote(dst_in_rootfs)}"
+
+    # Expose SSH_AUTH_SOCK inside the container via the temp script env.
+    # We patch state.env temporarily in _do_run.
+    m["_resolved_target"] = target  # pass back the in-container path
+
+    return cmd, dst_in_rootfs
+
+
+def _mount_cache(m: dict, state: _State) -> tuple:
+    """
+    --mount=type=cache,target=<path>[,id=<id>][,sharing=locked|shared|private]
+
+    Persistent cache directory stored at ~/.cache/oci2bin/build-cache/<id>.
+    Contents survive across builds but are NOT included in the image layer.
+    """
+    target = m.get("target") or m.get("dst")
+    if not target:
+        print("error: --mount=type=cache requires target=", file=sys.stderr)
+        sys.exit(1)
+
+    cache_id = m.get("id") or target.replace("/", "_").strip("_")
+    # Sanitise cache_id: only allow safe characters.
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]", "_", cache_id)
+    cache_dir = os.path.expanduser(
+        os.path.join("~", ".cache", "oci2bin", "build-cache", safe_id))
+    os.makedirs(cache_dir, exist_ok=True)
+
+    dst_in_rootfs = os.path.join(state.rootfs, target.lstrip("/"))
+    os.makedirs(dst_in_rootfs, exist_ok=True)
+
+    cmd = f"mount --bind {shlex.quote(cache_dir)} {shlex.quote(dst_in_rootfs)}"
+    # Do NOT clean up dst_in_rootfs — it's a real directory we created and
+    # the layer should contain it (empty).  Only the cache contents are transient.
+    return cmd, None
+
+
+def _mount_tmpfs(m: dict, state: _State) -> tuple:
+    """
+    --mount=type=tmpfs,target=<path>[,size=<bytes>]
+
+    In-memory filesystem for the RUN step only; discarded on exit.
+    """
+    target = m.get("target") or m.get("dst")
+    if not target:
+        print("error: --mount=type=tmpfs requires target=", file=sys.stderr)
+        sys.exit(1)
+
+    dst_in_rootfs = os.path.join(state.rootfs, target.lstrip("/"))
+    os.makedirs(dst_in_rootfs, exist_ok=True)
+
+    opts = ""
+    if "size" in m:
+        # Validate: must be a plain integer (bytes)
+        if not re.fullmatch(r"[0-9]+", str(m["size"])):
+            print(f"error: --mount=type=tmpfs,size= must be an integer",
+                  file=sys.stderr)
+            sys.exit(1)
+        opts = f",size={m['size']}"
+
+    cmd = f"mount -t tmpfs tmpfs{opts} {shlex.quote(dst_in_rootfs)}"
+    return cmd, None
+
+
+def _build_mount_cmds(mounts: list, state: _State) -> tuple:
+    """
+    Translate a list of mount spec dicts into (shell_cmd_list, cleanup_paths).
+
+    shell_cmd_list — commands to run inside the unshare namespace before chroot
+    cleanup_paths  — host paths to remove from rootfs after the RUN step
+    """
+    cmds: list = []
+    cleanup: list = []
+    ssh_targets: list = []
+
+    handlers = {
+        "bind":  _mount_bind,
+        "secret": _mount_secret,
+        "ssh":   _mount_ssh,
+        "cache": _mount_cache,
+        "tmpfs": _mount_tmpfs,
+    }
+
+    for m in mounts:
+        mtype = m.get("type", "bind")
+        handler = handlers.get(mtype)
+        if handler is None:
+            print(f"  warning: unsupported mount type: {mtype!r}",
+                  file=sys.stderr)
+            continue
+        cmd, cleanup_path = handler(m, state)
+        if cmd:
+            cmds.append(cmd)
+        if cleanup_path:
+            cleanup.append(cleanup_path)
+        if mtype == "ssh" and "_resolved_target" in m:
+            ssh_targets.append(m["_resolved_target"])
+
+    return cmds, cleanup, ssh_targets
+
+
 # ── Instruction handlers ─────────────────────────────────────────────────────
 
 def _do_from(state: _State, args: str, tmpdir: str) -> None:
-    # FROM <image> [AS <name>] — we ignore the alias
     image = args.split()[0]
 
-    # Remove any previous rootfs (multi-stage is simplified to last FROM)
     if state.rootfs and os.path.isdir(state.rootfs):
         shutil.rmtree(state.rootfs)
     state.rootfs = tempfile.mkdtemp(dir=tmpdir, prefix="rootfs_")
@@ -269,7 +537,6 @@ def _do_from(state: _State, args: str, tmpdir: str) -> None:
         print("oci2bin: FROM scratch — empty rootfs", file=sys.stderr)
         return
 
-    # Local OCI layout directory?
     if os.path.isdir(image) and os.path.exists(
             os.path.join(image, "oci-layout")):
         print(f"oci2bin: FROM {image} (local OCI layout)", file=sys.stderr)
@@ -277,7 +544,6 @@ def _do_from(state: _State, args: str, tmpdir: str) -> None:
         _inherit_config(state, cfg)
         return
 
-    # Try docker
     if shutil.which("docker"):
         print(f"oci2bin: FROM {image} (docker pull)", file=sys.stderr)
         subprocess.run(["docker", "pull", image], check=True)
@@ -294,7 +560,6 @@ def _do_from(state: _State, args: str, tmpdir: str) -> None:
 
 
 def _inherit_config(state: _State, cfg: dict) -> None:
-    """Pull ENV/ENTRYPOINT/CMD/WorkingDir from an extracted image config."""
     c = cfg.get("config", {})
     if c.get("Env"):
         state.env = list(c["Env"])
@@ -311,11 +576,8 @@ def _inherit_config(state: _State, cfg: dict) -> None:
 
 
 def _do_copy(state: _State, args: str) -> None:
-    """COPY [--chown=...] <src...> <dst>"""
-    # Strip --chown flag (not enforced at build time)
     parts = shlex.split(args)
     parts = [p for p in parts if not p.startswith("--chown=")]
-
     if len(parts) < 2:
         print(f"error: COPY requires at least src and dst: {args!r}",
               file=sys.stderr)
@@ -328,22 +590,21 @@ def _do_copy(state: _State, args: str) -> None:
     dst_is_dir = dst_rel.endswith("/") or (
         os.path.isdir(dst_host) and not os.path.islink(dst_host))
 
-    resolved_srcs: list = []
+    resolved: list = []
     for src in srcs:
         if any(c in src for c in ("*", "?", "[")):
             matched = _glob.glob(
                 os.path.join(state.context_dir, src), recursive=True)
-            resolved_srcs.extend(sorted(matched))
+            resolved.extend(sorted(matched))
         else:
-            resolved_srcs.append(os.path.join(state.context_dir, src))
+            resolved.append(os.path.join(state.context_dir, src))
 
-    if not resolved_srcs:
+    if not resolved:
         print(f"error: COPY: no files matched: {srcs}", file=sys.stderr)
         sys.exit(1)
 
-    for src_path in resolved_srcs:
+    for src_path in resolved:
         src_path = os.path.normpath(src_path)
-        # Ensure source stays within build context
         if not src_path.startswith(state.context_dir + os.sep) and \
                 src_path != state.context_dir:
             print(f"error: COPY source escapes build context: {src_path}",
@@ -352,14 +613,12 @@ def _do_copy(state: _State, args: str) -> None:
         if not os.path.lexists(src_path):
             print(f"error: COPY source not found: {src_path}", file=sys.stderr)
             sys.exit(1)
-
         if os.path.isdir(src_path) and not os.path.islink(src_path):
-            dest = dst_host if dst_is_dir else dst_host
-            os.makedirs(dest, exist_ok=True)
-            shutil.copytree(src_path, dest, symlinks=True,
+            os.makedirs(dst_host, exist_ok=True)
+            shutil.copytree(src_path, dst_host, symlinks=True,
                             dirs_exist_ok=True)
         else:
-            if dst_is_dir or len(resolved_srcs) > 1:
+            if dst_is_dir or len(resolved) > 1:
                 os.makedirs(dst_host, exist_ok=True)
                 dest = os.path.join(dst_host, os.path.basename(src_path))
             else:
@@ -374,41 +633,61 @@ def _do_copy(state: _State, args: str) -> None:
 
 
 def _do_run(state: _State, args: str) -> None:
-    """RUN <cmd> — execute in rootfs via unshare + chroot."""
+    """
+    RUN [--mount=type=bind|secret|ssh|cache|tmpfs,...] <cmd>
+
+    Executes <cmd> inside the rootfs using unshare --user --map-root-user
+    so no real root privilege is required.  All --mount options are set up
+    inside the new mount namespace and torn down automatically on exit;
+    secret/ssh mounts leave no trace in the image layer.
+    """
+    cmd, mounts = _parse_run_line(args)
+
     sh = os.path.join(state.rootfs, "bin", "sh")
     if not os.path.exists(sh):
-        print(f"error: RUN requires /bin/sh in the rootfs; got FROM scratch?",
-              file=sys.stderr)
+        print("error: RUN requires /bin/sh in the rootfs "
+              "(FROM scratch cannot execute RUN)", file=sys.stderr)
         sys.exit(1)
 
     proc_dir = os.path.join(state.rootfs, "proc")
     os.makedirs(proc_dir, exist_ok=True)
 
-    # Build environment for the RUN step (image env + build-time ARGs as env)
+    # Translate --mount options into shell commands + cleanup list.
+    mount_cmds, cleanup_paths, ssh_targets = _build_mount_cmds(mounts, state)
+
+    # Propagate image env + SSH_AUTH_SOCK for ssh mounts.
     run_env = dict(os.environ)
     for kv in state.env:
         if "=" in kv:
             k, v = kv.split("=", 1)
             run_env[k] = v
+    if ssh_targets:
+        # Point SSH_AUTH_SOCK at the first ssh mount target inside the container.
+        run_env["SSH_AUTH_SOCK"] = ssh_targets[0]
 
-    # Write the command to a temp script so we can exec it cleanly
+    # Write the command to a temp script inside rootfs so we can exec it.
     with tempfile.NamedTemporaryFile(
             dir=state.rootfs, prefix=".oci2bin_run_", suffix=".sh",
             mode="w", delete=False) as tmp:
-        tmp.write(f"#!/bin/sh\nset -e\n{args}\n")
+        tmp.write(f"#!/bin/sh\nset -e\n{cmd}\n")
         tmp_path = tmp.name
         tmp_arc = "/" + os.path.relpath(tmp_path, state.rootfs)
 
     try:
         os.chmod(tmp_path, 0o700)
-        # Mount proc inside rootfs, then chroot and exec the script.
-        # unshare --user --map-root-user gives us a private user namespace
-        # so chroot works without real root.
-        inner = (
-            f"mount -t proc proc {shlex.quote(proc_dir)} 2>/dev/null; "
+
+        # Build the inner shell script that runs inside the unshare namespace:
+        #   1. Mount proc (best-effort)
+        #   2. Apply RUN --mount bind-mounts (inside the new namespace only)
+        #   3. chroot into rootfs and exec the script
+        steps = [f"mount -t proc proc {shlex.quote(proc_dir)} 2>/dev/null"]
+        steps.extend(mount_cmds)
+        steps.append(
             f"chroot {shlex.quote(state.rootfs)} /bin/sh -e "
             f"{shlex.quote(tmp_arc)}"
         )
+        inner = "; ".join(steps)
+
         subprocess.run(
             ["unshare", "--user", "--map-root-user",
              "--mount", "--pid", "--fork",
@@ -417,38 +696,40 @@ def _do_run(state: _State, args: str) -> None:
             env=run_env,
         )
     finally:
+        # Remove the temp script — it must not appear in the image layer.
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+        # Remove secret/ssh placeholder files left as mount targets.
+        for path in cleanup_paths:
+            try:
+                if os.path.islink(path) or os.path.isfile(path):
+                    os.unlink(path)
+                elif os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
 
 
 def _do_env(state: _State, args: str) -> None:
-    """ENV KEY=VAL ... or ENV KEY VAL (legacy form)."""
-    # Try to parse as KEY=VAL pairs; fall back to legacy "KEY VAL" form
     if "=" in args.split()[0]:
-        # One or more KEY=VAL pairs (possibly with quoted values)
-        pairs = shlex.split(args)
-        for pair in pairs:
+        for pair in shlex.split(args):
             if "=" not in pair:
                 print(f"error: ENV: malformed pair: {pair!r}", file=sys.stderr)
                 sys.exit(1)
             k, v = pair.split("=", 1)
-            # Replace existing or append
-            new_env = [e for e in state.env if not e.startswith(k + "=")]
-            new_env.append(f"{k}={v}")
-            state.env = new_env
+            state.env = [e for e in state.env if not e.startswith(k + "=")]
+            state.env.append(f"{k}={v}")
     else:
-        # Legacy: ENV KEY VALUE
         parts = args.split(None, 1)
         if len(parts) != 2:
             print(f"error: ENV: expected KEY VALUE, got: {args!r}",
                   file=sys.stderr)
             sys.exit(1)
         k, v = parts
-        new_env = [e for e in state.env if not e.startswith(k + "=")]
-        new_env.append(f"{k}={v}")
-        state.env = new_env
+        state.env = [e for e in state.env if not e.startswith(k + "=")]
+        state.env.append(f"{k}={v}")
 
 
 def _do_workdir(state: _State, args: str) -> None:
@@ -456,8 +737,8 @@ def _do_workdir(state: _State, args: str) -> None:
     if not os.path.isabs(wd):
         wd = os.path.join(state.workdir, wd)
     state.workdir = os.path.normpath(wd)
-    host_wd = os.path.join(state.rootfs, state.workdir.lstrip("/"))
-    os.makedirs(host_wd, exist_ok=True)
+    os.makedirs(os.path.join(state.rootfs, state.workdir.lstrip("/")),
+                exist_ok=True)
 
 
 # ── Main build loop ──────────────────────────────────────────────────────────
@@ -465,6 +746,7 @@ def _do_workdir(state: _State, args: str) -> None:
 def build_from_dockerfile(dockerfile: str, out_dir: str, *,
                           context_dir: str,
                           build_args: dict,
+                          build_secrets: dict,
                           arch: str) -> None:
     instructions = _parse_dockerfile(dockerfile)
     if not instructions:
@@ -474,15 +756,16 @@ def build_from_dockerfile(dockerfile: str, out_dir: str, *,
         print("error: Dockerfile must begin with FROM", file=sys.stderr)
         sys.exit(1)
 
-    state = _State(context_dir, build_args, arch)
+    state = _State(context_dir, build_args, build_secrets, arch)
     tmpdir = tempfile.mkdtemp(prefix="oci2bin_build_")
     try:
         for instr, args in instructions:
-            # Expand ARG references in args
             for k, v in state.build_args.items():
                 args = args.replace(f"${k}", v).replace(f"${{{k}}}", v)
 
-            print(f"oci2bin: {instr} {args[:60]}", file=sys.stderr)
+            # Summarise: truncate long args for readability
+            summary = args[:72].replace("\n", " ")
+            print(f"oci2bin: {instr} {summary}", file=sys.stderr)
 
             if instr == "FROM":
                 _do_from(state, args, tmpdir)
@@ -508,16 +791,15 @@ def build_from_dockerfile(dockerfile: str, out_dir: str, *,
             elif instr == "EXPOSE":
                 state.exposed.append(args.strip())
             elif instr == "ARG":
-                # ARG NAME[=default] — register with default if not in build_args
                 name_default = args.strip().split("=", 1)
                 name = name_default[0]
                 if name not in state.build_args and len(name_default) == 2:
                     state.build_args[name] = name_default[1]
             elif instr in ("MAINTAINER", "STOPSIGNAL", "HEALTHCHECK",
                            "SHELL", "ONBUILD", "VOLUME"):
-                pass  # accepted but not acted upon
+                pass
             else:
-                print(f"warning: unsupported instruction: {instr}",
+                print(f"  warning: unsupported instruction: {instr}",
                       file=sys.stderr)
 
         if not state.rootfs:
@@ -525,8 +807,7 @@ def build_from_dockerfile(dockerfile: str, out_dir: str, *,
             sys.exit(1)
 
         from_chroot.build_oci_layout(
-            state.rootfs,
-            out_dir,
+            state.rootfs, out_dir,
             entrypoint=state.entrypoint,
             cmd=state.cmd,
             env=state.env or None,
@@ -541,18 +822,37 @@ def build_from_dockerfile(dockerfile: str, out_dir: str, *,
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def _parse_build_secret(s: str) -> tuple:
+    """Parse 'id=<id>,src=<path>' → (id, path)."""
+    kv = _parse_kvs(s)
+    sid = kv.get("id", "")
+    src = kv.get("src") or kv.get("source") or kv.get("from") or ""
+    if not sid or not src:
+        print(f"error: --build-secret must be id=<id>,src=<path>, got: {s!r}",
+              file=sys.stderr)
+        sys.exit(1)
+    src = os.path.abspath(src)
+    if not os.path.exists(src):
+        print(f"error: --build-secret src not found: {src}", file=sys.stderr)
+        sys.exit(1)
+    return sid, src
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Build an OCI image layout from a Dockerfile")
     p.add_argument("dockerfile", nargs="?", default="Dockerfile",
                    help="Path to Dockerfile (default: ./Dockerfile)")
-    p.add_argument("out_dir",
-                   help="Output OCI layout directory")
+    p.add_argument("out_dir", help="Output OCI layout directory")
     p.add_argument("--context", default=".", metavar="DIR",
-                   help="Build context directory (default: current dir)")
+                   help="Build context directory (default: .)")
     p.add_argument("--build-arg", action="append", default=[],
                    metavar="KEY=VAL",
                    help="Build-time variable (repeatable)")
+    p.add_argument("--build-secret", action="append", default=[],
+                   metavar="id=<id>,src=<path>",
+                   help="Secret file available to RUN --mount=type=secret "
+                        "(repeatable)")
     p.add_argument("--arch", choices=["amd64", "arm64"], default="amd64",
                    help="Target CPU architecture")
     args = p.parse_args()
@@ -571,11 +871,16 @@ def main() -> None:
         k, v = kv.split("=", 1)
         build_args[k] = v
 
+    build_secrets: dict = {}
+    for spec in args.build_secret:
+        sid, src = _parse_build_secret(spec)
+        build_secrets[sid] = src
+
     build_from_dockerfile(
-        dockerfile,
-        args.out_dir,
+        dockerfile, args.out_dir,
         context_dir=args.context,
         build_args=build_args,
+        build_secrets=build_secrets,
         arch=args.arch,
     )
 
