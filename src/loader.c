@@ -69,6 +69,15 @@
 #endif
 #endif
 
+#ifndef __NR_memfd_secret
+#if defined(__x86_64__) || defined(__aarch64__)
+#define __NR_memfd_secret 447
+#endif
+#endif
+
+/* Maximum bytes buffered by run_cmd_capture() before aborting. */
+#define RUN_CMD_CAPTURE_MAX (64u * 1024u * 1024u)
+
 #ifndef CLONE_NEWTIME
 #define CLONE_NEWTIME 0x00000080
 #endif
@@ -2237,9 +2246,9 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len)
     {
         if (len == cap)
         {
-            if (cap >= 64 * 1024 * 1024)
+            if (cap >= RUN_CMD_CAPTURE_MAX)
             {
-                /* Refuse to buffer more than 64 MiB of secret data */
+                /* Refuse to buffer more than RUN_CMD_CAPTURE_MAX of data */
                 fprintf(stderr, "oci2bin: systemd-creds output too large\n");
                 free(buf);
                 close(pipefd[0]);
@@ -3449,7 +3458,189 @@ static void setup_gdb_in_rootfs(const char* rootfs)
  * to dst_path (on the rootfs tmpfs) with mode 0400.
  * Returns 0 on success, -1 on error.
  */
-static int install_tpm2_secret(const char* cred_name, const char* dst_path)
+/* ── memfd_secret helpers ─────────────────────────────────────────────────── */
+
+/*
+ * Maximum size of a plain-file secret read into a memfd_secret region.
+ * Secrets are typically small (keys, tokens, passwords); 4 MiB is generous.
+ */
+#define SECRET_MEMFD_MAX (4u * 1024u * 1024u)
+
+/*
+ * Attempt to create a memfd_secret(2) file descriptor (Linux ≥ 5.14,
+ * CONFIG_SECRETMEM=y).  Returns the fd on success or -1 with errno=ENOSYS
+ * when the kernel does not support it (caller falls back silently).
+ *
+ * Pages backed by this fd are excluded from the kernel's direct mapping,
+ * are unpageable, and do not appear in /proc/kcore or crash dumps.
+ */
+static int
+make_memfd_secret(void)
+{
+#ifdef __NR_memfd_secret
+    return (int)syscall(__NR_memfd_secret, (unsigned long)0);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+/*
+ * Write 'len' bytes from 'data' into the memfd_secret fd 'sfd', then
+ * bind-mount the fd's /proc/self/fd/<n> path read-only onto 'dst_path'.
+ *
+ * 'sfd' is ALWAYS closed before this function returns (both on success and
+ * failure), so the caller must not close it again.
+ *
+ * Returns 0 on success, -1 on failure (the bind-mount is cleaned up).
+ */
+static int
+bind_mount_memfd_secret(int sfd, const void* data, size_t len,
+                        const char* dst_path)
+{
+    if (ftruncate(sfd, (off_t)len) < 0)
+    {
+        fprintf(stderr, "oci2bin: memfd_secret ftruncate: %s\n",
+                strerror(errno));
+        close(sfd);
+        return -1;
+    }
+    if (write_all_fd(sfd, data, len) < 0)
+    {
+        fprintf(stderr, "oci2bin: memfd_secret write: %s\n",
+                strerror(errno));
+        close(sfd);
+        return -1;
+    }
+    char proc_path[64];
+    int n = snprintf(proc_path, sizeof(proc_path),
+                     "/proc/self/fd/%d", sfd);
+    if (n < 0 || (size_t)n >= sizeof(proc_path))
+    {
+        fprintf(stderr, "oci2bin: memfd_secret: fd path overflow\n");
+        close(sfd);
+        return -1;
+    }
+    if (mount(proc_path, dst_path, NULL, MS_BIND, NULL) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: memfd_secret bind mount -> %s: %s\n",
+                dst_path, strerror(errno));
+        close(sfd);
+        return -1;
+    }
+    if (mount(NULL, dst_path, NULL,
+              MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV,
+              NULL) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: memfd_secret remount ro %s: %s\n",
+                dst_path, strerror(errno));
+        umount2(dst_path, MNT_DETACH);
+        close(sfd);
+        return -1;
+    }
+    close(sfd);
+    return 0;
+}
+
+/*
+ * Expose a plain host file as a read-only secret inside the container.
+ *
+ * Tries memfd_secret first: reads the file into a kernel-protected anonymous
+ * memory region and bind-mounts /proc/self/fd/<n> onto dst_path so the
+ * container sees a normal path but the data never touches the page cache.
+ *
+ * Falls back to a standard read-only bind-mount when:
+ *   - the kernel lacks memfd_secret (Linux < 5.14)
+ *   - the file is larger than SECRET_MEMFD_MAX
+ *   - any step in the memfd path fails
+ */
+static int
+install_plain_secret(const char* src, const char* dst, const char* ctr)
+{
+    int sfd = make_memfd_secret();
+    if (sfd >= 0)
+    {
+        int used_memfd = 0;
+        struct stat st_s;
+        if (stat(src, &st_s) == 0 &&
+                st_s.st_size >= 0 &&
+                (size_t)st_s.st_size <= SECRET_MEMFD_MAX)
+        {
+            size_t flen = (size_t)st_s.st_size;
+            char*  fbuf = malloc(flen + 1);
+            if (fbuf)
+            {
+                int rfd = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+                ssize_t nread = (rfd >= 0) ? (ssize_t)read(rfd, fbuf, flen)
+                                : (ssize_t)-1;
+                if (rfd >= 0)
+                {
+                    close(rfd);
+                }
+                if (nread >= 0 && (size_t)nread == flen)
+                {
+                    if (ensure_bind_mount_target(src, dst, "--secret") == 0)
+                    {
+                        /* bind_mount_memfd_secret always closes sfd */
+                        if (bind_mount_memfd_secret(sfd, fbuf, flen, dst) == 0)
+                        {
+                            used_memfd = 1;
+                            fprintf(stderr,
+                                    "oci2bin: secret %s -> %s"
+                                    " (memfd_secret)\n",
+                                    src, ctr);
+                        }
+                        sfd = -1; /* closed by bind_mount_memfd_secret */
+                    }
+                }
+                explicit_bzero(fbuf, flen + 1);
+                free(fbuf);
+            }
+        }
+        if (sfd >= 0)
+        {
+            close(sfd);
+        }
+        if (used_memfd)
+        {
+            return 0;
+        }
+        /* Fall through to bind-mount on any memfd failure */
+    }
+
+    /* Fallback: read-only bind-mount of the host file. */
+    if (ensure_bind_mount_target(src, dst, "--secret") < 0)
+    {
+        return -1;
+    }
+    if (mount(src, dst, NULL, MS_BIND, NULL) < 0)
+    {
+        fprintf(stderr, "oci2bin: secret bind mount %s -> %s: %s\n",
+                src, ctr, strerror(errno));
+        return -1;
+    }
+    if (mount(NULL, dst, NULL,
+              MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV,
+              NULL) < 0)
+    {
+        fprintf(stderr, "oci2bin: secret remount read-only %s: %s\n",
+                ctr, strerror(errno));
+        if (umount2(dst, MNT_DETACH) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: warning: could not unmount writable"
+                    " secret %s: %s\n", dst, strerror(errno));
+        }
+        return -1;
+    }
+    fprintf(stderr, "oci2bin: secret %s -> %s (read-only)\n", src, ctr);
+    return 0;
+}
+
+static int install_tpm2_secret(const char* cred_name, const char* dst_path,
+                               const char* ctr)
 {
     char creds_bin[PATH_MAX];
     if (find_helper_binary("systemd-creds", creds_bin,
@@ -3477,7 +3668,43 @@ static int install_tpm2_secret(const char* cred_name, const char* dst_path)
         return -1;
     }
 
-    int fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0400);
+    /* Prefer memfd_secret (Linux ≥ 5.14): plaintext never reaches the page
+     * cache or kernel crash dumps.  Create an empty regular file as the
+     * bind-mount target, overlay it with the secretmem fd, then discard. */
+    int sfd = make_memfd_secret();
+    if (sfd >= 0)
+    {
+        int tfd = open(dst_path,
+                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                       0400);
+        if (tfd < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: cannot create secret target %s: %s\n",
+                    dst_path, strerror(errno));
+            close(sfd);
+            explicit_bzero(plaintext, len);
+            free(plaintext);
+            return -1;
+        }
+        close(tfd);
+        /* bind_mount_memfd_secret always closes sfd */
+        int rc = bind_mount_memfd_secret(sfd, plaintext, len, dst_path);
+        explicit_bzero(plaintext, len);
+        free(plaintext);
+        if (rc == 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: tpm2 secret '%s' -> %s (memfd_secret)\n",
+                    cred_name, ctr);
+        }
+        return rc;
+    }
+
+    /* Fallback: write plaintext to a regular file inside rootfs. */
+    int fd = open(dst_path,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                  0400);
     if (fd < 0)
     {
         fprintf(stderr, "oci2bin: cannot create secret file %s: %s\n",
@@ -3496,6 +3723,11 @@ static int install_tpm2_secret(const char* cred_name, const char* dst_path)
     close(fd);
     explicit_bzero(plaintext, len);
     free(plaintext);
+    if (rc == 0)
+    {
+        fprintf(stderr, "oci2bin: tpm2 secret '%s' -> %s (read-only)\n",
+                cred_name, ctr);
+    }
     return rc;
 }
 
@@ -3581,17 +3813,12 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
 
         if (cred)
         {
-            /* TPM2-sealed secret: decrypt via systemd-creds and write to rootfs */
-            if (install_tpm2_secret(cred, dst) == 0)
-            {
-                fprintf(stderr,
-                        "oci2bin: tpm2 secret '%s' -> %s (read-only)\n",
-                        cred, ctr);
-            }
+            /* TPM2-sealed secret: decrypt and install (memfd_secret or file) */
+            install_tpm2_secret(cred, dst, ctr);
             continue;
         }
 
-        /* Plain-file secret: validate and bind-mount read-only */
+        /* Plain-file secret: validate host path then install. */
         if (!path_is_absolute_and_clean(src))
         {
             fprintf(stderr,
@@ -3600,38 +3827,7 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
             continue;
         }
 
-        if (ensure_bind_mount_target(src, dst, "--secret") < 0)
-        {
-            continue;
-        }
-
-        /* Bind-mount the secret file read-only */
-        if (mount(src, dst, NULL, MS_BIND, NULL) < 0)
-        {
-            fprintf(stderr, "oci2bin: secret bind mount %s -> %s failed: %s\n",
-                    src, ctr, strerror(errno));
-            continue;
-        }
-        /* Re-mount read-only with no-exec/no-suid/no-dev.
-         * MS_BIND alone does not enforce read-only; a second mount(2) call is
-         * required.  If this step fails the secret is left writable, so we
-         * must unmount and skip rather than continue with a writable mount. */
-        if (mount(NULL, dst, NULL,
-                  MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV,
-                  NULL) < 0)
-        {
-            fprintf(stderr, "oci2bin: secret remount read-only %s failed: %s\n",
-                    ctr, strerror(errno));
-            /* Undo the writable bind-mount rather than leave it accessible */
-            if (umount2(dst, MNT_DETACH) < 0)
-            {
-                fprintf(stderr,
-                        "oci2bin: warning: could not unmount writable secret %s: %s\n",
-                        dst, strerror(errno));
-            }
-            continue;
-        }
-        fprintf(stderr, "oci2bin: secret %s -> %s (read-only)\n", src, ctr);
+        install_plain_secret(src, dst, ctr);
     }
 }
 
