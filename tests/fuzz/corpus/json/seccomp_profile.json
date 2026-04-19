@@ -1,0 +1,1 @@
+{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["read","write","open","close","stat","mmap","exit_group"],"action":"SCMP_ACT_ALLOW"},{"names":[],"action":"SCMP_ACT_KILL"}]}

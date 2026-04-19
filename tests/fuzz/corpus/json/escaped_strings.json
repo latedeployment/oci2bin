@@ -1,0 +1,1 @@
+{"Entrypoint":["/bin/sh","-c","echo \"hello\\nworld\" && ls \\u0000"],"Env":["A=val\\twith\\ttabs","B=quote\"inside","C=back\\\\slash"],"WorkingDir":"/path/with/\\u0022quotes\\u0022"}

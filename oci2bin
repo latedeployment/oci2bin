@@ -133,6 +133,18 @@
 #                         <src> is a Docker image name or a .tar/.img file
 #                         Options: --output PATH, --no-strip,
 #                                  --label-prefix PREFIX
+#   from-chroot <dir>     Build a binary directly from a chroot directory
+#                         (no Docker required)
+#                         Options: -o OUTPUT, --entrypoint, --cmd, --env,
+#                                  --workdir, --arch, --user, --label
+#                                  -- [BUILD_OPTIONS...]
+#   build-dockerfile [F]  Build a binary from a Dockerfile (no Docker daemon)
+#                         Supports: FROM scratch/<oci-dir>/<image>, COPY, ADD,
+#                                   RUN, ENV, ENTRYPOINT, CMD, WORKDIR, LABEL,
+#                                   USER, EXPOSE, ARG
+#                         Options: -o OUTPUT, -f FILE, --context DIR,
+#                                  --build-arg KEY=VAL, --arch amd64|arm64
+#                                  -- [BUILD_OPTIONS...]
 #
 # Examples:
 #   oci2bin alpine:latest               # -> alpine_latest (host arch)
@@ -1516,6 +1528,150 @@ if [[ "${1:-}" == "pod" ]]; then
     wait "$PAUSE_BG" 2>/dev/null || true
 
     exit "$WORST_EXIT"
+fi
+
+# ── from-chroot subcommand ────────────────────────────────────────────────
+# Build a self-contained binary directly from a chroot directory — no Docker
+# required.  The chroot is packed into a single OCI layer and piped through
+# the standard build pipeline.
+#
+# Usage: oci2bin from-chroot <dir> [-o OUTPUT] [--entrypoint CMD [ARGS...]]
+#          [--cmd CMD [ARGS...]] [--env KEY=VAL] [--workdir PATH]
+#          [--arch amd64|arm64] [--user UID] [-- BUILD_OPTIONS...]
+
+if [[ "${1:-}" == "from-chroot" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin from-chroot <dir> [-o OUTPUT] [--entrypoint CMD]" >&2
+        echo "         [--cmd CMD] [--env KEY=VAL] [--workdir PATH]" >&2
+        echo "         [--arch amd64|arm64] [--user UID] [-- BUILD_OPTIONS...]" >&2
+        exit 1
+    fi
+    FC_CHROOT_DIR="$1"; shift
+    if [[ ! -d "$FC_CHROOT_DIR" ]]; then
+        echo "oci2bin from-chroot: not a directory: $FC_CHROOT_DIR" >&2
+        exit 1
+    fi
+
+    FC_OUTPUT=""
+    FC_PY_ARGS=()
+    FC_BUILD_ARGS=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --entrypoint)
+                shift
+                FC_PY_ARGS+=(--entrypoint)
+                while [[ $# -gt 0 && "${1:0:2}" != "--" ]]; do
+                    FC_PY_ARGS+=("$1"); shift
+                done ;;
+            --cmd)
+                shift
+                FC_PY_ARGS+=(--cmd)
+                while [[ $# -gt 0 && "${1:0:2}" != "--" ]]; do
+                    FC_PY_ARGS+=("$1"); shift
+                done ;;
+            --env)
+                [[ $# -lt 2 ]] && { echo "oci2bin from-chroot: --env requires KEY=VAL" >&2; exit 1; }
+                FC_PY_ARGS+=(--env "$2"); shift 2 ;;
+            --workdir)
+                [[ $# -lt 2 ]] && { echo "oci2bin from-chroot: --workdir requires PATH" >&2; exit 1; }
+                FC_PY_ARGS+=(--workdir "$2"); shift 2 ;;
+            --arch)
+                [[ $# -lt 2 ]] && { echo "oci2bin from-chroot: --arch requires amd64|arm64" >&2; exit 1; }
+                FC_PY_ARGS+=(--arch "$2"); shift 2 ;;
+            --user)
+                [[ $# -lt 2 ]] && { echo "oci2bin from-chroot: --user requires UID[:GID]" >&2; exit 1; }
+                FC_PY_ARGS+=(--user "$2"); shift 2 ;;
+            --label)
+                [[ $# -lt 2 ]] && { echo "oci2bin from-chroot: --label requires KEY=VAL" >&2; exit 1; }
+                FC_PY_ARGS+=(--label "$2"); shift 2 ;;
+            -o|--output)
+                [[ $# -lt 2 ]] && { echo "oci2bin from-chroot: -o requires PATH" >&2; exit 1; }
+                FC_OUTPUT="$2"; shift 2 ;;
+            --)
+                shift; FC_BUILD_ARGS+=("$@"); break ;;
+            *)
+                FC_BUILD_ARGS+=("$1"); shift ;;
+        esac
+    done
+
+    FC_OUTPUT="${FC_OUTPUT:-$(basename "$FC_CHROOT_DIR").bin}"
+    FC_TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$FC_TMPDIR"' EXIT
+
+    python3 "$OCI2BIN_HOME/scripts/from_chroot.py" \
+        "$FC_CHROOT_DIR" "$FC_TMPDIR/oci" \
+        "${FC_PY_ARGS[@]}"
+
+    "$0" --oci-dir "$FC_TMPDIR/oci" "local/chroot:latest" \
+        "$FC_OUTPUT" "${FC_BUILD_ARGS[@]}"
+    exit $?
+fi
+
+# ── build-dockerfile subcommand ───────────────────────────────────────────
+# Build a self-contained binary from a Dockerfile without a Docker daemon.
+# Supported: FROM scratch/<oci-dir>/<docker-image>, COPY, ADD, RUN, ENV,
+#            ENTRYPOINT, CMD, WORKDIR, LABEL, USER, EXPOSE, ARG.
+#
+# Usage: oci2bin build-dockerfile [Dockerfile] [-o OUTPUT]
+#          [--context DIR] [--build-arg KEY=VAL] [--arch amd64|arm64]
+#          [-- BUILD_OPTIONS...]
+
+if [[ "${1:-}" == "build-dockerfile" ]]; then
+    shift
+    BDF_DOCKERFILE="Dockerfile"
+    BDF_OUTPUT=""
+    BDF_PY_ARGS=()
+    BDF_BUILD_ARGS=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --context)
+                [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: --context requires DIR" >&2; exit 1; }
+                BDF_PY_ARGS+=(--context "$2"); shift 2 ;;
+            --build-arg)
+                [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: --build-arg requires KEY=VAL" >&2; exit 1; }
+                BDF_PY_ARGS+=(--build-arg "$2"); shift 2 ;;
+            --arch)
+                [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: --arch requires amd64|arm64" >&2; exit 1; }
+                BDF_PY_ARGS+=(--arch "$2"); shift 2 ;;
+            -o|--output)
+                [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: -o requires PATH" >&2; exit 1; }
+                BDF_OUTPUT="$2"; shift 2 ;;
+            -f|--file)
+                [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: -f requires PATH" >&2; exit 1; }
+                BDF_DOCKERFILE="$2"; shift 2 ;;
+            --)
+                shift; BDF_BUILD_ARGS+=("$@"); break ;;
+            -*)
+                BDF_BUILD_ARGS+=("$1"); shift ;;
+            *)
+                # First bare positional = Dockerfile path (if it looks like a file)
+                if [[ -f "$1" || "$1" == *.dockerfile || "$1" == Dockerfile* ]]; then
+                    BDF_DOCKERFILE="$1"
+                else
+                    BDF_BUILD_ARGS+=("$1")
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ ! -f "$BDF_DOCKERFILE" ]]; then
+        echo "oci2bin build-dockerfile: Dockerfile not found: $BDF_DOCKERFILE" >&2
+        exit 1
+    fi
+    BDF_OUTPUT="${BDF_OUTPUT:-$(basename "$(pwd)").bin}"
+    BDF_TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$BDF_TMPDIR"' EXIT
+
+    python3 "$OCI2BIN_HOME/scripts/dockerfile_build.py" \
+        "$BDF_DOCKERFILE" "$BDF_TMPDIR/oci" \
+        "${BDF_PY_ARGS[@]}"
+
+    "$0" --oci-dir "$BDF_TMPDIR/oci" "local/dockerfile:latest" \
+        "$BDF_OUTPUT" "${BDF_BUILD_ARGS[@]}"
+    exit $?
 fi
 
 # ── argument parsing ──────────────────────────────────────────────────────
