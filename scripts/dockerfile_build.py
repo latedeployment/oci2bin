@@ -326,7 +326,8 @@ def _mount_bind(m: dict, state: _State) -> tuple:
     else:
         os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
         if not os.path.exists(dst_in_rootfs):
-            open(dst_in_rootfs, "w").close()
+            with open(dst_in_rootfs, "w"):
+                pass
 
     ro = "rw" not in m
     remount = (
@@ -377,7 +378,8 @@ def _mount_secret(m: dict, state: _State) -> tuple:
     os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
     # Create empty placeholder; will be cleaned up after RUN completes.
     if not os.path.exists(dst_in_rootfs):
-        open(dst_in_rootfs, "w").close()
+        with open(dst_in_rootfs, "w"):
+            pass
 
     cmd = (
         f"mount --bind {shlex.quote(src)} {shlex.quote(dst_in_rootfs)}"
@@ -413,7 +415,8 @@ def _mount_ssh(m: dict, state: _State) -> tuple:
     os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
     # Create a regular-file placeholder for the socket bind-mount.
     if not os.path.lexists(dst_in_rootfs):
-        open(dst_in_rootfs, "w").close()
+        with open(dst_in_rootfs, "w"):
+            pass
 
     # Bind-mount the socket file.  The mount namespace is discarded when
     # the RUN step exits so this never leaks outside the build step.

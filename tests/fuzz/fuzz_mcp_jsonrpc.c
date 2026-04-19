@@ -146,7 +146,6 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         char* image  = json_get_string(ctx, "image");
         char* net    = json_get_string(ctx, "net");
         char* lines_s = json_get_string(ctx, "lines");
-        char* tool_name = json_get_string(ctx, "name");
 
         /* Validate name as mcp_name_valid does */
         if (name)
@@ -226,7 +225,6 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
         free(name);
         free(image);
         free(net);
-        free(tool_name);
     }
 
     /* Exercise tool-name matching for each known tool */

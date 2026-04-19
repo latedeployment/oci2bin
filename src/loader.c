@@ -3573,7 +3573,9 @@ install_plain_secret(const char* src, const char* dst, const char* ctr)
             if (fbuf)
             {
                 int rfd = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-                ssize_t nread = (rfd >= 0) ? (ssize_t)read(rfd, fbuf, flen)
+                /* Use read_all_fd to handle short reads correctly. */
+                ssize_t nread = (rfd >= 0)
+                                ? read_all_fd(rfd, fbuf, flen)
                                 : (ssize_t)-1;
                 if (rfd >= 0)
                 {
@@ -10633,7 +10635,52 @@ static void mcp_tool_run_container(long id, const char* args_json,
     int   n_vol = 0;
     if (vol_arr)
     {
-        n_vol = json_parse_string_array(vol_arr, vol_strs, MCP_VOL_MAX);
+        int raw_n_vol = json_parse_string_array(vol_arr, vol_strs, MCP_VOL_MAX);
+        /* Validate each volume spec: HOST:CONTAINER — both must be absolute
+         * clean paths with no '..' components. */
+        for (int i = 0; i < raw_n_vol; i++)
+        {
+            char* colon = strchr(vol_strs[i], ':');
+            int   ok    = 0;
+            if (colon)
+            {
+                *colon = '\0';
+                const char* host_part = vol_strs[i];
+                const char* ctr_part  = colon + 1;
+                /* Strip optional :ro or :rw option suffix */
+                const char* ctr_end = strchr(ctr_part, ':');
+                char        ctr_buf[PATH_MAX];
+                if (ctr_end)
+                {
+                    size_t clen = (size_t)(ctr_end - ctr_part);
+                    if (clen < sizeof(ctr_buf))
+                    {
+                        memcpy(ctr_buf, ctr_part, clen);
+                        ctr_buf[clen] = '\0';
+                        ctr_part = ctr_buf;
+                    }
+                }
+                if (path_is_absolute_and_clean(host_part) &&
+                        !path_has_dotdot_component(host_part) &&
+                        path_is_absolute_and_clean(ctr_part) &&
+                        !path_has_dotdot_component(ctr_part))
+                {
+                    ok = 1;
+                }
+                *colon = ':'; /* restore for argv */
+            }
+            if (ok)
+            {
+                vol_strs[n_vol++] = vol_strs[i];
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: MCP: rejecting invalid volume spec: %s\n",
+                        vol_strs[i]);
+                free(vol_strs[i]);
+            }
+        }
     }
 
     /* Build argv for the container binary */
@@ -10659,8 +10706,11 @@ static void mcp_tool_run_container(long id, const char* args_json,
     }
     ctr_argv[ai] = NULL;
 
-    /* Open log file before fork */
-    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    /* Open log file before fork.  O_NOFOLLOW prevents a symlink attack on the
+     * predictable /tmp/oci2bin-mcp-<name>.log path. */
+    int log_fd = open(log_path,
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                      0600);
     if (log_fd < 0)
     {
         mcp_send_error(id, -32603, "run_container: cannot open log file");
@@ -11220,8 +11270,11 @@ static const char* mcp_tools_list_json(void)
  */
 static int inspect_image_main(const char* self_path)
 {
-    /* Extract OCI tar to a temp dir and read manifest + config */
+    int  rc     = 1;
     char tmpdir[PATH_MAX];
+    tmpdir[0] = '\0';
+
+    /* Extract OCI tar to a temp dir and read manifest + config */
     if (make_runtime_tmpdir(tmpdir, sizeof(tmpdir), "oci2bin-inspect.") < 0)
     {
         return 1;
@@ -11231,53 +11284,57 @@ static int inspect_image_main(const char* self_path)
     if (snprintf(tar_path, sizeof(tar_path), "%s/image.tar", tmpdir)
             >= (int)sizeof(tar_path))
     {
-        return 1;
+        goto out;
     }
 
-    int self_fd = open(self_path, O_RDONLY);
-    if (self_fd < 0)
     {
-        return 1;
-    }
-    if (lseek(self_fd, (off_t)OCI_DATA_OFFSET, SEEK_SET) < 0)
-    {
-        close(self_fd);
-        return 1;
-    }
-    int out_fd = open(tar_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (out_fd < 0)
-    {
-        close(self_fd);
-        return 1;
-    }
-    if (copy_n_bytes(self_fd, out_fd, OCI_DATA_SIZE) < 0)
-    {
+        int self_fd = open(self_path, O_RDONLY);
+        if (self_fd < 0)
+        {
+            goto out;
+        }
+        if (lseek(self_fd, (off_t)OCI_DATA_OFFSET, SEEK_SET) < 0)
+        {
+            close(self_fd);
+            goto out;
+        }
+        int out_fd = open(tar_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (out_fd < 0)
+        {
+            close(self_fd);
+            goto out;
+        }
+        if (copy_n_bytes(self_fd, out_fd, OCI_DATA_SIZE) < 0)
+        {
+            close(self_fd);
+            close(out_fd);
+            goto out;
+        }
         close(self_fd);
         close(out_fd);
-        return 1;
     }
-    close(self_fd);
-    close(out_fd);
 
     /* Extract OCI tar */
     char oci_dir[PATH_MAX];
     if (snprintf(oci_dir, sizeof(oci_dir), "%s/oci", tmpdir)
             >= (int)sizeof(oci_dir))
     {
-        return 1;
+        goto out;
     }
     if (mkdir(oci_dir, 0700) < 0)
     {
-        return 1;
+        goto out;
     }
-    char* tar_argv[] =
     {
-        "tar", "xf", tar_path, "-C", oci_dir,
-        "--no-same-permissions", "--no-same-owner", NULL
-    };
-    if (run_cmd(tar_argv) != 0)
-    {
-        return 1;
+        char* tar_argv[] =
+        {
+            "tar", "xf", tar_path, "-C", oci_dir,
+            "--no-same-permissions", "--no-same-owner", NULL
+        };
+        if (run_cmd(tar_argv) != 0)
+        {
+            goto out;
+        }
     }
 
     /* Read manifest.json */
@@ -11285,77 +11342,92 @@ static int inspect_image_main(const char* self_path)
     if (snprintf(manifest_path, sizeof(manifest_path),
                  "%s/manifest.json", oci_dir) >= (int)sizeof(manifest_path))
     {
-        return 1;
+        goto out;
     }
-    size_t manifest_size;
-    char*  manifest = read_file(manifest_path, &manifest_size);
-    if (!manifest)
     {
-        return 1;
-    }
-
-    /* Get config digest from manifest */
-    char* config_digest = json_get_string(manifest, "Config");
-    free(manifest);
-
-    if (!config_digest)
-    {
-        return 1;
-    }
-
-    /* Sanitize config digest: only alnum, ':', '/' */
-    for (char* p = config_digest; *p; p++)
-    {
-        if (!isalnum((unsigned char)*p) && *p != ':' && *p != '/')
+        size_t manifest_size;
+        char*  manifest = read_file(manifest_path, &manifest_size);
+        if (!manifest)
         {
-            *p = '_';
+            goto out;
         }
-    }
 
-    /* Read config JSON from oci_dir/<digest> */
-    char config_path[PATH_MAX];
-    if (snprintf(config_path, sizeof(config_path), "%s/%s",
-                 oci_dir, config_digest) >= (int)sizeof(config_path))
-    {
+        /* Get config digest from manifest */
+        char* config_digest = json_get_string(manifest, "Config");
+        free(manifest);
+
+        if (!config_digest)
+        {
+            goto out;
+        }
+
+        /* Sanitize config digest: only alnum, ':', '-', '_' — no '/' to prevent
+         * path traversal when the digest is appended to oci_dir. */
+        for (char* p = config_digest; *p; p++)
+        {
+            if (!isalnum((unsigned char)*p) && *p != ':' &&
+                    *p != '-' && *p != '_')
+            {
+                *p = '_';
+            }
+        }
+
+        /* Read config JSON from oci_dir/<digest> */
+        char config_path[PATH_MAX];
+        int n = snprintf(config_path, sizeof(config_path), "%s/%s",
+                         oci_dir, config_digest);
         free(config_digest);
-        return 1;
-    }
-    free(config_digest);
+        if (n < 0 || n >= (int)sizeof(config_path))
+        {
+            goto out;
+        }
 
-    /* Reject path traversal in config path */
-    if (path_has_dotdot_component(config_path))
+        /* Reject path traversal (belt-and-suspenders) */
+        if (path_has_dotdot_component(config_path))
+        {
+            goto out;
+        }
+        /* Reject paths that escape oci_dir (e.g. from a leading '/' in the
+         * digest after sanitisation still produced a rooted component). */
+        size_t oci_dir_len = strlen(oci_dir);
+        if (strncmp(config_path, oci_dir, oci_dir_len) != 0 ||
+                config_path[oci_dir_len] != '/')
+        {
+            goto out;
+        }
+
+        size_t config_size;
+        char*  config_json = read_file(config_path, &config_size);
+        if (!config_json)
+        {
+            goto out;
+        }
+
+        /* Extract entrypoint, cmd, env from config */
+        char* entrypoint_arr = json_get_array(config_json, "Entrypoint");
+        char* cmd_arr        = json_get_array(config_json, "Cmd");
+        char* env_arr        = json_get_array(config_json, "Env");
+        free(config_json);
+
+        /* Print JSON to stdout */
+        printf("{\"entrypoint\":%s,\"cmd\":%s,\"env\":%s}\n",
+               entrypoint_arr ? entrypoint_arr : "null",
+               cmd_arr        ? cmd_arr        : "null",
+               env_arr        ? env_arr        : "null");
+        fflush(stdout);
+
+        free(entrypoint_arr);
+        free(cmd_arr);
+        free(env_arr);
+        rc = 0;
+    }
+
+out:
+    if (tmpdir[0] != '\0')
     {
-        return 1;
+        rm_rf_dir(tmpdir);
     }
-
-    size_t config_size;
-    char*  config_json = read_file(config_path, &config_size);
-    if (!config_json)
-    {
-        return 1;
-    }
-
-    /* Extract entrypoint, cmd, env from config */
-    char* entrypoint_arr = json_get_array(config_json, "Entrypoint");
-    char* cmd_arr        = json_get_array(config_json, "Cmd");
-    char* env_arr        = json_get_array(config_json, "Env");
-    free(config_json);
-
-    /* Get layers from manifest RepoTags or Layers field */
-    char  layers_buf[4096] = "[]";
-    (void)layers_buf; /* we'll print whatever we have */
-
-    /* Print JSON to stdout */
-    printf("{\"entrypoint\":%s,\"cmd\":%s,\"env\":%s}\n",
-           entrypoint_arr ? entrypoint_arr : "null",
-           cmd_arr        ? cmd_arr        : "null",
-           env_arr        ? env_arr        : "null");
-    fflush(stdout);
-
-    free(entrypoint_arr);
-    free(cmd_arr);
-    free(env_arr);
-    return 0;
+    return rc;
 }
 
 /*
