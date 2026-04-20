@@ -530,7 +530,7 @@ def warm_layer_cache(oci_data, use_cache=True):
 
 
 META_MAGIC = b'OCI2BIN_META\x00'
-OCI2BIN_VERSION = '0.10.0'
+OCI2BIN_VERSION = '0.11.0'
 HASH_ALGORITHM_HEX_LENGTHS = {
     'sha256': 64,
     'sha512': 128,
