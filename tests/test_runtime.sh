@@ -90,23 +90,26 @@ if [[ ! -x "$IMG" ]]; then
     exit 0
 fi
 
+# Flags applied to every container-running invocation.
+RUNNER=("$IMG" --no-userns-remap)
+
 # ── Test 1: Arg passthrough — simple echo ─────────────────────────────────
 
 run_test "arg passthrough: /bin/echo hello_from_container" \
     0 "hello_from_container" \
-    "$IMG" /bin/echo hello_from_container
+    "${RUNNER[@]}" /bin/echo hello_from_container
 
 # ── Test 2: Shell -c passthrough ─────────────────────────────────────────
 
 run_test "arg passthrough: /bin/sh -c echo polydocker_ok" \
     0 "polydocker_ok" \
-    "$IMG" /bin/sh -c 'echo polydocker_ok'
+    "${RUNNER[@]}" /bin/sh -c 'echo polydocker_ok'
 
 # ── Test 3: Exit code passthrough ────────────────────────────────────────
 
 T=$(( T + 1 ))
 exit_code=0
-timeout 15 "$IMG" /bin/sh -c 'exit 42' 2>/dev/null || exit_code=$?
+timeout 15 "${RUNNER[@]}" /bin/sh -c 'exit 42' 2>/dev/null || exit_code=$?
 if [[ "$exit_code" -eq 42 ]]; then
     echo "ok $T - exit code passthrough (exit 42)"
 else
@@ -119,13 +122,13 @@ fi
 
 run_test "--entrypoint /bin/echo with arg" \
     0 "ep_arg" \
-    "$IMG" --entrypoint /bin/echo ep_arg
+    "${RUNNER[@]}" --entrypoint /bin/echo ep_arg
 
 # ── Test 5: --entrypoint with shell -c ───────────────────────────────────
 
 run_test "--entrypoint /bin/sh -- -c 'echo ep_sh_ok'" \
     0 "ep_sh_ok" \
-    "$IMG" --entrypoint /bin/sh -- -c "echo ep_sh_ok"
+    "${RUNNER[@]}" --entrypoint /bin/sh -- -c "echo ep_sh_ok"
 
 # ── Test 6: -v volume mount ───────────────────────────────────────────────
 
@@ -135,7 +138,7 @@ echo "host_content_ok" > "$TMPDIR_V/testfile.txt"
 T=$(( T + 1 ))
 out=""
 exit_code=0
-out=$(timeout 15 "$IMG" -v "$TMPDIR_V:/mnt" /bin/cat /mnt/testfile.txt 2>/dev/null) \
+out=$(timeout 15 "${RUNNER[@]}" -v "$TMPDIR_V:/mnt" /bin/cat /mnt/testfile.txt 2>/dev/null) \
     || exit_code=$?
 
 if [[ "$exit_code" -eq 0 ]] && echo "$out" | grep -q "host_content_ok"; then
@@ -156,7 +159,7 @@ echo "auto_mnt_ok" > "$TMPDIR_V2/data.txt"
 T=$(( T + 1 ))
 out=""
 exit_code=0
-out=$(timeout 15 "$IMG" -v "$TMPDIR_V2:/newmnt" /bin/cat /newmnt/data.txt 2>/dev/null) \
+out=$(timeout 15 "${RUNNER[@]}" -v "$TMPDIR_V2:/newmnt" /bin/cat /newmnt/data.txt 2>/dev/null) \
     || exit_code=$?
 
 if [[ "$exit_code" -eq 0 ]] && echo "$out" | grep -q "auto_mnt_ok"; then
@@ -179,7 +182,7 @@ echo "vol_b_ok" > "$TMPDIR_B/b.txt"
 T=$(( T + 1 ))
 out=""
 exit_code=0
-out=$(timeout 15 "$IMG" \
+out=$(timeout 15 "${RUNNER[@]}" \
     -v "$TMPDIR_A:/mnt/a" \
     -v "$TMPDIR_B:/mnt/b" \
     /bin/sh -c 'cat /mnt/a/a.txt && cat /mnt/b/b.txt' 2>/dev/null) \
@@ -219,7 +222,7 @@ fi
 
 T=$(( T + 1 ))
 exit_code=0
-timeout 15 "$IMG" --no-such-flag 2>/dev/null || exit_code=$?
+timeout 15 "${RUNNER[@]}" --no-such-flag 2>/dev/null || exit_code=$?
 if [[ "$exit_code" -ne 0 ]]; then
     echo "ok $T - unknown flag returns non-zero exit"
 else
@@ -232,7 +235,7 @@ fi
 
 T=$(( T + 1 ))
 exit_code=0
-timeout 15 "$IMG" -v 2>/dev/null || exit_code=$?
+timeout 15 "${RUNNER[@]}" -v 2>/dev/null || exit_code=$?
 if [[ "$exit_code" -ne 0 ]]; then
     echo "ok $T - -v missing arg returns non-zero exit"
 else
@@ -245,7 +248,7 @@ fi
 
 T=$(( T + 1 ))
 exit_code=0
-timeout 15 "$IMG" -v nocolon 2>/dev/null || exit_code=$?
+timeout 15 "${RUNNER[@]}" -v nocolon 2>/dev/null || exit_code=$?
 if [[ "$exit_code" -ne 0 ]]; then
     echo "ok $T - -v without colon returns non-zero exit"
 else
@@ -258,25 +261,25 @@ fi
 
 run_test "PATH set inside container contains /usr/bin" \
     0 "/usr/bin" \
-    "$IMG" /bin/sh -c 'echo $PATH'
+    "${RUNNER[@]}" /bin/sh -c 'echo $PATH'
 
 # ── Test 14: HOME set to /root ────────────────────────────────────────────
 
 run_test "HOME set to /root inside container" \
     0 "/root" \
-    "$IMG" /bin/sh -c 'echo $HOME'
+    "${RUNNER[@]}" /bin/sh -c 'echo $HOME'
 
 # ── Test 15: -e sets environment variable ────────────────────────────────
 
 run_test "-e sets env var inside container" \
     0 "env_var_ok" \
-    "$IMG" -e MY_VAR=env_var_ok /bin/sh -c 'echo $MY_VAR'
+    "${RUNNER[@]}" -e MY_VAR=env_var_ok /bin/sh -c 'echo $MY_VAR'
 
 # ── Test 16: -e overrides built-in default (PATH) ────────────────────────
 
 run_test "-e overrides built-in PATH" \
     0 "/custom/path" \
-    "$IMG" -e PATH=/custom/path /bin/sh -c 'echo $PATH'
+    "${RUNNER[@]}" -e PATH=/custom/path /bin/sh -c 'echo $PATH'
 
 # ── Test 17: Host LANG does not leak into container ──────────────────────
 # Redis 8 (and other glibc programs) call setlocale(LC_ALL,"") on startup.
@@ -287,7 +290,7 @@ run_test "-e overrides built-in PATH" \
 T=$(( T + 1 ))
 out=""
 exit_code=0
-out=$(LANG=en_US.UTF-8 timeout 15 "$IMG" /bin/sh -c 'echo ${LANG:-UNSET}' \
+out=$(LANG=en_US.UTF-8 timeout 15 "${RUNNER[@]}" /bin/sh -c 'echo ${LANG:-UNSET}' \
     2>/dev/null) || exit_code=$?
 if [[ "$exit_code" -eq 0 ]] && ! echo "$out" | grep -q "en_US"; then
     echo "ok $T - host LANG does not leak into container"
@@ -307,7 +310,7 @@ T=$(( T + 1 ))
 out=""
 exit_code=0
 out=$(USER=hostuser DISPLAY=:99 XDG_SESSION_TYPE=x11 \
-    timeout 15 "$IMG" /bin/sh -c 'env' 2>/dev/null) || exit_code=$?
+    timeout 15 "${RUNNER[@]}" /bin/sh -c 'env' 2>/dev/null) || exit_code=$?
 leaked=""
 for var in USER DISPLAY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS; do
     if echo "$out" | grep -q "^${var}="; then
@@ -328,7 +331,7 @@ T=$(( T + 1 ))
 out=""
 exit_code=0
 out=$(env PATH="$(echo "$PATH" | tr ':' '\n' | grep -v docker | tr '\n' ':')" \
-    timeout 15 "$IMG" /bin/echo no_docker_needed 2>/dev/null) || exit_code=$?
+    timeout 15 "${RUNNER[@]}" /bin/echo no_docker_needed 2>/dev/null) || exit_code=$?
 if [[ "$exit_code" -eq 0 ]] && echo "$out" | grep -q "no_docker_needed"; then
     echo "ok $T - binary runs without docker in PATH"
 else
