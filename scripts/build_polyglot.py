@@ -511,6 +511,10 @@ def warm_layer_cache(oci_data, use_cache=True):
                 sys.exit(1)
 
             layer_data = fobj.read()
+            # OCI image layout (Docker 29+) stores compressed layers; diff_ids
+            # are sha256 of the *uncompressed* content, so decompress first.
+            if layer_data[:2] == b'\x1f\x8b':
+                layer_data = gzip.decompress(layer_data)
             actual = hashlib.sha256(layer_data).hexdigest()
             if actual != digest_hex:
                 print(

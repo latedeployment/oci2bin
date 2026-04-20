@@ -2444,7 +2444,7 @@ static char* extract_oci_rootfs(const char* self_path)
     }
 
     /* 5. Extract layers in order into rootfs */
-    if (path_join_suffix(rootfs, sizeof(rootfs), tmpdir, "/rootfs") < 0)
+    if (path_join_suffix(rootfs, sizeof(s_oci_rootfs), tmpdir, "/rootfs") < 0)
     {
         fprintf(stderr, "oci2bin: rootfs path too long\n");
         free(config_path_rel);
