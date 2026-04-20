@@ -59,7 +59,8 @@ VMLINUX_OUT    = build/vmlinux
         test-c test-c-aarch64 test-python test-shellcheck \
         test-vm-unit test-vm \
         lint lint-clang lint-semgrep lint-scan-build lint-shellcheck \
-        fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-mcp fuzz-clean
+        fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-mcp fuzz-clean \
+        coverage coverage-c coverage-python
 
 SHELLCHECK       ?= shellcheck
 SHELLCHECK_FLAGS  = -S warning
@@ -167,10 +168,45 @@ uninstall:
 
 clean:
 	rm -rf build/loader-* build/test_c_units* build/vmlinux $(OUTPUT)
-	rm -f $(INFO_DIR)/oci2bin.info
+	rm -rf build/cov build/coverage-html build/coverage-python-html
+	rm -f $(INFO_DIR)/oci2bin.info .coverage
 
 clean-all: clean
 	rm -rf build
+
+# ── Coverage targets ───────────────────────────────────────────────────────────
+
+# C coverage: compile test binary with gcov instrumentation, run, then generate
+# an lcov HTML report.  Requires: lcov + genhtml (lcov package).
+# Note: gcov is incompatible with -static; we link dynamically here.
+coverage-c:
+	@mkdir -p build/cov
+	cd build/cov && $(CC_X86_64) --coverage -O0 -Wno-return-local-addr \
+	    -o test_c_units_cov ../../$(TESTS_DIR)/test_c_units.c && \
+	    TMPDIR=$(TEST_TMPDIR) OCI2BIN_TMPDIR=$(TEST_TMPDIR) ./test_c_units_cov
+	lcov --capture --directory build/cov \
+	     --output-file build/cov/coverage.info \
+	     --exclude '*/test_c_units.c' 2>/dev/null || \
+	  gcov -r build/cov/test_c_units.c-*.gcda && \
+	  lcov --capture --directory build/cov \
+	       --output-file build/cov/coverage.info
+	genhtml build/cov/coverage.info \
+	        --output-directory build/coverage-html \
+	        --title "oci2bin C coverage" --legend 2>/dev/null || true
+	@echo "=== C line/branch summary ==="
+	lcov --summary build/cov/coverage.info 2>/dev/null || true
+	@echo "HTML report: build/coverage-html/index.html"
+
+# Python coverage: uses coverage.py (pip install coverage or python3-coverage).
+coverage-python:
+	@mkdir -p build/coverage-python-html
+	$(TEST_ENV) python3 -m coverage run --branch --source scripts,tests \
+	    -m unittest discover -s tests -p '*.py' -v 2>/dev/null || true
+	python3 -m coverage report --show-missing
+	python3 -m coverage html -d build/coverage-python-html
+	@echo "HTML report: build/coverage-python-html/index.html"
+
+coverage: coverage-c coverage-python
 
 # ── Lint targets ───────────────────────────────────────────────────────────────
 

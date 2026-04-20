@@ -2222,6 +2222,401 @@ static void test_build_exec_args_extended(void)
 
 /* ── test_mcp_helpers ─────────────────────────────────────────────────────── */
 
+/* ── test_parent_dir_path ─────────────────────────────────────────────────── */
+
+static void test_parent_dir_path(void)
+{
+    char out[PATH_MAX];
+
+    /* normal multi-component path */
+    ASSERT_INT_EQ(parent_dir_path("/foo/bar/baz", out, sizeof(out)), 0,
+                  "parent_dir: /foo/bar/baz returns 0");
+    ASSERT_INT_EQ(strcmp(out, "/foo/bar"), 0,
+                  "parent_dir: /foo/bar/baz -> /foo/bar");
+
+    /* one level below root */
+    ASSERT_INT_EQ(parent_dir_path("/foo", out, sizeof(out)), 0,
+                  "parent_dir: /foo returns 0");
+    ASSERT_INT_EQ(strcmp(out, "/"), 0,
+                  "parent_dir: /foo -> /");
+
+    /* no slash at all */
+    ASSERT_INT_EQ(parent_dir_path("nopath", out, sizeof(out)), -1,
+                  "parent_dir: no slash returns -1");
+
+    /* buffer too small */
+    char tiny[4];
+    ASSERT_INT_EQ(parent_dir_path("/foo/bar", tiny, sizeof(tiny)), -1,
+                  "parent_dir: tiny buffer returns -1");
+}
+
+/* ── test_read_write_all_fd ───────────────────────────────────────────────── */
+
+static void test_read_write_all_fd(void)
+{
+    char path[] = "/tmp/oci2bin-rwfd-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT(fd >= 0, "rwfd: mkstemp succeeds");
+    if (fd < 0)
+        return;
+
+    const char* msg = "hello, read_all_fd world\n";
+    size_t len = strlen(msg);
+
+    ASSERT_INT_EQ(write_all_fd(fd, msg, len), 0,
+                  "rwfd: write_all_fd returns 0");
+
+    ASSERT_INT_EQ((int)lseek(fd, 0, SEEK_SET), 0,
+                  "rwfd: lseek to start succeeds");
+
+    char buf[128];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = read_all_fd(fd, buf, len);
+    ASSERT(n == (ssize_t)len, "rwfd: read_all_fd returns full length");
+    ASSERT_INT_EQ(memcmp(buf, msg, len), 0,
+                  "rwfd: round-trip content matches");
+
+    /* write_all_fd with zero bytes is a no-op */
+    ASSERT_INT_EQ(write_all_fd(fd, msg, 0), 0,
+                  "rwfd: write_all_fd zero bytes returns 0");
+
+    close(fd);
+    unlink(path);
+}
+
+/* ── test_read_write_file ─────────────────────────────────────────────────── */
+
+static void test_read_write_file(void)
+{
+    char path[] = "/tmp/oci2bin-rwfile-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT(fd >= 0, "rwfile: mkstemp succeeds");
+    if (fd < 0)
+        return;
+    close(fd);
+
+    const char* content = "line1\nline2\n";
+    size_t clen = strlen(content);
+
+    ASSERT_INT_EQ(write_file(path, content, clen), 0,
+                  "rwfile: write_file returns 0");
+
+    size_t got_size = 0;
+    char* got = read_file(path, &got_size);
+    ASSERT(got != NULL, "rwfile: read_file returns non-NULL");
+    if (got)
+    {
+        ASSERT(got_size == clen, "rwfile: read_file returns correct size");
+        ASSERT_INT_EQ(memcmp(got, content, clen), 0,
+                      "rwfile: read_file content matches");
+        free(got);
+    }
+
+    /* read_file on missing path returns NULL */
+    ASSERT(read_file("/tmp/oci2bin-no-such-file-xyz", NULL) == NULL,
+           "rwfile: read_file missing path returns NULL");
+
+    unlink(path);
+}
+
+/* ── test_copy_n_bytes ────────────────────────────────────────────────────── */
+
+static void test_copy_n_bytes(void)
+{
+    char src_path[] = "/tmp/oci2bin-cpysrc-XXXXXX";
+    char dst_path[] = "/tmp/oci2bin-cpydst-XXXXXX";
+    int src_fd = mkstemp(src_path);
+    int dst_fd = mkstemp(dst_path);
+    ASSERT(src_fd >= 0 && dst_fd >= 0, "copy_n_bytes: mkstemp succeeds");
+    if (src_fd < 0 || dst_fd < 0)
+    {
+        if (src_fd >= 0) { close(src_fd); unlink(src_path); }
+        if (dst_fd >= 0) { close(dst_fd); unlink(dst_path); }
+        return;
+    }
+
+    const char* data = "0123456789abcdef";
+    unsigned long dlen = (unsigned long)strlen(data);
+    ASSERT_INT_EQ(write_all_fd(src_fd, data, dlen), 0,
+                  "copy_n_bytes: write source succeeds");
+    ASSERT_INT_EQ((int)lseek(src_fd, 0, SEEK_SET), 0,
+                  "copy_n_bytes: rewind source succeeds");
+
+    ASSERT_INT_EQ(copy_n_bytes(src_fd, dst_fd, dlen), 0,
+                  "copy_n_bytes: returns 0 on success");
+
+    ASSERT_INT_EQ((int)lseek(dst_fd, 0, SEEK_SET), 0,
+                  "copy_n_bytes: rewind dest succeeds");
+    char buf[64];
+    ssize_t n = read_all_fd(dst_fd, buf, dlen);
+    ASSERT(n == (ssize_t)dlen, "copy_n_bytes: dest has full length");
+    ASSERT_INT_EQ(memcmp(buf, data, dlen), 0,
+                  "copy_n_bytes: dest content matches source");
+
+    /* premature EOF returns -1 */
+    ASSERT_INT_EQ((int)lseek(src_fd, 0, SEEK_SET), 0,
+                  "copy_n_bytes: rewind for eof test");
+    ASSERT_INT_EQ(copy_n_bytes(src_fd, dst_fd, dlen * 2), -1,
+                  "copy_n_bytes: premature EOF returns -1");
+
+    close(src_fd); unlink(src_path);
+    close(dst_fd); unlink(dst_path);
+}
+
+/* ── test_lookup_passwd_group ─────────────────────────────────────────────── */
+
+static void test_lookup_passwd_group(void)
+{
+    char pw_path[] = "/tmp/oci2bin-passwd-XXXXXX";
+    char gr_path[] = "/tmp/oci2bin-group-XXXXXX";
+    int pw_fd = mkstemp(pw_path);
+    int gr_fd = mkstemp(gr_path);
+    ASSERT(pw_fd >= 0 && gr_fd >= 0, "passwd/group: mkstemp succeeds");
+    if (pw_fd < 0 || gr_fd < 0)
+    {
+        if (pw_fd >= 0) { close(pw_fd); unlink(pw_path); }
+        if (gr_fd >= 0) { close(gr_fd); unlink(gr_path); }
+        return;
+    }
+
+    const char* pw_data =
+        "root:x:0:0:root:/root:/bin/sh\n"
+        "nobody:x:65534:65534:nobody:/:/sbin/nologin\n"
+        "appuser:x:1000:1001:App User:/home/app:/bin/bash\n";
+    ASSERT_INT_EQ(write_all_fd(pw_fd, pw_data, strlen(pw_data)), 0,
+                  "passwd/group: write passwd file");
+    close(pw_fd);
+
+    const char* gr_data =
+        "root:x:0:\n"
+        "appgroup:x:1001:appuser\n"
+        "nobody:x:65534:\n";
+    ASSERT_INT_EQ(write_all_fd(gr_fd, gr_data, strlen(gr_data)), 0,
+                  "passwd/group: write group file");
+    close(gr_fd);
+
+    uid_t uid; gid_t gid;
+
+    ASSERT_INT_EQ(lookup_passwd_user(pw_path, "root", &uid, &gid), 0,
+                  "passwd: lookup root returns 0");
+    ASSERT_INT_EQ((int)uid, 0, "passwd: root uid=0");
+    ASSERT_INT_EQ((int)gid, 0, "passwd: root gid=0");
+
+    ASSERT_INT_EQ(lookup_passwd_user(pw_path, "appuser", &uid, &gid), 0,
+                  "passwd: lookup appuser returns 0");
+    ASSERT_INT_EQ((int)uid, 1000, "passwd: appuser uid=1000");
+    ASSERT_INT_EQ((int)gid, 1001, "passwd: appuser gid=1001");
+
+    ASSERT_INT_EQ(lookup_passwd_user(pw_path, "missing", &uid, &gid), -1,
+                  "passwd: missing user returns -1");
+
+    ASSERT_INT_EQ(lookup_passwd_user("/no-such-file", "root", &uid, &gid), -1,
+                  "passwd: missing file returns -1");
+
+    gid_t g;
+    ASSERT_INT_EQ(lookup_group_name(gr_path, "appgroup", &g), 0,
+                  "group: lookup appgroup returns 0");
+    ASSERT_INT_EQ((int)g, 1001, "group: appgroup gid=1001");
+
+    ASSERT_INT_EQ(lookup_group_name(gr_path, "nobody", &g), 0,
+                  "group: lookup nobody returns 0");
+    ASSERT_INT_EQ((int)g, 65534, "group: nobody gid=65534");
+
+    ASSERT_INT_EQ(lookup_group_name(gr_path, "missing", &g), -1,
+                  "group: missing group returns -1");
+
+    ASSERT_INT_EQ(lookup_group_name("/no-such-file", "root", &g), -1,
+                  "group: missing file returns -1");
+
+    unlink(pw_path);
+    unlink(gr_path);
+}
+
+/* ── test_openat_beneath ──────────────────────────────────────────────────── */
+
+/* ── test_misc_helpers ────────────────────────────────────────────────────── */
+
+/* ── test_write_read_file_beneath ─────────────────────────────────────────── */
+
+static void test_write_read_file_beneath(void)
+{
+    char base[] = "/tmp/oci2bin-fb-XXXXXX";
+    ASSERT(mkdtemp(base) != NULL, "file_beneath: mkdtemp succeeds");
+
+    int root_fd = open(base, O_RDONLY | O_DIRECTORY);
+    ASSERT(root_fd >= 0, "file_beneath: open base dir");
+    if (root_fd < 0)
+    {
+        rmdir(base);
+        return;
+    }
+
+    const char* content = "beneath content\n";
+    size_t clen = strlen(content);
+
+    ASSERT_INT_EQ(write_file_beneath(root_fd, "test.txt",
+                                     content, clen, 0644),
+                  0, "file_beneath: write_file_beneath succeeds");
+
+    size_t got_sz = 0;
+    char* got = read_file_beneath(root_fd, "test.txt", &got_sz);
+    ASSERT(got != NULL, "file_beneath: read_file_beneath returns non-NULL");
+    if (got)
+    {
+        ASSERT(got_sz == clen, "file_beneath: size matches");
+        ASSERT_INT_EQ(memcmp(got, content, clen), 0,
+                      "file_beneath: content matches");
+        free(got);
+    }
+
+    /* missing file returns NULL */
+    ASSERT(read_file_beneath(root_fd, "no-such.txt", NULL) == NULL,
+           "file_beneath: missing file returns NULL");
+
+    close(root_fd);
+
+    /* cleanup */
+    char fp[PATH_MAX];
+    snprintf(fp, sizeof(fp), "%s/test.txt", base);
+    unlink(fp);
+    rmdir(base);
+}
+
+/* ── test_kernel_feature_state ────────────────────────────────────────────── */
+
+static void test_kernel_feature_state(void)
+{
+    /* kernel_feature_state_from_syscall: rc >= 0 => SUPPORTED */
+    ASSERT_INT_EQ(kernel_feature_state_from_syscall(0, 0),
+                  KERNEL_FEATURE_SUPPORTED,
+                  "kfstate: rc=0 -> SUPPORTED");
+    ASSERT_INT_EQ(kernel_feature_state_from_syscall(1, ENOSYS),
+                  KERNEL_FEATURE_SUPPORTED,
+                  "kfstate: rc=1 ENOSYS -> SUPPORTED (rc wins)");
+    /* ENOSYS with negative rc => UNSUPPORTED */
+    ASSERT_INT_EQ(kernel_feature_state_from_syscall(-1, ENOSYS),
+                  KERNEL_FEATURE_UNSUPPORTED,
+                  "kfstate: rc=-1 ENOSYS -> UNSUPPORTED");
+    /* non-ENOSYS error with negative rc => SUPPORTED (kernel has it, call just failed) */
+    ASSERT_INT_EQ(kernel_feature_state_from_syscall(-1, EINVAL),
+                  KERNEL_FEATURE_SUPPORTED,
+                  "kfstate: rc=-1 EINVAL -> SUPPORTED");
+
+    /* kernel_set_feature_state: out-of-bounds feature is ignored */
+    kernel_set_feature_state(KERNEL_FEATURE_MAX, KERNEL_FEATURE_SUPPORTED);
+    kernel_set_feature_state(-1, KERNEL_FEATURE_SUPPORTED);
+
+    /* kernel_set_feature_state: valid id is stored and readable */
+    kernel_set_feature_state(0, KERNEL_FEATURE_UNSUPPORTED);
+    ASSERT_INT_EQ((int)g_kernel_feature_state[0],
+                  KERNEL_FEATURE_UNSUPPORTED,
+                  "kfstate: set stores value at index 0");
+    kernel_set_feature_state(0, KERNEL_FEATURE_UNKNOWN);
+}
+
+static void test_misc_helpers(void)
+{
+    /* safe_str: NULL input becomes "(null)" */
+    ASSERT_INT_EQ(strcmp(safe_str(NULL), "(null)"), 0,
+                  "safe_str: NULL -> (null)");
+    /* safe_str: non-NULL returned as-is */
+    const char* s = "hello";
+    ASSERT(safe_str(s) == s, "safe_str: non-NULL returned unchanged");
+
+    /* argv_has_debug_flag */
+    char* argv1[] = { "prog", "--debug", "arg" };
+    ASSERT_INT_EQ(argv_has_debug_flag(3, argv1), 1,
+                  "argv_has_debug_flag: finds --debug");
+    char* argv2[] = { "prog", "--other", "arg" };
+    ASSERT_INT_EQ(argv_has_debug_flag(3, argv2), 0,
+                  "argv_has_debug_flag: no --debug returns 0");
+    char* argv3[] = { "prog" };
+    ASSERT_INT_EQ(argv_has_debug_flag(1, argv3), 0,
+                  "argv_has_debug_flag: only argv[0] returns 0");
+
+    /* opts_net_mode */
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(strcmp(opts_net_mode(&opts), "host"), 0,
+                  "opts_net_mode: default is host");
+    opts.net = "slirp4netns";
+    ASSERT_INT_EQ(strcmp(opts_net_mode(&opts), "slirp4netns"), 0,
+                  "opts_net_mode: custom net string returned");
+    opts.net_join_pid = 42;
+    ASSERT_INT_EQ(strcmp(opts_net_mode(&opts), "container"), 0,
+                  "opts_net_mode: net_join_pid > 0 returns container");
+
+    /* debug_log: exercise with g_debug enabled (prints to stderr, not checked) */
+    int saved = g_debug;
+    g_debug = 1;
+    debug_log("test.event", "val=%d", 7);
+    debug_log("test.empty", "");
+    debug_log("test.null", NULL);
+    g_debug = saved;
+}
+
+/* ── test_openat_beneath ──────────────────────────────────────────────────── */
+
+static void test_openat_beneath(void)
+{
+    char base[] = "/tmp/oci2bin-ob-XXXXXX";
+    ASSERT(mkdtemp(base) != NULL, "openat_beneath: mkdtemp succeeds");
+
+    /* create subdir and file inside base */
+    char subdir[PATH_MAX];
+    snprintf(subdir, sizeof(subdir), "%s/sub", base);
+    ASSERT_INT_EQ(mkdir(subdir, 0755), 0, "openat_beneath: mkdir sub");
+
+    char filepath[PATH_MAX];
+    snprintf(filepath, sizeof(filepath), "%s/sub/file.txt", base);
+    int wfd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    ASSERT(wfd >= 0, "openat_beneath: create test file");
+    if (wfd >= 0)
+    {
+        write_all_fd(wfd, "test", 4);
+        close(wfd);
+    }
+
+    int root_fd = open(base, O_RDONLY | O_DIRECTORY);
+    ASSERT(root_fd >= 0, "openat_beneath: open base dir");
+    if (root_fd < 0)
+        goto cleanup_ob;
+
+    /* open nested file */
+    int fd = openat_beneath(root_fd, "sub/file.txt", O_RDONLY, 0);
+    ASSERT(fd >= 0, "openat_beneath: opens nested file");
+    if (fd >= 0) close(fd);
+
+    /* open file in root */
+    int wfd2 = openat_beneath(root_fd, "top.txt",
+                              O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    ASSERT(wfd2 >= 0, "openat_beneath: creates top-level file");
+    if (wfd2 >= 0) close(wfd2);
+
+    /* missing file returns -1 */
+    fd = openat_beneath(root_fd, "no-such-file", O_RDONLY, 0);
+    ASSERT_INT_EQ(fd, -1, "openat_beneath: missing file returns -1");
+
+    /* unlinkat_beneath: remove nested file */
+    ASSERT_INT_EQ(unlinkat_beneath(root_fd, "sub/file.txt", 0), 0,
+                  "unlinkat_beneath: removes nested file");
+
+    /* verify it's gone */
+    fd = openat_beneath(root_fd, "sub/file.txt", O_RDONLY, 0);
+    ASSERT_INT_EQ(fd, -1, "unlinkat_beneath: file is gone after removal");
+
+    /* unlinkat_beneath on top-level file */
+    ASSERT_INT_EQ(unlinkat_beneath(root_fd, "top.txt", 0), 0,
+                  "unlinkat_beneath: removes top-level file");
+
+    close(root_fd);
+
+cleanup_ob:
+    /* cleanup */
+    rmdir(subdir);
+    rmdir(base);
+}
+
 static void test_mcp_helpers(void)
 {
     /* mcp_name_valid: accepts alnum + allowed chars */
@@ -2289,6 +2684,15 @@ int main(void)
     test_parse_opts_ulimit();
     test_parse_opts_misc_flags();
     test_mcp_helpers();
+    test_parent_dir_path();
+    test_read_write_all_fd();
+    test_read_write_file();
+    test_copy_n_bytes();
+    test_lookup_passwd_group();
+    test_openat_beneath();
+    test_misc_helpers();
+    test_write_read_file_beneath();
+    test_kernel_feature_state();
 
     printf("1..%d\n", tap_test_num);
 
