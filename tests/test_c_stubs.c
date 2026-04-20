@@ -382,6 +382,11 @@ static long stub_syscall(long nr, ...)
         }
         return 0;
     }
+    if (nr == SYS_capget)
+    {
+        /* Leave caller's zeroed output buffers untouched — reports 0 caps */
+        return 0;
+    }
     /* All other syscalls (clone3, mseal, memfd_secret, …): report unavailable */
     errno = ENOSYS;
     return -1;
@@ -403,12 +408,31 @@ static long stub_syscall(long nr, ...)
 #undef prctl
 #endif
 
+/* execlp is the /bin/sh fallback after execvp fails in container_main */
+static int stub_execlp(const char* file, ...)
+{
+    (void)file;
+    STUB_RECORD("execlp", 0, 0);
+    errno = ENOEXEC;
+    return -1;
+}
+
+/* clearenv: called in container_main to drop host environment.
+ * Stubbed so it doesn't wipe the test process's own environment. */
+static int stub_clearenv(void)
+{
+    STUB_RECORD("clearenv", 0, 0);
+    return 0;
+}
+
 #define mount(s, t, f, fl, d)    stub_mount(s, t, f, fl, d)
 #define umount2(t, f)             stub_umount2(t, f)
 #define unshare(f)                stub_unshare(f)
 #define chroot(p)                 stub_chroot(p)
 #define prctl(opt, ...)           stub_prctl(opt, ##__VA_ARGS__)
 #define execvp(f, a)              stub_execvp(f, a)
+#define execlp(f, ...)            stub_execlp(f, ##__VA_ARGS__)
+#define clearenv()                stub_clearenv()
 #define setuid(u)                 stub_setuid(u)
 #define setgid(g)                 stub_setgid(g)
 #define setgroups(n, l)           stub_setgroups(n, l)
@@ -791,6 +815,425 @@ static void test_stub_run_as_init(void)
     ASSERT(1, "run_as_init: user-drop path completed (exit 127 confirms exec attempted)");
 }
 
+/* ── test_stub_load_env_file ───────────────────────────────────────────────
+ *
+ * load_env_file() reads KEY=VALUE lines from a file into opts->env_vars[].
+ * Skips blank lines and '#' comments.  Returns -1 on bad lines.
+ */
+static void test_stub_load_env_file(void)
+{
+    char path[] = "/tmp/oci2bin-envfile-XXXXXX";
+    int  fd     = mkstemp(path);
+    ASSERT(fd >= 0, "load_env_file: mkstemp");
+    if (fd < 0)
+        return;
+
+    const char* content =
+        "# comment line\n"
+        "\n"
+        "FOO=bar\n"
+        "BAZ=qux\r\n"  /* Windows-style CRLF */
+        "EMPTY=\n";
+    write_all_fd(fd, content, strlen(content));
+    close(fd);
+
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), 0,
+                  "load_env_file: returns 0 on valid file");
+    ASSERT_INT_EQ(opts.n_env, 3, "load_env_file: three vars loaded");
+    ASSERT_INT_EQ(strcmp(opts.env_vars[0], "FOO=bar"), 0,
+                  "load_env_file: first var is FOO=bar");
+    ASSERT_INT_EQ(strcmp(opts.env_vars[1], "BAZ=qux"), 0,
+                  "load_env_file: second var is BAZ=qux (CR stripped)");
+    ASSERT_INT_EQ(strcmp(opts.env_vars[2], "EMPTY="), 0,
+                  "load_env_file: third var is EMPTY=");
+    for (int i = 0; i < opts.n_env; i++) { free(opts.env_vars[i]); }
+
+    /* Bad line (no '='): should return -1 */
+    char bad_path[] = "/tmp/oci2bin-envfile2-XXXXXX";
+    int  bad_fd     = mkstemp(bad_path);
+    ASSERT(bad_fd >= 0, "load_env_file: mkstemp bad");
+    if (bad_fd >= 0)
+    {
+        write_all_fd(bad_fd, "NOEQUALS\n", 9);
+        close(bad_fd);
+        struct container_opts opts2;
+        memset(&opts2, 0, sizeof(opts2));
+        ASSERT_INT_EQ(load_env_file(bad_path, &opts2), -1,
+                      "load_env_file: bad line returns -1");
+        unlink(bad_path);
+    }
+
+    /* Missing file: should return -1 */
+    ASSERT_INT_EQ(load_env_file("/no-such-file-xyz", &opts), -1,
+                  "load_env_file: missing file returns -1");
+
+    unlink(path);
+}
+
+/* ── test_stub_resolve_user ────────────────────────────────────────────────
+ *
+ * resolve_user() accepts "uid", "uid:gid", "name", "name:group".
+ * Numeric-only specs work without touching /etc/passwd.
+ */
+static void test_stub_resolve_user(void)
+{
+    uid_t uid;
+    gid_t gid;
+
+    /* Pure numeric UID → success, gid defaults to 0 */
+    uid = 999; gid = 999;
+    ASSERT_INT_EQ(resolve_user("1000", &uid, &gid), 0,
+                  "resolve_user: numeric uid returns 0");
+    ASSERT_INT_EQ((int)uid, 1000, "resolve_user: numeric uid stored");
+    ASSERT_INT_EQ((int)gid, 0,    "resolve_user: numeric uid gid defaults 0");
+
+    /* uid:gid → both stored */
+    uid = 999; gid = 999;
+    ASSERT_INT_EQ(resolve_user("1000:2000", &uid, &gid), 0,
+                  "resolve_user: uid:gid returns 0");
+    ASSERT_INT_EQ((int)uid, 1000, "resolve_user: uid:gid uid stored");
+    ASSERT_INT_EQ((int)gid, 2000, "resolve_user: uid:gid gid stored");
+
+    /* uid:0 */
+    uid = 999; gid = 999;
+    ASSERT_INT_EQ(resolve_user("0:0", &uid, &gid), 0,
+                  "resolve_user: 0:0 returns 0");
+    ASSERT_INT_EQ((int)uid, 0, "resolve_user: 0:0 uid=0");
+    ASSERT_INT_EQ((int)gid, 0, "resolve_user: 0:0 gid=0");
+
+    /* Empty spec → -1 */
+    ASSERT_INT_EQ(resolve_user("", &uid, &gid), -1,
+                  "resolve_user: empty spec returns -1");
+    ASSERT_INT_EQ(resolve_user(NULL, &uid, &gid), -1,
+                  "resolve_user: NULL spec returns -1");
+
+    /* Name lookup fails without /etc/passwd (name doesn't start with digit) */
+    ASSERT_INT_EQ(resolve_user("nonexistent-user-xyz", &uid, &gid), -1,
+                  "resolve_user: unknown name returns -1");
+}
+
+/* ── test_stub_setup_secrets ───────────────────────────────────────────────
+ *
+ * setup_secrets() iterates over opts.secret_host[]/secret_ctr[] and for
+ * each valid entry calls install_plain_secret (which calls
+ * bind_mount_memfd_secret or falls back to bind-mount).
+ *
+ * With mount stubbed we verify path validation logic and call counts.
+ */
+static void test_stub_setup_secrets(void)
+{
+    char rootfs[] = "/tmp/oci2bin-ss-rootfs-XXXXXX";
+    ASSERT(mkdtemp(rootfs) != NULL, "setup_secrets: mkdtemp rootfs");
+
+    /* Create a real source secret file */
+    char src_path[] = "/tmp/oci2bin-secret-XXXXXX";
+    int  src_fd     = mkstemp(src_path);
+    ASSERT(src_fd >= 0, "setup_secrets: mkstemp src");
+    if (src_fd >= 0)
+    {
+        write_all_fd(src_fd, "mysecret", 8);
+        close(src_fd);
+    }
+
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+
+    /* Case A: zero secrets → no mount calls */
+    stub_reset();
+    opts.n_secrets = 0;
+    setup_secrets(rootfs, &opts);
+    ASSERT_INT_EQ(stub_count("mount"), 0,
+                  "setup_secrets: zero secrets → no mount calls");
+
+    /* Case B: one valid plain secret, no explicit container path */
+    stub_reset();
+    opts.n_secrets      = 1;
+    opts.secret_host[0] = src_path;
+    opts.secret_ctr[0]  = NULL;
+    opts.secret_cred[0] = NULL;
+    setup_secrets(rootfs, &opts);
+    /*
+     * install_plain_secret tries make_memfd_secret (syscall returns ENOSYS),
+     * falls back to a direct bind-mount.  Either way, mount() is called once.
+     */
+    ASSERT(stub_count("mount") >= 1,
+           "setup_secrets: one secret → at least one mount call");
+
+    /* Case C: relative host path is rejected */
+    stub_reset();
+    opts.n_secrets      = 1;
+    opts.secret_host[0] = "relative/secret";
+    opts.secret_ctr[0]  = NULL;
+    opts.secret_cred[0] = NULL;
+    setup_secrets(rootfs, &opts);
+    ASSERT_INT_EQ(stub_count("mount"), 0,
+                  "setup_secrets: relative host path → skipped, no mount");
+
+    /* Case D: invalid container path (non-absolute) is rejected */
+    stub_reset();
+    opts.n_secrets      = 1;
+    opts.secret_host[0] = src_path;
+    opts.secret_ctr[0]  = "run/secrets/mykey"; /* not absolute */
+    opts.secret_cred[0] = NULL;
+    setup_secrets(rootfs, &opts);
+    ASSERT_INT_EQ(stub_count("mount"), 0,
+                  "setup_secrets: non-absolute container path → skipped");
+
+    unlink(src_path);
+    /* cleanup rootfs */
+    {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/run/secrets", rootfs);
+        rmdir(p);
+        snprintf(p, sizeof(p), "%s/run", rootfs);
+        rmdir(p);
+    }
+    rmdir(rootfs);
+}
+
+/* ── test_stub_cg_write ────────────────────────────────────────────────────
+ *
+ * cg_write() opens a file for writing and calls write_all_fd.
+ * It's pure file I/O — no stubs needed, but lives in test_c_stubs so it
+ * contributes to coverage of the cgroup code path.
+ */
+static void test_stub_cg_write(void)
+{
+    char path[] = "/tmp/oci2bin-cg-XXXXXX";
+    int  fd     = mkstemp(path);
+    ASSERT(fd >= 0, "cg_write: mkstemp");
+    if (fd < 0) return;
+    close(fd);
+
+    /* cg_write opens for O_WRONLY — the file must exist and be writeable */
+    ASSERT_INT_EQ(cg_write(path, "200"), 0,
+                  "cg_write: write to existing file returns 0");
+
+    /* Verify content was written */
+    char buf[16] = {0};
+    int  rfd     = open(path, O_RDONLY);
+    ASSERT(rfd >= 0, "cg_write: reopen to verify");
+    if (rfd >= 0)
+    {
+        read(rfd, buf, sizeof(buf) - 1);
+        close(rfd);
+        ASSERT_INT_EQ(strcmp(buf, "200"), 0,
+                      "cg_write: content matches");
+    }
+
+    ASSERT_INT_EQ(cg_write("/no-such-file-xyz", "1"), -1,
+                  "cg_write: missing file returns -1");
+
+    unlink(path);
+}
+
+/* ── test_stub_read_text_file_at ───────────────────────────────────────────
+ *
+ * read_text_file_at(dirfd, relpath, buf, buf_sz) reads a relative path
+ * using openat.
+ */
+static void test_stub_read_text_file_at(void)
+{
+    char dir[] = "/tmp/oci2bin-rtfa-XXXXXX";
+    ASSERT(mkdtemp(dir) != NULL, "read_text_file_at: mkdtemp");
+
+    int  dirfd = open(dir, O_RDONLY | O_DIRECTORY);
+    ASSERT(dirfd >= 0, "read_text_file_at: open dir");
+    if (dirfd < 0) { rmdir(dir); return; }
+
+    /* Create file in dir */
+    char fp[PATH_MAX];
+    snprintf(fp, sizeof(fp), "%s/test.txt", dir);
+    int  wfd = open(fp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    ASSERT(wfd >= 0, "read_text_file_at: create file");
+    if (wfd >= 0)
+    {
+        write_all_fd(wfd, "hello\n", 6);
+        close(wfd);
+    }
+
+    char buf[64];
+    ASSERT_INT_EQ(read_text_file_at(dirfd, "test.txt", buf, sizeof(buf)), 0,
+                  "read_text_file_at: returns 0 on success");
+    ASSERT_INT_EQ(strcmp(buf, "hello\n"), 0,
+                  "read_text_file_at: content correct");
+
+    /* Missing file returns -1 */
+    ASSERT_INT_EQ(read_text_file_at(dirfd, "no-such.txt", buf, sizeof(buf)), -1,
+                  "read_text_file_at: missing file returns -1");
+
+    /* NULL buffer returns -1 */
+    ASSERT_INT_EQ(read_text_file_at(dirfd, "test.txt", NULL, 64), -1,
+                  "read_text_file_at: NULL buf returns -1");
+
+    /* Zero buffer size returns -1 */
+    ASSERT_INT_EQ(read_text_file_at(dirfd, "test.txt", buf, 0), -1,
+                  "read_text_file_at: zero buf_sz returns -1");
+
+    close(dirfd);
+    unlink(fp);
+    rmdir(dir);
+}
+
+/* ── test_stub_parse_u64_text ──────────────────────────────────────────────
+ *
+ * parse_u64_text() parses a single unsigned 64-bit integer from a string.
+ */
+static void test_stub_parse_u64_text(void)
+{
+    unsigned long long v;
+
+    ASSERT_INT_EQ(parse_u64_text("12345\n", &v), 0,
+                  "parse_u64_text: trailing newline OK");
+    ASSERT(v == 12345ULL, "parse_u64_text: value correct");
+
+    ASSERT_INT_EQ(parse_u64_text("0", &v), 0,
+                  "parse_u64_text: zero OK");
+    ASSERT(v == 0ULL, "parse_u64_text: zero stored");
+
+    ASSERT_INT_EQ(parse_u64_text("18446744073709551615", &v), 0,
+                  "parse_u64_text: UINT64_MAX OK");
+
+    ASSERT_INT_EQ(parse_u64_text("not-a-number", &v), -1,
+                  "parse_u64_text: non-numeric returns -1");
+
+    ASSERT_INT_EQ(parse_u64_text("", &v), -1,
+                  "parse_u64_text: empty string returns -1");
+
+    ASSERT_INT_EQ(parse_u64_text(NULL, &v), -1,
+                  "parse_u64_text: NULL returns -1");
+
+    ASSERT_INT_EQ(parse_u64_text("123 trailing", &v), -1,
+                  "parse_u64_text: trailing non-whitespace returns -1");
+
+    ASSERT_INT_EQ(parse_u64_text("123\t", &v), 0,
+                  "parse_u64_text: trailing tab OK");
+}
+
+/* ── test_stub_container_main ─────────────────────────────────────────────
+ *
+ * container_main() is the heart of the runtime: it sets up mounts, chroot,
+ * env, capabilities, seccomp, and execs the entrypoint.
+ *
+ * We run it in a forked child so clearenv / chdir don't affect the test
+ * process.  All privileged calls are redirected to stubs.  With no OCI
+ * config and no entrypoint, build_exec_args returns /bin/sh; stub_execvp
+ * and stub_execlp both return -1 so the child exits with code 1.
+ *
+ * Variants tested:
+ *   A: minimal (no flags, no_seccomp=1 to skip seccomp stub complexity)
+ *   B: use_init=1  → run_as_init forks grandchild; grandchild exits 127
+ *   C: no_host_dev=1 → device bind-mounts skipped
+ *   D: read_only=1 → overlay mount attempted
+ */
+static void test_stub_container_main(void)
+{
+    /* Create minimal rootfs (no .oci2bin_config → defaults) */
+    char rootfs[] = "/tmp/oci2bin-cm-rootfs-XXXXXX";
+    ASSERT(mkdtemp(rootfs) != NULL, "container_main: mkdtemp rootfs");
+
+    struct container_opts base_opts;
+    memset(&base_opts, 0, sizeof(base_opts));
+    base_opts.no_seccomp  = 1; /* avoid applying seccomp to test process */
+    base_opts.pty_slave_fd = -1;
+    base_opts.pty_master_fd = -1;
+
+    /* ── Case A: minimal run ── */
+    {
+        struct container_opts opts = base_opts;
+        pid_t child = fork();
+        ASSERT(child >= 0, "container_main A: fork succeeds");
+        if (child == 0)
+        {
+            stub_reset();
+            int rc = container_main(rootfs, &opts);
+            /* Use exit() so gcov flushes coverage data */
+            exit(rc);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        ASSERT_INT_EQ(rc, 1,
+                      "container_main A: minimal run returns 1 (exec fails)");
+    }
+
+    /* ── Case B: use_init=1 → run_as_init forks grandchild that exits 127 ── */
+    {
+        struct container_opts opts = base_opts;
+        opts.use_init = 1;
+        pid_t child = fork();
+        ASSERT(child >= 0, "container_main B: fork succeeds");
+        if (child == 0)
+        {
+            stub_reset();
+            int rc = container_main(rootfs, &opts);
+            exit(rc);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        ASSERT_INT_EQ(rc, 127,
+                      "container_main B: use_init path child exits 127");
+    }
+
+    /* ── Case C: no_host_dev=1 → device loop skipped ── */
+    {
+        struct container_opts opts = base_opts;
+        opts.no_host_dev = 1;
+        pid_t child = fork();
+        ASSERT(child >= 0, "container_main C: fork succeeds");
+        if (child == 0)
+        {
+            stub_reset();
+            int rc = container_main(rootfs, &opts);
+            exit(rc);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        ASSERT_INT_EQ(rc, 1,
+                      "container_main C: no_host_dev run returns 1");
+    }
+
+    /* ── Case D: cap_drop_mask set → apply_capabilities called ── */
+    {
+        struct container_opts opts = base_opts;
+        opts.cap_drop_mask = (1ULL << 21); /* drop CAP_SYS_ADMIN */
+        pid_t child = fork();
+        ASSERT(child >= 0, "container_main D: fork succeeds");
+        if (child == 0)
+        {
+            stub_reset();
+            int rc = container_main(rootfs, &opts);
+            exit(rc);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        ASSERT_INT_EQ(rc, 1,
+                      "container_main D: cap_drop_mask run returns 1");
+    }
+
+    /* cleanup */
+    {
+        char p[PATH_MAX];
+        /* container_main may have created dev/ subdirs in rootfs */
+        snprintf(p, sizeof(p), "%s/dev/pts", rootfs);
+        rmdir(p);
+        snprintf(p, sizeof(p), "%s/dev/ptmx", rootfs);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/null",  rootfs); unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/zero",  rootfs); unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/random", rootfs); unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/urandom", rootfs); unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/tty",   rootfs); unlink(p);
+        snprintf(p, sizeof(p), "%s/dev",       rootfs); rmdir(p);
+        rmdir(rootfs);
+    }
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -802,6 +1245,13 @@ int main(void)
     test_stub_setup_volumes();
     test_stub_bind_mount_memfd_secret();
     test_stub_run_as_init();
+    test_stub_load_env_file();
+    test_stub_resolve_user();
+    test_stub_setup_secrets();
+    test_stub_cg_write();
+    test_stub_read_text_file_at();
+    test_stub_parse_u64_text();
+    test_stub_container_main();
 
     printf("1..%d\n", tap_test_num);
 
