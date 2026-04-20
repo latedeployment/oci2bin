@@ -2,18 +2,41 @@
 
 **oci2bin** converts any Docker (OCI) image into a single executable file. The output runs as a rootless container on any Linux machine — without Docker, without a daemon, and without any installation on the target.
 
-The output is an [ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): simultaneously a native Linux executable and a valid `docker save` tar archive. The same file boots a container when run directly and can be reloaded into Docker if needed.
-
 ```bash
 oci2bin alpine:latest    # produces ./alpine_latest
 ./alpine_latest            # runs the container
 ```
 
-The output file is also a valid tar archive accepted by `docker load`:
+## What you can do
 
-```bash
-docker load < alpine_latest
-```
+| | Feature | One-liner |
+|---|---------|-----------|
+| 📦 | **Pack any image** | `oci2bin redis:7-alpine` |
+| 🏃 | **Run anywhere, no Docker** | `scp redis_7-alpine remote: && ssh remote ./redis_7-alpine` |
+| 🏗️ | **Build from a chroot** | `oci2bin from-chroot ./rootfs -o myapp.bin` |
+| 📄 | **Build from a Dockerfile** | `oci2bin build-dockerfile -o myapp.bin` |
+| 🔐 | **Inject secrets at runtime** | `./myapp --secret /run/secrets/key:/run/secrets/key` |
+| 🔑 | **TPM2-sealed secrets** | `./myapp --secret tpm2:mykey` |
+| 🔒 | **memfd_secret protection** | Secrets are kernel-protected (no page cache, no swap) on Linux ≥ 5.14 |
+| 🌐 | **SSH agent in builds** | `RUN --mount=type=ssh git clone git@github.com:...` |
+| 💾 | **Persistent build cache** | `RUN --mount=type=cache,target=/var/cache/apt apt-get install ...` |
+| 🖥️ | **Run as a VM** | `oci2vm alpine:latest` |
+| 🏛️ | **Cross-arch builds** | `oci2bin --arch aarch64 alpine:latest` |
+| 🎭 | **Fat binaries (x86+arm)** | `oci2bin --arch all alpine:latest` |
+| 📁 | **Volume mounts** | `./myapp -v /data:/data` |
+| 🔇 | **Read-only container** | `./myapp --read-only` |
+| 🛡️ | **Custom seccomp profile** | `./myapp --seccomp profile.json` |
+| 🔬 | **Diff two images** | `oci2bin diff image_v1 image_v2` |
+| 🔏 | **Sign the binary** | `oci2bin sign myapp.bin --key priv.pem` |
+| 🩺 | **Health check** | `oci2bin healthcheck myapp.bin` |
+| 📊 | **Live stats** | `oci2bin top` |
+| 🔄 | **systemd unit** | `oci2bin systemd myapp.bin` |
+| 📦 | **SBOM generation** | `oci2bin sbom myapp.bin` |
+| 🤖 | **AI/MCP integration** | `oci2bin mcp-serve` |
+| ♻️ | **Reconstruct from registry** | `oci2bin reconstruct myapp.bin` |
+| 💿 | **Reloadable into Docker** | `docker load < myapp.bin` |
+
+The output is an [ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): simultaneously a native Linux executable and a valid `docker save` tar archive.
 
 See below [How it works](#how-it-works).
 
