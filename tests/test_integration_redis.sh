@@ -53,7 +53,7 @@ tap_ok "redis: oci2bin build succeeded"
 
 # ── 2. Start redis-server in the background ───────────────────────────────────
 
-"$BIN" --no-seccomp --entrypoint /usr/local/bin/redis-server \
+"$BIN" --no-seccomp --no-userns-remap --entrypoint /usr/local/bin/redis-server \
     -- --port "$REDIS_PORT" --daemonize no \
     2>/dev/null &
 REDIS_PID=$!
