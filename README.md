@@ -2,12 +2,16 @@
 
 **oci2bin** converts any Docker (OCI) image into a single executable file. The output runs as a rootless container on any Linux machine — without Docker, without a daemon, and without any installation on the target.
 
+The output is an [ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): simultaneously a native Linux executable and a valid `docker save` tar archive.
+
+See below [How it works](#how-it-works).
+
 ```bash
 oci2bin alpine:latest    # produces ./alpine_latest
 ./alpine_latest            # runs the container
 ```
 
-## What you can do
+## Useful features
 
 | Feature | Example |
 |---------|---------|
@@ -36,9 +40,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Reconstruct binary from registry | `oci2bin reconstruct myapp.bin` |
 | Reload into Docker | `docker load < myapp.bin` |
 
-The output is an [ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): simultaneously a native Linux executable and a valid `docker save` tar archive.
 
-See below [How it works](#how-it-works).
 
 ## Table of contents
 
