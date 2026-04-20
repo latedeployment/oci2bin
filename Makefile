@@ -22,6 +22,7 @@ QEMU_AARCH64 ?= qemu-aarch64-static
 TESTS_DIR          = tests
 TEST_C_BIN         = build/test_c_units
 TEST_C_BIN_AARCH64 = build/test_c_units-aarch64
+TEST_C_STUBS_BIN   = build/test_c_stubs
 TEST_TMPDIR       ?= $(CURDIR)/build/test-tmp
 TEST_ENV           = TMPDIR=$(TEST_TMPDIR) OCI2BIN_TMPDIR=$(TEST_TMPDIR)
 
@@ -56,7 +57,7 @@ VMLINUX_OUT    = build/vmlinux
         loader-libkrun kernel doc install uninstall test test-unit \
         test-unit-aarch64 test-integration test-integration-redis \
         test-integration-nginx test-integration-services \
-        test-c test-c-aarch64 test-python test-shellcheck \
+        test-c test-c-aarch64 test-c-stubs test-python test-shellcheck \
         test-vm-unit test-vm \
         lint lint-clang lint-semgrep lint-scan-build lint-shellcheck \
         fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-mcp fuzz-clean \
@@ -290,7 +291,7 @@ test-shellcheck: lint-shellcheck
 
 test: test-unit test-integration
 
-test-unit: test-c test-python test-vm-unit test-shellcheck
+test-unit: test-c test-c-stubs test-python test-vm-unit test-shellcheck
 
 test-unit-aarch64: test-c-aarch64 test-python
 
@@ -301,6 +302,15 @@ test-c: $(TEST_C_BIN)
 $(TEST_C_BIN): $(TESTS_DIR)/test_c_units.c src/loader.c
 	@mkdir -p build $(TEST_TMPDIR)
 	$(TEST_ENV) $(CC) -static -Wno-return-local-addr -o $@ $<
+
+test-c-stubs: $(TEST_C_STUBS_BIN)
+	@echo "=== C stub-based tests (syscall stubs, x86_64) ==="
+	@$(TEST_C_STUBS_BIN)
+
+$(TEST_C_STUBS_BIN): $(TESTS_DIR)/test_c_stubs.c src/loader.c
+	@mkdir -p build $(TEST_TMPDIR)
+	$(TEST_ENV) $(CC) -O0 -Wno-return-local-addr -Wno-unused-function \
+	    -o $@ $<
 
 test-c-aarch64: $(TEST_C_BIN_AARCH64)
 	@echo "=== C unit tests (aarch64 via $(QEMU_AARCH64)) ==="
