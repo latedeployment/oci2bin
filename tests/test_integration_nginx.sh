@@ -69,7 +69,7 @@ http {
 }
 EOF
 
-"$BIN" --no-seccomp \
+"$BIN" --no-seccomp --no-userns-remap \
     -v "$NGINX_CONF:/etc/nginx/nginx.conf" \
     -- nginx -g "daemon off;" \
     2>/dev/null &
