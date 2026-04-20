@@ -2330,6 +2330,9 @@ static pid_t spawn_daemon(char* const argv[])
 
 /* ── OCI image extraction ────────────────────────────────────────────────── */
 
+/* File-level static so the returned pointer is never to stack memory. */
+static char s_oci_rootfs[PATH_MAX];
+
 /*
  * Extract the OCI tar data from ourselves into a temp directory,
  * then parse manifest.json and extract layers into a rootfs.
@@ -2338,7 +2341,7 @@ static pid_t spawn_daemon(char* const argv[])
  */
 static char* extract_oci_rootfs(const char* self_path)
 {
-    static char rootfs[PATH_MAX];
+    char* rootfs = s_oci_rootfs;
     char tmpdir[PATH_MAX];
 
     debug_log("extract.begin", "self=%s oci_offset=0x%lx oci_size=0x%lx",
@@ -3563,8 +3566,11 @@ install_plain_secret(const char* src, const char* dst, const char* ctr)
     if (sfd >= 0)
     {
         int used_memfd = 0;
+        /* Open first, then fstat the fd to avoid a TOCTOU race. */
+        int rfd = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         struct stat st_s;
-        if (stat(src, &st_s) == 0 &&
+        if (rfd >= 0 &&
+                fstat(rfd, &st_s) == 0 &&
                 st_s.st_size >= 0 &&
                 (size_t)st_s.st_size <= SECRET_MEMFD_MAX)
         {
@@ -3572,15 +3578,10 @@ install_plain_secret(const char* src, const char* dst, const char* ctr)
             char*  fbuf = malloc(flen + 1);
             if (fbuf)
             {
-                int rfd = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
                 /* Use read_all_fd to handle short reads correctly. */
-                ssize_t nread = (rfd >= 0)
-                                ? read_all_fd(rfd, fbuf, flen)
-                                : (ssize_t)-1;
-                if (rfd >= 0)
-                {
-                    close(rfd);
-                }
+                ssize_t nread = read_all_fd(rfd, fbuf, flen);
+                close(rfd);
+                rfd = -1;
                 if (nread >= 0 && (size_t)nread == flen)
                 {
                     if (ensure_bind_mount_target(src, dst, "--secret") == 0)
@@ -3600,6 +3601,10 @@ install_plain_secret(const char* src, const char* dst, const char* ctr)
                 explicit_bzero(fbuf, flen + 1);
                 free(fbuf);
             }
+        }
+        if (rfd >= 0)
+        {
+            close(rfd);
         }
         if (sfd >= 0)
         {
@@ -9115,31 +9120,10 @@ static pid_t start_metrics_helper(const char* socket_path)
             _exit(1);
         }
 
-        struct stat st;
-        if (lstat(socket_path, &st) == 0)
+        /* Unlink any stale socket unconditionally; treat ENOENT as OK. */
+        if (unlink(socket_path) < 0 && errno != ENOENT)
         {
-            if (!S_ISSOCK(st.st_mode))
-            {
-                fprintf(stderr,
-                        "oci2bin: --metrics-socket exists and is not a socket:"
-                        " %s\n",
-                        socket_path);
-                (void)write(sync_pipe[1], "0", 1);
-                close(sync_pipe[1]);
-                _exit(1);
-            }
-            if (unlink(socket_path) < 0)
-            {
-                fprintf(stderr, "oci2bin: --metrics-socket unlink %s: %s\n",
-                        socket_path, strerror(errno));
-                (void)write(sync_pipe[1], "0", 1);
-                close(sync_pipe[1]);
-                _exit(1);
-            }
-        }
-        else if (errno != ENOENT)
-        {
-            fprintf(stderr, "oci2bin: --metrics-socket stat %s: %s\n",
+            fprintf(stderr, "oci2bin: --metrics-socket unlink %s: %s\n",
                     socket_path, strerror(errno));
             (void)write(sync_pipe[1], "0", 1);
             close(sync_pipe[1]);

@@ -831,7 +831,7 @@ def _parse_build_secret(s: str) -> tuple:
     sid = kv.get("id", "")
     src = kv.get("src") or kv.get("source") or kv.get("from") or ""
     if not sid or not src:
-        print(f"error: --build-secret must be id=<id>,src=<path>, got: {s!r}",
+        print("error: --build-secret must be id=<id>,src=<path>",
               file=sys.stderr)
         sys.exit(1)
     src = os.path.abspath(src)
