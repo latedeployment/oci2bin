@@ -8,7 +8,7 @@ environments = ["sys_platform == 'linux'"]
 
 [project]
 name = "oci2bin"
-version = "0.10.0"
+version = "0.11.0"
 description = "Convert OCI/Docker images into self-contained ELF executables"
 readme = "README.md"
 license = { text = "MIT" }

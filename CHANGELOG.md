@@ -2,6 +2,95 @@
 
 All notable changes to oci2bin are documented here.
 
+## [0.11.0] - 2026-04-20
+
+### Added
+
+- **`memfd_secret` runtime secrets** — when `--secret` is used on Linux ≥ 5.14
+  with `CONFIG_SECRETMEM=y`, the secret data is placed in a kernel-protected
+  anonymous memory region excluded from the kernel direct mapping, crash dumps,
+  and swap. The container still sees a normal path (`/run/secrets/<name>`) via
+  a bind-mount of `/proc/self/fd/<n>`. TPM2-sealed secrets (decrypted via
+  `systemd-creds`) use the same mechanism so the plaintext never enters the
+  page cache. Falls back transparently to a read-only bind-mount on older
+  kernels. All secret file opens now use `O_NOFOLLOW`.
+
+- **`oci2bin from-chroot <dir>`** — build a self-contained binary directly
+  from a chroot directory without Docker. The directory is packed into a single
+  OCI image layer (setuid/setgid stripped, `proc`/`sys`/`dev` skipped, mtime
+  forced to 0 for reproducibility) and piped through the standard build
+  pipeline. Supports `--entrypoint`, `--cmd`, `--env`, `--workdir`, `--arch`,
+  `--user`, `--label`, and pass-through `-- BUILD_OPTIONS`.
+
+- **`oci2bin build-dockerfile [Dockerfile]`** — build a self-contained binary
+  from a Dockerfile without a Docker daemon. Supports a BuildKit-compatible
+  Dockerfile subset:
+  - Instructions: `FROM scratch|<oci-layout-dir>|<docker-image>`, `COPY`,
+    `ADD`, `RUN`, `ENV`, `ENTRYPOINT`, `CMD`, `WORKDIR`, `LABEL`, `USER`,
+    `EXPOSE`, `ARG`
+  - `RUN` executes via `unshare --user --map-root-user --mount --pid --fork
+    chroot` — no daemon required
+  - `RUN --mount=type=secret,id=<id>` — inject a `--build-secret` file into
+    the build step only; not included in the image layer
+  - `RUN --mount=type=ssh` — forward `$SSH_AUTH_SOCK` into the build step
+  - `RUN --mount=type=cache,target=<path>` — persistent cache across builds at
+    `~/.cache/oci2bin/build-cache/<id>`
+  - `RUN --mount=type=bind,source=<src>` — bind-mount from the build context
+  - `RUN --mount=type=tmpfs,target=<path>` — in-memory scratch space
+  - `--build-secret id=<id>,src=<path>` and `--build-arg KEY=VAL` flags
+
+- **`oci2bin mcp-serve`** — JSON-RPC 2.0 MCP server exposing container
+  lifecycle tools (`run_container`, `stop_container`, `list_containers`,
+  `inspect_image`) to AI agents and editors via stdin/stdout.
+
+- **`--lazy` flag** — experimental userfaultfd-based lazy loading: registers
+  the OCI tar region with the kernel and services page faults on demand,
+  reducing startup latency for large images by avoiding an upfront full read.
+  Requires `UFFD_FEATURE_MISSING_ANON` (Linux ≥ 5.7). Automatically disabled
+  if the kernel does not support it.
+
+- **TPM2-sealed secrets via `--secret tpm2:<cred>[:<path>]`** — decrypt
+  credentials sealed with `systemd-creds encrypt --tpm2-device=auto` at
+  container startup. Requires `systemd-creds` in PATH.
+
+- **libFuzzer harnesses** — `fuzz_json.c` (JSON helpers), `fuzz_seccomp.c`,
+  `fuzz_parse_opts.c`, `fuzz_mcp_jsonrpc.c` (MCP JSON-RPC parser). Corpus
+  expanded with 8 new seed inputs targeting real edge cases: escaped strings,
+  bracket-in-string (targeting `json_get_array` bracket-matcher), seccomp
+  profiles, unicode keys, deep nesting, large arrays.
+
+- **`RUN_CMD_CAPTURE_MAX` constant** — replaced bare `64 * 1024 * 1024`
+  literal in `run_cmd_capture()` with a named constant.
+
+### Fixed
+
+- **MCP log symlink attack** — `open()` for `/tmp/oci2bin-mcp-<name>.log`
+  now uses `O_NOFOLLOW`; a local attacker could have pre-created the path as a
+  symlink to redirect log writes to an arbitrary file.
+
+- **MCP volume path injection** — volume specs received from an MCP client are
+  now validated with `path_is_absolute_and_clean` and
+  `path_has_dotdot_component` before being forwarded to the container argv.
+  Invalid specs are rejected and logged.
+
+- **`inspect_image_main` config digest traversal** — `/` removed from the
+  digest sanitizer charset; a crafted `Config` field like
+  `"sha256:../../etc/shadow"` could have constructed a path outside the OCI
+  directory. Added an explicit `strncmp` check that the resolved path stays
+  under `oci_dir/`.
+
+- **`inspect_image_main` tmpdir leak** — the function created a
+  `mkdtemp`-allocated temporary directory but none of the ~15 return paths
+  called `rm_rf_dir()`. Every invocation left a
+  `/tmp/oci2bin-inspect.XXXXXX` directory.
+
+- **`install_plain_secret` short read** — replaced single `read()` syscall
+  with `read_all_fd()` loop. A short read would silently fall back from
+  `memfd_secret` to a less-protected bind-mount without any warning.
+
+- **`run_cmd_capture()` cap check** — tightened from `>` to `>=` so the
+  64 MiB ceiling is enforced exactly at the boundary rather than one byte over.
+
 ## [0.10.0] - 2026-04-18
 
 ### Added
