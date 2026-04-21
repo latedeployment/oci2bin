@@ -360,16 +360,16 @@ def _mount_secret(m: dict, state: _State) -> tuple:
     src = state.build_secrets.get(secret_id)
     if not src:
         if m.get("required") is True or m.get("required") == "true":
-            print(f"error: --mount=type=secret,id={secret_id}: "
-                  f"secret not provided (use --build-secret id={secret_id},src=<path>)",
+            print("error: --mount=type=secret: required secret not provided"
+                  " (use --build-secret id=<id>,src=<path>)",
                   file=sys.stderr)
             sys.exit(1)
-        print(f"  warning: secret id={secret_id!r} not provided, skipping mount",
+        print("  warning: optional secret not provided, skipping mount",
               file=sys.stderr)
         return "", None
 
     if not os.path.exists(src):
-        print(f"error: --build-secret id={secret_id}: file not found: {src}",
+        print("error: --build-secret: secret file not found",
               file=sys.stderr)
         sys.exit(1)
 
