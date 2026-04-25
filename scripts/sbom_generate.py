@@ -114,6 +114,21 @@ def extract_rootfs_to_tmpdir(oci_bytes, tmpdir):
             name = member.name.lstrip('./')
             if '..' in name.split('/'):
                 continue
+            # Refuse to traverse through any existing symlink in the path:
+            # a malicious earlier layer could drop a symlink (e.g. etc -> /tmp)
+            # that would redirect a later file write outside the rootfs.
+            parts = name.split('/')
+            cur = rootfs
+            traversed_symlink = False
+            for p in parts[:-1]:
+                if not p or p == '.':
+                    continue
+                cur = os.path.join(cur, p)
+                if os.path.islink(cur):
+                    traversed_symlink = True
+                    break
+            if traversed_symlink:
+                continue
             dest = os.path.join(rootfs, name)
             if member.isdir():
                 os.makedirs(dest, exist_ok=True)

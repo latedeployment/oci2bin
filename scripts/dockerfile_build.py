@@ -314,7 +314,8 @@ def _mount_bind(m: dict, state: _State) -> tuple:
         sys.exit(1)
 
     src = os.path.normpath(os.path.join(state.context_dir, src_rel))
-    if not src.startswith(state.context_dir):
+    if src != state.context_dir and \
+            not src.startswith(state.context_dir + os.sep):
         print(f"error: --mount=type=bind source escapes build context: {src_rel}",
               file=sys.stderr)
         sys.exit(1)

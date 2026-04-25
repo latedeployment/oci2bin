@@ -585,7 +585,12 @@ if [[ "${1:-}" == "push" ]]; then
 
     echo "oci2bin push: loading $PUSH_BINARY into Docker..." >&2
     LOAD_OUTPUT="$(docker load < "$PUSH_BINARY" 2>&1)"
-    LOADED_IMAGE="$(echo "$LOAD_OUTPUT" | grep -oP 'Loaded image: \K.*' | head -1)"
+    # Anchor the match to start-of-line so a crafted RepoTag containing a
+    # newline + "Loaded image: " cannot spoof the captured image name.
+    LOADED_IMAGE="$(printf '%s\n' "$LOAD_OUTPUT" | awk -F': ' '
+        /^Loaded image: / { print substr($0, 15); exit }
+        /^Loaded image ID: / { print substr($0, 18); exit }
+    ')"
 
     if [[ -z "$LOADED_IMAGE" ]]; then
         echo "oci2bin push: docker load failed:" >&2

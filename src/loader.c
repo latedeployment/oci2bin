@@ -946,17 +946,32 @@ static const char* json_skip_to_value(const char* json, const char* key)
     {
         return NULL;    /* key too long */
     }
-    const char* p = strstr(json, needle);
-    if (!p)
+    /* Reject matches that sit inside a JSON string value: a hostile
+     * manifest could embed `\"Cmd\":fake` in an unrelated string.
+     * Require the matched key to appear at a structural position —
+     * the previous non-whitespace byte must be '{' or ',' (object
+     * start or member separator), or the key is at the start. */
+    const char* p = json;
+    while ((p = strstr(p, needle)) != NULL)
     {
-        return NULL;
+        const char* q = p;
+        while (q > json && (q[-1] == ' ' || q[-1] == '\t' ||
+                            q[-1] == '\n' || q[-1] == '\r'))
+        {
+            q--;
+        }
+        if (q == json || q[-1] == '{' || q[-1] == ',')
+        {
+            const char* v = p + (size_t)nlen;
+            while (*v == ' ' || *v == ':' || *v == '\t' || *v == '\n')
+            {
+                v++;
+            }
+            return v;
+        }
+        p++;    /* not at structural position; keep scanning */
     }
-    p += (size_t)nlen;
-    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n')
-    {
-        p++;
-    }
-    return p;
+    return NULL;
 }
 
 /* Find a JSON string value for a given key. Returns malloc'd string or NULL. */
