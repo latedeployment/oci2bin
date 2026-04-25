@@ -1219,6 +1219,29 @@ static void test_parse_opts_misc_flags(void)
                       "parse_opts: --no-userns-remap sets flag");
     }
 
+    /* --landlock / --no-landlock */
+    {
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(opts.landlock_mode, LANDLOCK_MODE_AUTO,
+                      "parse_opts: landlock default is AUTO");
+    }
+    {
+        char* argv[] = {"prog", "--landlock", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --landlock returns 0");
+        ASSERT_INT_EQ(opts.landlock_mode, LANDLOCK_MODE_ON,
+                      "parse_opts: --landlock sets ON");
+    }
+    {
+        char* argv[] = {"prog", "--no-landlock", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --no-landlock returns 0");
+        ASSERT_INT_EQ(opts.landlock_mode, LANDLOCK_MODE_OFF,
+                      "parse_opts: --no-landlock sets OFF");
+    }
+
     /* --workdir */
     {
         char arg[] = "/app";
@@ -1677,6 +1700,28 @@ static void test_kernel_feature_runtime_detection(void)
                       uffd_live ? KERNEL_FEATURE_SUPPORTED :
                       KERNEL_FEATURE_UNSUPPORTED,
                       "kernel feature: uffd probe result cached");
+    }
+
+    /* Landlock probe */
+    kernel_set_feature_state(KERNEL_FEATURE_LANDLOCK,
+                             KERNEL_FEATURE_UNSUPPORTED);
+    ASSERT_INT_EQ(kernel_supports_landlock(), 0,
+                  "kernel feature: landlock cached unsupported");
+    kernel_set_feature_state(KERNEL_FEATURE_LANDLOCK,
+                             KERNEL_FEATURE_SUPPORTED);
+    ASSERT_INT_EQ(kernel_supports_landlock(), 1,
+                  "kernel feature: landlock cached supported");
+
+    kernel_set_feature_state(KERNEL_FEATURE_LANDLOCK,
+                             KERNEL_FEATURE_UNKNOWN);
+    {
+        int ll_live = kernel_supports_landlock();
+        ASSERT_INT_EQ(ll_live == 0 || ll_live == 1, 1,
+                      "kernel feature: landlock runtime probe returns 0 or 1");
+        ASSERT_INT_EQ(g_kernel_feature_state[KERNEL_FEATURE_LANDLOCK],
+                      ll_live ? KERNEL_FEATURE_SUPPORTED :
+                      KERNEL_FEATURE_UNSUPPORTED,
+                      "kernel feature: landlock probe result cached");
     }
 }
 

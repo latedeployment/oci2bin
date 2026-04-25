@@ -76,6 +76,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
   - [Capabilities](#capabilities)
   - [Seccomp filter](#seccomp-filter)
     - [Generating a minimal seccomp profile](#generating-a-minimal-seccomp-profile)
+  - [Landlock filesystem sandbox](#landlock-filesystem-sandbox)
   - [Debugging with gdb](#debugging-with-gdb)
   - [Clock offset (time namespace)](#clock-offset-time-namespace)
   - [Audit logging](#audit-logging)
@@ -963,6 +964,34 @@ required.
 > **Tip:** Run the tracer against a representative workload — startup, warm-up
 > requests, graceful shutdown — to ensure all syscalls are captured before
 > locking down the profile.
+
+### Landlock filesystem sandbox
+
+The loader applies a [Landlock LSM](https://landlock.io/) sandbox after chroot
+on Linux 5.13+. Once enforced, the kernel allows filesystem access only inside
+the rootfs, explicit `-v` bind targets, `--tmpfs` paths, and `--secret` mounts
+— nothing else, even after a hypothetical chroot escape (rules are pinned to
+inodes, not paths).
+
+```bash
+./my-app                  # auto-on when the kernel supports Landlock
+./my-app --landlock       # require Landlock; fail if kernel lacks support
+./my-app --no-landlock    # disable Landlock (e.g. for debugging tools)
+```
+
+The default is **auto**: enabled on supporting kernels, silently skipped on
+older ones. `--landlock` makes Landlock a hard requirement; `--no-landlock`
+turns it off entirely. Landlock complements seccomp — seccomp blocks syscalls
+by *number*, Landlock blocks filesystem access by *path*. Both layers run in
+parallel.
+
+**Notes:**
+- Landlock is irrevocable: once `landlock_restrict_self()` returns, the rules
+  stick to the process and all its children.
+- The audit-log fd and the metrics-socket fd are inherited from the parent
+  pre-fork, so they keep working even though their backing paths sit outside
+  the allowed subtrees.
+- Use `--debug` to see which paths were added to the ruleset.
 
 ### Debugging with gdb
 

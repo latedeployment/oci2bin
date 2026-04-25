@@ -75,6 +75,57 @@
 #endif
 #endif
 
+/* Landlock LSM (Linux 5.13+).  Probed at runtime; the syscall numbers are
+ * the same on x86_64 and aarch64 (444/445/446).  Provide fallback definitions
+ * so the loader builds against older kernel headers. */
+#ifndef __NR_landlock_create_ruleset
+#if defined(__x86_64__) || defined(__aarch64__)
+#define __NR_landlock_create_ruleset 444
+#endif
+#endif
+#ifndef __NR_landlock_add_rule
+#if defined(__x86_64__) || defined(__aarch64__)
+#define __NR_landlock_add_rule 445
+#endif
+#endif
+#ifndef __NR_landlock_restrict_self
+#if defined(__x86_64__) || defined(__aarch64__)
+#define __NR_landlock_restrict_self 446
+#endif
+#endif
+
+#ifndef LANDLOCK_CREATE_RULESET_VERSION
+#define LANDLOCK_CREATE_RULESET_VERSION (1U << 0)
+#endif
+#ifndef LANDLOCK_ACCESS_FS_EXECUTE
+#define LANDLOCK_ACCESS_FS_EXECUTE     (1ULL << 0)
+#define LANDLOCK_ACCESS_FS_WRITE_FILE  (1ULL << 1)
+#define LANDLOCK_ACCESS_FS_READ_FILE   (1ULL << 2)
+#define LANDLOCK_ACCESS_FS_READ_DIR    (1ULL << 3)
+#define LANDLOCK_ACCESS_FS_REMOVE_DIR  (1ULL << 4)
+#define LANDLOCK_ACCESS_FS_REMOVE_FILE (1ULL << 5)
+#define LANDLOCK_ACCESS_FS_MAKE_CHAR   (1ULL << 6)
+#define LANDLOCK_ACCESS_FS_MAKE_DIR    (1ULL << 7)
+#define LANDLOCK_ACCESS_FS_MAKE_REG    (1ULL << 8)
+#define LANDLOCK_ACCESS_FS_MAKE_SOCK   (1ULL << 9)
+#define LANDLOCK_ACCESS_FS_MAKE_FIFO   (1ULL << 10)
+#define LANDLOCK_ACCESS_FS_MAKE_BLOCK  (1ULL << 11)
+#define LANDLOCK_ACCESS_FS_MAKE_SYM    (1ULL << 12)
+#endif
+
+#ifndef LANDLOCK_RULE_PATH_BENEATH
+#define LANDLOCK_RULE_PATH_BENEATH 1
+struct landlock_ruleset_attr
+{
+    unsigned long long handled_access_fs;
+};
+struct landlock_path_beneath_attr
+{
+    unsigned long long allowed_access;
+    int parent_fd;
+} __attribute__((packed));
+#endif
+
 /* Maximum bytes buffered by run_cmd_capture() before aborting. */
 #define RUN_CMD_CAPTURE_MAX (64u * 1024u * 1024u)
 
@@ -140,6 +191,7 @@ enum kernel_feature_id
     KERNEL_FEATURE_CLONE3 = 0,
     KERNEL_FEATURE_MSEAL,
     KERNEL_FEATURE_UFFD,
+    KERNEL_FEATURE_LANDLOCK,
     KERNEL_FEATURE_MAX,
 };
 
@@ -222,6 +274,22 @@ static int probe_uffd_support(void)
 #endif
 }
 
+/*
+ * Probe Landlock by asking the kernel for the supported ABI version.
+ * landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION) returns
+ * the version (>=1) on supported kernels, or -1/ENOSYS otherwise.
+ */
+static int probe_landlock_support(void)
+{
+#ifdef __NR_landlock_create_ruleset
+    long abi = syscall(__NR_landlock_create_ruleset, NULL, 0UL,
+                       (unsigned long)LANDLOCK_CREATE_RULESET_VERSION);
+    return abi > 0;
+#else
+    return 0;
+#endif
+}
+
 static int kernel_feature_supported(enum kernel_feature_id feature)
 {
     int state;
@@ -251,6 +319,11 @@ static int kernel_feature_supported(enum kernel_feature_id feature)
                         KERNEL_FEATURE_SUPPORTED :
                         KERNEL_FEATURE_UNSUPPORTED;
                 break;
+            case KERNEL_FEATURE_LANDLOCK:
+                state = probe_landlock_support() ?
+                        KERNEL_FEATURE_SUPPORTED :
+                        KERNEL_FEATURE_UNSUPPORTED;
+                break;
             default:
                 state = KERNEL_FEATURE_UNSUPPORTED;
                 break;
@@ -274,6 +347,11 @@ static int kernel_supports_mseal(void)
 static int kernel_supports_uffd(void)
 {
     return kernel_feature_supported(KERNEL_FEATURE_UFFD);
+}
+
+static int kernel_supports_landlock(void)
+{
+    return kernel_feature_supported(KERNEL_FEATURE_LANDLOCK);
 }
 
 /*
@@ -549,7 +627,16 @@ struct container_opts
 
     /* --lazy  (experimental: attempt userfaultfd-based on-demand rootfs paging) */
     int lazy;
+
+    /* Landlock LSM filesystem sandbox.
+     *  0 = auto (default ON when kernel supports it)
+     *  1 = forced on (--landlock); error out if unsupported
+     *  2 = forced off (--no-landlock); never apply */
+    int landlock_mode;
 };
+#define LANDLOCK_MODE_AUTO  0
+#define LANDLOCK_MODE_ON    1
+#define LANDLOCK_MODE_OFF   2
 
 struct userns_map_plan
 {
@@ -4209,6 +4296,208 @@ static int run_as_init(char** exec_args,
     audit_emit_wait_status("exit", child, child_status);
     return 1;
 }
+/* ── Landlock LSM filesystem sandbox ─────────────────────────────────────── */
+
+/*
+ * Add a path-beneath rule to a Landlock ruleset.  Opens `path` with O_PATH so
+ * the kernel can pin the inode, then calls landlock_add_rule.  The fd is
+ * closed before returning.  Returns 0 on success or -1 (errno set) on failure.
+ */
+static int landlock_add_path_rule(int rs_fd, const char* path,
+                                  unsigned long long allowed_access)
+{
+#ifdef __NR_landlock_add_rule
+    int parent_fd = open(path, O_PATH | O_CLOEXEC);
+    if (parent_fd < 0)
+    {
+        return -1;
+    }
+    struct landlock_path_beneath_attr pb;
+    pb.allowed_access = allowed_access;
+    pb.parent_fd      = parent_fd;
+    long rc = syscall(__NR_landlock_add_rule, rs_fd,
+                      (unsigned long)LANDLOCK_RULE_PATH_BENEATH,
+                      &pb, 0UL);
+    int saved = errno;
+    close(parent_fd);
+    if (rc < 0)
+    {
+        errno = saved;
+        return -1;
+    }
+    return 0;
+#else
+    (void)rs_fd;
+    (void)path;
+    (void)allowed_access;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+/*
+ * Build and enforce a Landlock ruleset that allows full filesystem access
+ * inside the container's rootfs and any explicit user-supplied bind targets,
+ * tmpfs paths, and secret mounts.  Once landlock_restrict_self() returns,
+ * the kernel will deny any filesystem access outside the named subtrees —
+ * even after a hypothetical chroot escape, because rules are anchored to
+ * inodes, not paths.
+ *
+ * MUST be called AFTER chroot so that "/" refers to the rootfs and bind
+ * mounts are reachable at their container paths.  Landlock pins the
+ * underlying inode of each named path; bind mounts therefore need their
+ * own rule (the rootfs rule does not cover them).
+ *
+ * mode: LANDLOCK_MODE_AUTO/ON/OFF.  AUTO/ON apply when the kernel supports
+ * Landlock; ON additionally errors out if not supported.  OFF returns 0.
+ *
+ * Returns 0 on success or no-op (unsupported kernel under AUTO), -1 on error.
+ */
+static int apply_landlock_sandbox(const struct container_opts* opts)
+{
+#ifdef __NR_landlock_create_ruleset
+    int mode = opts->landlock_mode;
+    if (mode == LANDLOCK_MODE_OFF)
+    {
+        return 0;
+    }
+    if (!kernel_supports_landlock())
+    {
+        if (mode == LANDLOCK_MODE_ON)
+        {
+            fprintf(stderr,
+                    "oci2bin: --landlock requested but kernel does not"
+                    " support Landlock LSM (Linux 5.13+ required)\n");
+            return -1;
+        }
+        if (g_debug)
+        {
+            debug_log("landlock.skip", "kernel does not support landlock");
+        }
+        return 0;
+    }
+
+    unsigned long long handled =
+        LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+        LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+        LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_DIR |
+        LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_SOCK |
+        LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+        LANDLOCK_ACCESS_FS_MAKE_SYM;
+
+    struct landlock_ruleset_attr ra;
+    ra.handled_access_fs = handled;
+
+    int rs_fd = (int)syscall(__NR_landlock_create_ruleset, &ra,
+                             sizeof(ra), 0UL);
+    if (rs_fd < 0)
+    {
+        if (mode == LANDLOCK_MODE_ON)
+        {
+            fprintf(stderr, "oci2bin: landlock_create_ruleset: %s\n",
+                    strerror(errno));
+            return -1;
+        }
+        return 0;    /* AUTO: silently skip */
+    }
+
+    /* Allow the rootfs subtree (full RWX). After chroot, "/" IS the rootfs. */
+    if (landlock_add_path_rule(rs_fd, "/", handled) < 0)
+    {
+        fprintf(stderr, "oci2bin: landlock add rootfs '/': %s\n",
+                strerror(errno));
+        close(rs_fd);
+        return mode == LANDLOCK_MODE_ON ? -1 : 0;
+    }
+
+    /* Allow each bind-mount container path: bind mounts have a different
+     * underlying inode than the rootfs, so the rootfs rule above does not
+     * automatically cover them. */
+    for (int i = 0; i < opts->n_vols; i++)
+    {
+        if (landlock_add_path_rule(rs_fd, opts->vol_ctr[i], handled) < 0)
+        {
+            if (g_debug)
+            {
+                debug_log("landlock.vol", "skip %s: %s",
+                          opts->vol_ctr[i], strerror(errno));
+            }
+        }
+    }
+
+    /* Allow each tmpfs mount inside the container. */
+    for (int i = 0; i < opts->n_tmpfs; i++)
+    {
+        if (landlock_add_path_rule(rs_fd, opts->tmpfs_mounts[i],
+                                   handled) < 0)
+        {
+            if (g_debug)
+            {
+                debug_log("landlock.tmpfs", "skip %s: %s",
+                          opts->tmpfs_mounts[i], strerror(errno));
+            }
+        }
+    }
+
+    /* Allow secret container paths (read-only is sufficient). */
+    for (int i = 0; i < opts->n_secrets; i++)
+    {
+        const char* p = opts->secret_ctr[i];
+        if (!p)
+        {
+            continue;    /* default location is under /run/secrets, in rootfs */
+        }
+        unsigned long long ro =
+            LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+        if (landlock_add_path_rule(rs_fd, p, ro) < 0)
+        {
+            if (g_debug)
+            {
+                debug_log("landlock.secret", "skip %s: %s",
+                          p, strerror(errno));
+            }
+        }
+    }
+
+    /* Landlock requires PR_SET_NO_NEW_PRIVS.  Seccomp setup also sets it,
+     * but Landlock may run before seccomp on the --no-seccomp / --gdb paths. */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: prctl(PR_SET_NO_NEW_PRIVS) failed (landlock): %s\n",
+                strerror(errno));
+        close(rs_fd);
+        return mode == LANDLOCK_MODE_ON ? -1 : 0;
+    }
+
+    if (syscall(__NR_landlock_restrict_self, rs_fd, 0UL) < 0)
+    {
+        fprintf(stderr, "oci2bin: landlock_restrict_self: %s\n",
+                strerror(errno));
+        close(rs_fd);
+        return mode == LANDLOCK_MODE_ON ? -1 : 0;
+    }
+    close(rs_fd);
+
+    if (g_debug)
+    {
+        debug_log("landlock.applied", "vols=%d tmpfs=%d secrets=%d",
+                  opts->n_vols, opts->n_tmpfs, opts->n_secrets);
+    }
+    audit_emit_pid("landlock", getpid(), "");
+    return 0;
+#else
+    if (opts->landlock_mode == LANDLOCK_MODE_ON)
+    {
+        fprintf(stderr,
+                "oci2bin: --landlock: this build has no Landlock support\n");
+        return -1;
+    }
+    return 0;
+#endif
+}
+
 /* ── seccomp ─────────────────────────────────────────────────────────────── */
 
 /*
@@ -6683,6 +6972,15 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         apply_capabilities(opts);
     }
 
+    /* Apply Landlock LSM filesystem sandbox (Linux 5.13+).  Pins inodes for
+     * the rootfs and bind/tmpfs/secret targets; everything else becomes
+     * unreachable for filesystem syscalls — even if a chroot escape were
+     * possible.  AUTO mode no-ops on older kernels; --landlock enforces it. */
+    if (apply_landlock_sandbox(opts) < 0)
+    {
+        return 1;
+    }
+
     /* Apply seccomp filter (must be before fork so child inherits it).
      * --gdb disables seccomp entirely: gdb needs ptrace and many syscalls. */
     if (opts->gdb)
@@ -7109,6 +7407,10 @@ static void usage(const char* prog)
             "                      and write a minimal Docker-compatible allowlist\n"
             "                      JSON to FILE. Use the output with\n"
             "                      --seccomp-profile for hardened production runs.\n"
+            "  --landlock          Require Landlock LSM filesystem sandbox\n"
+            "                      (Linux 5.13+); error out if unsupported.\n"
+            "                      Default: auto-on when supported, skip otherwise.\n"
+            "  --no-landlock       Disable the Landlock filesystem sandbox.\n"
             "  --gdb               Launch gdb inside the container with the image\n"
             "                      entrypoint as the debuggee (host gdb bind-mounted\n"
             "                      in if not present). Disables seccomp to allow\n"
@@ -8440,6 +8742,14 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--lazy") == 0)
         {
             opts->lazy = 1;
+        }
+        else if (strcmp(argv[i], "--landlock") == 0)
+        {
+            opts->landlock_mode = LANDLOCK_MODE_ON;
+        }
+        else if (strcmp(argv[i], "--no-landlock") == 0)
+        {
+            opts->landlock_mode = LANDLOCK_MODE_OFF;
         }
         else if (strcmp(argv[i], "-t") == 0
                  || strcmp(argv[i], "--tty") == 0)
