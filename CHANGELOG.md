@@ -2,6 +2,21 @@
 
 All notable changes to oci2bin are documented here.
 
+## [Unreleased]
+
+### Skipped
+
+- **`--vsock-control` for VM mode** — deferred. The full feature
+  requires (1) wiring `--vsock cid=3,socket=PATH` into the
+  cloud-hypervisor argv builder, (2) calling `krun_set_vsock_port`
+  in the libkrun path, (3) shipping a tiny guest-side daemon inside
+  the initramfs that listens on AF_VSOCK and dispatches
+  `exec`/`stop`/`stats` commands, and (4) a host-side helper to send
+  commands to the UNIX socket the VMM exposes. The guest agent is the
+  largest piece because it needs its own statically-linked binary
+  injected into `build_initramfs` plus an init wrapper. Skipped this
+  iteration; tracked in `RALPH_WORK.md` as still pending.
+
 ## [0.11.0] - 2026-04-20
 
 ### Added
