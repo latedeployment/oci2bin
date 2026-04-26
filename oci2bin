@@ -361,6 +361,13 @@ if [[ "${1:-}" == "verify" ]]; then
     exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" verify "$@"
 fi
 
+# ── attest-show subcommand ────────────────────────────────────────────────
+
+if [[ "${1:-}" == "attest-show" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" attest-show "$@"
+fi
+
 # ── detached file signing subcommands ──────────────────────────────────────
 
 if [[ "${1:-}" == "sign-file" ]]; then

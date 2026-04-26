@@ -1240,6 +1240,33 @@ oci2bin verify-file --key signing.pub --in ./update.json --sig ./update.json.sig
 If verification fails the process exits immediately without writing a single byte
 to disk.
 
+#### SLSA / in-toto provenance
+
+`oci2bin sign --attest` embeds an [in-toto Statement v1](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md) carrying a [SLSA provenance v1](https://slsa.dev/spec/v1.0/provenance) predicate alongside the binary signature. The attestation describes the build environment and is signed with the same key, so a single `oci2bin verify` validates both the binary AND its provenance.
+
+```bash
+# Auto-generate provenance describing the build host (oci2bin version,
+# host arch, kernel, hostname, invocation ID, timestamps).
+oci2bin sign --key signing.key --attest auto --in ./redis_7-alpine
+
+# Auto-generate and record the source image digest in the attestation.
+oci2bin sign --key signing.key --attest auto \
+    --source-image-digest "$(docker inspect --format '{{index .RepoDigests 0}}' redis:7-alpine)" \
+    --in ./redis_7-alpine
+
+# Embed a hand-rolled in-toto Statement v1 from a JSON file.
+oci2bin sign --key signing.key --attest provenance.json --in ./redis_7-alpine
+
+# Verify and require an attestation to be present.
+oci2bin verify --key signing.pub --in ./redis_7-alpine --require-attestation
+echo $?   # 0 = both signature and attestation OK; 2 = either failed
+
+# Inspect the embedded attestation.
+oci2bin attest-show --in ./redis_7-alpine
+```
+
+Without `--attest`, the binary is signed with the legacy v2 trailer for compatibility with older `oci2bin verify` clients. With `--attest`, a v3 trailer is written that older clients will fail to parse — choose based on your verification fleet. The attestation JSON is capped at 256 KiB.
+
 For self-updating binaries, point `--self-update-url` at a JSON manifest and sign that manifest with `sign-file`. The manifest format is:
 
 ```json

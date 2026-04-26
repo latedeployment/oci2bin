@@ -334,6 +334,8 @@ test-python:
 		tests.test_embed_loader.TestEmbedLoaderLabels -v
 	@echo "=== CLI feature unit tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_cli_features -v
+	@echo "=== Sign + attestation unit tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_sign_attest -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

@@ -12,13 +12,27 @@ Embedded signature block formats (appended to end of binary):
     trailer:  b"OCI2BIN_SIG_END\x00"  (16 bytes)
     totallen: uint32 big-endian
 
-  v2 current:
+  v2:
     magic:    b"OCI2BIN_SIG\x00"
     version:  uint8 = 2
     hash_alg: uint8 (1=sha256, 3=sha512)
     keyid:    SHA-256 of DER public key
     siglen:   uint16 big-endian
     sig:      DER-encoded ECDSA signature
+    trailer:  b"OCI2BIN_SIG_END\x00"
+    totallen: uint32 big-endian
+
+  v3 current — adds optional in-toto/SLSA attestation:
+    magic:    b"OCI2BIN_SIG\x00"
+    version:  uint8 = 3
+    hash_alg: uint8
+    keyid:    SHA-256 of DER public key
+    siglen:   uint16 big-endian
+    sig:      DER-encoded ECDSA signature over the binary content
+    attlen:   uint32 big-endian      — 0 if no attestation embedded
+    att:      attlen bytes (UTF-8 in-toto Statement v1 JSON)
+    attsiglen:uint16 big-endian      — 0 if no attestation embedded
+    attsig:   attsiglen bytes (DER ECDSA signature over att)
     trailer:  b"OCI2BIN_SIG_END\x00"
     totallen: uint32 big-endian
 
@@ -36,26 +50,41 @@ Detached signature files:
 Usage:
   sign_binary.py sign --key KEY.pem --in BINARY [--out BINARY]
                       [--hash-algorithm sha256|sha512]
-  sign_binary.py verify --key PUB.pem --in BINARY
+                      [--attest auto|FILE] [--source-image-digest DIGEST]
+  sign_binary.py verify --key PUB.pem --in BINARY [--require-attestation]
+  sign_binary.py attest-show --in BINARY
   sign_binary.py sign-file --key KEY.pem --in FILE --out SIG
                            [--hash-algorithm sha256|sha512]
   sign_binary.py verify-file --key PUB.pem --in FILE --sig SIG
 """
 
 import argparse
+import datetime
 import hashlib
+import json
+import platform
+import socket
 import struct
 import subprocess
 import sys
 import os
 import tempfile
+import uuid
 
 MAGIC = b"OCI2BIN_SIG\x00"
 TRAILER = b"OCI2BIN_SIG_END\x00"
 DETACHED_MAGIC = b"OCI2BIN_DSIG\x00"
 VERSION_LEGACY = 1
 VERSION_ALGO = 2
+VERSION_ATTESTED = 3
 DETACHED_VERSION = 1
+# Cap embedded attestation at 256 KiB so we never read an attacker-controlled
+# uint32 length without bound.
+MAX_ATTESTATION_BYTES = 256 * 1024
+SLSA_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
+INTOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+OCI2BIN_BUILD_TYPE = "https://oci2bin.dev/build/v1"
+OCI2BIN_BUILDER_ID = "https://oci2bin.dev/builders/local"
 HASH_ALGORITHMS = {
     "sha256": 1,
     "sha512": 3,
@@ -204,36 +233,44 @@ def _read_pubkey_der_from_privkey(privkey_pem: bytes) -> bytes:
 def _find_sig_block(data: bytes):
     """
     Locate and parse the signature block at the end of data.
-    Returns (content_end, sig_bytes, keyid, hash_algorithm) or
-    (None, None, None, None) if not signed. content_end is the offset where
-    the sig block begins.
+    Returns a 6-tuple:
+        (content_end, sig_bytes, keyid, hash_algorithm,
+         attestation_bytes, attestation_sig_bytes)
+    or (None,)*6 if not signed. content_end is the offset where the sig block
+    begins.  attestation_bytes / attestation_sig_bytes are non-empty only when
+    a v3 block embeds an in-toto attestation.
     """
+    not_signed = (None, None, None, None, None, None)
     if len(data) < FOOTER_SIZE:
-        return None, None, None, None
+        return not_signed
     trailer_pos = len(data) - FOOTER_SIZE
     if data[trailer_pos:trailer_pos + len(TRAILER)] != TRAILER:
-        return None, None, None, None
+        return not_signed
     total_len = struct.unpack(">I", data[-4:])[0]
     min_legacy_len = len(MAGIC) + 1 + 32 + 2 + len(TRAILER) + 4
-    min_current_len = len(MAGIC) + 1 + 1 + 32 + 2 + len(TRAILER) + 4
+    min_v2_len = len(MAGIC) + 1 + 1 + 32 + 2 + len(TRAILER) + 4
+    min_v3_len = min_v2_len + 4 + 2  # attlen + attsiglen
     if total_len > len(data) or total_len < min_legacy_len:
-        return None, None, None, None
+        return not_signed
     block_start = len(data) - total_len
     if data[block_start:block_start + len(MAGIC)] != MAGIC:
-        return None, None, None, None
+        return not_signed
+    block_end_excl_footer = trailer_pos
     off = block_start + len(MAGIC)
     version = data[off]
     if version == VERSION_LEGACY:
         algorithm = "sha256"
-    elif version == VERSION_ALGO:
-        if total_len < min_current_len:
-            return None, None, None, None
+    elif version in (VERSION_ALGO, VERSION_ATTESTED):
+        min_required = (min_v3_len if version == VERSION_ATTESTED
+                        else min_v2_len)
+        if total_len < min_required:
+            return not_signed
         off += 1
         algorithm = HASH_ALGORITHMS_BY_ID.get(data[off])
         if algorithm is None:
-            return None, None, None, None
+            return not_signed
     else:
-        return None, None, None, None
+        return not_signed
     off += 1
     keyid = data[off:off + 32]
     off += 32
@@ -241,8 +278,35 @@ def _find_sig_block(data: bytes):
     off += 2
     sig = data[off:off + siglen]
     if len(sig) != siglen:
-        return None, None, None, None
-    return block_start, sig, keyid, algorithm
+        return not_signed
+    off += siglen
+
+    att_bytes = b""
+    att_sig = b""
+    if version == VERSION_ATTESTED:
+        if off + 4 > block_end_excl_footer:
+            return not_signed
+        attlen = struct.unpack(">I", data[off:off + 4])[0]
+        off += 4
+        if attlen > MAX_ATTESTATION_BYTES:
+            return not_signed
+        if off + attlen > block_end_excl_footer:
+            return not_signed
+        att_bytes = data[off:off + attlen]
+        off += attlen
+        if off + 2 > block_end_excl_footer:
+            return not_signed
+        attsiglen = struct.unpack(">H", data[off:off + 2])[0]
+        off += 2
+        if off + attsiglen > block_end_excl_footer:
+            return not_signed
+        att_sig = data[off:off + attsiglen]
+        off += attsiglen
+    if off != block_end_excl_footer:
+        # Trailing junk between sig payload and the trailer — refuse rather
+        # than silently accept extra bytes that aren't covered by either sig.
+        return not_signed
+    return block_start, sig, keyid, algorithm, att_bytes, att_sig
 
 
 def _encode_detached_signature(algorithm: str, sig_bytes: bytes) -> bytes:
@@ -274,6 +338,92 @@ def _decode_detached_signature(data: bytes):
     return algorithm, sig
 
 
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(
+        tz=datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def _read_oci2bin_version() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.normpath(os.path.join(here, "..", "pyproject.toml"))
+    try:
+        with open(candidate, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("version") and "=" in line:
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _build_auto_provenance(content_hash: bytes, algorithm: str,
+                           source_image_digest: str = "") -> dict:
+    """
+    Build an in-toto Statement v1 with a SLSA provenance v1 predicate
+    describing the just-built binary.  No external tools are required.
+    """
+    subject_digest = {algorithm: content_hash.hex()}
+    started_on = _utc_now_iso()
+    invocation_id = str(uuid.uuid4())
+    external_params: dict = {}
+    if source_image_digest:
+        external_params["sourceImageDigest"] = source_image_digest
+    return {
+        "_type": INTOTO_STATEMENT_TYPE,
+        "subject": [{
+            "name":   "binary",
+            "digest": subject_digest,
+        }],
+        "predicateType": SLSA_PREDICATE_TYPE,
+        "predicate": {
+            "buildDefinition": {
+                "buildType":          OCI2BIN_BUILD_TYPE,
+                "externalParameters": external_params,
+                "internalParameters": {
+                    "oci2binVersion": _read_oci2bin_version(),
+                    "hostArch":       platform.machine() or "unknown",
+                    "hostKernel":     platform.release() or "unknown",
+                    "hostname":       socket.gethostname() or "unknown",
+                },
+                "resolvedDependencies": [],
+            },
+            "runDetails": {
+                "builder": {"id": OCI2BIN_BUILDER_ID},
+                "metadata": {
+                    "invocationId": invocation_id,
+                    "startedOn":    started_on,
+                    "finishedOn":   started_on,
+                },
+            },
+        },
+    }
+
+
+def _load_provenance_file(path: str) -> dict:
+    try:
+        size = os.stat(path).st_size
+    except OSError as e:
+        raise RuntimeError(f"--attest: cannot stat {path}: {e}") from e
+    if size > MAX_ATTESTATION_BYTES:
+        raise RuntimeError(
+            f"--attest: file too large ({size} > {MAX_ATTESTATION_BYTES})"
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"--attest: {path} is not valid JSON: {e}") from e
+
+
+def _attestation_bytes(att_json: dict) -> bytes:
+    """Canonical UTF-8 JSON encoding for the attestation embedded in the
+    binary.  Sorted keys + no extraneous whitespace gives a stable input to
+    the signature so the same JSON object always produces the same bytes."""
+    return json.dumps(att_json, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8")
+
+
 def cmd_sign(args):
     in_path = args.input
     out_path = args.output if args.output else in_path
@@ -288,7 +438,7 @@ def cmd_sign(args):
         data = f.read()
 
     # Strip any existing sig block
-    block_start, _, _, _ = _find_sig_block(data)
+    block_start, _, _, _, _, _ = _find_sig_block(data)
     if block_start is not None:
         data = data[:block_start]
 
@@ -298,47 +448,64 @@ def cmd_sign(args):
     algorithm = _normalize_hash_algorithm(args.hash_algorithm)
     content_hash = _hash_bytes(data, algorithm)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as hashf:
-        hashf.write(content_hash)
-        hash_path = hashf.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".sig") as sigf:
-        sig_path = sigf.name
-
-    try:
-        result = subprocess.run(
-            ["openssl", "pkeyutl", "-sign",
-             "-inkey", args.key,
-             "-in", hash_path,
-             "-out", sig_path,
-             "-pkeyopt", f"digest:{algorithm}"],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            print("sign_binary: openssl sign failed:",
-                  result.stderr.decode(errors="replace"), file=sys.stderr)
-            sys.exit(1)
-        with open(sig_path, "rb") as f:
-            sig_bytes = f.read()
-    finally:
-        os.unlink(hash_path)
-        os.unlink(sig_path)
-
+    sig_bytes = _sign_hash_with_key(args.key, content_hash, algorithm)
     if len(sig_bytes) > 65535:
         print("sign_binary: signature too large", file=sys.stderr)
         sys.exit(1)
 
-    # Build block
+    # Build optional in-toto attestation (v3 only).
+    att_bytes = b""
+    att_sig = b""
+    attest_arg = getattr(args, "attest", None)
+    source_image_digest = getattr(args, "source_image_digest", None) or ""
+    if attest_arg:
+        try:
+            if attest_arg == "auto":
+                att_json = _build_auto_provenance(
+                    content_hash, algorithm, source_image_digest)
+            else:
+                att_json = _load_provenance_file(attest_arg)
+        except RuntimeError as e:
+            print(f"sign_binary: {e}", file=sys.stderr)
+            sys.exit(1)
+        att_bytes = _attestation_bytes(att_json)
+        if len(att_bytes) > MAX_ATTESTATION_BYTES:
+            print("sign_binary: attestation too large "
+                  f"({len(att_bytes)} > {MAX_ATTESTATION_BYTES})",
+                  file=sys.stderr)
+            sys.exit(1)
+        att_digest = _hash_bytes(att_bytes, algorithm)
+        att_sig = _sign_hash_with_key(args.key, att_digest, algorithm)
+        if len(att_sig) > 65535:
+            print("sign_binary: attestation signature too large",
+                  file=sys.stderr)
+            sys.exit(1)
+
     siglen = len(sig_bytes)
-    total_len = len(MAGIC) + 1 + 1 + 32 + 2 + siglen + len(TRAILER) + 4
-    block = (
-        MAGIC
-        + bytes([VERSION_ALGO, HASH_ALGORITHMS[algorithm]])
-        + keyid
-        + struct.pack(">H", siglen)
-        + sig_bytes
-        + TRAILER
-        + struct.pack(">I", total_len)
-    )
+    if att_bytes or att_sig:
+        version_byte = VERSION_ATTESTED
+        body = (
+            MAGIC
+            + bytes([version_byte, HASH_ALGORITHMS[algorithm]])
+            + keyid
+            + struct.pack(">H", siglen)
+            + sig_bytes
+            + struct.pack(">I", len(att_bytes))
+            + att_bytes
+            + struct.pack(">H", len(att_sig))
+            + att_sig
+        )
+    else:
+        version_byte = VERSION_ALGO
+        body = (
+            MAGIC
+            + bytes([version_byte, HASH_ALGORITHMS[algorithm]])
+            + keyid
+            + struct.pack(">H", siglen)
+            + sig_bytes
+        )
+    total_len = len(body) + len(TRAILER) + 4
+    block = body + TRAILER + struct.pack(">I", total_len)
 
     with open(out_path, "wb") as f:
         f.write(data + block)
@@ -347,7 +514,8 @@ def cmd_sign(args):
     st = os.stat(out_path)
     os.chmod(out_path, st.st_mode | 0o111)
 
-    print(f"Signed: {out_path} (keyid: {keyid.hex()[:16]}...)")
+    suffix = " +attestation" if att_bytes else ""
+    print(f"Signed: {out_path} (keyid: {keyid.hex()[:16]}...{suffix})")
     return 0
 
 
@@ -361,49 +529,78 @@ def cmd_verify(args):
     with open(args.input, "rb") as f:
         data = f.read()
 
-    block_start, sig_bytes, keyid, algorithm = _find_sig_block(data)
+    (block_start, sig_bytes, keyid, algorithm,
+     att_bytes, att_sig) = _find_sig_block(data)
     if block_start is None:
         print(f"sign_binary: {args.input}: not signed", file=sys.stderr)
         sys.exit(1)
 
     content = data[:block_start]
-    content_hash = _hash_bytes(content, algorithm)
 
-    # Verify using openssl pkeyutl
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as kf:
         kf.write(pub_pem)
         key_path = kf.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as hf:
-        hf.write(content_hash)
-        hash_path = hf.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".sig") as sf:
-        sf.write(sig_bytes)
-        sig_path = sf.name
-
     try:
-        result = subprocess.run(
-            ["openssl", "pkeyutl", "-verify",
-             "-pubin", "-inkey", key_path,
-             "-in", hash_path,
-             "-sigfile", sig_path,
-             "-pkeyopt", f"digest:{algorithm}"],
-            capture_output=True,
-        )
-        verified = result.returncode == 0
+        binary_ok = _verify_hash_with_key(
+            key_path, _hash_bytes(content, algorithm), sig_bytes, algorithm)
+        attestation_ok = None
+        if att_bytes or att_sig:
+            attestation_ok = bool(att_bytes) and bool(att_sig) and \
+                _verify_hash_with_key(
+                    key_path, _hash_bytes(att_bytes, algorithm),
+                    att_sig, algorithm)
     finally:
         os.unlink(key_path)
-        os.unlink(hash_path)
-        os.unlink(sig_path)
 
-    if verified:
-        print(
-            f"Verified OK: {args.input} "
-            f"(keyid: {keyid.hex()[:16]}..., hash: {algorithm})"
-        )
-        return 0
-    else:
+    require_att = bool(getattr(args, "require_attestation", False))
+    if require_att and not att_bytes:
+        print(f"sign_binary: {args.input}: --require-attestation set but"
+              " no attestation embedded", file=sys.stderr)
+        sys.exit(2)
+
+    if not binary_ok:
         print(f"Verification FAILED: {args.input}", file=sys.stderr)
         sys.exit(2)
+
+    if attestation_ok is False:
+        print(f"Verification FAILED (attestation): {args.input}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    suffix = ""
+    if attestation_ok is True:
+        suffix = ", attestation: ok"
+    elif att_bytes and not attestation_ok:
+        # unreachable — guarded by branch above, but kept for safety.
+        suffix = ", attestation: BAD"
+    print(
+        f"Verified OK: {args.input} "
+        f"(keyid: {keyid.hex()[:16]}..., hash: {algorithm}{suffix})"
+    )
+    return 0
+
+
+def cmd_attest_show(args):
+    with open(args.input, "rb") as f:
+        data = f.read()
+    (block_start, _sig, _keyid, _algorithm,
+     att_bytes, _att_sig) = _find_sig_block(data)
+    if block_start is None:
+        print(f"sign_binary: {args.input}: not signed", file=sys.stderr)
+        sys.exit(1)
+    if not att_bytes:
+        print(f"sign_binary: {args.input}: no attestation embedded",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        parsed = json.loads(att_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        print(f"sign_binary: {args.input}: corrupt attestation: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.write(json.dumps(parsed, indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+    return 0
 
 
 def _sign_hash_with_key(key_path: str, digest: bytes, algorithm: str) -> bytes:
@@ -504,10 +701,24 @@ def main():
     p_sign.add_argument("--hash-algorithm", default=DEFAULT_SIGNATURE_HASH,
                         choices=sorted(HASH_ALGORITHMS),
                         help="Digest used before signing (default: %(default)s)")
+    p_sign.add_argument("--attest", default=None,
+                        help="Embed an in-toto/SLSA provenance attestation. "
+                        "Pass 'auto' to auto-generate one, or a path to a "
+                        "JSON file containing a Statement v1 to embed.")
+    p_sign.add_argument("--source-image-digest", default=None,
+                        help="Source OCI image digest, recorded in the auto-"
+                        "generated attestation as externalParameters.")
 
     p_verify = sub.add_parser("verify", help="Verify a binary signature")
     p_verify.add_argument("--key", required=True, help="PEM public key")
     p_verify.add_argument("--in", dest="input", required=True, help="Binary to verify")
+    p_verify.add_argument("--require-attestation", action="store_true",
+                          help="Fail if no in-toto attestation is embedded")
+
+    p_attest = sub.add_parser("attest-show",
+                              help="Print the embedded in-toto attestation")
+    p_attest.add_argument("--in", dest="input", required=True,
+                          help="Signed binary to inspect")
 
     p_sign_file = sub.add_parser("sign-file", help="Sign an arbitrary file")
     p_sign_file.add_argument("--key", required=True, help="PEM private key")
@@ -532,6 +743,8 @@ def main():
         sys.exit(cmd_sign(args))
     elif args.cmd == "verify":
         sys.exit(cmd_verify(args))
+    elif args.cmd == "attest-show":
+        sys.exit(cmd_attest_show(args))
     elif args.cmd == "sign-file":
         sys.exit(cmd_sign_file(args))
     elif args.cmd == "verify-file":
