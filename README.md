@@ -1585,6 +1585,30 @@ oci2bin diff --live $CONTAINER_PID ./redis_7-alpine
 
 This is useful for detecting drift between the running filesystem and the packaged image (e.g. after exec-ing into the container and modifying files).
 
+`--syscalls` runs each binary briefly under the loader's `--gen-seccomp` tracer and compares the syscall sets. Useful for "did this image upgrade widen attack surface?":
+
+```bash
+# Run each binary, capture its syscall set, print the delta.
+oci2bin diff --syscalls ./redis_old ./redis_new --cmd /bin/true --timeout 10
+```
+
+```
+- keyctl
++ landlock_add_rule
++ landlock_create_ruleset
++ landlock_restrict_self
+
+3 added, 1 removed, 142 unchanged (./redis_old: 143 → ./redis_new: 145)
+```
+
+The default trace runs each binary with `--entrypoint /bin/true` (overridable via `--cmd`) to capture the loader's init syscall surface plus a single user-process exec. Pass a longer-running command like `--cmd /usr/local/bin/myservice --self-test` for a more representative trace; raise `--timeout` accordingly. Exit code is 0 if both sets are identical, 1 if any syscall was added or removed.
+
+When you already have generated profiles (e.g. from CI), use `--from-profile` to skip the runtime trace:
+
+```bash
+oci2bin diff --syscalls --from-profile ./old.seccomp.json ./new.seccomp.json
+```
+
 ### reconstruct
 
 Rebuild a polyglot binary from a Docker image that was built with `--embed-loader-layer` or `--embed-loader-labels`. Accepts either a Docker image name (runs `docker save` internally) or a path to an existing tar or `.img` file:

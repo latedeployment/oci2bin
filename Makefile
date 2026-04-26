@@ -338,6 +338,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_sign_attest -v
 	@echo "=== Multi-arch wrapper unit tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_arch_wrapper -v
+	@echo "=== diff --syscalls unit tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_diff_syscalls -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

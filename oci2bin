@@ -557,9 +557,15 @@ if [[ "${1:-}" == "diff" ]]; then
         exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" \
             --live "$DIFF_PID" "$DIFF_BINARY"
     fi
+    if [[ "${1:-}" == "--syscalls" ]]; then
+        # Pass through --syscalls and any subsequent flags to diff_images.py.
+        exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" "$@"
+    fi
     if [[ $# -lt 2 ]]; then
         echo "Usage: oci2bin diff <binary1> <binary2>" >&2
         echo "       oci2bin diff --live PID BINARY" >&2
+        echo "       oci2bin diff --syscalls <bin1> <bin2> [--cmd CMD] [--timeout N]" >&2
+        echo "       oci2bin diff --syscalls --from-profile <profile1.json> <profile2.json>" >&2
         exit 1
     fi
     exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" "$1" "$2"

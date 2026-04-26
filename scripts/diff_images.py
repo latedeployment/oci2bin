@@ -4,6 +4,8 @@ diff_images.py — compare file contents of two oci2bin polyglot binaries.
 
 Usage:
     diff_images.py <binary1> <binary2>
+    diff_images.py --syscalls <binary1> <binary2> [--cmd CMD] [--timeout N]
+    diff_images.py --syscalls --from-profile profile1.json profile2.json
 
 Extracts the embedded OCI tar from each binary, walks all layer tarballs,
 and prints a diff of the filesystem contents:
@@ -14,7 +16,15 @@ and prints a diff of the filesystem contents:
 
 Summary line at the end: N added, N removed, N modified
 
-Pure Python, stdlib only.
+`--syscalls` runs each binary under the loader's --gen-seccomp tracer (or
+reads pre-existing JSON profiles via --from-profile) and prints the
+syscall set delta:
+
+    + landlock_add_rule    (only used by binary2)
+    - keyctl               (only used by binary1)
+
+Useful for "did this image upgrade widen attack surface?".  Pure Python,
+stdlib only.
 """
 
 import gzip
@@ -23,8 +33,10 @@ import json
 import os
 import stat as stat_module
 import struct
+import subprocess
 import sys
 import tarfile
+import tempfile
 
 # Reuse marker constants from inspect_image.py logic
 OFFSET_MARKER  = struct.pack('<Q', 0xDEADBEEFCAFEBABE)
@@ -256,7 +268,149 @@ def print_diff_results(added, removed, modified, d1, d2):
     return 1 if (added or removed or modified) else 0
 
 
+def extract_syscalls_from_profile(path):
+    """Parse a Docker-compatible seccomp profile and return the set of
+    syscall names in any ALLOW entry.  Unknown / extra fields are tolerated;
+    only `syscalls[*].names` with action SCMP_ACT_ALLOW are honoured."""
+    if os.path.getsize(path) > 4 * 1024 * 1024:
+        raise RuntimeError(f"{path}: profile larger than 4 MiB")
+    with open(path, 'r', encoding='utf-8') as f:
+        profile = json.load(f)
+    if not isinstance(profile, dict):
+        raise RuntimeError(f"{path}: profile root must be a JSON object")
+    out = set()
+    for entry in profile.get('syscalls') or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('action') != 'SCMP_ACT_ALLOW':
+            continue
+        for name in entry.get('names') or []:
+            if isinstance(name, str) and name:
+                out.add(name)
+    return out
+
+
+def trace_binary_syscalls(binary, cmd, timeout_secs):
+    """Run `binary --gen-seccomp <tmp> --entrypoint <cmd>` with a hard
+    timeout, then parse the emitted profile.  Returns the syscall name set
+    or raises RuntimeError on failure.  We deliberately do NOT pass any of
+    the workload's normal flags — the goal is to capture the loader's own
+    init-time syscall surface plus a single cmd."""
+    if not os.path.isfile(binary):
+        raise RuntimeError(f"binary not found: {binary}")
+    if not os.access(binary, os.X_OK):
+        raise RuntimeError(f"binary not executable: {binary}")
+    fd, profile_path = tempfile.mkstemp(prefix='oci2bin-syscalls-',
+                                        suffix='.json')
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            [binary, '--gen-seccomp', profile_path,
+             '--entrypoint', cmd, '--no-seccomp'],
+            capture_output=True, timeout=timeout_secs,
+            check=False,
+        )
+        if not os.path.exists(profile_path) or \
+                os.path.getsize(profile_path) == 0:
+            stderr = proc.stderr.decode(errors='replace')[-500:]
+            raise RuntimeError(
+                f"--gen-seccomp produced no output for {binary}\n{stderr}")
+        return extract_syscalls_from_profile(profile_path)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"--gen-seccomp timed out after {timeout_secs}s "
+                           f"for {binary}") from exc
+    finally:
+        try:
+            os.unlink(profile_path)
+        except OSError:
+            pass
+
+
+def print_syscall_diff(left_label, left_set, right_label, right_set):
+    """Pretty-print the syscall delta and return an exit code."""
+    only_left = sorted(left_set - right_set)
+    only_right = sorted(right_set - left_set)
+    common = left_set & right_set
+
+    for name in only_left:
+        print(f"- {name}")
+    for name in only_right:
+        print(f"+ {name}")
+
+    print()
+    print(f"{len(only_right)} added, {len(only_left)} removed, "
+          f"{len(common)} unchanged "
+          f"({left_label}: {len(left_set)} → {right_label}: "
+          f"{len(right_set)})")
+    return 1 if (only_left or only_right) else 0
+
+
+def cmd_syscalls(argv):
+    """Handle the --syscalls subcommand.  argv excludes the leading
+    --syscalls token."""
+    cmd = '/bin/true'
+    timeout_secs = 10
+    from_profile = False
+    positional = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--cmd' and i + 1 < len(argv):
+            cmd = argv[i + 1]
+            i += 2
+            continue
+        if a == '--timeout' and i + 1 < len(argv):
+            try:
+                timeout_secs = int(argv[i + 1])
+            except ValueError:
+                print("diff: --timeout requires an integer", file=sys.stderr)
+                sys.exit(1)
+            if timeout_secs < 1 or timeout_secs > 600:
+                print("diff: --timeout must be 1..600 seconds",
+                      file=sys.stderr)
+                sys.exit(1)
+            i += 2
+            continue
+        if a == '--from-profile':
+            from_profile = True
+            i += 1
+            continue
+        if a.startswith('--'):
+            print(f"diff: unknown --syscalls option: {a}", file=sys.stderr)
+            sys.exit(1)
+        positional.append(a)
+        i += 1
+
+    if len(positional) != 2:
+        print("Usage: diff_images.py --syscalls <bin1> <bin2> "
+              "[--cmd CMD] [--timeout N]", file=sys.stderr)
+        print("       diff_images.py --syscalls --from-profile "
+              "<profile1.json> <profile2.json>", file=sys.stderr)
+        sys.exit(1)
+    left, right = positional
+
+    try:
+        if from_profile:
+            left_set = extract_syscalls_from_profile(left)
+            right_set = extract_syscalls_from_profile(right)
+        else:
+            print(f"diff: tracing {left}...", file=sys.stderr)
+            left_set = trace_binary_syscalls(left, cmd, timeout_secs)
+            print(f"diff: tracing {right}...", file=sys.stderr)
+            right_set = trace_binary_syscalls(right, cmd, timeout_secs)
+    except RuntimeError as e:
+        print(f"diff: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    sys.exit(print_syscall_diff(left, left_set, right, right_set))
+
+
 def main():
+    # --syscalls SUBCOMMAND
+    if len(sys.argv) >= 2 and sys.argv[1] == '--syscalls':
+        cmd_syscalls(sys.argv[2:])
+        return
+
     # --live PID BINARY mode
     if len(sys.argv) >= 4 and sys.argv[1] == '--live':
         pid_str = sys.argv[2]
@@ -280,6 +434,10 @@ def main():
     if len(sys.argv) != 3:
         print(f"Usage: {sys.argv[0]} <binary1> <binary2>", file=sys.stderr)
         print(f"       {sys.argv[0]} --live PID BINARY", file=sys.stderr)
+        print(f"       {sys.argv[0]} --syscalls <bin1> <bin2> "
+              "[--cmd CMD] [--timeout N]", file=sys.stderr)
+        print(f"       {sys.argv[0]} --syscalls --from-profile "
+              "<profile1.json> <profile2.json>", file=sys.stderr)
         sys.exit(1)
 
     b1, b2 = sys.argv[1], sys.argv[2]
