@@ -336,6 +336,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_cli_features -v
 	@echo "=== Sign + attestation unit tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_sign_attest -v
+	@echo "=== Multi-arch wrapper unit tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_arch_wrapper -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

@@ -192,6 +192,26 @@ oci2bin --arch all alpine:latest
 
 The wrapper and the arch-specific binaries must remain in the same directory.
 
+##### Cross-arch fallback via qemu-user-static
+
+When the host architecture doesn't match either bundled binary (e.g. running an
+`x86_64`+`aarch64` bundle on a riscv64 host, or the only-x86_64 binary lands on
+an aarch64 machine), the wrapper transparently falls back to
+`qemu-user-static`:
+
+```bash
+# x86_64 bundle running on aarch64 host without binfmt_misc
+sudo apt install qemu-user-static    # or: dnf install qemu-user-static
+./alpine_latest                       # auto-execs via qemu-x86_64-static
+```
+
+Lookup order: `command -v qemu-<arch>-static`, `/usr/bin/qemu-<arch>-static`,
+`/usr/local/bin/qemu-<arch>-static`, `/opt/qemu/bin/qemu-<arch>-static`. If
+neither qemu binary nor binfmt_misc handler is present, the wrapper exits with
+a clear actionable message naming the missing helper. binfmt_misc-registered
+hosts still take the native fast path because the kernel handles foreign-arch
+ELFs transparently before the wrapper's qemu lookup runs.
+
 ### Injecting files at build time
 
 Use `--add-file HOST:CONTAINER` and `--add-dir HOST:CONTAINER` to inject files or directories into the image at build time, without needing a volume mount at runtime:

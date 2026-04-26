@@ -1915,19 +1915,62 @@ if [[ "$TARGET_ARCH" == "all" ]]; then
         MULTI_ARCH_OUTPUTS+=("$out_a")
     done
 
-    # Write the wrapper script that auto-selects the right binary
+    # Write the wrapper script that auto-selects the right binary.
+    # Native arch is preferred; on mismatched hosts (e.g. running an x86_64
+    # bundle on an aarch64 host), the wrapper falls back to qemu-user-static
+    # if available — saving the user from "Exec format error" surprises.
     cat > "$OUTPUT" <<WRAPPER_EOF
 #!/bin/sh
 _ARCH=\$(uname -m)
-_DIR=\$(dirname "\$0")
+_DIR=\$(cd "\$(dirname "\$0")" && pwd)
+_X86=\${_DIR}/${OUTPUT}_x86_64
+_ARM=\${_DIR}/${OUTPUT}_aarch64
+
+# Native execution.
 case "\$_ARCH" in
-    x86_64)  exec "\$_DIR/${OUTPUT}_x86_64" "\$@" ;;
-    aarch64) exec "\$_DIR/${OUTPUT}_aarch64" "\$@" ;;
-    *)
-        echo "oci2bin: unsupported architecture: \$_ARCH" >&2
-        exit 1
-        ;;
+    x86_64)  [ -x "\$_X86" ] && exec "\$_X86" "\$@" ;;
+    aarch64) [ -x "\$_ARM" ] && exec "\$_ARM" "\$@" ;;
 esac
+
+# Cross-arch fallback via qemu-user-static.  Try in order: arch matching
+# the host most closely, then the other bundled arch.  binfmt_misc may
+# already handle foreign ELFs transparently — in that case the native
+# branch above will have run.
+_find_qemu() {
+    _q=\$1
+    if command -v "\$_q" >/dev/null 2>&1; then
+        command -v "\$_q"
+        return 0
+    fi
+    for _p in /usr/bin/\$_q /usr/local/bin/\$_q /opt/qemu/bin/\$_q; do
+        if [ -x "\$_p" ]; then
+            printf '%s\n' "\$_p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ -x "\$_X86" ]; then
+    if _Q=\$(_find_qemu qemu-x86_64-static); then
+        exec "\$_Q" "\$_X86" "\$@"
+    fi
+fi
+if [ -x "\$_ARM" ]; then
+    if _Q=\$(_find_qemu qemu-aarch64-static); then
+        exec "\$_Q" "\$_ARM" "\$@"
+    fi
+fi
+
+cat >&2 <<MSG
+oci2bin: host architecture \$_ARCH cannot run any of the bundled binaries.
+oci2bin: bundled archs: x86_64 aarch64
+oci2bin: install qemu-user-static (e.g. apt install qemu-user-static,
+         dnf install qemu-user-static, or apk add qemu-x86_64) to
+         transparently run a foreign-arch binary on this host, or
+         rebuild with --arch \$_ARCH.
+MSG
+exit 1
 WRAPPER_EOF
     chmod +x "$OUTPUT"
     echo "oci2bin: multi-arch wrapper → $OUTPUT"
