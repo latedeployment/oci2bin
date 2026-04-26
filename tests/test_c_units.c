@@ -1242,6 +1242,47 @@ static void test_parse_opts_misc_flags(void)
                       "parse_opts: --no-landlock sets OFF");
     }
 
+    /* --seccomp-deny-write */
+    {
+        char a1[] = "/etc";
+        char a2[] = "/var/lib/secret";
+        char* argv[] = {"prog", "--seccomp-deny-write", a1,
+                        "--seccomp-deny-write", a2, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(5, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --seccomp-deny-write x2 returns 0");
+        ASSERT_INT_EQ(opts.n_deny_write, 2,
+                      "parse_opts: n_deny_write counts both");
+        ASSERT_STR_EQ(opts.deny_write[0], "/etc",
+                      "parse_opts: --seccomp-deny-write[0] stored");
+        ASSERT_STR_EQ(opts.deny_write[1], "/var/lib/secret",
+                      "parse_opts: --seccomp-deny-write[1] stored");
+    }
+    {
+        char arg[] = "relative/path";
+        char* argv[] = {"prog", "--seccomp-deny-write", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --seccomp-deny-write rejects relative");
+    }
+    {
+        char arg[] = "/etc/../passwd";
+        char* argv[] = {"prog", "--seccomp-deny-write", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --seccomp-deny-write rejects ..");
+    }
+    {
+        char* argv[] = {"prog", "--seccomp-deny-write", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --seccomp-deny-write missing arg returns -1");
+    }
+
     /* --workdir */
     {
         char arg[] = "/app";

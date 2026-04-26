@@ -965,6 +965,40 @@ required.
 > requests, graceful shutdown — to ensure all syscalls are captured before
 > locking down the profile.
 
+The tracer also records every path the workload writes to (or attempts to
+write to) for the syscalls `open`, `openat`, `openat2`, `creat`, `unlink`,
+`unlinkat`, `rename`, `renameat`, `renameat2`, `mkdir`, `mkdirat`. The list
+is emitted as a non-standard `oci2binWritablePaths` array alongside the
+syscall allowlist:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "syscalls": [{ "names": ["read", "write", ...], "action": "SCMP_ACT_ALLOW" }],
+  "oci2binWritablePaths": [
+    "/var/lib/myapp/state.db",
+    "/tmp/myapp.sock",
+    "/proc/self/oom_score_adj"
+  ]
+}
+```
+
+Use `--seccomp-deny-write PATH` (repeatable) at runtime to bind-mount any
+path inside the container read-only. Pure seccomp BPF cannot match path
+strings — it operates on integer registers — so write denials are enforced
+at the mount layer (`MS_BIND | MS_REMOUNT | MS_RDONLY`) and verified by the
+kernel for every write syscall regardless of how the workload reaches the
+file:
+
+```bash
+# Lock down two specific paths inside the container.
+./my-app --seccomp-deny-write /etc --seccomp-deny-write /var/lib/myapp
+```
+
+`--seccomp-deny-write` complements the Landlock sandbox: Landlock pins
+inodes for the entire allowed subtree, while `--seccomp-deny-write` carves
+read-only holes inside otherwise writable subtrees.
+
 ### Landlock filesystem sandbox
 
 The loader applies a [Landlock LSM](https://landlock.io/) sandbox after chroot

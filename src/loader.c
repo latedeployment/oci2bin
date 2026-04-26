@@ -633,6 +633,14 @@ struct container_opts
      *  1 = forced on (--landlock); error out if unsupported
      *  2 = forced off (--no-landlock); never apply */
     int landlock_mode;
+
+    /* --seccomp-deny-write PATH (repeatable): paths inside the container
+     * that the workload must not be able to write to.  Enforced via
+     * bind-mount + MS_REMOUNT|MS_RDONLY after chroot.  The seccomp tracer
+     * records observed write paths into the emitted JSON so users can pick
+     * which subtrees to lock down. */
+    char* deny_write[MAX_VOLUMES];
+    int   n_deny_write;
 };
 #define LANDLOCK_MODE_AUTO  0
 #define LANDLOCK_MODE_ON    1
@@ -5461,6 +5469,141 @@ static int syscall_name_to_nr(const char* name)
  */
 #define GEN_SECCOMP_MAX_PIDS 256
 
+/*
+ * Maximum number of unique write-class paths recorded by the tracer.
+ * Each entry is a heap-allocated string up to PATH_MAX bytes.
+ */
+#define GS_MAX_WRITE_PATHS 256
+
+/*
+ * Write-class syscalls we record path arguments for.  `path_arg_idx` is the
+ * 0-based register index that holds the path pointer for this syscall:
+ * x86_64: rdi(0), rsi(1), rdx(2), r10(3), r8(4), r9(5).
+ * aarch64: x0..x5 in the same order.
+ */
+struct gs_write_syscall
+{
+    long        nr_x86_64;
+    long        nr_aarch64;
+    int         path_arg_idx;
+    const char* name; /* for diagnostics */
+};
+
+static const struct gs_write_syscall g_gs_write_syscalls[] =
+{
+#ifdef __NR_open
+    {__NR_open, -1,            0, "open"},
+#else
+    {-1, -1,            0, "open"},
+#endif
+    {__NR_openat, __NR_openat,   1, "openat"},
+#ifdef __NR_openat2
+    {__NR_openat2, __NR_openat2, 1, "openat2"},
+#endif
+#ifdef __NR_creat
+    {__NR_creat, -1,            0, "creat"},
+#endif
+#ifdef __NR_unlink
+    {__NR_unlink, -1,            0, "unlink"},
+#endif
+    {__NR_unlinkat, __NR_unlinkat, 1, "unlinkat"},
+#ifdef __NR_rename
+    {__NR_rename, -1,            0, "rename"},
+#endif
+    {__NR_renameat, __NR_renameat, 1, "renameat"},
+#ifdef __NR_renameat2
+    {__NR_renameat2, __NR_renameat2, 1, "renameat2"},
+#endif
+#ifdef __NR_mkdir
+    {__NR_mkdir, -1,            0, "mkdir"},
+#endif
+    {__NR_mkdirat, __NR_mkdirat, 1, "mkdirat"},
+};
+
+static int gs_is_write_syscall(long nr, int* path_arg_idx)
+{
+    int n = (int)(sizeof(g_gs_write_syscalls) /
+                  sizeof(g_gs_write_syscalls[0]));
+    for (int i = 0; i < n; i++)
+    {
+#ifdef __aarch64__
+        long expect = g_gs_write_syscalls[i].nr_aarch64;
+#else
+        long expect = g_gs_write_syscalls[i].nr_x86_64;
+#endif
+        if (expect >= 0 && expect == nr)
+        {
+            *path_arg_idx = g_gs_write_syscalls[i].path_arg_idx;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Read a NUL-terminated string from the tracee's address space using
+ * PTRACE_PEEKDATA.  Returns 0 on success, -1 on error.  The string is
+ * truncated at bufsz-1 bytes.
+ */
+static int gs_peek_string(pid_t pid, unsigned long addr, char* buf,
+                          size_t bufsz)
+{
+    if (bufsz == 0 || addr == 0)
+    {
+        return -1;
+    }
+    size_t off = 0;
+    while (off + sizeof(long) <= bufsz - 1)
+    {
+        errno = 0;
+        long word = ptrace(PTRACE_PEEKDATA, pid,
+                           (void*)(addr + off), NULL);
+        if (errno != 0)
+        {
+            return -1;
+        }
+        memcpy(buf + off, &word, sizeof(long));
+        for (size_t b = 0; b < sizeof(long); b++)
+        {
+            if (buf[off + b] == '\0')
+            {
+                return 0;
+            }
+        }
+        off += sizeof(long);
+    }
+    buf[bufsz - 1] = '\0';
+    return 0;
+}
+
+static int gs_record_write_path(char** paths, int* n_paths, const char* path)
+{
+    /* Skip empty / very short / clearly procfs internals. */
+    if (!path || path[0] == '\0')
+    {
+        return 0;
+    }
+    /* Dedupe: linear scan is fine for ≤256 entries. */
+    for (int i = 0; i < *n_paths; i++)
+    {
+        if (strcmp(paths[i], path) == 0)
+        {
+            return 0;
+        }
+    }
+    if (*n_paths >= GS_MAX_WRITE_PATHS)
+    {
+        return 0;    /* table full — silently drop */
+    }
+    char* dup = strdup(path);
+    if (!dup)
+    {
+        return -1;
+    }
+    paths[(*n_paths)++] = dup;
+    return 0;
+}
+
 struct gs_pid_state
 {
     pid_t pid;
@@ -5509,6 +5652,8 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
     /* Bitset: seen[nr/8] bit (nr%8) = syscall nr was observed */
     unsigned char seen[64];
     memset(seen, 0, sizeof(seen));
+    char* write_paths[GS_MAX_WRITE_PATHS];
+    int   n_write_paths = 0;
 
     fprintf(stderr,
             "oci2bin: --gen-seccomp: tracing container (output → %s)\n",
@@ -5610,8 +5755,12 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
 
             if (!was_in)
             {
-                /* Entry stop — read the syscall number */
+                /* Entry stop — read the syscall number AND, for write-class
+                 * syscalls, the path argument from the tracee's registers. */
                 long nr = -1;
+                unsigned long path_addr = 0;
+                int path_idx = -1;
+                int is_write = 0;
 #ifdef __aarch64__
                 struct iovec iov;
                 struct user_pt_regs aregs;
@@ -5621,17 +5770,53 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
                            (void*)(long)NT_PRSTATUS, &iov) == 0)
                 {
                     nr = (long)aregs.regs[8]; /* x8 = syscall nr on aarch64 */
+                    is_write = gs_is_write_syscall(nr, &path_idx);
+                    if (is_write && path_idx >= 0 && path_idx < 6)
+                    {
+                        path_addr = (unsigned long)aregs.regs[path_idx];
+                    }
                 }
 #else
                 struct user_regs_struct regs;
                 if (ptrace(PTRACE_GETREGS, stopped, NULL, &regs) == 0)
                 {
                     nr = (long)regs.orig_rax;
+                    is_write = gs_is_write_syscall(nr, &path_idx);
+                    if (is_write)
+                    {
+                        switch (path_idx)
+                        {
+                            case 0:
+                                path_addr = (unsigned long)regs.rdi;
+                                break;
+                            case 1:
+                                path_addr = (unsigned long)regs.rsi;
+                                break;
+                            case 2:
+                                path_addr = (unsigned long)regs.rdx;
+                                break;
+                            case 3:
+                                path_addr = (unsigned long)regs.r10;
+                                break;
+                            default:
+                                break;
+                        }
+                    }
                 }
 #endif
                 if (nr >= 0 && nr < (long)(sizeof(seen) * 8))
                 {
                     seen[nr / 8] |= (unsigned char)(1u << (nr % 8));
+                }
+                if (is_write && path_addr != 0)
+                {
+                    char pbuf[PATH_MAX];
+                    if (gs_peek_string(stopped, path_addr, pbuf,
+                                       sizeof(pbuf)) == 0)
+                    {
+                        gs_record_write_path(write_paths,
+                                             &n_write_paths, pbuf);
+                    }
                 }
             }
             ptrace(PTRACE_SYSCALL, stopped, NULL, NULL);
@@ -5677,6 +5862,10 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
     {
         fprintf(stderr, "oci2bin: --gen-seccomp: cannot write %s: %s\n",
                 out_path, strerror(errno));
+        for (int i = 0; i < n_write_paths; i++)
+        {
+            free(write_paths[i]);
+        }
         return child_exit;
     }
 
@@ -5693,14 +5882,38 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
     fprintf(f, "      ],\n");
     fprintf(f, "      \"action\": \"SCMP_ACT_ALLOW\"\n");
     fprintf(f, "    }\n");
-    fprintf(f, "  ]\n");
-    fprintf(f, "}\n");
+    fprintf(f, "  ]");
+    /* Non-standard extension: list all paths the workload was observed
+     * writing to (or attempting to write to).  Docker-compatible parsers
+     * ignore unknown top-level keys, so this is safe alongside `syscalls`.
+     * Operators can use this list to pick `--seccomp-deny-write` paths. */
+    if (n_write_paths > 0)
+    {
+        fprintf(f, ",\n  \"oci2binWritablePaths\": [\n");
+        for (int i = 0; i < n_write_paths; i++)
+        {
+            char esc[PATH_MAX * 2];
+            if (json_escape_string(write_paths[i], esc, sizeof(esc)) < 0)
+            {
+                continue;
+            }
+            fprintf(f, "    \"%s\"%s\n", esc,
+                    i < n_write_paths - 1 ? "," : "");
+        }
+        fprintf(f, "  ]");
+    }
+    fprintf(f, "\n}\n");
     fclose(f);
 
+    for (int i = 0; i < n_write_paths; i++)
+    {
+        free(write_paths[i]);
+    }
+
     fprintf(stderr,
-            "oci2bin: --gen-seccomp: %d syscalls observed → %s\n"
+            "oci2bin: --gen-seccomp: %d syscalls, %d write paths observed → %s\n"
             "oci2bin: --gen-seccomp: use with: --seccomp-profile %s\n",
-            n_names, out_path, out_path);
+            n_names, n_write_paths, out_path, out_path);
     return child_exit;
 }
 
@@ -6972,6 +7185,37 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         apply_capabilities(opts);
     }
 
+    /* --seccomp-deny-write PATH: bind-mount each path on top of itself and
+     * remount read-only so the workload — which seccomp BPF cannot filter
+     * by path string — physically cannot write to it inside the container.
+     * Done after chroot so the paths are container-relative.  Must precede
+     * Landlock so the read-only remount is captured in the inode pinning. */
+    for (int i = 0; i < opts->n_deny_write; i++)
+    {
+        const char* p = opts->deny_write[i];
+        if (mount(p, p, NULL, MS_BIND, NULL) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --seccomp-deny-write: bind %s: %s (skipping)\n",
+                    p, strerror(errno));
+            continue;
+        }
+        if (mount(NULL, p, NULL,
+                  MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID, NULL) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --seccomp-deny-write: remount-RO %s: %s\n",
+                    p, strerror(errno));
+            /* Best-effort detach so we don't leave a writable bind in place. */
+            (void)umount2(p, MNT_DETACH);
+            continue;
+        }
+        if (g_debug)
+        {
+            debug_log("seccomp.deny_write", "%s now read-only", p);
+        }
+    }
+
     /* Apply Landlock LSM filesystem sandbox (Linux 5.13+).  Pins inodes for
      * the rootfs and bind/tmpfs/secret targets; everything else becomes
      * unreachable for filesystem syscalls — even if a chroot escape were
@@ -7411,6 +7655,11 @@ static void usage(const char* prog)
             "                      (Linux 5.13+); error out if unsupported.\n"
             "                      Default: auto-on when supported, skip otherwise.\n"
             "  --no-landlock       Disable the Landlock filesystem sandbox.\n"
+            "  --seccomp-deny-write PATH\n"
+            "                      Bind-mount remount-RO PATH inside the container\n"
+            "                      so the workload cannot write to it (repeatable).\n"
+            "                      Pair with --gen-seccomp's oci2binWritablePaths\n"
+            "                      output to lock down observed write targets.\n"
             "  --gdb               Launch gdb inside the container with the image\n"
             "                      entrypoint as the debuggee (host gdb bind-mounted\n"
             "                      in if not present). Disables seccomp to allow\n"
@@ -8750,6 +8999,36 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-landlock") == 0)
         {
             opts->landlock_mode = LANDLOCK_MODE_OFF;
+        }
+        else if (strcmp(argv[i], "--seccomp-deny-write") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --seccomp-deny-write requires a PATH"
+                        " argument\n");
+                return -1;
+            }
+            i++;
+            const char* p = argv[i];
+            if (!path_is_absolute_and_clean(p))
+            {
+                fprintf(stderr,
+                        "oci2bin: --seccomp-deny-write path must be"
+                        " absolute and clean: %s\n", p);
+                return -1;
+            }
+            if (opts->n_deny_write >= (int)(sizeof(opts->deny_write) /
+                                            sizeof(opts->deny_write[0])))
+            {
+                fprintf(stderr,
+                        "oci2bin: too many --seccomp-deny-write flags"
+                        " (max %zu)\n",
+                        sizeof(opts->deny_write) /
+                        sizeof(opts->deny_write[0]));
+                return -1;
+            }
+            opts->deny_write[opts->n_deny_write++] = argv[i];
         }
         else if (strcmp(argv[i], "-t") == 0
                  || strcmp(argv[i], "--tty") == 0)
