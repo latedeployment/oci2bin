@@ -1338,6 +1338,35 @@ oci2bin attest-show --in ./redis_7-alpine
 
 Without `--attest`, the binary is signed with the legacy v2 trailer for compatibility with older `oci2bin verify` clients. With `--attest`, a v3 trailer is written that older clients will fail to parse — choose based on your verification fleet. The attestation JSON is capped at 256 KiB.
 
+#### Verifying source-image cosign signatures via attestation
+
+When the build pipeline runs `--verify-cosign`, the wrapper records the cosign verification outcome in environment variables (`OCI2BIN_COSIGN_REF`, `OCI2BIN_COSIGN_KEY`, `OCI2BIN_COSIGN_RESULT`). A subsequent `oci2bin sign --attest auto` picks them up automatically and embeds them under `predicate.runDetails.metadata.cosignVerification`:
+
+```json
+"cosignVerification": {
+  "imageRef": "redis:7-alpine",
+  "result":   "verified",
+  "keyPath":  "/etc/keys/redis.pub"
+}
+```
+
+`oci2bin attest verify --in BINARY` reads that record and prints the build-time verification outcome:
+
+```bash
+oci2bin attest verify --in ./redis_7-alpine
+# Source image:        redis:7-alpine
+# Recorded result:     verified
+# Recorded key path:   /etc/keys/redis.pub
+
+# --recheck re-runs cosign verify against the current registry signature.
+oci2bin attest verify --in ./redis_7-alpine --recheck
+# Source image:        redis:7-alpine
+# Recorded result:     verified
+# Live cosign verify: OK
+```
+
+`--recheck` requires `cosign` on PATH; without it, only the recorded outcome is printed.
+
 For self-updating binaries, point `--self-update-url` at a JSON manifest and sign that manifest with `sign-file`. The manifest format is:
 
 ```json

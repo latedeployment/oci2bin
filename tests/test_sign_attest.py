@@ -169,6 +169,146 @@ class TestSignAttestRoundtrip(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("openssl"), "openssl not available")
+class TestAttestVerifyCosign(unittest.TestCase):
+    """Cover the cosign-verification metadata embedded by --attest auto and
+    re-checked by `attest-verify`.  No real cosign needed for these cases."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="oci2bin-cosign-"))
+        self.priv = self.tmpdir / "priv.pem"
+        self.pub = self.tmpdir / "pub.pem"
+        subprocess.run(
+            ["openssl", "ecparam", "-name", "prime256v1", "-genkey",
+             "-noout", "-out", str(self.priv)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["openssl", "ec", "-in", str(self.priv),
+             "-pubout", "-out", str(self.pub)],
+            check=True, capture_output=True,
+        )
+        self.binary = self.tmpdir / "demo.bin"
+        self.binary.write_bytes(b"\x7fELF-cosign-test\x00")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _sign_with_cosign_meta(self, **flags):
+        cmd = ["python3", str(SIGN_PY), "sign",
+               "--key", str(self.priv),
+               "--in", str(self.binary),
+               "--attest", "auto"]
+        for k, v in flags.items():
+            cmd += [f"--{k.replace('_', '-')}", v]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+
+    def test_cli_flags_recorded_in_provenance(self):
+        self._sign_with_cosign_meta(
+            cosign_image_ref="redis@sha256:" + ("a" * 64),
+            cosign_key_path="/tmp/vendor.pub",
+            cosign_result="verified",
+            source_image_digest="redis@sha256:" + ("a" * 64),
+        )
+        data = self.binary.read_bytes()
+        _block, _sig, _keyid, _alg, att, _attsig = sb._find_sig_block(data)
+        parsed = json.loads(att.decode("utf-8"))
+        cosign = parsed["predicate"]["runDetails"]["metadata"][
+            "cosignVerification"]
+        self.assertEqual(cosign["imageRef"], "redis@sha256:" + ("a" * 64))
+        self.assertEqual(cosign["keyPath"], "/tmp/vendor.pub")
+        self.assertEqual(cosign["result"], "verified")
+        deps = parsed["predicate"]["buildDefinition"]["resolvedDependencies"]
+        self.assertTrue(any("sha256" in (d.get("digest") or {})
+                            for d in deps),
+                        "resolvedDependencies should carry the source digest")
+
+    def test_env_var_fallback_records_cosign(self):
+        env = os.environ.copy()
+        env["OCI2BIN_COSIGN_REF"] = "alpine:3.19"
+        env["OCI2BIN_COSIGN_KEY"] = "/etc/keys/alpine.pub"
+        env["OCI2BIN_COSIGN_RESULT"] = "verified"
+        r = subprocess.run(
+            ["python3", str(SIGN_PY), "sign",
+             "--key", str(self.priv),
+             "--in", str(self.binary),
+             "--attest", "auto"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        data = self.binary.read_bytes()
+        _block, _sig, _keyid, _alg, att, _attsig = sb._find_sig_block(data)
+        parsed = json.loads(att.decode("utf-8"))
+        cosign = parsed["predicate"]["runDetails"]["metadata"][
+            "cosignVerification"]
+        self.assertEqual(cosign["imageRef"], "alpine:3.19")
+        self.assertEqual(cosign["keyPath"], "/etc/keys/alpine.pub")
+        self.assertEqual(cosign["result"], "verified")
+
+    def test_attest_verify_prints_recorded_result(self):
+        self._sign_with_cosign_meta(
+            cosign_image_ref="redis:7-alpine",
+            cosign_key_path="/etc/vendor.pub",
+            cosign_result="verified",
+        )
+        r = subprocess.run(
+            ["python3", str(SIGN_PY), "attest-verify",
+             "--in", str(self.binary)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertIn("redis:7-alpine", r.stdout)
+        self.assertIn("verified", r.stdout)
+
+    def test_attest_verify_failed_recorded_result_exits_two(self):
+        self._sign_with_cosign_meta(
+            cosign_image_ref="bad:image",
+            cosign_result="failed",
+        )
+        r = subprocess.run(
+            ["python3", str(SIGN_PY), "attest-verify",
+             "--in", str(self.binary)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 2, msg=r.stdout)
+
+    def test_attest_verify_missing_cosign_field_exits_one(self):
+        # Sign WITHOUT cosign metadata.
+        subprocess.run(
+            ["python3", str(SIGN_PY), "sign",
+             "--key", str(self.priv),
+             "--in", str(self.binary),
+             "--attest", "auto"],
+            capture_output=True, text=True, check=True,
+        )
+        r = subprocess.run(
+            ["python3", str(SIGN_PY), "attest-verify",
+             "--in", str(self.binary)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("cosignVerification", r.stderr)
+
+
+def _fallback_read_att(path):
+    """Read attestation directly via _find_sig_block (used when sb has no
+    _read_attestation helper, e.g. older sign_binary versions)."""
+    data = open(path, "rb").read()
+    _block, _sig, _keyid, _alg, att, _attsig = sb._find_sig_block(data)
+    return att.decode("utf-8") if att else "{}"
+
+
+def _read_att_via_subprocess(binary):
+    """Last-resort: invoke attest-show to read the attestation as JSON."""
+    r = subprocess.run(
+        ["python3", str(SIGN_PY), "attest-show", "--in", str(binary)],
+        capture_output=True, text=True,
+    )
+    return r.stdout
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl not available")
 class TestSigBlockParser(unittest.TestCase):
     def test_oversized_attestation_length_is_rejected(self):
         # Build a fake v3 block whose attestation length exceeds

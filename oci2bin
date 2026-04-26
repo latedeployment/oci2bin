@@ -368,6 +368,12 @@ if [[ "${1:-}" == "attest-show" ]]; then
     exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" attest-show "$@"
 fi
 
+if [[ "${1:-}" == "attest-verify" ]] || [[ "${1:-}" == "attest" && "${2:-}" == "verify" ]]; then
+    if [[ "${1:-}" == "attest" ]]; then shift; fi
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/sign_binary.py" attest-verify "$@"
+fi
+
 # ── detached file signing subcommands ──────────────────────────────────────
 
 if [[ "${1:-}" == "sign-file" ]]; then
@@ -2055,6 +2061,7 @@ fi
 
 # ── cosign image signature verification ──────────────────────────────────
 
+COSIGN_RESULT="skipped"
 if [[ "$VERIFY_COSIGN" -eq 1 ]]; then
     if command -v cosign >/dev/null 2>&1; then
         echo "oci2bin: verifying image signature with cosign..." >&2
@@ -2063,7 +2070,9 @@ if [[ "$VERIFY_COSIGN" -eq 1 ]]; then
         COSIGN_ARGS+=("$IMAGE")
         if "${COSIGN_ARGS[@]}" >/dev/null 2>&1; then
             echo "oci2bin: cosign verification passed" >&2
+            COSIGN_RESULT="verified"
         else
+            COSIGN_RESULT="failed"
             if [[ "$REQUIRE_COSIGN" -eq 1 ]]; then
                 echo "oci2bin: cosign verification failed (--require-cosign)" >&2
                 exit 1
@@ -2072,6 +2081,7 @@ if [[ "$VERIFY_COSIGN" -eq 1 ]]; then
             fi
         fi
     else
+        COSIGN_RESULT="unavailable"
         if [[ "$REQUIRE_COSIGN" -eq 1 ]]; then
             echo "oci2bin: cosign not installed (--require-cosign)" >&2
             exit 1
@@ -2080,6 +2090,12 @@ if [[ "$VERIFY_COSIGN" -eq 1 ]]; then
         fi
     fi
 fi
+# Export the cosign verification outcome so a subsequent
+# `oci2bin sign --attest auto` invocation can record it in the
+# embedded SLSA provenance without the user re-typing the metadata.
+export OCI2BIN_COSIGN_RESULT="$COSIGN_RESULT"
+[[ "$VERIFY_COSIGN" -eq 1 ]] && export OCI2BIN_COSIGN_REF="$IMAGE"
+[[ -n "${COSIGN_KEY:-}" ]] && export OCI2BIN_COSIGN_KEY="$COSIGN_KEY"
 
 # ── get image digest for cache key and reproducibility ────────────────────
 #

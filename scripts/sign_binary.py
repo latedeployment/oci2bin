@@ -357,18 +357,50 @@ def _read_oci2bin_version() -> str:
     return "unknown"
 
 
+COSIGN_RESULTS = {"verified", "failed", "skipped", "unavailable"}
+
+
 def _build_auto_provenance(content_hash: bytes, algorithm: str,
-                           source_image_digest: str = "") -> dict:
+                           source_image_digest: str = "",
+                           cosign_image_ref: str = "",
+                           cosign_key_path: str = "",
+                           cosign_result: str = "") -> dict:
     """
     Build an in-toto Statement v1 with a SLSA provenance v1 predicate
     describing the just-built binary.  No external tools are required.
+
+    When the build pipeline ran `cosign verify` on the source image, the
+    outcome is recorded under predicate.runDetails.metadata.cosignVerification
+    AND the source image is added to predicate.buildDefinition
+    .resolvedDependencies.  oci2bin attest verify re-verifies the signature
+    using the recorded image ref + key path.
     """
     subject_digest = {algorithm: content_hash.hex()}
     started_on = _utc_now_iso()
     invocation_id = str(uuid.uuid4())
     external_params: dict = {}
+    resolved_deps: list = []
     if source_image_digest:
         external_params["sourceImageDigest"] = source_image_digest
+        resolved_deps.append({
+            "uri":    f"docker://{source_image_digest}"
+                      if "/" in source_image_digest
+                      else source_image_digest,
+            "digest": _digest_dict_from_ref(source_image_digest),
+        })
+    metadata = {
+        "invocationId": invocation_id,
+        "startedOn":    started_on,
+        "finishedOn":   started_on,
+    }
+    if cosign_image_ref:
+        cosign_info = {
+            "imageRef": cosign_image_ref,
+            "result":   cosign_result or "unknown",
+        }
+        if cosign_key_path:
+            cosign_info["keyPath"] = cosign_key_path
+        metadata["cosignVerification"] = cosign_info
     return {
         "_type": INTOTO_STATEMENT_TYPE,
         "subject": [{
@@ -386,18 +418,34 @@ def _build_auto_provenance(content_hash: bytes, algorithm: str,
                     "hostKernel":     platform.release() or "unknown",
                     "hostname":       socket.gethostname() or "unknown",
                 },
-                "resolvedDependencies": [],
+                "resolvedDependencies": resolved_deps,
             },
             "runDetails": {
                 "builder": {"id": OCI2BIN_BUILDER_ID},
-                "metadata": {
-                    "invocationId": invocation_id,
-                    "startedOn":    started_on,
-                    "finishedOn":   started_on,
-                },
+                "metadata": metadata,
             },
         },
     }
+
+
+def _digest_dict_from_ref(ref: str) -> dict:
+    """Convert a docker-style ref like `image@sha256:hex` into a SLSA
+    digest dict.  Returns an empty dict if the ref has no @sha-prefix."""
+    at = ref.rfind("@")
+    if at < 0:
+        return {}
+    digest_part = ref[at + 1:]
+    colon = digest_part.find(":")
+    if colon < 0:
+        return {}
+    algo = digest_part[:colon].lower()
+    hex_digest = digest_part[colon + 1:].lower()
+    if algo not in ("sha256", "sha512"):
+        return {}
+    expected_len = HASH_ALGORITHM_HEX_LENGTHS.get(algo)
+    if expected_len and len(hex_digest) != expected_len:
+        return {}
+    return {algo: hex_digest}
 
 
 def _load_provenance_file(path: str) -> dict:
@@ -461,8 +509,20 @@ def cmd_sign(args):
     if attest_arg:
         try:
             if attest_arg == "auto":
+                # Cosign metadata: prefer explicit CLI flags, fall back to
+                # env vars set by the bash build pipeline so users don't
+                # need to thread the same info twice.
+                cosign_ref = (getattr(args, "cosign_image_ref", None)
+                              or os.environ.get("OCI2BIN_COSIGN_REF", ""))
+                cosign_key = (getattr(args, "cosign_key_path", None)
+                              or os.environ.get("OCI2BIN_COSIGN_KEY", ""))
+                cosign_res = (getattr(args, "cosign_result", None)
+                              or os.environ.get("OCI2BIN_COSIGN_RESULT", ""))
                 att_json = _build_auto_provenance(
-                    content_hash, algorithm, source_image_digest)
+                    content_hash, algorithm, source_image_digest,
+                    cosign_image_ref=cosign_ref,
+                    cosign_key_path=cosign_key,
+                    cosign_result=cosign_res)
             else:
                 att_json = _load_provenance_file(attest_arg)
         except RuntimeError as e:
@@ -578,6 +638,95 @@ def cmd_verify(args):
         f"(keyid: {keyid.hex()[:16]}..., hash: {algorithm}{suffix})"
     )
     return 0
+
+
+def _read_attestation(binary_path):
+    """Read the embedded attestation JSON from a signed binary.  Returns
+    the parsed dict.  Raises RuntimeError if the binary isn't signed or
+    has no attestation."""
+    with open(binary_path, "rb") as f:
+        data = f.read()
+    block_start, _sig, _keyid, _algorithm, att_bytes, _att_sig = \
+        _find_sig_block(data)
+    if block_start is None:
+        raise RuntimeError(f"{binary_path}: not signed")
+    if not att_bytes:
+        raise RuntimeError(f"{binary_path}: no attestation embedded")
+    try:
+        return json.loads(att_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise RuntimeError(
+            f"{binary_path}: corrupt attestation: {e}") from e
+
+
+def cmd_attest_verify(args):
+    """
+    Verify the embedded attestation's recorded cosign verification by
+    re-running cosign verify against the source image referenced in the
+    provenance.  This complements `oci2bin verify`, which checks that
+    the attestation is signed by the trusted key — `attest verify`
+    additionally checks that the image the attestation describes still
+    has a valid cosign signature today.
+    """
+    try:
+        att = _read_attestation(args.input)
+    except RuntimeError as e:
+        print(f"sign_binary: {e}", file=sys.stderr)
+        sys.exit(1)
+    cosign = (att.get("predicate", {}).get("runDetails", {})
+              .get("metadata", {}).get("cosignVerification"))
+    if not cosign:
+        print(f"sign_binary: {args.input}: attestation has no "
+              "cosignVerification field — was the binary built with "
+              "--verify-cosign?", file=sys.stderr)
+        sys.exit(1)
+    image_ref = cosign.get("imageRef")
+    if not image_ref:
+        print(f"sign_binary: {args.input}: cosignVerification is missing "
+              "imageRef", file=sys.stderr)
+        sys.exit(1)
+    recorded_result = cosign.get("result", "unknown")
+    key_path = cosign.get("keyPath", "")
+    print(f"Source image:        {image_ref}")
+    print(f"Recorded result:     {recorded_result}")
+    if key_path:
+        print(f"Recorded key path:   {key_path}")
+
+    if not args.recheck:
+        # No re-check requested — just print the recorded outcome.
+        if recorded_result == "verified":
+            return 0
+        if recorded_result in ("failed",):
+            sys.exit(2)
+        sys.exit(1)
+
+    # Re-run cosign verify with the recorded image ref + key.
+    cosign_bin = shutil_which("cosign")
+    if not cosign_bin:
+        print("sign_binary: cosign not installed; cannot --recheck",
+              file=sys.stderr)
+        sys.exit(1)
+    cosign_argv = [cosign_bin, "verify"]
+    chosen_key = args.key or key_path
+    if chosen_key:
+        cosign_argv += ["--key", chosen_key]
+    cosign_argv.append(image_ref)
+    proc = subprocess.run(cosign_argv, capture_output=True, text=True)
+    if proc.returncode != 0:
+        stderr_tail = proc.stderr.splitlines()[-3:]
+        print("\nLive cosign verify FAILED:", file=sys.stderr)
+        for line in stderr_tail:
+            print(f"  {line}", file=sys.stderr)
+        sys.exit(2)
+    print("\nLive cosign verify: OK")
+    return 0
+
+
+def shutil_which(prog):
+    """Stdlib-only shutil.which shim — kept here so the test stubs can
+    monkey-patch this single hook to inject a fake cosign binary."""
+    import shutil as _shutil
+    return _shutil.which(prog)
 
 
 def cmd_attest_show(args):
@@ -708,6 +857,17 @@ def main():
     p_sign.add_argument("--source-image-digest", default=None,
                         help="Source OCI image digest, recorded in the auto-"
                         "generated attestation as externalParameters.")
+    p_sign.add_argument("--cosign-image-ref", default=None,
+                        help="Source image reference passed to cosign verify "
+                        "during the build.  Recorded in the attestation so "
+                        "`oci2bin attest verify` can re-check the signature.")
+    p_sign.add_argument("--cosign-key-path", default=None,
+                        help="Public key path used by cosign verify.  "
+                        "Recorded alongside --cosign-image-ref.")
+    p_sign.add_argument("--cosign-result", default=None,
+                        choices=sorted(COSIGN_RESULTS),
+                        help="Outcome of the build-time cosign verification "
+                        "(verified|failed|skipped|unavailable).")
 
     p_verify = sub.add_parser("verify", help="Verify a binary signature")
     p_verify.add_argument("--key", required=True, help="PEM public key")
@@ -719,6 +879,19 @@ def main():
                               help="Print the embedded in-toto attestation")
     p_attest.add_argument("--in", dest="input", required=True,
                           help="Signed binary to inspect")
+
+    p_atv = sub.add_parser("attest-verify",
+                           help="Verify the embedded attestation's "
+                                "cosign-verification record")
+    p_atv.add_argument("--in", dest="input", required=True,
+                       help="Signed binary to verify")
+    p_atv.add_argument("--recheck", action="store_true",
+                       help="Re-run cosign verify against the source image "
+                            "referenced in the attestation (requires cosign)")
+    p_atv.add_argument("--key", default=None,
+                       help="Override the cosign public key path "
+                            "(default: use the path recorded in the "
+                            "attestation, if any)")
 
     p_sign_file = sub.add_parser("sign-file", help="Sign an arbitrary file")
     p_sign_file.add_argument("--key", required=True, help="PEM private key")
@@ -745,6 +918,8 @@ def main():
         sys.exit(cmd_verify(args))
     elif args.cmd == "attest-show":
         sys.exit(cmd_attest_show(args))
+    elif args.cmd == "attest-verify":
+        sys.exit(cmd_attest_verify(args))
     elif args.cmd == "sign-file":
         sys.exit(cmd_sign_file(args))
     elif args.cmd == "verify-file":
