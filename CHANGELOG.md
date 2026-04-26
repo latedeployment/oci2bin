@@ -14,8 +14,7 @@ All notable changes to oci2bin are documented here.
   `exec`/`stop`/`stats` commands, and (4) a host-side helper to send
   commands to the UNIX socket the VMM exposes. The guest agent is the
   largest piece because it needs its own statically-linked binary
-  injected into `build_initramfs` plus an init wrapper. Skipped this
-  iteration; tracked in `RALPH_WORK.md` as still pending.
+  injected into `build_initramfs` plus an init wrapper.
 
 ## [0.11.0] - 2026-04-20
 
