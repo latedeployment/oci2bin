@@ -1704,6 +1704,7 @@ HOST_ARCH="$(uname -m)"
 TARGET_ARCH="$HOST_ARCH"
 USE_CACHE=0
 NO_LAYER_CACHE=0
+REPRODUCIBLE_BUILD=0
 LAYER_IMAGES=()
 DO_STRIP=0
 STRIP_PREFIX_ARGS=()
@@ -1749,6 +1750,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-cache)
             NO_LAYER_CACHE=1
+            shift
+            ;;
+        --reproducible)
+            REPRODUCIBLE_BUILD=1
             shift
             ;;
         --layer)
@@ -2240,6 +2245,7 @@ EMBED_LOADER_ARG=()
 [[ -n "$SELF_UPDATE_URL"  ]] && EMBED_LOADER_ARG+=(--self-update-url "$SELF_UPDATE_URL")
 [[ -n "$PIN_DIGEST"       ]] && EMBED_LOADER_ARG+=(--pin-digest "$PIN_DIGEST")
 [[ "$NO_LAYER_CACHE" -eq 1 ]] && EMBED_LOADER_ARG+=(--no-cache)
+[[ "$REPRODUCIBLE_BUILD" -eq 1 ]] && EMBED_LOADER_ARG+=(--reproducible)
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \

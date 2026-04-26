@@ -368,6 +368,23 @@ When `--cache` is active, the cache key includes the digest so that `redis:lates
 
 `--pin-digest auto` keeps the legacy SHA-256 behavior. Stronger hashes are also supported with an explicit prefix such as `--pin-digest sha512:auto` or `--pin-digest sha512:<hex>`. On startup, the loader recomputes the canonical digest (with the digest field zeroed before hashing) before extraction and aborts if it does not match. This is most useful together with signatures: the digest gives a stable integrity assertion, while the external key provides the trust anchor.
 
+`--reproducible` makes two builds of the same OCI input produce a byte-identical output binary, which pairs naturally with `--pin-digest`:
+
+```bash
+# Build twice, get identical bytes — verifiable by sha256.
+oci2bin --reproducible --tar fixed-image.tar repro:test repro_v1
+oci2bin --reproducible --tar fixed-image.tar repro:test repro_v2
+sha256sum repro_v1 repro_v2   # identical hashes
+```
+
+`--reproducible` normalises every source of build-time non-determinism the builder controls:
+
+- The metadata `timestamp` field is pinned to `1970-01-01T00:00:00Z` instead of `datetime.now()`.
+- The embedded OCI tar is re-emitted with members sorted by name; `mtime`, `uid`, `gid`, `uname`, `gname` are zeroed.
+- Each gzipped layer is re-compressed with `mtime=0` in its gzip header (Python `gzip.GzipFile` defaults to `time.time()` otherwise).
+
+`--reproducible` does **not** rewrite content-addressed blob filenames — if your upstream `docker save` produces a different layer SHA on each run (e.g. because the source image's gzip layer mtime differs), the input is non-equivalent regardless of the flag. Combine `--reproducible` with `--tar fixed.tar` (or use [`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/docs/source-date-epoch/) when invoking `docker buildx`) to give the builder content-stable input.
+
 ### VM-mode binaries (oci2vm)
 
 `oci2vm` is a symlink to `oci2bin` that builds binaries which run in VM mode by default — no `--vm` flag needed at runtime. The output is named `oci2vm_<image>` so that the embedded loader detects the invocation name and enables VM mode automatically.

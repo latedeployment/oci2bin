@@ -603,16 +603,24 @@ def validate_pin_digest(pin_digest):
         ) from exc
 
 
+REPRODUCIBLE_TIMESTAMP = '1970-01-01T00:00:00Z'
+
+
 def build_meta_block(image_name, digest=None, self_update_url=None,
-                     pin_digest=None):
+                     pin_digest=None, reproducible=False):
     """
     Build the OCI2BIN_META block appended to the end of the output binary.
     Format: uint32_le(total_size) + META_MAGIC + json_bytes + b'\\x00'
     total_size counts from the start of the uint32 field to the end of the block.
     """
+    if reproducible:
+        timestamp = REPRODUCIBLE_TIMESTAMP
+    else:
+        timestamp = datetime.datetime.now(
+            datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     meta = {
         'image':     image_name,
-        'timestamp': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'timestamp': timestamp,
         'version':   OCI2BIN_VERSION,
     }
     if digest:
@@ -691,6 +699,65 @@ def patch_auto_pin_digest(output_path):
 
         f.seek(meta_start + needle_off)
         f.write(repl)
+
+
+def repack_oci_tar_reproducible(oci_data):
+    """
+    Re-emit an OCI tar with all sources of non-determinism removed:
+      - Members sorted by name (stable across input orderings)
+      - mtime/uid/gid zeroed
+      - uname/gname zeroed (Docker-saved tars often record builder identity)
+      - Each gzipped layer re-compressed with mtime=0 (gzip embeds a 4-byte
+        mtime in its header; default Python gzip uses time.time())
+    Two runs of `docker save` for the same image diverge in mtimes and
+    sometimes member order; this pass makes them converge.
+    """
+    in_buf = io.BytesIO(oci_data)
+    with tarfile.open(fileobj=in_buf, mode='r:*') as in_tf:
+        members = sorted(in_tf.getmembers(), key=lambda m: m.name)
+        # Materialize the file contents up front so re-emission is independent
+        # of in_tf's internal cursor state.
+        bodies = {}
+        for m in members:
+            if m.isfile():
+                f = in_tf.extractfile(m)
+                bodies[m.name] = f.read() if f else b''
+            else:
+                bodies[m.name] = b''
+
+    out_buf = io.BytesIO()
+    with tarfile.open(fileobj=out_buf, mode='w:',
+                      format=tarfile.USTAR_FORMAT) as out_tf:
+        for m in members:
+            new = tarfile.TarInfo(name=m.name)
+            new.size = m.size
+            new.mode = m.mode
+            new.type = m.type
+            new.linkname = m.linkname
+            new.uid = 0
+            new.gid = 0
+            new.uname = ''
+            new.gname = ''
+            new.mtime = 0
+            data = bodies[m.name]
+            # Re-compress gzipped layers with mtime=0 so the output bytes
+            # match across builds.  Detect via gzip magic 1f 8b.
+            if data[:2] == b'\x1f\x8b':
+                try:
+                    raw = gzip.decompress(data)
+                    rebuf = io.BytesIO()
+                    with gzip.GzipFile(fileobj=rebuf, mode='wb',
+                                       mtime=0, compresslevel=6) as gz:
+                        gz.write(raw)
+                    data = rebuf.getvalue()
+                    new.size = len(data)
+                except OSError:
+                    pass    # leave layer untouched if decompress fails
+            if m.isfile():
+                out_tf.addfile(new, io.BytesIO(data))
+            else:
+                out_tf.addfile(new)
+    return out_buf.getvalue()
 
 
 def _repack_oci_tar(orig_data, replacements, extra_entries):
@@ -894,7 +961,7 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    loader_dir=DEFAULT_LOADER_DIR,
                    label_prefix=DEFAULT_LABEL_PREFIX,
                    self_update_url=None, pin_digest=None,
-                   use_layer_cache=True):
+                   use_layer_cache=True, reproducible=False):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -953,6 +1020,13 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                                           arch_name,
                                           chunk_bytes=label_chunk_bytes,
                                           label_prefix=label_prefix)
+
+    # --reproducible: re-emit the OCI tar with sorted members, mtime=0,
+    # zeroed uid/gid/uname/gname, and gzip mtime=0 in each layer header.
+    # `docker save` by itself is not deterministic across runs; this pass
+    # makes two builds of the same input produce byte-identical output.
+    if reproducible:
+        oci_data = repack_oci_tar_reproducible(oci_data)
 
     oci_size = len(oci_data)
 
@@ -1126,7 +1200,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     meta_image = image_name_for_meta if image_name_for_meta else image_name
     meta_block = build_meta_block(meta_image, digest,
                                   self_update_url=self_update_url,
-                                  pin_digest=pin_digest)
+                                  pin_digest=pin_digest,
+                                  reproducible=reproducible)
     with open(output_path, 'wb') as f:
         f.write(polyglot)
         f.write(meta_block)
@@ -1212,6 +1287,12 @@ def main():
                         metavar='PREFIX',
                         help=f'Label key prefix for all oci2bin.loader.* labels '
                              f'(default: {DEFAULT_LABEL_PREFIX!r})')
+    parser.add_argument('--reproducible', action='store_true', default=False,
+                        help='Produce a byte-identical output across runs of '
+                             'the same input: re-emit the OCI tar with sorted '
+                             'members, mtime=0, zeroed uid/gid/uname/gname, '
+                             'gzip mtime=0 in each layer; pin the metadata '
+                             'block timestamp to 1970-01-01T00:00:00Z.')
 
     args = parser.parse_args()
 
@@ -1274,7 +1355,8 @@ def main():
                    label_prefix=args.label_prefix,
                    self_update_url=args.self_update_url,
                    pin_digest=args.pin_digest,
-                   use_layer_cache=not args.no_cache)
+                   use_layer_cache=not args.no_cache,
+                   reproducible=args.reproducible)
 
 
 if __name__ == '__main__':

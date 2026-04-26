@@ -340,6 +340,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_arch_wrapper -v
 	@echo "=== diff --syscalls unit tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_diff_syscalls -v
+	@echo "=== Reproducible build unit tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_reproducible_build -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="
