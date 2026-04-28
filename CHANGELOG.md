@@ -4,17 +4,17 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
-### Skipped
+### Added
 
-- **`--vsock-control` for VM mode** — deferred. The full feature
-  requires (1) wiring `--vsock cid=3,socket=PATH` into the
-  cloud-hypervisor argv builder, (2) calling `krun_set_vsock_port`
-  in the libkrun path, (3) shipping a tiny guest-side daemon inside
-  the initramfs that listens on AF_VSOCK and dispatches
-  `exec`/`stop`/`stats` commands, and (4) a host-side helper to send
-  commands to the UNIX socket the VMM exposes. The guest agent is the
-  largest piece because it needs its own statically-linked binary
-  injected into `build_initramfs` plus an init wrapper.
+- **`--vsock-port PORT`** — VM mode now ships an AF_VSOCK control agent
+  inside the guest. The agent (folded into the loader binary, which is
+  already the guest `/init`) forks before the entrypoint exec and listens
+  on `PORT`. The host reaches it through the cloud-hypervisor hybrid-vsock
+  UDS or the libkrun-mapped UDS. New `oci2bin vsock-ctl [--hybrid PORT]
+  SOCKET CMD…` subcommand drives it. Wire protocol is one ASCII line per
+  request: `exec ARGV…`, `stats`, or `stop`. Inputs are bounds-checked
+  (4 KiB line, 64 args, no embedded control bytes) and `exec`'s child
+  inherits the connection as stdio so workload output streams back.
 
 ## [0.11.0] - 2026-04-20
 

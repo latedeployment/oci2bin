@@ -2738,6 +2738,116 @@ static void test_mcp_helpers(void)
     g_mcp_n_ctrs = 0;
 }
 
+static void test_vsock_split_line(void)
+{
+    {
+        char line[64] = "exec /bin/echo hello\n";
+        char* args[VSOCK_MAX_ARGS];
+        int argc = vsock_split_line(line, args, VSOCK_MAX_ARGS);
+        ASSERT_INT_EQ(argc, 3, "vsock_split_line: argc=3");
+        ASSERT_STR_EQ(args[0], "exec",      "vsock_split_line: argv[0]=exec");
+        ASSERT_STR_EQ(args[1], "/bin/echo", "vsock_split_line: argv[1]=path");
+        ASSERT_STR_EQ(args[2], "hello",     "vsock_split_line: argv[2]=arg");
+    }
+    {
+        char line[16] = "stop\n";
+        char* args[VSOCK_MAX_ARGS];
+        int argc = vsock_split_line(line, args, VSOCK_MAX_ARGS);
+        ASSERT_INT_EQ(argc, 1, "vsock_split_line: bare stop argc=1");
+        ASSERT_STR_EQ(args[0], "stop", "vsock_split_line: stop");
+    }
+    {
+        char line[64] = "  exec   foo  bar  \n";
+        char* args[VSOCK_MAX_ARGS];
+        int argc = vsock_split_line(line, args, VSOCK_MAX_ARGS);
+        ASSERT_INT_EQ(argc, 3,
+                      "vsock_split_line: collapses repeated spaces");
+        ASSERT_STR_EQ(args[1], "foo",
+                      "vsock_split_line: arg1 after spaces");
+    }
+    {
+        char line[16] = "bad\x01cmd\n";
+        char* args[VSOCK_MAX_ARGS];
+        int argc = vsock_split_line(line, args, VSOCK_MAX_ARGS);
+        ASSERT_INT_EQ(argc, -1,
+                      "vsock_split_line: rejects control bytes");
+    }
+    {
+        char line[16] = "high\xc2\xa0byte\n";
+        char* args[VSOCK_MAX_ARGS];
+        int argc = vsock_split_line(line, args, VSOCK_MAX_ARGS);
+        ASSERT_INT_EQ(argc, -1,
+                      "vsock_split_line: rejects high-bit bytes");
+    }
+    {
+        char line[256];
+        size_t off = 0;
+        for (int i = 0; i < 80; i++)
+        {
+            int n = snprintf(line + off, sizeof(line) - off,
+                             (i == 0) ? "exec" : " a");
+            if (n < 0)
+            {
+                break;
+            }
+            off += (size_t)n;
+        }
+        char* args[8];
+        int argc = vsock_split_line(line, args, 8);
+        ASSERT_INT_EQ(argc, -1,
+                      "vsock_split_line: argc overflow returns -1");
+    }
+}
+
+static void test_parse_opts_vsock_port(void)
+{
+    struct container_opts opts;
+
+    {
+        char* argv[] = {"prog", "--vsock-port", "1234", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --vsock-port 1234 returns 0");
+        ASSERT_INT_EQ(opts.vsock_port, 1234,
+                      "parse_opts: --vsock-port stored");
+    }
+    {
+        char* argv[] = {"prog", "--vsock-port", "0", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --vsock-port 0 rejected");
+    }
+    {
+        char* argv[] = {"prog", "--vsock-port", "65536", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --vsock-port 65536 rejected");
+    }
+    {
+        char* argv[] = {"prog", "--vsock-port", "abc", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --vsock-port non-numeric rejected");
+    }
+    {
+        char* argv[] = {"prog", "--vsock-port", "1024abc", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --vsock-port trailing-junk rejected");
+    }
+    {
+        char* argv[] = {"prog", "--vsock-port", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --vsock-port without value rejected");
+    }
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -2779,6 +2889,8 @@ int main(void)
     test_misc_helpers();
     test_write_read_file_beneath();
     test_kernel_feature_state();
+    test_vsock_split_line();
+    test_parse_opts_vsock_port();
 
     printf("1..%d\n", tap_test_num);
 
