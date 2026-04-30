@@ -4,6 +4,8 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-04-30
+
 ### Added
 
 - **`--vsock-port PORT`** — VM mode now ships an AF_VSOCK control agent
@@ -719,6 +721,7 @@ Initial public release.
   `snprintf` truncation checks on all `PATH_MAX` buffers, no `system()`/`popen()`
   anywhere in the codebase.
 
+[0.13.0]: https://github.com/latedeployment/oci2bin/compare/v0.12.0...v0.13.0
 [0.3.0]: https://github.com/latedeployment/oci2bin/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/latedeployment/oci2bin/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/latedeployment/oci2bin/releases/tag/v0.1.0
