@@ -7325,18 +7325,44 @@ static int container_main(const char* rootfs, struct container_opts *opts)
 
     if (do_drop)
     {
-        /* setgroups may be denied in a user namespace (EPERM) — non-fatal */
-        setgroups(0, NULL);
-        /* In a user namespace only UID/GID 0 is mapped; setgid/setuid
-         * for other IDs fails with EINVAL.  Treat as non-fatal so the
-         * container still runs as the mapped uid=0. */
+        /* When --user was passed explicitly the workload MUST run as that
+         * UID/GID; failing open would silently leave it running as root.
+         * For the image-User fallback we keep the previous best-effort
+         * behavior (only UID 0 is mapped in a user namespace, so other
+         * IDs fail with EINVAL — that's expected and not a bug). */
+        const int strict = opts->has_user;
+
+        if (setgroups(0, NULL) < 0)
+        {
+            if (strict && errno != EPERM)
+            {
+                fprintf(stderr,
+                        "oci2bin: --user: setgroups failed: %s\n",
+                        strerror(errno));
+                return 1;
+            }
+        }
         if (setgid(drop_gid) < 0)
         {
+            if (strict)
+            {
+                fprintf(stderr,
+                        "oci2bin: --user: setgid(%d) failed: %s\n",
+                        (int)drop_gid, strerror(errno));
+                return 1;
+            }
             debug_log("container.setgid_skip", "gid=%d err=%s",
                       (int)drop_gid, strerror(errno));
         }
         if (setuid(drop_uid) < 0)
         {
+            if (strict)
+            {
+                fprintf(stderr,
+                        "oci2bin: --user: setuid(%d) failed: %s\n",
+                        (int)drop_uid, strerror(errno));
+                return 1;
+            }
             debug_log("container.setuid_skip", "uid=%d err=%s",
                       (int)drop_uid, strerror(errno));
         }
