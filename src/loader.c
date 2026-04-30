@@ -34,7 +34,6 @@
 #include <linux/filter.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
-#include <linux/vm_sockets.h>
 #include <ctype.h>
 #include <time.h>
 #ifdef __aarch64__
@@ -206,7 +205,6 @@ enum kernel_feature_state
 static signed char g_kernel_feature_state[KERNEL_FEATURE_MAX];
 
 static int write_all_fd(int fd, const char* data, size_t len);
-static int vsock_agent_main(int port);
 static int json_escape_string(const char* src, char* dst, size_t dstsz);
 static unsigned long long current_effective_caps(void);
 
@@ -599,11 +597,6 @@ struct container_opts
     int   use_vm;   /* 1 if --vm was given */
     char* vmm;      /* "cloud-hypervisor" | path; NULL = default */
 
-    /* --vsock-port PORT  (expose a guest-side AF_VSOCK control agent on the
-     * given port; the host reaches it via the cloud-hypervisor UDS or the
-     * libkrun-mapped UDS).  0 = unset (feature disabled). */
-    int vsock_port;
-
     /* PTY relay: set by run_container() before fork, used by container_main() */
     int pty_master_fd; /* -1 if no PTY; parent closes slave, uses this for relay */
     int pty_slave_fd;  /* -1 if no PTY; child sets as controlling terminal */
@@ -668,7 +661,7 @@ static void audit_emit_start_event(const char* image_path,
     char image[PATH_MAX];
     char name[256];
     char net[64];
-    char extra[PATH_MAX + 512];
+    char extra[1024];
 
     audit_escape_string(image_path, image, sizeof(image));
     audit_escape_string(opts->name ? opts->name : "", name, sizeof(name));
@@ -1236,7 +1229,6 @@ static int path_has_dotdot_component(const char* path);
 static int path_is_absolute_and_clean(const char* path);
 static ssize_t read_all_fd(int fd, char* buf, size_t len);
 static int write_all_fd(int fd, const char* data, size_t len);
-static int vsock_agent_main(int port);
 static int parent_dir_path(const char* path, char* out, size_t out_sz);
 static int mkdir_p_secure(const char* path, mode_t leaf_mode, const char* what);
 static int ensure_path_not_symlink(const char* path, const char* what);
@@ -1832,8 +1824,7 @@ static char* read_file(const char* path, size_t* out_size)
     return buf;
 }
 
-static int __attribute__((unused)) write_file(const char* path,
-        const char* data, size_t len)
+static int write_file(const char* path, const char* data, size_t len)
 {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
@@ -7724,8 +7715,6 @@ static void usage(const char* prog)
             "  --vm               run container inside a microVM (requires KVM or HVF)\n"
             "  --vmm VMM          VMM backend: cloud-hypervisor, or path to binary\n"
             "                     (default: cloud-hypervisor; libkrun if compiled with LIBKRUN=1)\n"
-            "  --vsock-port PORT  expose an AF_VSOCK control agent inside the VM on PORT\n"
-            "                     (use `oci2bin vsock-ctl` from the host to send commands)\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -8667,28 +8656,6 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->vmm = argv[++i];
-        }
-        else if (strcmp(argv[i], "--vsock-port") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                fprintf(stderr,
-                        "oci2bin: --vsock-port requires a PORT argument\n");
-                return -1;
-            }
-            i++;
-            char* endp = NULL;
-            errno = 0;
-            long val = strtol(argv[i], &endp, 10);
-            if (endp == argv[i] || (endp && *endp != '\0') ||
-                    errno == ERANGE || val < 1 || val > 65535)
-            {
-                fprintf(stderr,
-                        "oci2bin: --vsock-port: invalid port '%s'"
-                        " (must be 1-65535)\n", argv[i]);
-                return -1;
-            }
-            opts->vsock_port = (int)val;
         }
         else if (strcmp(argv[i], "--memory") == 0)
         {
@@ -10195,35 +10162,6 @@ static int vm_init_main(void)
     char* vm_cmdline = read_file("/proc/cmdline", &cmdline_size);
     if (vm_cmdline)
     {
-        /* oci2bin.vsock_port=N: fork the AF_VSOCK control agent before the
-         * entrypoint exec so the host can drive the guest while the
-         * workload runs.  Stays a sibling of the entrypoint; when init
-         * (the entrypoint) exits, the kernel reaps the agent. */
-        char* vk = strstr(vm_cmdline, "oci2bin.vsock_port=");
-        if (vk)
-        {
-            vk += strlen("oci2bin.vsock_port=");
-            char* endp = NULL;
-            long port = strtol(vk, &endp, 10);
-            if (endp != vk && port >= 1 && port <= 65535)
-            {
-                pid_t agent = fork();
-                if (agent == 0)
-                {
-                    _exit(vsock_agent_main((int)port));
-                }
-                if (agent < 0)
-                {
-                    perror("oci2bin-init: fork vsock agent");
-                }
-                else
-                {
-                    debug_log("vm.init.vsock_agent", "pid=%d port=%ld",
-                              (int)agent, port);
-                }
-            }
-        }
-
         for (int mi = 0; mi < 64; mi++)
         {
             char key[32];
@@ -10351,523 +10289,6 @@ static int vm_init_main(void)
     return 1;
 }
 
-/* ── vsock control plane ─────────────────────────────────────────────────
- *
- * `--vsock-port PORT` exposes an AF_VSOCK control agent inside the VM.
- * The host reaches it via the cloud-hypervisor hybrid-vsock UDS or the
- * libkrun-mapped UDS.  Wire protocol is one newline-terminated ASCII line
- * per request, up to VSOCK_LINE_MAX bytes:
- *
- *   exec ARG1 ARG2 ...     fork+execvp; reply "OK exited status=N\n"
- *   stop                   reply "OK\n"; agent stops accepting connections
- *   stats                  reply "OK loadavg=A uptime=B memfree=C memtotal=D\n"
- *
- * Errors come back as "ERR <message>\n" with no embedded newlines.
- */
-
-#define VSOCK_LINE_MAX 4096
-#define VSOCK_MAX_ARGS 64
-
-/*
- * vsock_split_line: in-place split on single spaces, NUL-terminating each
- * token.  Mutates `line`.  Returns argc, or -1 if argc would exceed
- * max_args, or -1 if the input contains anything outside printable ASCII
- * (rejects embedded NULs, control chars, and high bytes).
- *
- * A trailing '\n' is stripped before splitting so callers can pass the
- * line as read.
- */
-static int vsock_split_line(char* line, char* args[], int max_args)
-{
-    if (!line || max_args <= 0)
-    {
-        return -1;
-    }
-    size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-    {
-        line[--len] = '\0';
-    }
-    for (size_t i = 0; i < len; i++)
-    {
-        unsigned char c = (unsigned char)line[i];
-        if (c < 0x20 || c >= 0x7f)
-        {
-            return -1;
-        }
-    }
-    int argc = 0;
-    char* p = line;
-    while (*p)
-    {
-        while (*p == ' ')
-        {
-            *p++ = '\0';
-        }
-        if (!*p)
-        {
-            break;
-        }
-        if (argc >= max_args)
-        {
-            return -1;
-        }
-        args[argc++] = p;
-        while (*p && *p != ' ')
-        {
-            p++;
-        }
-    }
-    return argc;
-}
-
-/* Read a single \n-terminated line into buf (NUL-terminated), up to
- * bufsize-1 bytes.  Returns bytes read excluding terminator, or -1 on
- * error/EOF/oversize.  EOF before any data returns 0. */
-static ssize_t vsock_read_line(int fd, char* buf, size_t bufsize)
-{
-    if (bufsize < 2)
-    {
-        return -1;
-    }
-    size_t off = 0;
-    while (off + 1 < bufsize)
-    {
-        char c;
-        ssize_t r;
-        do
-        {
-            r = read(fd, &c, 1);
-        }
-        while (r < 0 && errno == EINTR);
-        if (r < 0)
-        {
-            return -1;
-        }
-        if (r == 0)
-        {
-            if (off == 0)
-            {
-                return 0;
-            }
-            break;
-        }
-        buf[off++] = c;
-        if (c == '\n')
-        {
-            break;
-        }
-    }
-    if (off + 1 >= bufsize && buf[off - 1] != '\n')
-    {
-        return -1; /* line too long */
-    }
-    buf[off] = '\0';
-    return (ssize_t)off;
-}
-
-/* Send a NUL-terminated string with retry on partial writes. */
-static int vsock_write_str(int fd, const char* s)
-{
-    size_t len = strlen(s);
-    return write_all_fd(fd, s, len);
-}
-
-/* Format: "OK exited status=N\n" or "ERR exec: <reason>\n". */
-static void vsock_handle_exec(int fd, char* args[], int argc)
-{
-    if (argc < 2)
-    {
-        vsock_write_str(fd, "ERR exec: missing argv\n");
-        return;
-    }
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        char msg[64];
-        int n = snprintf(msg, sizeof(msg), "ERR exec: fork: errno %d\n",
-                         errno);
-        if (n > 0 && (size_t)n < sizeof(msg))
-        {
-            vsock_write_str(fd, msg);
-        }
-        return;
-    }
-    if (pid == 0)
-    {
-        /* Child: redirect stdio to the client socket so command output
-         * streams back to the host. */
-        if (dup2(fd, 0) < 0 || dup2(fd, 1) < 0 || dup2(fd, 2) < 0)
-        {
-            _exit(127);
-        }
-        /* args[1..argc-1] are the command and arguments; build a NULL-
-         * terminated argv for execvp. */
-        char* execv_argv[VSOCK_MAX_ARGS + 1];
-        int n = argc - 1;
-        if (n > VSOCK_MAX_ARGS)
-        {
-            n = VSOCK_MAX_ARGS;
-        }
-        for (int i = 0; i < n; i++)
-        {
-            execv_argv[i] = args[i + 1];
-        }
-        execv_argv[n] = NULL;
-        execvp(execv_argv[0], execv_argv);
-        _exit(127);
-    }
-    int status = 0;
-    pid_t w;
-    do
-    {
-        w = waitpid(pid, &status, 0);
-    }
-    while (w < 0 && errno == EINTR);
-    int rc = -1;
-    if (w >= 0)
-    {
-        if (WIFEXITED(status))
-        {
-            rc = WEXITSTATUS(status);
-        }
-        else if (WIFSIGNALED(status))
-        {
-            rc = 128 + WTERMSIG(status);
-        }
-    }
-    char msg[64];
-    int n = snprintf(msg, sizeof(msg), "OK exited status=%d\n", rc);
-    if (n > 0 && (size_t)n < sizeof(msg))
-    {
-        vsock_write_str(fd, msg);
-    }
-}
-
-static void vsock_handle_stats(int fd)
-{
-    /* Parse fields from /proc/loadavg, /proc/uptime, /proc/meminfo without
-     * any allocation.  Each helper falls back to "?" on read failure. */
-    char loadavg[64] = "?";
-    char uptime[32]  = "?";
-    long mem_free    = -1;
-    long mem_total   = -1;
-
-    int la_fd = open("/proc/loadavg", O_RDONLY | O_CLOEXEC);
-    if (la_fd >= 0)
-    {
-        char buf[128];
-        ssize_t r = read(la_fd, buf, sizeof(buf) - 1);
-        close(la_fd);
-        if (r > 0)
-        {
-            buf[r] = '\0';
-            char* sp = strchr(buf, ' ');
-            if (sp)
-            {
-                sp = strchr(sp + 1, ' ');
-            }
-            if (sp)
-            {
-                sp = strchr(sp + 1, ' ');
-            }
-            if (sp)
-            {
-                *sp = '\0';
-            }
-            size_t cl = strlen(buf);
-            if (cl > 0 && cl < sizeof(loadavg))
-            {
-                memcpy(loadavg, buf, cl + 1);
-            }
-        }
-    }
-
-    int up_fd = open("/proc/uptime", O_RDONLY | O_CLOEXEC);
-    if (up_fd >= 0)
-    {
-        char buf[64];
-        ssize_t r = read(up_fd, buf, sizeof(buf) - 1);
-        close(up_fd);
-        if (r > 0)
-        {
-            buf[r] = '\0';
-            char* sp = strchr(buf, ' ');
-            if (sp)
-            {
-                *sp = '\0';
-            }
-            size_t cl = strlen(buf);
-            if (cl > 0 && cl < sizeof(uptime))
-            {
-                memcpy(uptime, buf, cl + 1);
-            }
-        }
-    }
-
-    int mi_fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
-    if (mi_fd >= 0)
-    {
-        char buf[2048];
-        ssize_t r = read(mi_fd, buf, sizeof(buf) - 1);
-        close(mi_fd);
-        if (r > 0)
-        {
-            buf[r] = '\0';
-            char* mt = strstr(buf, "MemTotal:");
-            if (mt)
-            {
-                mem_total = strtol(mt + 9, NULL, 10);
-            }
-            char* mf = strstr(buf, "MemAvailable:");
-            if (mf)
-            {
-                mem_free = strtol(mf + 13, NULL, 10);
-            }
-        }
-    }
-
-    char out[256];
-    int n = snprintf(out, sizeof(out),
-                     "OK loadavg=%s uptime=%s memfree=%ld memtotal=%ld\n",
-                     loadavg, uptime, mem_free, mem_total);
-    if (n > 0 && (size_t)n < sizeof(out))
-    {
-        vsock_write_str(fd, out);
-    }
-}
-
-/*
- * vsock_agent_main: bind AF_VSOCK port and serve the line protocol.
- * One connection at a time keeps the agent simple and prevents resource
- * exhaustion in the guest.  Returns 0 on clean stop, 1 on bind/listen
- * failure.
- */
-static int vsock_agent_main(int port)
-{
-    int srv = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (srv < 0)
-    {
-        perror("oci2bin-agent: socket(AF_VSOCK)");
-        return 1;
-    }
-    struct sockaddr_vm addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.svm_family = AF_VSOCK;
-    addr.svm_port   = (unsigned int)port;
-    addr.svm_cid    = VMADDR_CID_ANY;
-    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0)
-    {
-        perror("oci2bin-agent: bind");
-        close(srv);
-        return 1;
-    }
-    if (listen(srv, 1) < 0)
-    {
-        perror("oci2bin-agent: listen");
-        close(srv);
-        return 1;
-    }
-    debug_log("vm.agent.listen", "port=%d", port);
-
-    int stopped = 0;
-    while (!stopped)
-    {
-        int c = accept4(srv, NULL, NULL, SOCK_CLOEXEC);
-        if (c < 0)
-        {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-            perror("oci2bin-agent: accept");
-            break;
-        }
-        char line[VSOCK_LINE_MAX];
-        ssize_t r = vsock_read_line(c, line, sizeof(line));
-        if (r <= 0)
-        {
-            close(c);
-            continue;
-        }
-        char* args[VSOCK_MAX_ARGS];
-        int argc = vsock_split_line(line, args, VSOCK_MAX_ARGS);
-        if (argc < 1)
-        {
-            vsock_write_str(c, "ERR malformed request\n");
-            close(c);
-            continue;
-        }
-        if (strcmp(args[0], "exec") == 0)
-        {
-            vsock_handle_exec(c, args, argc);
-        }
-        else if (strcmp(args[0], "stop") == 0)
-        {
-            vsock_write_str(c, "OK\n");
-            stopped = 1;
-        }
-        else if (strcmp(args[0], "stats") == 0)
-        {
-            vsock_handle_stats(c);
-        }
-        else
-        {
-            vsock_write_str(c, "ERR unknown command\n");
-        }
-        close(c);
-    }
-    close(srv);
-    return 0;
-}
-
-/*
- * vsock_ctl_main: host-side client.  Connects to the UDS that the VMM
- * exposes and pipes a single request line, then prints whatever the
- * agent writes back until EOF.
- *
- * Usage:
- *   oci2bin vsock-ctl SOCKET_PATH CMD [ARGS...]   (libkrun, raw UDS)
- *   oci2bin vsock-ctl --hybrid PORT SOCKET CMD..  (cloud-hypervisor)
- *
- * For --hybrid we send "CONNECT <port>\n" and read a single response
- * line ("OK <hostport>\n") before forwarding the command.
- */
-static int vsock_ctl_main(int argc, char** argv)
-{
-    int hybrid_port = 0;
-    int idx = 2; /* argv[1] is "vsock-ctl" */
-    if (idx < argc && strcmp(argv[idx], "--hybrid") == 0)
-    {
-        if (idx + 1 >= argc)
-        {
-            fprintf(stderr,
-                    "oci2bin vsock-ctl --hybrid: missing PORT argument\n");
-            return 2;
-        }
-        char* endp = NULL;
-        long p = strtol(argv[idx + 1], &endp, 10);
-        if (endp == argv[idx + 1] || (endp && *endp != '\0') ||
-                p < 1 || p > 65535)
-        {
-            fprintf(stderr, "oci2bin vsock-ctl --hybrid: invalid port\n");
-            return 2;
-        }
-        hybrid_port = (int)p;
-        idx += 2;
-    }
-    if (idx + 1 >= argc)
-    {
-        fprintf(stderr,
-                "usage: oci2bin vsock-ctl [--hybrid PORT] SOCKET CMD..\n");
-        return 2;
-    }
-    const char* sock_path = argv[idx++];
-    /* Build the command line from remaining args.  Reject embedded
-     * newlines so a caller can't smuggle an extra protocol line. */
-    char cmd[VSOCK_LINE_MAX];
-    cmd[0] = '\0';
-    size_t off = 0;
-    for (int i = idx; i < argc; i++)
-    {
-        if (strchr(argv[i], '\n') != NULL)
-        {
-            fprintf(stderr,
-                    "oci2bin vsock-ctl: argument contains newline\n");
-            return 2;
-        }
-        int n = snprintf(cmd + off, sizeof(cmd) - off,
-                         "%s%s", (i > idx) ? " " : "", argv[i]);
-        if (n < 0 || (size_t)n >= sizeof(cmd) - off)
-        {
-            fprintf(stderr, "oci2bin vsock-ctl: command line too long\n");
-            return 2;
-        }
-        off += (size_t)n;
-    }
-    if (off + 2 > sizeof(cmd))
-    {
-        fprintf(stderr, "oci2bin vsock-ctl: command line too long\n");
-        return 2;
-    }
-    cmd[off++] = '\n';
-    cmd[off]   = '\0';
-
-    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0)
-    {
-        perror("oci2bin vsock-ctl: socket");
-        return 1;
-    }
-    struct sockaddr_un sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sun_family = AF_UNIX;
-    if (strlen(sock_path) >= sizeof(sa.sun_path))
-    {
-        fprintf(stderr, "oci2bin vsock-ctl: socket path too long\n");
-        close(s);
-        return 2;
-    }
-    memcpy(sa.sun_path, sock_path, strlen(sock_path) + 1);
-    if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) < 0)
-    {
-        perror("oci2bin vsock-ctl: connect");
-        close(s);
-        return 1;
-    }
-    if (hybrid_port > 0)
-    {
-        char hello[64];
-        int n = snprintf(hello, sizeof(hello),
-                         "CONNECT %d\n", hybrid_port);
-        if (n < 0 || (size_t)n >= sizeof(hello) ||
-                write_all_fd(s, hello, (size_t)n) < 0)
-        {
-            perror("oci2bin vsock-ctl: write CONNECT");
-            close(s);
-            return 1;
-        }
-        char ok[64];
-        ssize_t r = vsock_read_line(s, ok, sizeof(ok));
-        if (r <= 0 || strncmp(ok, "OK", 2) != 0)
-        {
-            fprintf(stderr,
-                    "oci2bin vsock-ctl: hybrid CONNECT rejected: %s",
-                    (r > 0) ? ok : "(no response)\n");
-            close(s);
-            return 1;
-        }
-    }
-    if (write_all_fd(s, cmd, off) < 0)
-    {
-        perror("oci2bin vsock-ctl: write");
-        close(s);
-        return 1;
-    }
-    /* Stream the agent's response back to stdout until EOF. */
-    char buf[4096];
-    while (1)
-    {
-        ssize_t r;
-        do
-        {
-            r = read(s, buf, sizeof(buf));
-        }
-        while (r < 0 && errno == EINTR);
-        if (r <= 0)
-        {
-            break;
-        }
-        if (write_all_fd(1, buf, (size_t)r) < 0)
-        {
-            close(s);
-            return 1;
-        }
-    }
-    close(s);
-    return 0;
-}
-
 #ifdef USE_LIBKRUN
 #include <libkrun.h>
 
@@ -10878,6 +10299,7 @@ static int vsock_ctl_main(int argc, char** argv)
 static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
                              struct container_opts* opts)
 {
+    (void)tmpdir; /* unused in libkrun path */
     debug_log("vm.libkrun.begin", "rootfs=%s", rootfs);
 
     /* Read OCI config and build exec argv */
@@ -11008,47 +10430,6 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
         }
     }
 
-    /* --vsock-port: map a UDS on the host to an AF_VSOCK port inside the
-     * guest.  Buffers live for the rest of run_as_vm_libkrun() so libkrun
-     * can read them up to and including krun_start_enter(). */
-    char vsock_uds[PATH_MAX];
-    char vsock_env[64];
-    if (opts->vsock_port > 0)
-    {
-        const char* base = (tmpdir && tmpdir[0]) ? tmpdir : "/tmp";
-        int vn = snprintf(vsock_uds, sizeof(vsock_uds),
-                          "%s/oci2bin-vsock-%d.sock", base, (int)getpid());
-        if (vn < 0 || (size_t)vn >= sizeof(vsock_uds))
-        {
-            fprintf(stderr, "oci2bin: vsock UDS path truncated\n");
-            goto cleanup;
-        }
-        /* Pre-existing path would prevent libkrun from binding. */
-        unlink(vsock_uds);
-        if (krun_add_vsock_port((uint32_t)ctx,
-                                (uint32_t)opts->vsock_port,
-                                vsock_uds) != 0)
-        {
-            fprintf(stderr, "oci2bin: krun_add_vsock_port failed\n");
-            goto cleanup;
-        }
-        vn = snprintf(vsock_env, sizeof(vsock_env),
-                      "OCI2BIN_VSOCK_PORT=%d", opts->vsock_port);
-        if (vn < 0 || (size_t)vn >= sizeof(vsock_env))
-        {
-            fprintf(stderr, "oci2bin: vsock env truncated\n");
-            goto cleanup;
-        }
-        if (flat_env_n < MAX_ENV)
-        {
-            flat_env[flat_env_n++] = vsock_env;
-            flat_env[flat_env_n] = NULL;
-        }
-        debug_log("vm.libkrun.vsock", "port=%d uds=%s", opts->vsock_port,
-                  vsock_uds);
-        fprintf(stderr, "oci2bin: vsock UDS available at %s\n", vsock_uds);
-    }
-
     /* Set exec */
     if (krun_set_exec((uint32_t)ctx, exec_args[0],
                       (const char* const *)(exec_args + 1),
@@ -11097,8 +10478,6 @@ struct vm_ch_ctx
     char polyglot_py[PATH_MAX];
     char data_img_path[PATH_MAX];
     char disk_arg[PATH_MAX + 16];
-    char vsock_path[PATH_MAX];
-    char vsock_arg[PATH_MAX + 32];
     char cpus_str[32];
     char mem_str[32];
     char cmdline[4096];
@@ -11353,10 +10732,6 @@ static int vm_ch_build_cmdline(struct vm_ch_ctx* ctx,
     {
         CMDLINE_APPEND(" oci2bin.data=/dev/vda");
     }
-    if (opts->vsock_port > 0)
-    {
-        CMDLINE_APPEND(" oci2bin.vsock_port=%d", opts->vsock_port);
-    }
     for (int vi = 0; vi < opts->n_vols; vi++)
     {
         if (strstr(opts->vol_ctr[vi], "..") != NULL ||
@@ -11565,32 +10940,6 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         ctx->argv[ai++] = ctx->disk_arg;
     }
 
-    /* 6b. --vsock-port: expose a UDS the host can use to reach an AF_VSOCK
-     * port inside the guest (cloud-hypervisor "hybrid vsock"). */
-    if (opts->vsock_port > 0)
-    {
-        n = snprintf(ctx->vsock_path, sizeof(ctx->vsock_path),
-                     "%s/vsock.sock", tmpdir);
-        if (n < 0 || (size_t)n >= sizeof(ctx->vsock_path))
-        {
-            fprintf(stderr, "oci2bin: vsock path truncated\n");
-            free(ctx);
-            return 1;
-        }
-        n = snprintf(ctx->vsock_arg, sizeof(ctx->vsock_arg),
-                     "cid=3,socket=%s", ctx->vsock_path);
-        if (n < 0 || (size_t)n >= sizeof(ctx->vsock_arg))
-        {
-            fprintf(stderr, "oci2bin: vsock arg too long\n");
-            free(ctx);
-            return 1;
-        }
-        ctx->argv[ai++] = "--vsock";
-        ctx->argv[ai++] = ctx->vsock_arg;
-        debug_log("vm.ch.vsock", "port=%d socket=%s", opts->vsock_port,
-                  ctx->vsock_path);
-    }
-
     /* 7. Start virtiofsd daemons for -v mounts */
     CH_CALL(vm_ch_start_virtiofsd(ctx, opts, tmpdir, &ai));
 
@@ -11769,8 +11118,6 @@ static int mcp_find_ctr(const char* name)
 static void mcp_tool_run_container(long id, const char* args_json,
                                    const char* self_path, int allow_net)
 {
-    (void)self_path;
-
     char* image = json_get_string(args_json, "image");
     char* name  = json_get_string(args_json, "name");
     char* net   = json_get_string(args_json, "net");
@@ -11988,12 +11335,14 @@ static void mcp_tool_run_container(long id, const char* args_json,
 
     /* Track the container */
     int slot = g_mcp_n_ctrs++;
-    memcpy(g_mcp_ctrs[slot].name, name, strlen(name) + 1);
+    strncpy(g_mcp_ctrs[slot].name, name, MCP_NAME_MAX - 1);
+    g_mcp_ctrs[slot].name[MCP_NAME_MAX - 1] = '\0';
     g_mcp_ctrs[slot].pid = child;
-    memcpy(g_mcp_ctrs[slot].log_path, log_path, strlen(log_path) + 1);
+    strncpy(g_mcp_ctrs[slot].log_path, log_path, PATH_MAX - 1);
+    g_mcp_ctrs[slot].log_path[PATH_MAX - 1] = '\0';
 
     /* Return container ID */
-    char result[MCP_NAME_MAX * 2 + 64];
+    char result[256];
     char name_esc[MCP_NAME_MAX * 2];
     json_escape_string(name, name_esc, sizeof(name_esc));
     snprintf(result, sizeof(result),
@@ -12846,7 +12195,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
             }
             else
             {
-                char msg[512];
+                char msg[256];
                 char esc[256];
                 json_escape_string(tool_name, esc, sizeof(esc));
                 snprintf(msg, sizeof(msg), "unknown tool: %s", esc);
@@ -12861,7 +12210,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
         }
         else
         {
-            char msg[512];
+            char msg[256];
             char esc[256];
             json_escape_string(method, esc, sizeof(esc));
             snprintf(msg, sizeof(msg), "method not found: %s", esc);
@@ -12924,12 +12273,6 @@ int main(int argc, char* argv[])
             }
         }
         return mcp_serve_main(self_path, allow_net);
-    }
-
-    /* 1c. "vsock-ctl" subcommand: send a request to the in-VM agent. */
-    if (argc >= 2 && strcmp(argv[1], "vsock-ctl") == 0)
-    {
-        return vsock_ctl_main(argc, argv);
     }
 
     /* 1b. oci2vm mode: if invoked as "oci2vm", prepend --vm to argv so VM

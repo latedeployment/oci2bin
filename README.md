@@ -736,7 +736,6 @@ These defaults apply when `--cpus` or `--memory` are not passed at runtime.
 | `--cpus N` | Number of vCPUs (default 1) |
 | `--overlay-persist DIR` | Persist a 1 GiB ext2 data disk in `DIR/oci2bin-data.ext2` |
 | `-v HOST:CTR` | Mount host directory inside the VM |
-| `--vsock-port PORT` | Expose an in-VM AF_VSOCK control agent on `PORT` |
 | `--debug` | Print verbose runtime diagnostics (execution path, VM config, extracted paths) |
 
 ### Notes
@@ -748,41 +747,6 @@ These defaults apply when `--cpus` or `--memory` are not passed at runtime.
   `virtiofsd` must be in `$PATH` for the cloud-hypervisor path.
 - `--overlay-persist` in VM mode creates a separate ext2 block device. It does
   not use overlayfs (that is the namespace-mode behaviour).
-
-### Vsock control agent (`--vsock-port`)
-
-Pass `--vsock-port PORT` to fork a tiny AF_VSOCK control agent inside the
-guest before the entrypoint exec. The host reaches it through the UDS the
-VMM exposes:
-
-```bash
-# cloud-hypervisor: --vsock cid=3,socket=/tmp/oci2bin-<pid>/vsock.sock
-./alpine_vm --vm --vsock-port 1024 /bin/sleep infinity &
-
-# the loader prints the UDS path on stderr; copy it from there.
-oci2bin vsock-ctl --hybrid 1024 /tmp/oci2bin-<pid>/vsock.sock \
-    exec /bin/echo "hello from the guest"
-oci2bin vsock-ctl --hybrid 1024 /tmp/oci2bin-<pid>/vsock.sock stats
-oci2bin vsock-ctl --hybrid 1024 /tmp/oci2bin-<pid>/vsock.sock stop
-
-# libkrun: krun_add_vsock_port maps a raw UDS at
-#   <tmpdir-or-/tmp>/oci2bin-vsock-<pid>.sock
-oci2bin vsock-ctl /tmp/oci2bin-vsock-<pid>.sock exec /bin/uname -a
-```
-
-Wire protocol is one newline-terminated ASCII line per request, max 4096
-bytes:
-
-| Command | Behaviour |
-|---|---|
-| `exec ARG1 ARG2 …` | Fork+`execvp` inside the guest, stream stdio back over the connection, reply `OK exited status=N` on completion |
-| `stats` | One line: `OK loadavg=X uptime=Y memfree=Z memtotal=W` |
-| `stop` | Reply `OK` and stop accepting connections |
-
-The agent is a sibling of the entrypoint, not its parent, so when the
-container's main process exits the kernel reaps the agent along with the
-VM. Cloud-hypervisor's hybrid-vsock UDS requires the `--hybrid PORT`
-prefix in `vsock-ctl`; libkrun's mapped UDS does not.
 
 ## Isolation and security
 

@@ -4,20 +4,6 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
-## [0.13.0] - 2026-04-30
-
-### Added
-
-- **`--vsock-port PORT`** — VM mode now ships an AF_VSOCK control agent
-  inside the guest. The agent (folded into the loader binary, which is
-  already the guest `/init`) forks before the entrypoint exec and listens
-  on `PORT`. The host reaches it through the cloud-hypervisor hybrid-vsock
-  UDS or the libkrun-mapped UDS. New `oci2bin vsock-ctl [--hybrid PORT]
-  SOCKET CMD…` subcommand drives it. Wire protocol is one ASCII line per
-  request: `exec ARGV…`, `stats`, or `stop`. Inputs are bounds-checked
-  (4 KiB line, 64 args, no embedded control bytes) and `exec`'s child
-  inherits the connection as stdio so workload output streams back.
-
 ## [0.11.0] - 2026-04-20
 
 ### Added
