@@ -18,9 +18,50 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import sys
 import tarfile
 import time
+
+
+def _validate_container_path(spec: str, container_path: str) -> str:
+    """Normalize and validate a user-supplied container path.
+
+    Rules:
+      - must be non-empty
+      - must not contain NUL bytes or control characters (a tar entry
+        name with embedded \\0 / \\n is malformed and ambiguous)
+      - posixpath.normpath() is applied so '//' and '.' segments
+        collapse cleanly; the input must end up as an absolute path
+        (i.e. start with '/'); after normalization there must be no
+        '..' segments left (those would mean the user requested
+        something outside the rootfs root)
+
+    Returns the cleaned absolute container path. sys.exit(1) on any
+    rule violation, with a message naming the original spec.
+    """
+    if not container_path:
+        print(f"add_files: empty container path in {spec!r}",
+              file=sys.stderr)
+        sys.exit(1)
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in container_path):
+        print(f"add_files: control bytes in container path: "
+              f"{spec!r}", file=sys.stderr)
+        sys.exit(1)
+    if "\\" in container_path:
+        print(f"add_files: backslash in container path: {spec!r}",
+              file=sys.stderr)
+        sys.exit(1)
+    if not container_path.startswith("/"):
+        print(f"add_files: container path must be absolute: "
+              f"{spec!r}", file=sys.stderr)
+        sys.exit(1)
+    norm = posixpath.normpath(container_path)
+    if any(p == ".." for p in norm.split("/") if p):
+        print(f"add_files: '..' segment in container path: "
+              f"{spec!r}", file=sys.stderr)
+        sys.exit(1)
+    return norm
 
 
 def build_layer(entries):
@@ -53,7 +94,7 @@ def collect_entries(files, dirs):
                   file=sys.stderr)
             sys.exit(1)
         host = spec[:colon]
-        ctr  = spec[colon + 1:]
+        ctr  = _validate_container_path(spec, spec[colon + 1:])
         if not os.path.isfile(host):
             print(f"add_files: host file not found: {host}", file=sys.stderr)
             sys.exit(1)
@@ -66,7 +107,7 @@ def collect_entries(files, dirs):
                   file=sys.stderr)
             sys.exit(1)
         host = spec[:colon]
-        ctr  = spec[colon + 1:]
+        ctr  = _validate_container_path(spec, spec[colon + 1:])
         if not os.path.isdir(host):
             print(f"add_files: host directory not found: {host}", file=sys.stderr)
             sys.exit(1)

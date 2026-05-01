@@ -69,5 +69,51 @@ class TestAddFiles(unittest.TestCase):
                 self.assertEqual(len(config["rootfs"]["diff_ids"]), 1)
 
 
+class TestValidateContainerPath(unittest.TestCase):
+    def _ok(self, path):
+        return add_files_mod._validate_container_path(
+            f"/tmp/host:{path}", path)
+
+    def _bad(self, path):
+        with self.assertRaises(SystemExit):
+            add_files_mod._validate_container_path(
+                f"/tmp/host:{path}", path)
+
+    def test_plain_absolute(self):
+        self.assertEqual(self._ok("/etc/passwd"), "/etc/passwd")
+
+    def test_root_path(self):
+        self.assertEqual(self._ok("/"), "/")
+
+    def test_canonicalized(self):
+        self.assertEqual(self._ok("/etc/./foo"), "/etc/foo")
+        # posixpath.normpath preserves a leading "//" per POSIX, so
+        # we just check it canonicalizes interior duplicates.
+        self.assertEqual(self._ok("/etc//foo"), "/etc/foo")
+
+    def test_relative_rejected(self):
+        self._bad("etc/passwd")
+        self._bad("./etc")
+
+    def test_empty_rejected(self):
+        self._bad("")
+
+    def test_dotdot_rejected_when_remains_after_normalize(self):
+        # posixpath.normpath('/../tmp') -> '/tmp' on POSIX, so this
+        # case is sanitized — we check the remaining attack pattern
+        # of '..' segments that survive normalization in relative
+        # forms (rejected by absolute-path requirement).
+        self._bad("../tmp")
+
+    def test_newline_rejected(self):
+        self._bad("/etc/foo\n/etc/bar")
+
+    def test_nul_rejected(self):
+        self._bad("/etc/foo\x00bar")
+
+    def test_backslash_rejected(self):
+        self._bad("/etc\\windows")
+
+
 if __name__ == "__main__":
     unittest.main()
