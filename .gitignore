@@ -13,3 +13,23 @@ crash-*
 leak-*
 oom-*
 timeout-*
+# IDE / editor scratch (CLion, IntelliJ, Codex)
+.idea/
+.codex
+cmake-build-debug/
+CMakeLists.txt
+main.c
+src/loader
+# Python packaging metadata
+oci2bin.egg-info/
+# Built oci2bin binaries kept in the repo root for local testing
+/alpine
+/redis
+# Local design / planning notes (not part of the project history)
+linux-embedd.md
+macwin-os-support.md
+oci2bin-codex-suggestions.md
+vm-backend-impl.md
+# Local Ralph-loop workflow file
+RALPH_WORK.md
+.claude/ralph-loop.local.md
