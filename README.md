@@ -1573,6 +1573,29 @@ seccomp, Landlock ABI, cgroup v2 controllers, unprivileged user
 namespaces, `slirp4netns`/`pasta`, `/dev/kvm`/`libkrun`,
 `openssl`/`cosign`, `tar`/`gzip`/`zstd`.
 
+### explain
+
+Combined human-readable report on what a binary contains and what
+the host needs to run it:
+
+```bash
+oci2bin explain ./redis_7-alpine
+oci2bin explain ./redis_7-alpine --json
+```
+
+Sections:
+
+- **Binary / Image / Build metadata** — same fields as `inspect`,
+  with secret-shaped env values (KEY/TOKEN/SECRET/PASSWORD/PASSWD/PWD)
+  redacted.
+- **Signature / SBOM** — quick presence check (`OCI2BIN_SIG` trailer
+  and `spdxVersion`/`bomFormat` heuristic).
+- **Host capabilities** — full table from `oci2bin doctor`. Exit
+  code is non-zero only if at least one host feature the binary
+  *requires* (subuid mappings, userns, `tar`/`gzip`, plus VM tooling
+  if the binary embeds a kernel) is reported `MISSING`. `DEGRADED`
+  is informational.
+
 ### inspect
 
 Display metadata embedded in any oci2bin binary without running it:

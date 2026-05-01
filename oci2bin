@@ -354,6 +354,17 @@ if [[ "${1:-}" == "doctor" ]]; then
     exec python3 "$OCI2BIN_HOME/scripts/doctor.py" "$@"
 fi
 
+# ── explain subcommand ────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "explain" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin explain <binary> [--json]" >&2
+        exit 1
+    fi
+    exec python3 "$OCI2BIN_HOME/scripts/explain.py" "$@"
+fi
+
 # ── sign subcommand ───────────────────────────────────────────────────────
 
 if [[ "${1:-}" == "sign" ]]; then
