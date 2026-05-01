@@ -8443,6 +8443,13 @@ static void usage(const char* prog)
             "  --vm               run container inside a microVM (requires KVM or HVF)\n"
             "  --vmm VMM          VMM backend: cloud-hypervisor, or path to binary\n"
             "                     (default: cloud-hypervisor; libkrun if compiled with LIBKRUN=1)\n"
+            "  --profile NAME      Apply a runtime profile (sets defaults; later flags override)\n"
+            "                     dev         host net, no read-only, full caps (no-op marker)\n"
+            "                     prod        --net none, --read-only, drop all caps + safe\n"
+            "                                 baseline (chown/dac_override/fowner/setuid/\n"
+            "                                 setgid/net_bind_service/kill), default seccomp\n"
+            "                     locked-down prod plus --landlock, --strict, --pids-limit 512,\n"
+            "                                 --memory 1g\n"
             "  --strict            Fail closed on every security-relevant degradation\n"
             "                     (seccomp install / NO_NEW_PRIVS / landlock-unsupported /\n"
             "                     cap drop/add rejected) — never silently continue\n"
@@ -9749,6 +9756,69 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--strict") == 0)
         {
             opts->strict = 1;
+        }
+        else if (strcmp(argv[i], "--profile") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --profile requires a NAME"
+                        " (dev|prod|locked-down)\n");
+                return -1;
+            }
+            i++;
+            const char* name = argv[i];
+            /* Profiles set DEFAULTS. Later flags on the same command
+             * line override any field they touch. */
+            if (strcmp(name, "dev") == 0)
+            {
+                /* No-op profile: explicit "I want host net, no
+                 * read-only, full caps, default seccomp." Useful as
+                 * a marker in audit logs and oci2bin explain. */
+            }
+            else if (strcmp(name, "prod") == 0 ||
+                     strcmp(name, "locked-down") == 0)
+            {
+                if (!opts->net)
+                {
+                    opts->net = (char*)"none";
+                }
+                opts->read_only = 1;
+                opts->cap_drop_all = 1;
+                /* Sane baseline caps: enough to drop privilege via
+                 * setuid/setgid, do typical file ops, and bind to
+                 * privileged ports. Workloads needing more should
+                 * add via --cap-add after --profile. */
+                opts->cap_add_mask |=
+                    (1ULL << 0)  | /* CAP_CHOWN            */
+                    (1ULL << 1)  | /* CAP_DAC_OVERRIDE     */
+                    (1ULL << 3)  | /* CAP_FOWNER           */
+                    (1ULL << 6)  | /* CAP_SETGID           */
+                    (1ULL << 7)  | /* CAP_SETUID           */
+                    (1ULL << 10) | /* CAP_NET_BIND_SERVICE */
+                    (1ULL << 14);  /* CAP_KILL             */
+                if (strcmp(name, "locked-down") == 0)
+                {
+                    opts->landlock_mode = LANDLOCK_MODE_ON;
+                    opts->strict = 1;
+                    if (opts->cg_pids == 0)
+                    {
+                        opts->cg_pids = 512;
+                    }
+                    if (opts->cg_memory_bytes == 0)
+                    {
+                        /* 1 GiB default — workloads can override */
+                        opts->cg_memory_bytes = 1LL << 30;
+                    }
+                }
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: --profile: unknown profile %s"
+                        " (use dev, prod, or locked-down)\n", name);
+                return -1;
+            }
         }
         else if (strcmp(argv[i], "--lazy") == 0)
         {

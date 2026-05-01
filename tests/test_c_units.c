@@ -2948,6 +2948,97 @@ static void test_parse_opts_strict(void)
     }
 }
 
+static void test_parse_opts_profile(void)
+{
+    struct container_opts opts;
+
+    /* dev: no-op marker */
+    {
+        char* argv[] = {"prog", "--profile", "dev", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --profile dev returns 0");
+        ASSERT_INT_EQ(opts.read_only, 0,
+                      "parse_opts: dev keeps read_only off");
+        ASSERT_INT_EQ(opts.cap_drop_all, 0,
+                      "parse_opts: dev keeps caps");
+        ASSERT_INT_EQ(opts.strict, 0,
+                      "parse_opts: dev does not enable strict");
+    }
+    /* prod: net=none, read-only, drop+baseline caps */
+    {
+        char* argv[] = {"prog", "--profile", "prod", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --profile prod returns 0");
+        ASSERT_NOT_NULL(opts.net,
+                        "parse_opts: prod sets opts.net");
+        if (opts.net)
+        {
+            ASSERT_STR_EQ(opts.net, "none",
+                          "parse_opts: prod default net is none");
+        }
+        ASSERT_INT_EQ(opts.read_only, 1,
+                      "parse_opts: prod sets read_only");
+        ASSERT_INT_EQ(opts.cap_drop_all, 1,
+                      "parse_opts: prod drops all caps");
+        ASSERT(opts.cap_add_mask & (1ULL << 0),
+               "parse_opts: prod adds CAP_CHOWN");
+        ASSERT(opts.cap_add_mask & (1ULL << 7),
+               "parse_opts: prod adds CAP_SETUID");
+        ASSERT_INT_EQ(opts.strict, 0,
+                      "parse_opts: prod does not enable strict");
+    }
+    /* locked-down: prod + landlock + strict + cgroup limits */
+    {
+        char* argv[] = {"prog", "--profile", "locked-down", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --profile locked-down returns 0");
+        ASSERT_INT_EQ(opts.read_only, 1,
+                      "parse_opts: locked-down sets read_only");
+        ASSERT_INT_EQ(opts.landlock_mode, LANDLOCK_MODE_ON,
+                      "parse_opts: locked-down forces landlock on");
+        ASSERT_INT_EQ(opts.strict, 1,
+                      "parse_opts: locked-down enables strict");
+        ASSERT(opts.cg_pids > 0,
+               "parse_opts: locked-down sets pids limit");
+        ASSERT(opts.cg_memory_bytes > 0,
+               "parse_opts: locked-down sets memory limit");
+    }
+    /* later --net host overrides prod profile's --net none */
+    {
+        char* argv[] = {"prog", "--profile", "prod", "--net", "host",
+                        NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(5, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: prod + --net host returns 0");
+        if (opts.net)
+        {
+            ASSERT_STR_EQ(opts.net, "host",
+                          "parse_opts: --net host overrides prod default");
+        }
+    }
+    /* unknown profile name */
+    {
+        char* argv[] = {"prog", "--profile", "frogurt", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --profile rejects unknown name");
+    }
+    /* --profile with no arg */
+    {
+        char* argv[] = {"prog", "--profile", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --profile rejects missing name");
+    }
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -2994,6 +3085,7 @@ int main(void)
     test_is_resolver_token_safe();
     test_parse_opts_resolver_injection();
     test_parse_opts_strict();
+    test_parse_opts_profile();
 
     printf("1..%d\n", tap_test_num);
 
