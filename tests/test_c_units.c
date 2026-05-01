@@ -2738,6 +2738,120 @@ static void test_mcp_helpers(void)
     g_mcp_n_ctrs = 0;
 }
 
+static void test_tar_entry_name_unsafe(void)
+{
+    ASSERT_INT_EQ(tar_entry_name_unsafe(NULL),         1,
+                  "tar_entry_name_unsafe: NULL is unsafe");
+    ASSERT_INT_EQ(tar_entry_name_unsafe(""),           1,
+                  "tar_entry_name_unsafe: empty is unsafe");
+    ASSERT_INT_EQ(tar_entry_name_unsafe("/etc/passwd"), 1,
+                  "tar_entry_name_unsafe: absolute path");
+    ASSERT_INT_EQ(tar_entry_name_unsafe("../etc"),     1,
+                  "tar_entry_name_unsafe: leading ..");
+    ASSERT_INT_EQ(tar_entry_name_unsafe("a/../b"),     1,
+                  "tar_entry_name_unsafe: embedded ..");
+    ASSERT_INT_EQ(tar_entry_name_unsafe("a/b/.."),     1,
+                  "tar_entry_name_unsafe: trailing ..");
+    ASSERT_INT_EQ(tar_entry_name_unsafe("a/b/c"),      0,
+                  "tar_entry_name_unsafe: clean relative");
+    ASSERT_INT_EQ(tar_entry_name_unsafe("a/..hidden"), 0,
+                  "tar_entry_name_unsafe: dotdot prefix in name not segment");
+    ASSERT_INT_EQ(tar_entry_name_unsafe("usr/bin/sh"), 0,
+                  "tar_entry_name_unsafe: deep clean path");
+}
+
+/*
+ * test_safe_merge_layer_blocks_escape: build a staging directory whose
+ * contents would, if merged naively, redirect a write outside the
+ * rootfs via a symlink. Verify safe_merge_layer keeps writes inside.
+ */
+static void test_safe_merge_layer_blocks_escape(void)
+{
+    char tmpl[] = "/tmp/oci2bin-merge-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "merge test: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    char rootfs[256], stage[256], victim[256];
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs", tdir);
+    snprintf(stage,  sizeof(stage),  "%s/stage",  tdir);
+    snprintf(victim, sizeof(victim), "%s/victim", tdir);
+
+    mkdir(rootfs, 0755);
+    mkdir(stage,  0755);
+    mkdir(victim, 0755);
+
+    /* Stage layer 1: an absolute symlink pointing outside rootfs */
+    char layer1_link[256];
+    snprintf(layer1_link, sizeof(layer1_link), "%s/escape", stage);
+    int sl_rc = symlink(victim, layer1_link);
+    ASSERT_INT_EQ(sl_rc, 0, "merge test: stage symlink created");
+
+    int rfd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT(rfd >= 0, "merge test: rootfs fd opened");
+    int rc = safe_merge_layer(rfd, stage);
+    ASSERT_INT_EQ(rc, 0, "merge test: layer 1 (symlink) merge succeeds");
+
+    /* The rootfs should now have the symlink — but as a symlink, not
+     * as a path that resolves outside. Verify it's a symlink. */
+    char rootfs_escape[256];
+    snprintf(rootfs_escape, sizeof(rootfs_escape), "%s/escape", rootfs);
+    struct stat st;
+    int lst = lstat(rootfs_escape, &st);
+    ASSERT_INT_EQ(lst, 0, "merge test: rootfs/escape exists");
+    ASSERT(S_ISLNK(st.st_mode),
+           "merge test: rootfs/escape is a symlink");
+
+    /* Stage layer 2: a regular file at "escape/poison". If the merge
+     * naively followed the rootfs/escape symlink it would write to
+     * <victim>/poison. With RESOLVE_IN_ROOT, the symlink target
+     * "<victim>" is resolved inside rootfs (rootfs/<victim>) which
+     * doesn't exist, so the openat2 fails with ENOENT and the file
+     * is NOT created in the victim dir. */
+    char stage2[256];
+    snprintf(stage2, sizeof(stage2), "%s/stage2", tdir);
+    mkdir(stage2, 0755);
+    char layer2_dir[256], layer2_file[256];
+    snprintf(layer2_dir,  sizeof(layer2_dir),  "%s/escape", stage2);
+    snprintf(layer2_file, sizeof(layer2_file), "%s/escape/poison", stage2);
+    mkdir(layer2_dir, 0755);
+    int pfd = creat(layer2_file, 0644);
+    ASSERT(pfd >= 0, "merge test: layer2 poison created in stage");
+    if (pfd >= 0)
+    {
+        if (write(pfd, "PWNED", 5) != 5) { /* ignore */ }
+        close(pfd);
+    }
+
+    /* Merge layer 2 — the file open in rootfs will fail because
+     * "escape" resolves via RESOLVE_IN_ROOT to a non-existent
+     * <rootfs>/<victim_path>, blocking the escape. */
+    safe_merge_layer(rfd, stage2);
+
+    char victim_poison[256];
+    snprintf(victim_poison, sizeof(victim_poison), "%s/poison", victim);
+    struct stat vst;
+    int vrc = lstat(victim_poison, &vst);
+    ASSERT(vrc < 0,
+           "merge test: poison did NOT escape into victim/");
+
+    close(rfd);
+
+    /* Best-effort cleanup */
+    unlink(layer1_link);
+    unlink(layer2_file);
+    rmdir(layer2_dir);
+    rmdir(stage2);
+    unlink(rootfs_escape);
+    rmdir(rootfs);
+    rmdir(stage);
+    rmdir(victim);
+    rmdir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -2779,6 +2893,8 @@ int main(void)
     test_misc_helpers();
     test_write_read_file_beneath();
     test_kernel_feature_state();
+    test_tar_entry_name_unsafe();
+    test_safe_merge_layer_blocks_escape();
 
     printf("1..%d\n", tap_test_num);
 

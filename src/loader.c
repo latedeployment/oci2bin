@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include <ftw.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -32,6 +33,7 @@
 #endif
 #include <linux/elf.h>
 #include <linux/filter.h>
+#include <linux/openat2.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <ctype.h>
@@ -205,6 +207,9 @@ enum kernel_feature_state
 static signed char g_kernel_feature_state[KERNEL_FEATURE_MAX];
 
 static int write_all_fd(int fd, const char* data, size_t len);
+static char* run_cmd_capture(char* const argv[], size_t* out_len);
+static int run_cmd(char* const argv[]);
+static void rm_rf_dir(const char* path);
 static int json_escape_string(const char* src, char* dst, size_t dstsz);
 static unsigned long long current_effective_caps(void);
 
@@ -1326,6 +1331,589 @@ static int path_has_dotdot_component(const char* path)
 static int path_is_absolute_and_clean(const char* path)
 {
     return path && path[0] == '/' && !path_has_dotdot_component(path);
+}
+
+/*
+ * tar_entry_name_unsafe: a tar entry path is unsafe to extract under a
+ * rootfs if it would escape that rootfs at extraction time. Reject:
+ *   - empty paths
+ *   - absolute paths (any leading '/')
+ *   - any '..' segment
+ *   - embedded NUL bytes
+ *   - leading "./../" patterns that path_has_dotdot_component already
+ *     catches via component splitting
+ *
+ * Returns 1 if unsafe, 0 if safe. Note that we still allow a leading
+ * "./" prefix (tar's standard convention).
+ */
+static int tar_entry_name_unsafe(const char* name)
+{
+    if (!name || !*name)
+    {
+        return 1;
+    }
+    if (name[0] == '/')
+    {
+        return 1;
+    }
+    if (strchr(name, '\0') != name + strlen(name))
+    {
+        /* defensive: strlen-vs-strchr disagreement is impossible in
+         * well-formed C strings, but the check costs nothing */
+        return 1;
+    }
+    if (path_has_dotdot_component(name))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * tar_layer_prescan: walk the entry list of `tar_path` via `tar -tf`
+ * and reject the layer if any entry name is unsafe. This is a cheap
+ * defense-in-depth check; the real protection against symlink-based
+ * escape is the in-process safe_extract_layer() merge below, which
+ * uses openat2(RESOLVE_IN_ROOT) so symlinks resolve relative to the
+ * rootfs and absolute targets do not escape.
+ *
+ * Returns 0 if safe, -1 otherwise.
+ */
+static int tar_layer_prescan(const char* tar_path)
+{
+    char* argv[] = { "tar", "-tf", (char*)tar_path, NULL };
+    size_t out_len = 0;
+    char* out = run_cmd_capture(argv, &out_len);
+    if (!out)
+    {
+        fprintf(stderr,
+                "oci2bin: tar -tf prescan failed for %s\n", tar_path);
+        return -1;
+    }
+    int rc = 0;
+    char* p = out;
+    char* end = out + out_len;
+    while (p < end)
+    {
+        char* nl = memchr(p, '\n', (size_t)(end - p));
+        size_t line_len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        if (line_len > 0 && line_len < PATH_MAX)
+        {
+            char name[PATH_MAX];
+            memcpy(name, p, line_len);
+            name[line_len] = '\0';
+            /* tar may emit a trailing '/' for directory entries */
+            if (line_len > 0 && name[line_len - 1] == '/')
+            {
+                name[line_len - 1] = '\0';
+            }
+            /* strip a leading "./" if present (tar's default prefix) */
+            const char* check = name;
+            if (check[0] == '.' && check[1] == '/')
+            {
+                check += 2;
+            }
+            if (*check && tar_entry_name_unsafe(check))
+            {
+                fprintf(stderr,
+                        "oci2bin: rejecting tar entry with unsafe path: %s\n",
+                        name);
+                rc = -1;
+                break;
+            }
+        }
+        else if (line_len >= PATH_MAX)
+        {
+            fprintf(stderr,
+                    "oci2bin: rejecting tar entry with overlong path\n");
+            rc = -1;
+            break;
+        }
+        if (!nl)
+        {
+            break;
+        }
+        p = nl + 1;
+    }
+    free(out);
+    return rc;
+}
+
+/*
+ * openat2_in_root: open `relpath` rooted at `rootfs_fd` using openat2()
+ * with RESOLVE_IN_ROOT. With this resolve flag the kernel transparently
+ * treats:
+ *   - leading '/' as relative to rootfs_fd
+ *   - all symlinks as relative to rootfs_fd (so an embedded
+ *     "/etc/passwd" symlink target resolves inside the rootfs, not
+ *     on the host)
+ *   - '..' that would escape rootfs_fd as -EXDEV
+ *
+ * Returns the new fd on success, -1 with errno set on failure.
+ * On kernels without openat2 (rare since 5.6) errno is ENOSYS — the
+ * caller must fall back to openat_beneath() for those cases. Static
+ * link with musl/glibc both expose syscall(2).
+ */
+static int openat2_in_root(int rootfs_fd, const char* relpath,
+                           int flags, mode_t mode)
+{
+    struct open_how how;
+    memset(&how, 0, sizeof(how));
+    how.flags   = (uint64_t)flags;
+    how.mode    = (flags & (O_CREAT | O_TMPFILE)) ? (uint64_t)mode : 0;
+    how.resolve = RESOLVE_IN_ROOT;
+    long rc = syscall(__NR_openat2, rootfs_fd, relpath, &how,
+                      sizeof(how));
+    if (rc < 0)
+    {
+        return -1;
+    }
+    return (int)rc;
+}
+
+/*
+ * mkdirat_in_root: create a single directory at `relpath` under
+ * `rootfs_fd`, resolving via RESOLVE_IN_ROOT so any intermediate
+ * symlinks are confined to rootfs_fd.
+ *
+ * The mkdirat syscall does not take a resolve mode, so we open the
+ * parent with openat2(RESOLVE_IN_ROOT|O_DIRECTORY|O_PATH) and then
+ * mkdirat the leaf at that fd. Returns 0 on success or if the dir
+ * already exists, -1 otherwise.
+ */
+static int mkdirat_in_root(int rootfs_fd, const char* relpath, mode_t mode)
+{
+    if (!relpath || !*relpath)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    /* Skip a leading "./" — common tar convention, no semantic meaning. */
+    if (relpath[0] == '.' && relpath[1] == '/')
+    {
+        relpath += 2;
+    }
+    if (!*relpath)
+    {
+        return 0; /* root itself */
+    }
+
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s", relpath) >= (int)sizeof(buf))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char* slash = strrchr(buf, '/');
+    int parent_fd;
+    const char* leaf;
+    if (slash)
+    {
+        *slash = '\0';
+        leaf = slash + 1;
+        parent_fd = openat2_in_root(rootfs_fd, buf,
+                                    O_DIRECTORY | O_PATH | O_CLOEXEC, 0);
+        if (parent_fd < 0)
+        {
+            return -1;
+        }
+    }
+    else
+    {
+        leaf = buf;
+        parent_fd = dup(rootfs_fd);
+        if (parent_fd < 0)
+        {
+            return -1;
+        }
+    }
+    int rc = mkdirat(parent_fd, leaf, mode);
+    int saved = errno;
+    close(parent_fd);
+    if (rc < 0 && saved != EEXIST)
+    {
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * mkdir_p_in_root: ensure every component of `relpath` exists as a
+ * directory under `rootfs_fd`, creating any missing component with
+ * mode 0755. Symlink components are followed via RESOLVE_IN_ROOT so
+ * an in-rootfs symlink to a directory works; a symlink whose target
+ * leaves the rootfs is blocked by the kernel.
+ */
+static int mkdir_p_in_root(int rootfs_fd, const char* relpath)
+{
+    if (!relpath || !*relpath)
+    {
+        return 0;
+    }
+    char buf[PATH_MAX];
+    if (snprintf(buf, sizeof(buf), "%s", relpath) >= (int)sizeof(buf))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    /* Skip leading "./" */
+    char* p = buf;
+    if (p[0] == '.' && p[1] == '/')
+    {
+        p += 2;
+    }
+    char* cur = p;
+    while ((cur = strchr(cur, '/')) != NULL)
+    {
+        *cur = '\0';
+        if (*p && mkdirat_in_root(rootfs_fd, p, 0755) < 0)
+        {
+            return -1;
+        }
+        *cur = '/';
+        cur++;
+    }
+    if (*p)
+    {
+        if (mkdirat_in_root(rootfs_fd, p, 0755) < 0)
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Forward declarations for safe_merge_layer recursion. */
+static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
+                           int cur_dir_fd, const char* rel_dir);
+
+/*
+ * safe_merge_layer: walk `stage_path` (a directory containing a
+ * single layer's already-extracted contents) and recreate every
+ * entry under `rootfs_fd`, using openat2(RESOLVE_IN_ROOT) so a
+ * malicious symlink in the rootfs cannot redirect a write to the
+ * host filesystem.
+ *
+ * The staging directory is fresh on every layer extraction, so the
+ * tar invocation that filled it has no symlink-following risk —
+ * the only path the symlinks can resolve to is inside the staging
+ * directory itself. The risk was always at merge time, when a
+ * symlink in the rootfs (planted by an earlier layer) would be
+ * followed by tar. By doing the merge in-process via openat2 we
+ * eliminate that risk.
+ *
+ * Returns 0 on success, -1 if any entry could not be merged.
+ */
+static int safe_merge_layer(int rootfs_fd, const char* stage_path)
+{
+    int stage_fd = open(stage_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (stage_fd < 0)
+    {
+        perror("oci2bin: open stage dir");
+        return -1;
+    }
+    int rc = safe_merge_walk(rootfs_fd, stage_fd, stage_fd, "");
+    close(stage_fd);
+    return rc;
+}
+
+/*
+ * safe_merge_walk: process every entry under cur_dir_fd. Recurses
+ * into directories. rel_dir is the path relative to stage_root_fd
+ * (used for log messages and to compute the rootfs-relative path).
+ */
+static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
+                           int cur_dir_fd, const char* rel_dir)
+{
+    (void)stage_root_fd;
+    int dup_fd = dup(cur_dir_fd);
+    if (dup_fd < 0)
+    {
+        perror("oci2bin: dup stage fd");
+        return -1;
+    }
+    DIR* d = fdopendir(dup_fd);
+    if (!d)
+    {
+        perror("oci2bin: fdopendir");
+        close(dup_fd);
+        return -1;
+    }
+    int rc = 0;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL)
+    {
+        if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                 (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+        {
+            continue;
+        }
+        char rel_path[PATH_MAX];
+        int n;
+        if (rel_dir[0] == '\0')
+        {
+            n = snprintf(rel_path, sizeof(rel_path), "%s", de->d_name);
+        }
+        else
+        {
+            n = snprintf(rel_path, sizeof(rel_path), "%s/%s",
+                         rel_dir, de->d_name);
+        }
+        if (n < 0 || (size_t)n >= sizeof(rel_path))
+        {
+            fprintf(stderr,
+                    "oci2bin: layer entry path too long, skipping\n");
+            continue;
+        }
+        if (tar_entry_name_unsafe(rel_path))
+        {
+            fprintf(stderr,
+                    "oci2bin: skipping unsafe layer entry: %s\n", rel_path);
+            continue;
+        }
+        struct stat st;
+        if (fstatat(cur_dir_fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0)
+        {
+            perror("oci2bin: fstatat stage entry");
+            rc = -1;
+            break;
+        }
+        if (S_ISDIR(st.st_mode))
+        {
+            if (mkdirat_in_root(rootfs_fd, rel_path,
+                                st.st_mode & 0777) < 0 &&
+                    errno != EEXIST)
+            {
+                fprintf(stderr,
+                        "oci2bin: mkdir failed for %s: %s\n",
+                        rel_path, strerror(errno));
+                rc = -1;
+                break;
+            }
+            int sub_fd = openat(cur_dir_fd, de->d_name,
+                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                O_CLOEXEC);
+            if (sub_fd < 0)
+            {
+                perror("oci2bin: open stage subdir");
+                rc = -1;
+                break;
+            }
+            int sub_rc = safe_merge_walk(rootfs_fd, stage_root_fd,
+                                         sub_fd, rel_path);
+            close(sub_fd);
+            if (sub_rc < 0)
+            {
+                rc = -1;
+                break;
+            }
+        }
+        else if (S_ISREG(st.st_mode))
+        {
+            /* Ensure parent dir exists in rootfs (legitimate case:
+             * staging dir got created implicitly by tar before any
+             * file in it). */
+            char parent[PATH_MAX];
+            int pn = snprintf(parent, sizeof(parent), "%s", rel_path);
+            if (pn < 0 || (size_t)pn >= sizeof(parent))
+            {
+                rc = -1;
+                break;
+            }
+            char* slash = strrchr(parent, '/');
+            if (slash)
+            {
+                *slash = '\0';
+                if (mkdir_p_in_root(rootfs_fd, parent) < 0 &&
+                        errno != EEXIST)
+                {
+                    fprintf(stderr,
+                            "oci2bin: mkdir -p failed for %s: %s\n",
+                            parent, strerror(errno));
+                    rc = -1;
+                    break;
+                }
+            }
+            int src_fd = openat(cur_dir_fd, de->d_name,
+                                O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (src_fd < 0)
+            {
+                perror("oci2bin: open stage file");
+                rc = -1;
+                break;
+            }
+            int dst_fd = openat2_in_root(rootfs_fd, rel_path,
+                                         O_WRONLY | O_CREAT | O_TRUNC |
+                                         O_CLOEXEC,
+                                         st.st_mode & 0777);
+            if (dst_fd < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: openat2 dst failed for %s: %s\n",
+                        rel_path, strerror(errno));
+                close(src_fd);
+                rc = -1;
+                break;
+            }
+            char buf[65536];
+            int copy_err = 0;
+            while (1)
+            {
+                ssize_t r = read(src_fd, buf, sizeof(buf));
+                if (r < 0)
+                {
+                    if (errno == EINTR)
+                    {
+                        continue;
+                    }
+                    perror("oci2bin: read stage file");
+                    copy_err = 1;
+                    break;
+                }
+                if (r == 0)
+                {
+                    break;
+                }
+                if (write_all_fd(dst_fd, buf, (size_t)r) < 0)
+                {
+                    perror("oci2bin: write rootfs file");
+                    copy_err = 1;
+                    break;
+                }
+            }
+            close(src_fd);
+            close(dst_fd);
+            if (copy_err)
+            {
+                rc = -1;
+                break;
+            }
+        }
+        else if (S_ISLNK(st.st_mode))
+        {
+            char target[PATH_MAX];
+            ssize_t tlen = readlinkat(cur_dir_fd, de->d_name,
+                                      target, sizeof(target) - 1);
+            if (tlen < 0)
+            {
+                perror("oci2bin: readlinkat stage symlink");
+                rc = -1;
+                break;
+            }
+            target[tlen] = '\0';
+            /* Ensure parent dir exists in rootfs */
+            char parent[PATH_MAX];
+            int pn = snprintf(parent, sizeof(parent), "%s", rel_path);
+            if (pn < 0 || (size_t)pn >= sizeof(parent))
+            {
+                rc = -1;
+                break;
+            }
+            char* slash = strrchr(parent, '/');
+            int parent_fd;
+            const char* leaf;
+            if (slash)
+            {
+                *slash = '\0';
+                if (mkdir_p_in_root(rootfs_fd, parent) < 0 &&
+                        errno != EEXIST)
+                {
+                    rc = -1;
+                    break;
+                }
+                parent_fd = openat2_in_root(rootfs_fd, parent,
+                                            O_DIRECTORY | O_PATH | O_CLOEXEC,
+                                            0);
+                leaf = slash + 1;
+            }
+            else
+            {
+                parent_fd = dup(rootfs_fd);
+                leaf = rel_path;
+            }
+            if (parent_fd < 0)
+            {
+                rc = -1;
+                break;
+            }
+            /* Remove any existing file at the destination so the
+             * symlink call doesn't fail with EEXIST. The unlinkat
+             * uses parent_fd which was resolved with RESOLVE_IN_ROOT
+             * so this cannot reach outside the rootfs. */
+            unlinkat(parent_fd, leaf, 0);
+            if (symlinkat(target, parent_fd, leaf) < 0 &&
+                    errno != EEXIST)
+            {
+                fprintf(stderr,
+                        "oci2bin: symlinkat failed for %s -> %s: %s\n",
+                        rel_path, target, strerror(errno));
+                close(parent_fd);
+                rc = -1;
+                break;
+            }
+            close(parent_fd);
+        }
+        else
+        {
+            /* char/block devices, fifos, sockets — skip with a note.
+             * These are rare in container images and creating them
+             * usually requires CAP_MKNOD anyway. */
+            debug_log("layer.merge.skip_special",
+                      "path=%s mode=0%o", rel_path, (unsigned)st.st_mode);
+        }
+    }
+    closedir(d);
+    return rc;
+}
+
+/*
+ * safe_extract_layer: extract `tar_path` to a fresh staging directory
+ * under `tmpdir_parent`, then merge the result into `rootfs_fd` using
+ * symlink-safe primitives. Removes the staging directory before
+ * returning. Returns 0 on success, -1 on failure.
+ */
+static int safe_extract_layer(int rootfs_fd, const char* tar_path,
+                              const char* tmpdir_parent, int layer_idx)
+{
+    if (tar_layer_prescan(tar_path) < 0)
+    {
+        return -1;
+    }
+    char stage[PATH_MAX];
+    int n = snprintf(stage, sizeof(stage), "%s/stage-%d",
+                     tmpdir_parent, layer_idx);
+    if (n < 0 || (size_t)n >= sizeof(stage))
+    {
+        fprintf(stderr, "oci2bin: stage path truncated\n");
+        return -1;
+    }
+    /* Best-effort cleanup of any stale staging dir from a previous run
+     * sharing the tmpdir (defensive — tmpdir is per-pid in normal use). */
+    rm_rf_dir(stage);
+    if (mkdir(stage, 0700) < 0)
+    {
+        perror("oci2bin: mkdir stage");
+        return -1;
+    }
+    char* tar_argv[] =
+    {
+        "tar", "xf", (char*)tar_path, "-C", stage,
+        "--no-same-permissions", "--no-same-owner", NULL
+    };
+    int tar_rc = run_cmd(tar_argv);
+    int merge_rc = -1;
+    if (tar_rc == 0)
+    {
+        merge_rc = safe_merge_layer(rootfs_fd, stage);
+    }
+    rm_rf_dir(stage);
+    if (tar_rc != 0)
+    {
+        return -1;
+    }
+    return merge_rc;
 }
 
 static ssize_t read_all_fd(int fd, char* buf, size_t len)
@@ -2518,6 +3106,12 @@ static char* extract_oci_rootfs(const char* self_path)
         return NULL;
     }
 
+    if (tar_layer_prescan(oci_tar_path) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: OCI tar contains unsafe entry names; refusing\n");
+        return NULL;
+    }
     char* tar_argv[] = {"tar", "xf", oci_tar_path, "-C", oci_dir,
                         "--no-same-permissions", "--no-same-owner", NULL
                        };
@@ -2593,13 +3187,20 @@ static char* extract_oci_rootfs(const char* self_path)
             continue;
         }
 
-        char* layer_argv[] = {"tar", "xf", layer_path, "-C", rootfs,
-                              "--no-same-permissions", "--no-same-owner", NULL
-                             };
-        if (run_cmd(layer_argv) != 0)
+        /* Open the rootfs as a directory fd for safe-merge primitives. */
+        int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (rootfs_fd < 0)
         {
-            fprintf(stderr, "oci2bin: failed to extract layer %s\n", layers[i]);
+            perror("oci2bin: open rootfs for layer merge");
+            free(layers[i]);
+            continue;
         }
+        if (safe_extract_layer(rootfs_fd, layer_path, tmpdir, i) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: failed to extract layer %s\n", layers[i]);
+        }
+        close(rootfs_fd);
         free(layers[i]);
     }
 
