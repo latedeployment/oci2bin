@@ -2926,6 +2926,28 @@ static void test_parse_opts_resolver_injection(void)
     }
 }
 
+static void test_parse_opts_strict(void)
+{
+    struct container_opts opts;
+    {
+        char* argv[] = {"prog", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(1, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: no --strict default 0");
+        ASSERT_INT_EQ(opts.strict, 0,
+                      "parse_opts: opts.strict defaults to 0");
+    }
+    {
+        char* argv[] = {"prog", "--strict", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --strict returns 0");
+        ASSERT_INT_EQ(opts.strict, 1,
+                      "parse_opts: --strict sets opts.strict");
+    }
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -2971,6 +2993,7 @@ int main(void)
     test_safe_merge_layer_blocks_escape();
     test_is_resolver_token_safe();
     test_parse_opts_resolver_injection();
+    test_parse_opts_strict();
 
     printf("1..%d\n", tap_test_num);
 

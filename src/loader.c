@@ -602,6 +602,19 @@ struct container_opts
     int   use_vm;   /* 1 if --vm was given */
     char* vmm;      /* "cloud-hypervisor" | path; NULL = default */
 
+    /* --strict  (fail closed across the board)
+     * When set, every security-relevant degradation that today emits
+     * a warn-and-continue diagnostic instead aborts the run with a
+     * non-zero exit code:
+     *   - default seccomp install failure
+     *   - PR_SET_NO_NEW_PRIVS failure
+     *   - explicit --landlock unsupported by kernel
+     *   - cap drop/add the kernel rejects
+     *   - any other place that consults opts->strict
+     * Explicit-flag failures (e.g. --read-only, --seccomp-profile)
+     * are already fatal whether or not --strict is set. */
+    int strict;
+
     /* PTY relay: set by run_container() before fork, used by container_main() */
     int pty_master_fd; /* -1 if no PTY; parent closes slave, uses this for relay */
     int pty_slave_fd;  /* -1 if no PTY; child sets as controlling terminal */
@@ -5011,6 +5024,13 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
                     " support Landlock LSM (Linux 5.13+ required)\n");
             return -1;
         }
+        if (opts->strict)
+        {
+            fprintf(stderr,
+                    "oci2bin: --strict: kernel does not support"
+                    " Landlock — refusing to skip the sandbox\n");
+            return -1;
+        }
         if (g_debug)
         {
             debug_log("landlock.skip", "kernel does not support landlock");
@@ -5147,7 +5167,12 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
  * Uses the seccomp(2) syscall with TSYNC; falls back to prctl if unavailable.
  * PR_SET_NO_NEW_PRIVS is set unconditionally — it is good practice regardless.
  */
-static void apply_seccomp_filter(void)
+/*
+ * Returns 0 on success, -1 if either PR_SET_NO_NEW_PRIVS or the
+ * seccomp install step failed. Callers wanting strict behavior should
+ * abort the run on -1; warn-and-continue is the historical default.
+ */
+static int apply_seccomp_filter(void)
 {
     /* Detect architecture at compile time */
 #ifdef __aarch64__
@@ -5245,12 +5270,16 @@ static void apply_seccomp_filter(void)
         .filter = filter,
     };
 
+    int nnp_failed = 0;
+    int seccomp_failed = 0;
+
     /* PR_SET_NO_NEW_PRIVS: prevent gaining new privileges via setuid/caps */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
     {
         fprintf(stderr,
-                "oci2bin: prctl(PR_SET_NO_NEW_PRIVS) failed: %s (non-fatal)\n",
+                "oci2bin: prctl(PR_SET_NO_NEW_PRIVS) failed: %s\n",
                 strerror(errno));
+        nnp_failed = 1;
     }
 
     /* Try seccomp(2) syscall with TSYNC first */
@@ -5258,19 +5287,19 @@ static void apply_seccomp_filter(void)
                 SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0)
     {
         fprintf(stderr, "oci2bin: seccomp filter applied\n");
-        return;
     }
-
-    /* Fall back to prctl */
-    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0)
+    else if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0)
     {
-        fprintf(stderr, "oci2bin: seccomp filter failed: %s (non-fatal)\n",
+        fprintf(stderr, "oci2bin: seccomp filter failed: %s\n",
                 strerror(errno));
+        seccomp_failed = 1;
     }
     else
     {
         fprintf(stderr, "oci2bin: seccomp filter applied (via prctl)\n");
     }
+
+    return (nnp_failed || seccomp_failed) ? -1 : 0;
 }
 
 /*
@@ -7912,7 +7941,15 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
         else
         {
-            apply_seccomp_filter();
+            int sc_rc = apply_seccomp_filter();
+            if (sc_rc < 0 && opts->strict)
+            {
+                fprintf(stderr,
+                        "oci2bin: --strict: aborting because the"
+                        " default seccomp filter could not be"
+                        " installed\n");
+                return 1;
+            }
         }
     }
 
@@ -8406,6 +8443,9 @@ static void usage(const char* prog)
             "  --vm               run container inside a microVM (requires KVM or HVF)\n"
             "  --vmm VMM          VMM backend: cloud-hypervisor, or path to binary\n"
             "                     (default: cloud-hypervisor; libkrun if compiled with LIBKRUN=1)\n"
+            "  --strict            Fail closed on every security-relevant degradation\n"
+            "                     (seccomp install / NO_NEW_PRIVS / landlock-unsupported /\n"
+            "                     cap drop/add rejected) — never silently continue\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -9705,6 +9745,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-userns-remap") == 0)
         {
             opts->no_userns_remap = 1;
+        }
+        else if (strcmp(argv[i], "--strict") == 0)
+        {
+            opts->strict = 1;
         }
         else if (strcmp(argv[i], "--lazy") == 0)
         {
