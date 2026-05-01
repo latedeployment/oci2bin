@@ -346,6 +346,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_safe_resolve -v
 	@echo "=== Dockerfile RUN env construction tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_run_env -v
+	@echo "=== MCP params shape tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_mcp_params_shape -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

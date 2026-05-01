@@ -12828,17 +12828,81 @@ static int mcp_serve_main(const char* self_path, int allow_net)
         }
         else if (strcmp(method, "tools/call") == 0)
         {
-            /* Parse params.name and params.arguments */
+            /* JSON-RPC 2.0 / MCP normally sends params as an object.
+             * Older clients (and our previous behavior) sometimes wrap
+             * the object as a JSON-encoded string. Accept both: try
+             * string first, then fall back to extracting the raw
+             * object substring. */
             char* params = json_get_string(line, "params");
-            if (!params)
+            char* params_obj = NULL;
+            const char* raw_params = json_skip_to_value(line, "params");
+            if (raw_params && *raw_params == '{')
+            {
+                int depth = 0;
+                const char* pp = raw_params;
+                while (*pp)
+                {
+                    if (*pp == '"')
+                    {
+                        /* skip JSON string literal */
+                        pp++;
+                        while (*pp && *pp != '"')
+                        {
+                            if (*pp == '\\' && *(pp + 1))
+                            {
+                                pp++;
+                            }
+                            pp++;
+                        }
+                        if (*pp != '"')
+                        {
+                            break;
+                        }
+                        pp++;
+                        continue;
+                    }
+                    if (*pp == '{')
+                    {
+                        depth++;
+                    }
+                    else if (*pp == '}')
+                    {
+                        depth--;
+                        if (depth == 0)
+                        {
+                            break;
+                        }
+                    }
+                    pp++;
+                }
+                if (depth == 0 && *pp == '}')
+                {
+                    size_t olen = (size_t)(pp - raw_params + 1);
+                    params_obj = malloc(olen + 1);
+                    if (params_obj)
+                    {
+                        memcpy(params_obj, raw_params, olen);
+                        params_obj[olen] = '\0';
+                    }
+                }
+            }
+            const char* lookup = params_obj ? params_obj : params;
+            if (!lookup)
             {
                 free(method);
                 mcp_send_error(id, -32602, "tools/call: params missing");
                 continue;
             }
 
-            char* tool_name = json_get_string(params, "name");
-            char* args_raw  = json_get_string(params, "arguments");
+            char* tool_name = json_get_string(lookup, "name");
+            char* args_raw  = json_get_string(lookup, "arguments");
+            /* From here on `params` is used only by the args-as-object
+             * fallback below (json_skip_to_value(params, "arguments")).
+             * Point it at the active lookup so that path works for both
+             * the string and the object case; we free both originals
+             * after the block. */
+            char* params_str_freed_later = params;
+            params = (char*)lookup;
             /* arguments may be an object; try array fallback */
             char* args_obj  = args_raw;
             if (!args_obj)
@@ -12875,7 +12939,10 @@ static int mcp_serve_main(const char* self_path, int allow_net)
                     }
                 }
             }
-            free(params);
+            /* `params` was reassigned to `lookup`; free both originals. */
+            free(params_str_freed_later);
+            free(params_obj);
+            params = NULL;
 
             if (!tool_name)
             {
