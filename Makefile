@@ -344,6 +344,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_reproducible_build -v
 	@echo "=== Dockerfile safe-resolve unit tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_safe_resolve -v
+	@echo "=== Dockerfile RUN env construction tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_run_env -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

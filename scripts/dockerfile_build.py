@@ -752,15 +752,38 @@ def _do_run(state: _State, args: str) -> None:
     # Translate --mount options into shell commands + cleanup list.
     mount_cmds, cleanup_paths, ssh_targets = _build_mount_cmds(mounts, state)
 
-    # Propagate image env + SSH_AUTH_SOCK for ssh mounts.
-    run_env = dict(os.environ)
+    # Build the RUN environment from scratch.  Inheriting os.environ
+    # would expose the host's tokens, cloud creds, proxy settings, CI
+    # variables, and so on to whatever command the Dockerfile chose
+    # to run — which is exactly the leak BuildKit explicitly avoids.
+    # Start with a minimal safe base, then layer image ENV + declared
+    # build-args + the SSH_AUTH_SOCK pointer for --mount=type=ssh.
+    run_env = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:"
+                "/usr/bin:/sbin:/bin",
+        "HOME": "/root",
+        "TERM": "xterm",
+        # Disable debconf prompts in apt-based images during RUN steps.
+        "DEBIAN_FRONTEND": "noninteractive",
+    }
+    # Image ENV (Dockerfile ENV directives + inherited from FROM image).
     for kv in state.env:
         if "=" in kv:
             k, v = kv.split("=", 1)
             run_env[k] = v
+    # Declared build-args (only those the user explicitly passed via
+    # --build-arg KEY=VAL — we read those into state.build_args at
+    # parse time, so this is an allowlist, not a host leak).
+    for k, v in state.build_args.items():
+        run_env[k] = v
     if ssh_targets:
         # Point SSH_AUTH_SOCK at the first ssh mount target inside the container.
         run_env["SSH_AUTH_SOCK"] = ssh_targets[0]
+    # `unshare` itself needs to find a few host commands; pull just
+    # those control variables across without leaking secrets.
+    for k in ("LANG", "LC_ALL"):
+        if k in os.environ:
+            run_env[k] = os.environ[k]
 
     # Write the command to a temp script inside rootfs so we can exec it.
     with tempfile.NamedTemporaryFile(
