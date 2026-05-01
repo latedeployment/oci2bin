@@ -150,6 +150,115 @@ def _parse_run_line(args: str) -> tuple:
 
 # ── Layer extraction helpers ─────────────────────────────────────────────────
 
+class _DockerIgnore:
+    """
+    Minimal .dockerignore matcher.
+
+    Reads <context>/.dockerignore once at construction. Each non-empty,
+    non-`#`-comment line is a glob pattern (fnmatch syntax with `**`
+    expanded to "any number of segments"). A leading `!` re-includes
+    a previously-excluded path.
+
+    Pattern semantics intended to match BuildKit's:
+      foo            anywhere named foo
+      /foo           foo at the context root only
+      foo/           any directory named foo (and its descendants)
+      *.log          any .log file at any depth
+      docs/**.md     any .md file under docs/
+      !keep.log      re-include a previously-excluded file
+
+    Patterns are evaluated in order; the last matching rule wins. If
+    the file is missing or empty the matcher excludes nothing.
+    """
+
+    def __init__(self, context_dir: str):
+        self.patterns = []
+        try:
+            with open(os.path.join(context_dir, ".dockerignore"),
+                      "r", encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    line = raw.rstrip("\r\n").strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    negated = line.startswith("!")
+                    if negated:
+                        line = line[1:].lstrip()
+                    if not line:
+                        continue
+                    self.patterns.append((line, negated))
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    def _match_one(pattern: str, rel: str) -> bool:
+        pat = pattern.lstrip("/")
+        is_dir_pat = pat.endswith("/")
+        if is_dir_pat:
+            pat = pat.rstrip("/")
+        anchored = pattern.startswith("/")
+        # `**` segments match zero-or-more path components.
+        if "**" in pat:
+            # Treat as a regex-ish split: split on **, fnmatch-match
+            # each segment greedily against rel.
+            segments = pat.split("**")
+            cursor = 0
+            for i, seg in enumerate(segments):
+                seg = seg.strip("/")
+                if not seg:
+                    continue
+                if i == 0 and anchored:
+                    # Must match the prefix exactly.
+                    sub = rel[cursor:cursor + len(seg)]
+                    if not fnmatch.fnmatchcase(sub, seg):
+                        return False
+                    cursor += len(seg)
+                    continue
+                # Find the next position where seg matches a path
+                # component starting after `cursor`.
+                while cursor < len(rel):
+                    end = rel.find("/", cursor)
+                    chunk = rel[cursor:end] if end >= 0 else rel[cursor:]
+                    if fnmatch.fnmatchcase(chunk, seg):
+                        cursor = end + 1 if end >= 0 else len(rel)
+                        break
+                    cursor = end + 1 if end >= 0 else len(rel) + 1
+                else:
+                    return False
+            return True
+        # No `**`: ordinary fnmatch against full path or any ancestor.
+        if anchored:
+            if fnmatch.fnmatchcase(rel, pat):
+                return True
+            if is_dir_pat and (rel == pat or rel.startswith(pat + "/")):
+                return True
+            return False
+        # Unanchored — match the full path or any single component.
+        if fnmatch.fnmatchcase(rel, pat):
+            return True
+        for component in rel.split("/"):
+            if fnmatch.fnmatchcase(component, pat):
+                return True
+        if is_dir_pat:
+            for i in range(len(rel)):
+                if rel[i] == "/" and fnmatch.fnmatchcase(rel[:i], pat):
+                    return True
+            if fnmatch.fnmatchcase(rel, pat):
+                return True
+        return False
+
+    def matches(self, rel_path: str) -> bool:
+        """Return True if rel_path (relative to context, '/'-separated)
+        is excluded by the .dockerignore."""
+        if not self.patterns:
+            return False
+        rel = rel_path.replace(os.sep, "/").lstrip("/")
+        excluded = False
+        for pattern, negated in self.patterns:
+            if self._match_one(pattern, rel):
+                excluded = not negated
+        return excluded
+
+
 def _safe_resolve(rootfs: str, container_path: str) -> str:
     """
     Resolve *container_path* (an absolute path as it would appear
@@ -368,11 +477,14 @@ def _extract_docker_save_to_rootfs(tar_path: str, rootfs: str) -> dict:
 # ── Build-state ──────────────────────────────────────────────────────────────
 
 class _State:
+    dockerignore: "_DockerIgnore"
+
     def __init__(self, context_dir: str, build_args: dict,
                  build_secrets: dict, arch: str):
         self.context_dir = os.path.abspath(context_dir)
         self.build_args = dict(build_args)
         self.build_secrets = dict(build_secrets)  # id -> host path
+        self.dockerignore = _DockerIgnore(self.context_dir)
         self.arch = arch
         self.rootfs: str = ""
         self.env: list = []
@@ -696,9 +808,32 @@ def _do_copy(state: _State, args: str) -> None:
         else:
             resolved.append(os.path.join(state.context_dir, src))
 
+    # Apply .dockerignore: drop sources matching ignored patterns. A
+    # negated rule (`!keep.log`) is honoured because matches() walks
+    # the full pattern list with later-wins semantics.
+    if state.dockerignore.patterns:
+        kept = []
+        for sp in resolved:
+            rel = os.path.relpath(sp, state.context_dir)
+            if state.dockerignore.matches(rel):
+                continue
+            kept.append(sp)
+        resolved = kept
+
     if not resolved:
         print(f"error: COPY: no files matched: {srcs}", file=sys.stderr)
         sys.exit(1)
+
+    def _ignore_for_copytree(dirpath: str, names: list) -> list:
+        if not state.dockerignore.patterns:
+            return []
+        out = []
+        for n in names:
+            full = os.path.join(dirpath, n)
+            rel = os.path.relpath(full, state.context_dir)
+            if state.dockerignore.matches(rel):
+                out.append(n)
+        return out
 
     for src_path in resolved:
         src_path = os.path.normpath(src_path)
@@ -713,7 +848,8 @@ def _do_copy(state: _State, args: str) -> None:
         if os.path.isdir(src_path) and not os.path.islink(src_path):
             os.makedirs(dst_host, exist_ok=True)
             shutil.copytree(src_path, dst_host, symlinks=True,
-                            dirs_exist_ok=True)
+                            dirs_exist_ok=True,
+                            ignore=_ignore_for_copytree)
         else:
             if dst_is_dir or len(resolved) > 1:
                 os.makedirs(dst_host, exist_ok=True)
