@@ -45,6 +45,7 @@ import glob as _glob
 import io
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -149,8 +150,78 @@ def _parse_run_line(args: str) -> tuple:
 
 # ── Layer extraction helpers ─────────────────────────────────────────────────
 
+def _safe_resolve(rootfs: str, container_path: str) -> str:
+    """
+    Resolve *container_path* (an absolute path as it would appear
+    inside the container) to an absolute host path under *rootfs*,
+    refusing any escape via symlinks whose target leaves *rootfs*.
+
+    The lookup is symlink-aware on the *parent* directory: if the
+    parent already exists under *rootfs* and contains a symlink that
+    points outside *rootfs*, the call raises. The leaf component is
+    NOT dereferenced — that lets callers safely overwrite or replace
+    a destination symlink without writing through it.
+
+    *container_path* must be absolute. Callers should resolve any
+    relative form (e.g. WORKDIR-based) before invoking this helper.
+    Empty input is rejected.
+
+    Note that posixpath.normpath canonicalizes `..` segments in
+    absolute paths (so `/a/../b` becomes `/b`); the symlink escape
+    check catches the only remaining attack surface, where a `..`
+    traverses through a symlink chain.
+
+    Returns the absolute host path. Raises ValueError on any unsafe
+    input or on a symlink escape.
+    """
+    if not container_path:
+        raise ValueError("empty container path")
+    if not container_path.startswith("/"):
+        raise ValueError(
+            f"container path must be absolute: {container_path!r}")
+    norm = posixpath.normpath(container_path)
+    rel = norm.lstrip("/")
+    real_root = os.path.realpath(rootfs)
+    if not rel:
+        return real_root
+    parent_rel, leaf = posixpath.split(rel)
+    if parent_rel:
+        parent_host = os.path.join(rootfs, parent_rel)
+        # realpath resolves any symlinks in the parent chain; if the
+        # parent doesn't yet exist on disk, realpath leaves the
+        # nonexistent suffix as-is — which is fine because the only
+        # way to get out is through an existing symlink.
+        real_parent = os.path.realpath(parent_host)
+    else:
+        real_parent = real_root
+    if real_parent != real_root and \
+            not real_parent.startswith(real_root + os.sep):
+        raise ValueError(
+            f"symlink escape: {container_path!r} resolves outside "
+            f"the rootfs ({real_parent!r})")
+    return os.path.join(real_parent, leaf) if leaf else real_parent
+
+
+def _safe_unlink_if_present(path: str) -> None:
+    """Remove an existing file or symlink at *path* (no-op if absent).
+    Used before writing through a destination so we replace a symlink
+    rather than follow it."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except IsADirectoryError:
+        pass
+
+
 def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
-    """Apply one OCI/docker layer tarball to *rootfs*, handling whiteouts."""
+    """Apply one OCI/docker layer tarball to *rootfs*, handling whiteouts.
+
+    Every destination path is routed through _safe_resolve so a symlink
+    planted by an earlier layer cannot redirect this layer's writes
+    outside *rootfs*. Hardlink targets are likewise resolved so a
+    crafted layer cannot hardlink-escape via member.linkname.
+    """
     for member in tf.getmembers():
         name = member.name
         while name.startswith("./") or name.startswith("/"):
@@ -163,9 +234,16 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
             continue
 
         basename = os.path.basename(name)
+        try:
+            container_abs = "/" + name
+            dest = _safe_resolve(rootfs, container_abs)
+        except ValueError as exc:
+            print(f"  warning: skipping unsafe tar path: "
+                  f"{member.name!r}: {exc}", file=sys.stderr)
+            continue
 
         if basename == ".wh..wh..opq":
-            parent = os.path.join(rootfs, os.path.dirname(name))
+            parent = os.path.dirname(dest)
             if os.path.isdir(parent):
                 for entry in os.listdir(parent):
                     ep = os.path.join(parent, entry)
@@ -176,36 +254,46 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
             continue
 
         if basename.startswith(".wh."):
-            target = os.path.join(rootfs,
-                                  os.path.dirname(name), basename[len(".wh."):])
+            try:
+                target = _safe_resolve(
+                    rootfs,
+                    "/" + os.path.dirname(name) + "/" +
+                    basename[len(".wh."):])
+            except ValueError as exc:
+                print(f"  warning: whiteout escape: {exc}",
+                      file=sys.stderr)
+                continue
             if os.path.islink(target) or os.path.isfile(target):
                 os.unlink(target)
             elif os.path.isdir(target):
                 shutil.rmtree(target, ignore_errors=True)
             continue
 
-        dest = os.path.join(rootfs, name)
         member.mode = member.mode & 0o1777
         try:
             if member.isdir():
                 os.makedirs(dest, exist_ok=True)
                 os.chmod(dest, member.mode)
             elif member.issym():
-                if os.path.lexists(dest):
-                    os.unlink(dest)
+                _safe_unlink_if_present(dest)
                 os.symlink(member.linkname, dest)
             elif member.islnk():
                 link_rel = member.linkname
                 while link_rel.startswith("./") or link_rel.startswith("/"):
                     link_rel = (link_rel[2:] if link_rel.startswith("./")
                                 else link_rel[1:])
-                link_src = os.path.join(rootfs, link_rel)
-                if os.path.lexists(dest):
-                    os.unlink(dest)
+                try:
+                    link_src = _safe_resolve(rootfs, "/" + link_rel)
+                except ValueError as exc:
+                    print(f"  warning: hardlink escape: "
+                          f"{member.name!r}: {exc}", file=sys.stderr)
+                    continue
+                _safe_unlink_if_present(dest)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 if os.path.exists(link_src):
                     os.link(link_src, dest)
             elif member.isfile():
+                _safe_unlink_if_present(dest)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 fobj = tf.extractfile(member)
                 if fobj:
@@ -320,7 +408,7 @@ def _mount_bind(m: dict, state: _State) -> tuple:
               file=sys.stderr)
         sys.exit(1)
 
-    dst_in_rootfs = os.path.join(state.rootfs, dst.lstrip("/"))
+    dst_in_rootfs = _safe_resolve(state.rootfs, "/" + dst.lstrip("/"))
     is_dir = os.path.isdir(src)
     if is_dir:
         os.makedirs(dst_in_rootfs, exist_ok=True)
@@ -375,7 +463,7 @@ def _mount_secret(m: dict, state: _State) -> tuple:
         sys.exit(1)
 
     target = m.get("target") or m.get("dst") or f"/run/secrets/{secret_id}"
-    dst_in_rootfs = os.path.join(state.rootfs, target.lstrip("/"))
+    dst_in_rootfs = _safe_resolve(state.rootfs, "/" + target.lstrip("/"))
     os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
     # Create empty placeholder; will be cleaned up after RUN completes.
     if not os.path.exists(dst_in_rootfs):
@@ -412,7 +500,7 @@ def _mount_ssh(m: dict, state: _State) -> tuple:
 
     target = (m.get("target") or m.get("dst")
               or "/run/buildkit/ssh_agent.0")
-    dst_in_rootfs = os.path.join(state.rootfs, target.lstrip("/"))
+    dst_in_rootfs = _safe_resolve(state.rootfs, "/" + target.lstrip("/"))
     os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
     # Create a regular-file placeholder for the socket bind-mount.
     if not os.path.lexists(dst_in_rootfs):
@@ -449,7 +537,7 @@ def _mount_cache(m: dict, state: _State) -> tuple:
         os.path.join("~", ".cache", "oci2bin", "build-cache", safe_id))
     os.makedirs(cache_dir, exist_ok=True)
 
-    dst_in_rootfs = os.path.join(state.rootfs, target.lstrip("/"))
+    dst_in_rootfs = _safe_resolve(state.rootfs, "/" + target.lstrip("/"))
     os.makedirs(dst_in_rootfs, exist_ok=True)
 
     cmd = f"mount --bind {shlex.quote(cache_dir)} {shlex.quote(dst_in_rootfs)}"
@@ -469,7 +557,7 @@ def _mount_tmpfs(m: dict, state: _State) -> tuple:
         print("error: --mount=type=tmpfs requires target=", file=sys.stderr)
         sys.exit(1)
 
-    dst_in_rootfs = os.path.join(state.rootfs, target.lstrip("/"))
+    dst_in_rootfs = _safe_resolve(state.rootfs, "/" + target.lstrip("/"))
     os.makedirs(dst_in_rootfs, exist_ok=True)
 
     opts = ""
@@ -590,7 +678,12 @@ def _do_copy(state: _State, args: str) -> None:
     srcs, dst_rel = parts[:-1], parts[-1]
     dst_container = dst_rel if os.path.isabs(dst_rel) else \
         os.path.join(state.workdir, dst_rel)
-    dst_host = os.path.join(state.rootfs, dst_container.lstrip("/"))
+    try:
+        dst_host = _safe_resolve(state.rootfs, dst_container)
+    except ValueError as exc:
+        print(f"error: COPY destination escapes rootfs: {exc}",
+              file=sys.stderr)
+        sys.exit(1)
     dst_is_dir = dst_rel.endswith("/") or (
         os.path.isdir(dst_host) and not os.path.islink(dst_host))
 
@@ -741,8 +834,12 @@ def _do_workdir(state: _State, args: str) -> None:
     if not os.path.isabs(wd):
         wd = os.path.join(state.workdir, wd)
     state.workdir = os.path.normpath(wd)
-    os.makedirs(os.path.join(state.rootfs, state.workdir.lstrip("/")),
-                exist_ok=True)
+    try:
+        wd_host = _safe_resolve(state.rootfs, state.workdir)
+    except ValueError as exc:
+        print(f"error: WORKDIR escapes rootfs: {exc}", file=sys.stderr)
+        sys.exit(1)
+    os.makedirs(wd_host, exist_ok=True)
 
 
 # ── Main build loop ──────────────────────────────────────────────────────────
