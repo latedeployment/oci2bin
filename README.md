@@ -1552,6 +1552,27 @@ oci2bin exec $PID -- redis-cli -p 6379 INFO server
 
 `exec` joins the user, mount, PID, UTS, and IPC namespaces of the target process. The process must still be running — use `--detach` or run in another terminal.
 
+### doctor
+
+Probe the host for the toolchain and kernel features oci2bin uses, and
+print exact fix commands for each missing piece.
+
+```bash
+oci2bin doctor
+oci2bin doctor --json    # machine-readable
+```
+
+Each row reports `OK`, `DEGRADED`, or `MISSING` plus a one-line
+detail. On `MISSING` the row includes a `fix:` command. The exit
+code is non-zero only when at least one check is `MISSING`;
+`DEGRADED` (e.g. `cosign` not installed) is informational.
+
+Checks: `gcc`, static libc (`musl-gcc` or `gcc -static`),
+Docker/Podman, `newuidmap`/`newgidmap` and `/etc/subuid`/`subgid`,
+seccomp, Landlock ABI, cgroup v2 controllers, unprivileged user
+namespaces, `slirp4netns`/`pasta`, `/dev/kvm`/`libkrun`,
+`openssl`/`cosign`, `tar`/`gzip`/`zstd`.
+
 ### inspect
 
 Display metadata embedded in any oci2bin binary without running it:

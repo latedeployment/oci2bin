@@ -137,6 +137,7 @@ install: build/loader-$(ARCH)
 	install -m 644 scripts/add_files.py        $(PREFIX)/share/oci2bin/scripts/
 	install -m 644 scripts/build_polyglot.py   $(PREFIX)/share/oci2bin/scripts/
 	install -m 644 scripts/diff_images.py      $(PREFIX)/share/oci2bin/scripts/
+	install -m 644 scripts/doctor.py           $(PREFIX)/share/oci2bin/scripts/
 	install -m 644 scripts/inspect_image.py    $(PREFIX)/share/oci2bin/scripts/
 	install -m 644 scripts/merge_layers.py     $(PREFIX)/share/oci2bin/scripts/
 	install -m 644 scripts/oci_layout_to_tar.py $(PREFIX)/share/oci2bin/scripts/
@@ -350,6 +351,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_mcp_params_shape -v
 	@echo "=== .dockerignore tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_dockerignore -v
+	@echo "=== oci2bin doctor tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_doctor -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

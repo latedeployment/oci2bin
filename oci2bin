@@ -347,6 +347,13 @@ if [[ "${1:-}" == "inspect" ]]; then
     exec python3 "$OCI2BIN_HOME/scripts/inspect_image.py" "$@"
 fi
 
+# ── doctor subcommand ─────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "doctor" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/doctor.py" "$@"
+fi
+
 # ── sign subcommand ───────────────────────────────────────────────────────
 
 if [[ "${1:-}" == "sign" ]]; then
