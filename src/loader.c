@@ -7593,11 +7593,38 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                 if (mount("overlay", rootfs, "overlay", 0,
                           overlay_opts) < 0)
                 {
+                    /* Both --read-only and --overlay-persist are
+                     * explicit flags — silently degrading to
+                     * read-write on overlayfs failure would defeat
+                     * the user's request. Fail closed. */
                     fprintf(stderr,
-                            "oci2bin: overlayfs unavailable,"
-                            " running read-write\n");
+                            "oci2bin: %s requested but overlayfs"
+                            " mount failed: %s\n",
+                            opts->read_only ? "--read-only"
+                            : "--overlay-persist",
+                            strerror(errno));
+                    return 1;
                 }
             }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: overlay options string truncated\n");
+                return 1;
+            }
+        }
+        else
+        {
+            /* upper_ok==0 means the upper/work setup failed (path
+             * truncated, mkdir, or cross-device).  The earlier
+             * branches already printed a specific error; for an
+             * explicit flag we now refuse to silently downgrade. */
+            fprintf(stderr,
+                    "oci2bin: %s requested but overlay upper/work"
+                    " could not be prepared\n",
+                    opts->read_only ? "--read-only"
+                    : "--overlay-persist");
+            return 1;
         }
     }
 
@@ -7837,13 +7864,18 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     {
         if (opts->seccomp_profile)
         {
-            /* Custom profile: fall back to built-in default on parse error */
+            /* --seccomp-profile is explicit: the user picked a
+             * specific policy. Silently falling back to the built-in
+             * defaults could leave the workload less restricted than
+             * the user requested, which is a security regression. */
             if (apply_seccomp_profile(opts->seccomp_profile) < 0)
             {
                 fprintf(stderr,
-                        "oci2bin: --seccomp-profile failed,"
-                        " falling back to built-in filter\n");
-                apply_seccomp_filter();
+                        "oci2bin: --seccomp-profile %s failed to load"
+                        " or apply; refusing to fall back to default"
+                        " filter\n",
+                        opts->seccomp_profile);
+                return 1;
             }
         }
         else
