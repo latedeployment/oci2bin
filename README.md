@@ -883,9 +883,9 @@ oci2bin pod run \
 
 If overlayfs is not available, a warning is printed and the container runs read-write.
 
-### Lazy rootfs extraction (experimental)
+### Lazy rootfs extraction (probe-only, reserved for future use)
 
-`--lazy` enables experimental on-demand rootfs paging via `userfaultfd(2)` (Linux 4.3+). When the kernel supports UFFD, the loader prints a warning that lazy mode is experimental and falls back to full extraction. On kernels without UFFD support the flag is silently treated as a no-op with a diagnostic message.
+`--lazy` is currently a capability probe for `userfaultfd(2)` (Linux 4.3+). It does NOT yet enable on-demand paging — the loader always performs a full upfront extraction. The flag is reserved for a future implementation; on a UFFD-capable kernel the loader prints a diagnostic and falls back to full extraction; on kernels without UFFD it prints an unsupported-kernel diagnostic and likewise falls back.
 
 ```bash
 ./my-app --lazy /bin/sh

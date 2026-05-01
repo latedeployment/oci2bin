@@ -45,11 +45,10 @@ All notable changes to oci2bin are documented here.
   lifecycle tools (`run_container`, `stop_container`, `list_containers`,
   `inspect_image`) to AI agents and editors via stdin/stdout.
 
-- **`--lazy` flag** — experimental userfaultfd-based lazy loading: registers
-  the OCI tar region with the kernel and services page faults on demand,
-  reducing startup latency for large images by avoiding an upfront full read.
-  Requires `UFFD_FEATURE_MISSING_ANON` (Linux ≥ 5.7). Automatically disabled
-  if the kernel does not support it.
+- **`--lazy` flag** — probes for userfaultfd support and prints a diagnostic.
+  Reserved for a future demand-paging implementation; today the loader still
+  performs a full upfront extraction whether `--lazy` is set or not. Use as a
+  capability probe; do not depend on reduced startup latency yet.
 
 - **TPM2-sealed secrets via `--secret tpm2:<cred>[:<path>]`** — decrypt
   credentials sealed with `systemd-creds encrypt --tpm2-device=auto` at
