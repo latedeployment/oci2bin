@@ -1334,6 +1334,38 @@ static int path_is_absolute_and_clean(const char* path)
 }
 
 /*
+ * is_resolver_token_safe: a value bound for /etc/hosts or
+ * /etc/resolv.conf must be a single line. Reject any string that:
+ *   - is NULL or empty
+ *   - is longer than max_len bytes (inclusive — i.e. strlen <= max_len)
+ *   - contains a byte outside printable ASCII [0x20, 0x7e]
+ * The check is intentionally strict: legitimate values for hostnames,
+ * IPs, and DNS search domains are all printable ASCII.
+ *
+ * Returns 1 if safe, 0 if unsafe.
+ */
+static int is_resolver_token_safe(const char* s, size_t max_len)
+{
+    if (!s || !*s)
+    {
+        return 0;
+    }
+    size_t n = 0;
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++, n++)
+    {
+        if (n > max_len)
+        {
+            return 0;
+        }
+        if (*p < 0x20 || *p >= 0x7f)
+        {
+            return 0;
+        }
+    }
+    return n <= max_len;
+}
+
+/*
  * tar_entry_name_unsafe: a tar entry path is unsafe to extract under a
  * rootfs if it would escape that rootfs at extraction time. Reject:
  *   - empty paths
@@ -9221,6 +9253,17 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         "oci2bin: --add-host argument must be HOST:IP\n");
                 return -1;
             }
+            /* Reject control bytes / non-ASCII so a crafted argument
+             * cannot inject extra lines into /etc/hosts. The split
+             * into HOST and IP halves is enforced by the colon, and
+             * the helper rejects any value over 252 bytes — well
+             * under PATH_MAX yet plenty for "hostname:255.255.255.255". */
+            if (!is_resolver_token_safe(argv[i], 252))
+            {
+                fprintf(stderr,
+                        "oci2bin: --add-host: rejecting unsafe value\n");
+                return -1;
+            }
             opts->add_hosts[opts->n_add_hosts++] = argv[i];
         }
         else if (strcmp(argv[i], "--dns") == 0)
@@ -9237,6 +9280,16 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         "oci2bin: too many --dns flags (max 8)\n");
                 return -1;
             }
+            /* DNS server values land in /etc/resolv.conf. A newline
+             * here would let a caller smuggle additional resolver
+             * directives. 45 bytes covers the longest IPv6 plus zone
+             * id ("ffff:...:ffff%eth0"). */
+            if (!is_resolver_token_safe(argv[i], 45))
+            {
+                fprintf(stderr,
+                        "oci2bin: --dns: rejecting unsafe value\n");
+                return -1;
+            }
             opts->dns_servers[opts->n_dns_servers++] = argv[i];
         }
         else if (strcmp(argv[i], "--dns-search") == 0)
@@ -9251,6 +9304,12 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             {
                 fprintf(stderr,
                         "oci2bin: too many --dns-search flags (max 8)\n");
+                return -1;
+            }
+            if (!is_resolver_token_safe(argv[i], 252))
+            {
+                fprintf(stderr,
+                        "oci2bin: --dns-search: rejecting unsafe value\n");
                 return -1;
             }
             opts->dns_search[opts->n_dns_search++] = argv[i];

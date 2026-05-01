@@ -2852,6 +2852,80 @@ static void test_safe_merge_layer_blocks_escape(void)
     rmdir(tdir);
 }
 
+static void test_is_resolver_token_safe(void)
+{
+    ASSERT_INT_EQ(is_resolver_token_safe(NULL, 100),  0,
+                  "is_resolver_token_safe: NULL is unsafe");
+    ASSERT_INT_EQ(is_resolver_token_safe("",   100),  0,
+                  "is_resolver_token_safe: empty is unsafe");
+    ASSERT_INT_EQ(is_resolver_token_safe("foo", 100), 1,
+                  "is_resolver_token_safe: plain ascii ok");
+    ASSERT_INT_EQ(is_resolver_token_safe("foo:1.2.3.4", 100), 1,
+                  "is_resolver_token_safe: host:ip ok");
+    ASSERT_INT_EQ(is_resolver_token_safe("foo\nbar", 100), 0,
+                  "is_resolver_token_safe: newline rejected");
+    ASSERT_INT_EQ(is_resolver_token_safe("foo\rbar", 100), 0,
+                  "is_resolver_token_safe: CR rejected");
+    ASSERT_INT_EQ(is_resolver_token_safe("foo\tbar", 100), 0,
+                  "is_resolver_token_safe: tab rejected");
+    ASSERT_INT_EQ(is_resolver_token_safe("foo\xff", 100), 0,
+                  "is_resolver_token_safe: high byte rejected");
+    ASSERT_INT_EQ(is_resolver_token_safe("12345", 4), 0,
+                  "is_resolver_token_safe: over max_len rejected");
+    ASSERT_INT_EQ(is_resolver_token_safe("1234", 4), 1,
+                  "is_resolver_token_safe: at max_len accepted");
+    ASSERT_INT_EQ(is_resolver_token_safe("123",  4), 1,
+                  "is_resolver_token_safe: under max_len ok");
+}
+
+static void test_parse_opts_resolver_injection(void)
+{
+    struct container_opts opts;
+
+    /* --add-host with newline injection */
+    {
+        char* argv[] = {"prog", "--add-host", "evil:1.2.3.4\nnameserver 6.6.6.6", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --add-host rejects newline");
+    }
+    /* --add-host with normal value */
+    {
+        char* argv[] = {"prog", "--add-host", "host.example:127.0.0.1", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --add-host accepts plain value");
+        ASSERT_INT_EQ(opts.n_add_hosts, 1,
+                      "parse_opts: --add-host stored once");
+    }
+    /* --dns with newline */
+    {
+        char* argv[] = {"prog", "--dns", "8.8.8.8\nfoo", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --dns rejects newline");
+    }
+    /* --dns-search with control byte */
+    {
+        char* argv[] = {"prog", "--dns-search", "example\x01com", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --dns-search rejects control byte");
+    }
+    /* --dns-search with normal value */
+    {
+        char* argv[] = {"prog", "--dns-search", "example.com", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --dns-search accepts plain value");
+    }
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -2895,6 +2969,8 @@ int main(void)
     test_kernel_feature_state();
     test_tar_entry_name_unsafe();
     test_safe_merge_layer_blocks_escape();
+    test_is_resolver_token_safe();
+    test_parse_opts_resolver_injection();
 
     printf("1..%d\n", tap_test_num);
 
