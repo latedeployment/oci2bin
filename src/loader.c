@@ -392,24 +392,21 @@ static void audit_emit_pid(const char* event, pid_t pid, const char* extra)
     char timebuf[32];
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
 
-    char line[1024];
-    int n;
+    char prefix[256];
+    int n = snprintf(prefix, sizeof(prefix),
+                     "{\"event\":\"%s\",\"time\":\"%s\",\"pid\":%d",
+                     event, timebuf, (int)pid);
+    if (n <= 0 || n >= (int)sizeof(prefix))
+    {
+        return;
+    }
+    write_all_fd(g_audit_fd, prefix, (size_t)n);
     if (extra && extra[0])
     {
-        n = snprintf(line, sizeof(line),
-                     "{\"event\":\"%s\",\"time\":\"%s\",\"pid\":%d,%s}\n",
-                     event, timebuf, (int)pid, extra);
+        write_all_fd(g_audit_fd, ",", 1);
+        write_all_fd(g_audit_fd, extra, strlen(extra));
     }
-    else
-    {
-        n = snprintf(line, sizeof(line),
-                     "{\"event\":\"%s\",\"time\":\"%s\",\"pid\":%d}\n",
-                     event, timebuf, (int)pid);
-    }
-    if (n > 0 && n < (int)sizeof(line))
-    {
-        write_all_fd(g_audit_fd, line, (size_t)n);
-    }
+    write_all_fd(g_audit_fd, "}\n", 2);
 }
 
 static void audit_emit(const char* event, const char* extra)
@@ -679,7 +676,7 @@ static void audit_emit_start_event(const char* image_path,
     char image[PATH_MAX];
     char name[256];
     char net[64];
-    char extra[1024];
+    char extra[PATH_MAX + 512];
 
     audit_escape_string(image_path, image, sizeof(image));
     audit_escape_string(opts->name ? opts->name : "", name, sizeof(name));
@@ -2457,18 +2454,6 @@ static char* read_file(const char* path, size_t* out_size)
     return buf;
 }
 
-static int write_file(const char* path, const char* data, size_t len)
-{
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-    {
-        return -1;
-    }
-    int rc = write_all_fd(fd, data, len);
-    close(fd);
-    return rc;
-}
-
 static int write_file_beneath(int rootfs_fd, const char* rel_path,
                               const char* data, size_t len, mode_t mode)
 {
@@ -2700,11 +2685,11 @@ static void install_custom_resolv_conf(const char* rootfs,
         }
         for (int i = 0; i < n_dns_search && pos < (int)sizeof(buf) - 2; i++)
         {
-            int n = snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-                             " %s", dns_search[i]);
-            if (n > 0 && n < (int)(sizeof(buf) - (size_t)pos))
+            int written = snprintf(buf + pos, sizeof(buf) - (size_t)pos,
+                                   " %s", dns_search[i]);
+            if (written > 0 && written < (int)(sizeof(buf) - (size_t)pos))
             {
-                pos += n;
+                pos += written;
             }
         }
         if (pos < (int)sizeof(buf) - 1)
@@ -11948,7 +11933,7 @@ static int mcp_find_ctr(const char* name)
 
 /* tools/call: run_container */
 static void mcp_tool_run_container(long id, const char* args_json,
-                                   const char* self_path, int allow_net)
+                                   int allow_net)
 {
     char* image = json_get_string(args_json, "image");
     char* name  = json_get_string(args_json, "name");
@@ -12167,14 +12152,14 @@ static void mcp_tool_run_container(long id, const char* args_json,
 
     /* Track the container */
     int slot = g_mcp_n_ctrs++;
-    strncpy(g_mcp_ctrs[slot].name, name, MCP_NAME_MAX - 1);
-    g_mcp_ctrs[slot].name[MCP_NAME_MAX - 1] = '\0';
+    size_t name_len = strlen(name);
+    memcpy(g_mcp_ctrs[slot].name, name, name_len + 1);
     g_mcp_ctrs[slot].pid = child;
-    strncpy(g_mcp_ctrs[slot].log_path, log_path, PATH_MAX - 1);
-    g_mcp_ctrs[slot].log_path[PATH_MAX - 1] = '\0';
+    size_t log_path_len = strlen(log_path);
+    memcpy(g_mcp_ctrs[slot].log_path, log_path, log_path_len + 1);
 
     /* Return container ID */
-    char result[256];
+    char result[512];
     char name_esc[MCP_NAME_MAX * 2];
     json_escape_string(name, name_esc, sizeof(name_esc));
     snprintf(result, sizeof(result),
@@ -13070,7 +13055,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
 
             if (strcmp(tool_name, "run_container") == 0)
             {
-                mcp_tool_run_container(id, args, self_path, allow_net);
+                mcp_tool_run_container(id, args, allow_net);
             }
             else if (strcmp(tool_name, "list_containers") == 0)
             {
@@ -13094,7 +13079,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
             }
             else
             {
-                char msg[256];
+                char msg[512];
                 char esc[256];
                 json_escape_string(tool_name, esc, sizeof(esc));
                 snprintf(msg, sizeof(msg), "unknown tool: %s", esc);
@@ -13109,7 +13094,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
         }
         else
         {
-            char msg[256];
+            char msg[512];
             char esc[256];
             json_escape_string(method, esc, sizeof(esc));
             snprintf(msg, sizeof(msg), "method not found: %s", esc);
@@ -13117,8 +13102,6 @@ static int mcp_serve_main(const char* self_path, int allow_net)
         }
         free(method);
     }
-    free(line);
-    return 0;
 }
 
 /* ── main ────────────────────────────────────────────────────────────────── */

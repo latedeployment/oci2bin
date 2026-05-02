@@ -2379,13 +2379,13 @@ static void test_read_write_file(void)
     ASSERT(fd >= 0, "rwfile: mkstemp succeeds");
     if (fd < 0)
         return;
-    close(fd);
 
     const char* content = "line1\nline2\n";
     size_t clen = strlen(content);
 
-    ASSERT_INT_EQ(write_file(path, content, clen), 0,
-                  "rwfile: write_file returns 0");
+    ASSERT_INT_EQ(write_all_fd(fd, content, clen), 0,
+                  "rwfile: write_all_fd returns 0");
+    close(fd);
 
     size_t got_size = 0;
     char* got = read_file(path, &got_size);
