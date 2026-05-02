@@ -36,47 +36,11 @@ inspect_image = _load("inspect_image")
 doctor = _load("doctor")
 
 
-SIG_MAGIC = b"OCI2BIN_SIG\x00"
-SIG_TRAILER = b"OCI2BIN_SIG_END\x00"
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _has_signature(binary_path: str) -> bool:
-    """Look for the OCI2BIN_SIG block trailer at any offset."""
-    try:
-        with open(binary_path, "rb") as f:
-            data = f.read()
-    except OSError:
-        return False
-    return SIG_TRAILER in data and SIG_MAGIC in data
-
-
-def _has_sbom(binary_path: str) -> bool:
-    """Heuristic: SBOM blocks are typically appended with a JSON
-    document containing 'spdxVersion' or 'bomFormat'."""
-    try:
-        with open(binary_path, "rb") as f:
-            tail = f.read()[-262144:]
-    except OSError:
-        return False
-    return b"spdxVersion" in tail or b"bomFormat" in tail
-
-
-def _redact_env(env_list):
-    """Hide secret-shaped env values (KEY/TOKEN/SECRET/PASSWORD), keep keys."""
-    out = []
-    for kv in env_list or []:
-        if "=" not in kv:
-            out.append(kv)
-            continue
-        k, v = kv.split("=", 1)
-        if any(s in k.upper() for s in
-               ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PWD")):
-            out.append(f"{k}=<redacted>")
-        else:
-            out.append(f"{k}={v}")
-    return out
+# Helpers live in inspect_image — explain reuses them so the redaction
+# rule and signature check stay consistent.
+_has_signature = inspect_image.has_signature
+_has_sbom      = inspect_image.has_sbom
+_redact_env    = inspect_image.redact_env
 
 
 def _required_doctor_checks(meta, cfg):

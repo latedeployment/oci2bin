@@ -29,6 +29,66 @@ PATCHED_MARKER = struct.pack('<Q', 0xAAAAAAAAAAAAAAAA)
 # OCI2BIN_META magic prefix (Feature 10)
 META_MAGIC = b'OCI2BIN_META\x00'
 
+# OCI2BIN_SIG block magic + trailer (Feature: signing)
+SIG_MAGIC   = b'OCI2BIN_SIG\x00'
+SIG_TRAILER = b'OCI2BIN_SIG_END\x00'
+
+
+def has_signature(binary_path):
+    """Return True if the binary has an embedded OCI2BIN_SIG block."""
+    try:
+        with open(binary_path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return False
+    return SIG_TRAILER in data and SIG_MAGIC in data
+
+
+def has_sbom(binary_path):
+    """Heuristic: look for SPDX/CycloneDX markers in the trailing 256 KiB
+    of the binary (where SBOM blobs are typically appended)."""
+    try:
+        with open(binary_path, 'rb') as f:
+            tail = f.read()[-262144:]
+    except OSError:
+        return False
+    return b'spdxVersion' in tail or b'bomFormat' in tail
+
+
+def redact_env(env_list):
+    """Hide secret-shaped env values; keep keys for context."""
+    out = []
+    for kv in env_list or []:
+        if '=' not in kv:
+            out.append(kv)
+            continue
+        k, v = kv.split('=', 1)
+        if any(s in k.upper() for s in
+               ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'PASSWD', 'PWD')):
+            out.append(f'{k}=<redacted>')
+        else:
+            out.append(f'{k}={v}')
+    return out
+
+
+def estimated_extracted_size(oci_bytes):
+    """Sum of regular-file sizes in the embedded OCI tar. Best-effort:
+    returns 0 on any tar parse error so callers don't have to wrap."""
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(oci_bytes), mode='r')
+    except (tarfile.TarError, EOFError):
+        return 0
+    total = 0
+    try:
+        for m in tf:
+            if m.isfile():
+                total += m.size
+    except (tarfile.TarError, EOFError):
+        pass
+    finally:
+        tf.close()
+    return total
+
 
 def find_marker(data, marker):
     """Return offset of first occurrence of marker bytes, or None."""
@@ -107,19 +167,27 @@ def read_oci_data(binary_path):
 
 
 def parse_config(oci_bytes):
-    """Parse manifest.json and image config from the embedded OCI tar bytes."""
+    """Parse manifest.json and image config from the embedded OCI tar bytes.
+
+    Returns (repo_tags, layers, config). On a tar parse error or a
+    missing manifest.json the function returns empty defaults rather
+    than aborting — callers may still want to print the OCI2BIN_META
+    block, signature presence, etc."""
     try:
         tf = tarfile.open(fileobj=io.BytesIO(oci_bytes), mode='r')
-    except tarfile.TarError as e:
-        print(f"inspect: tar error: {e}", file=sys.stderr)
-        sys.exit(1)
+    except (tarfile.TarError, EOFError) as e:
+        print(f"inspect: tar parse error: {e} (continuing with defaults)",
+              file=sys.stderr)
+        return [], [], {}
 
     manifest_member = None
     try:
         manifest_member = tf.getmember('manifest.json')
-    except KeyError:
-        print("inspect: manifest.json not found in embedded tar", file=sys.stderr)
-        sys.exit(1)
+    except (KeyError, tarfile.ReadError, EOFError):
+        print("inspect: manifest.json not found in embedded tar "
+              "(continuing with defaults)", file=sys.stderr)
+        tf.close()
+        return [], [], {}
 
     manifest = json.loads(tf.extractfile(manifest_member).read())
     if not manifest:
@@ -188,20 +256,36 @@ def main():
         sys.exit(1)
 
     if args.json:
-        # JSON mode: return meta block or minimal fallback
-        meta = read_meta_block(binary_path)
+        # JSON mode: return meta block + the same extended fields the
+        # human output shows, so tooling can consume one source of truth.
+        meta = read_meta_block(binary_path) or {}
         file_size = os.path.getsize(binary_path)
-        if meta is None:
-            meta = {}
-        # Fill in image name from OCI tar if not in meta
-        if 'image' not in meta:
-            try:
-                oci_bytes = read_oci_data(binary_path)
-                repo_tags, _, _ = parse_config(oci_bytes)
-                meta['image'] = repo_tags[0] if repo_tags else 'unknown'
-            except SystemExit:
-                meta['image'] = 'unknown'
+        oci_bytes = b''
+        repo_tags, layers, config = [], [], {}
+        try:
+            oci_bytes = read_oci_data(binary_path)
+            repo_tags, layers, config = parse_config(oci_bytes)
+        except SystemExit:
+            pass
+        cfg = config.get('config', config)
+        image_name = repo_tags[0] if repo_tags else 'unknown'
+        meta.setdefault('image', image_name)
         meta['size'] = file_size
+        meta['layers'] = len(layers)
+        meta['architecture'] = config.get('architecture', 'unknown')
+        meta['entrypoint'] = cfg.get('Entrypoint') or []
+        meta['cmd'] = cfg.get('Cmd') or []
+        meta['workdir'] = cfg.get('WorkingDir') or '/'
+        meta['user'] = cfg.get('User') or '0'
+        meta['env'] = redact_env(cfg.get('Env') or [])
+        meta['exposed_ports'] = list(
+            (cfg.get('ExposedPorts') or {}).keys())
+        meta['healthcheck'] = cfg.get('Healthcheck') or {}
+        meta['volumes'] = list((cfg.get('Volumes') or {}).keys())
+        meta['labels'] = cfg.get('Labels') or {}
+        meta['extracted_size_bytes'] = estimated_extracted_size(oci_bytes)
+        meta['signature_present'] = has_signature(binary_path)
+        meta['sbom_present'] = has_sbom(binary_path)
         print(json.dumps(meta))
         return
 
@@ -212,11 +296,19 @@ def main():
 
     image_name = repo_tags[0] if repo_tags else '(unknown)'
     arch = config.get('architecture', '(unknown)')
-    entrypoint = cfg.get('Entrypoint') or []
-    cmd        = cfg.get('Cmd') or []
-    workdir    = cfg.get('WorkingDir') or '/'
-    env        = cfg.get('Env') or []
-    ports      = cfg.get('ExposedPorts') or {}
+    entrypoint  = cfg.get('Entrypoint') or []
+    cmd         = cfg.get('Cmd') or []
+    workdir     = cfg.get('WorkingDir') or '/'
+    env         = cfg.get('Env') or []
+    ports       = cfg.get('ExposedPorts') or {}
+    healthcheck = cfg.get('Healthcheck') or {}
+    user        = cfg.get('User') or '0'
+    volumes     = list((cfg.get('Volumes') or {}).keys())
+    labels      = cfg.get('Labels') or {}
+
+    extracted_size = estimated_extracted_size(oci_bytes)
+    sig_present    = has_signature(binary_path)
+    sbom_present   = has_sbom(binary_path)
 
     print(f"Image:        {image_name}")
     print(f"Architecture: {arch}")
@@ -224,14 +316,38 @@ def main():
     print(f"Entrypoint:   {json.dumps(entrypoint)}")
     print(f"Cmd:          {json.dumps(cmd)}")
     print(f"WorkingDir:   {workdir}")
+    print(f"User:         {user}")
 
     if env:
         print("Env:")
-        for e in env:
+        for e in redact_env(env):
             print(f"              {e}")
 
     if ports:
         print(f"ExposedPorts: {' '.join(ports.keys())}")
+
+    if healthcheck:
+        # Healthcheck.Test is a list like ["CMD", "curl", "-f", "..."]
+        print(f"Healthcheck:  "
+              f"{json.dumps(healthcheck.get('Test') or healthcheck)}")
+        for k in ('Interval', 'Timeout', 'StartPeriod', 'Retries'):
+            if k in healthcheck:
+                print(f"              {k}: {healthcheck[k]}")
+
+    if volumes:
+        print(f"Volumes:      {' '.join(volumes)}")
+
+    if labels:
+        print("Labels:")
+        for k, v in labels.items():
+            print(f"              {k}={v}")
+
+    if extracted_size:
+        print(f"Extracted:    ~{extracted_size} bytes "
+              f"({extracted_size / (1024 * 1024):.1f} MiB)")
+
+    print(f"Signature:    {'present' if sig_present else 'absent'}")
+    print(f"SBOM:         {'embedded' if sbom_present else 'absent'}")
 
     # Display OCI2BIN_META block if present
     meta = read_meta_block(binary_path)

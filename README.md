@@ -1602,7 +1602,26 @@ Display metadata embedded in any oci2bin binary without running it:
 
 ```bash
 oci2bin inspect ./redis_7-alpine
+oci2bin inspect ./redis_7-alpine --json
 ```
+
+The default human output includes:
+
+- image name, architecture, layer count
+- entrypoint, cmd, workdir, declared user
+- environment (with `KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`PASSWD`/`PWD`
+  values redacted)
+- exposed ports, healthcheck (Test + Interval/Timeout/Retries),
+  declared volumes, image labels
+- estimated extracted size (sum of regular-file sizes in the
+  embedded OCI tar)
+- signature presence (`OCI2BIN_SIG` block scan)
+- SBOM presence (heuristic `spdxVersion`/`bomFormat` scan in tail)
+- the `OCI2BIN_META` build metadata block (image name, digest,
+  build timestamp, oci2bin version)
+
+`--json` produces the same fields as a single object for scripting.
+Use `oci2bin explain` if you also want host-capability checks.
 
 ```
 Image:        redis:7-alpine
@@ -1611,9 +1630,13 @@ Layers:       6
 Entrypoint:   ["docker-entrypoint.sh"]
 Cmd:          ["redis-server"]
 WorkingDir:   /data
+User:         0
 Env:
               PATH=/usr/local/sbin:...
               REDIS_VERSION=7.4.2
+ExposedPorts: 6379/tcp
+Signature:    present
+SBOM:         embedded
 
 Build metadata:
   Image:     redis:7-alpine

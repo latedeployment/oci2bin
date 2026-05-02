@@ -356,6 +356,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_doctor -v
 	@echo "=== oci2bin explain tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_explain -v
+	@echo "=== oci2bin inspect extended tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_inspect_extended -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="
