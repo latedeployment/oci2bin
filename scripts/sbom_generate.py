@@ -111,7 +111,9 @@ def extract_rootfs_to_tmpdir(oci_bytes, tmpdir):
             if os.path.basename(member.name).startswith('.wh.'):
                 continue
             # Safety: skip absolute paths and .. components
-            name = member.name.lstrip('./')
+            name = member.name
+            while name.startswith('./') or name.startswith('/'):
+                name = name[2:] if name.startswith('./') else name[1:]
             if '..' in name.split('/'):
                 continue
             # Refuse to traverse through any existing symlink in the path:

@@ -80,11 +80,15 @@ def squash_oci_tar(input_path, output_path, compress='gzip'):
 
         try:
             layer_tf = open_layer(layer_data)
-        except Exception:
+        except Exception as e:
+            print(f"squash_layers: skipping unreadable layer "
+                  f"{layer_name}: {e}", file=sys.stderr)
             continue
 
         for m in layer_tf.getmembers():
-            name = m.name.lstrip('./')
+            name = m.name
+            while name.startswith('./') or name.startswith('/'):
+                name = name[2:] if name.startswith('./') else name[1:]
             if not name:
                 continue
             # Reject path traversal components
@@ -116,7 +120,9 @@ def squash_oci_tar(input_path, output_path, compress='gzip'):
                 try:
                     f = layer_tf.extractfile(m)
                     data = f.read() if f else b''
-                except Exception:
+                except Exception as e:
+                    print(f"squash_layers: failed to read {name!r} "
+                          f"in {layer_name}: {e}", file=sys.stderr)
                     data = b''
 
             file_dict[name] = (m, data)

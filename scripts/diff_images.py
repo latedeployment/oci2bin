@@ -121,11 +121,18 @@ def build_file_dict(oci_bytes):
 
         try:
             layer_tf = open_layer(layer_data)
-        except Exception:
+        except Exception as e:
+            print(f"diff_images: skipping unreadable layer "
+                  f"{layer_name}: {e}", file=sys.stderr)
             continue
 
         for m in layer_tf.getmembers():
-            path = '/' + m.name.lstrip('./')
+            name = m.name
+            while name.startswith('./') or name.startswith('/'):
+                name = name[2:] if name.startswith('./') else name[1:]
+            if '..' in name.split('/'):
+                continue
+            path = '/' + name
             # Normalize double slashes
             while '//' in path:
                 path = path.replace('//', '/')

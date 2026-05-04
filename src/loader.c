@@ -211,6 +211,7 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len);
 static int run_cmd(char* const argv[]);
 static void rm_rf_dir(const char* path);
 static int json_escape_string(const char* src, char* dst, size_t dstsz);
+static int path_has_dotdot_component(const char* path);
 static unsigned long long current_effective_caps(void);
 
 static int kernel_feature_state_from_syscall(long rc, int err)
@@ -916,7 +917,7 @@ static void write_container_state(const char* name, pid_t pid,
             return;
         }
     }
-    if (home[0] != '/' || strstr(home, ".."))
+    if (home[0] != '/' || path_has_dotdot_component(home))
     {
         return;
     }
@@ -7694,7 +7695,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     }
 
     /* Mount /tmp as fresh tmpfs so container cannot see host /tmp */
-    mkdir("/tmp", 0777);
+    mkdir("/tmp", 01777);
     if (mount("tmpfs", "/tmp", "tmpfs",
               MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=1777") < 0)
     {
@@ -11021,8 +11022,8 @@ static int vm_init_main(void)
             }
             memcpy(mnt_path, colon + 1, path_len);
             mnt_path[path_len] = '\0';
-            /* validate path — reject .. */
-            if (strstr(mnt_path, "..") != NULL || mnt_path[0] != '/')
+            /* validate path — reject .. components and require absolute */
+            if (path_has_dotdot_component(mnt_path) || mnt_path[0] != '/')
             {
                 fprintf(stderr,
                         "oci2bin-init: skipping unsafe mount path: %s\n",
@@ -11196,13 +11197,13 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
         const char* mapped[MAX_VOLUMES + 1];
         for (int vi = 0; vi < opts->n_vols; vi++)
         {
-            if (strstr(opts->vol_host[vi], "..") != NULL)
+            if (path_has_dotdot_component(opts->vol_host[vi]))
             {
                 fprintf(stderr, "oci2bin: -v host path contains ..: %s\n",
                         opts->vol_host[vi]);
                 goto cleanup;
             }
-            if (strstr(opts->vol_ctr[vi], "..") != NULL ||
+            if (path_has_dotdot_component(opts->vol_ctr[vi]) ||
                     opts->vol_ctr[vi][0] != '/')
             {
                 fprintf(stderr, "oci2bin: -v container path invalid: %s\n",
@@ -11232,7 +11233,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
                            (oci_cfg.workdir ? oci_cfg.workdir : NULL);
         if (wdir && wdir[0])
         {
-            if (strstr(wdir, "..") != NULL)
+            if (path_has_dotdot_component(wdir))
             {
                 fprintf(stderr,
                         "oci2bin: workdir contains ..: %s\n", wdir);
@@ -11468,7 +11469,7 @@ static int vm_ch_prepare_data_disk(struct vm_ch_ctx* ctx,
     {
         return 0;
     }
-    if (strstr(opts->overlay_persist, "..") != NULL)
+    if (path_has_dotdot_component(opts->overlay_persist))
     {
         fprintf(stderr, "oci2bin: --overlay-persist path contains ..\n");
         return -1;
@@ -11551,7 +11552,7 @@ static int vm_ch_build_cmdline(struct vm_ch_ctx* ctx,
     }
     for (int vi = 0; vi < opts->n_vols; vi++)
     {
-        if (strstr(opts->vol_ctr[vi], "..") != NULL ||
+        if (path_has_dotdot_component(opts->vol_ctr[vi]) ||
                 opts->vol_ctr[vi][0] != '/' ||
                 strchr(opts->vol_ctr[vi], ' ') != NULL)
         {
@@ -11576,7 +11577,7 @@ static int vm_ch_start_virtiofsd(struct vm_ch_ctx* ctx,
 {
     for (int vi = 0; vi < opts->n_vols; vi++)
     {
-        if (strstr(opts->vol_host[vi], "..") != NULL)
+        if (path_has_dotdot_component(opts->vol_host[vi]))
         {
             fprintf(stderr, "oci2bin: -v host path contains ..: %s\n",
                     opts->vol_host[vi]);

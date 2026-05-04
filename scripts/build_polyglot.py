@@ -1184,16 +1184,20 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     if kernel_data:
         pad = (PAGE_ALIGN - (len(polyglot) % PAGE_ALIGN)) % PAGE_ALIGN
         polyglot += b'\x00' * pad
-        assert len(polyglot) == kernel_file_offset, \
-            f"kernel offset mismatch: {len(polyglot)} != {kernel_file_offset}"
+        if len(polyglot) != kernel_file_offset:
+            raise SystemExit(
+                f"build_polyglot: kernel offset mismatch: "
+                f"{len(polyglot)} != {kernel_file_offset}")
         polyglot += kernel_data
 
     # Append initramfs blob (page-aligned) if provided
     if initramfs_data:
         pad = (PAGE_ALIGN - (len(polyglot) % PAGE_ALIGN)) % PAGE_ALIGN
         polyglot += b'\x00' * pad
-        assert len(polyglot) == initramfs_file_offset, \
-            f"initramfs offset mismatch: {len(polyglot)} != {initramfs_file_offset}"
+        if len(polyglot) != initramfs_file_offset:
+            raise SystemExit(
+                f"build_polyglot: initramfs offset mismatch: "
+                f"{len(polyglot)} != {initramfs_file_offset}")
         polyglot += initramfs_data
 
     # 10. Write output (polyglot + metadata block)
