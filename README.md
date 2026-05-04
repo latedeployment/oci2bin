@@ -16,7 +16,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Feature | Example |
 |---------|---------|
 | Pack any image into a single binary | `oci2bin redis:7-alpine` |
-| Run anywhere — no Docker, no daemon | `scp redis_7-alpine remote: && ssh remote ./redis_7-alpine` |
+| Run anywhere — no Docker, no daemon | `scp redis_7-alpine remote && ssh remote ./redis_7-alpine` |
 | Build from a chroot directory | `oci2bin from-chroot ./rootfs -o myapp.bin` |
 | Build from a Dockerfile | `oci2bin build-dockerfile -o myapp.bin` |
 | Inject secrets at runtime | `./myapp --secret /etc/ssl/key.pem:/run/secrets/key` |
