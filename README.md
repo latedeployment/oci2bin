@@ -8,7 +8,7 @@ See below [How it works](#how-it-works).
 
 ```bash
 oci2bin alpine:latest    # produces ./alpine_latest
-./alpine_latest            # runs the container
+./alpine_latest          # runs the container
 ```
 
 ## Useful features
