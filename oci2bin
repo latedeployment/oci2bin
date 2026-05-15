@@ -123,6 +123,9 @@
 #   diff <b1> <b2>        Show filesystem diff between two oci2bin binaries
 #   diff-fs OVERLAY_PATH  Show A/D classification of an overlayfs upperdir
 #                         (use after a --overlay-persist DIR run)
+#   freeze NAME [-- CMD]  Snapshot SQLite DBs inside a running container;
+#                         with -- CMD also runs CMD then auto-thaws
+#   thaw NAME             Delete snapshots created by a prior freeze
 #   run IMAGE [...]       Build to a temp file and execute it once
 #   systemd BINARY        Emit a ready-to-use systemd unit file
 #   healthcheck BINARY    Run the embedded OCI HEALTHCHECK command
@@ -595,6 +598,29 @@ if [[ "${1:-}" == "diff" ]]; then
         exit 1
     fi
     exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" "$1" "$2"
+fi
+
+# ── freeze / thaw subcommands ─────────────────────────────────────────────
+
+if [[ "${1:-}" == "freeze" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin freeze NAME [-- CMD ARGS...]" >&2
+        echo "       Snapshots SQLite DBs inside the running container." >&2
+        echo "       With -- CMD: runs CMD then auto-thaws on exit." >&2
+        echo "       Without -- CMD: writes a token; pair with 'thaw NAME'." >&2
+        exit 1
+    fi
+    exec python3 "$OCI2BIN_HOME/scripts/freeze.py" freeze "$@"
+fi
+
+if [[ "${1:-}" == "thaw" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin thaw NAME" >&2
+        exit 1
+    fi
+    exec python3 "$OCI2BIN_HOME/scripts/freeze.py" thaw "$@"
 fi
 
 # ── diff-fs subcommand ────────────────────────────────────────────────────

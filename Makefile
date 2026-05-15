@@ -360,6 +360,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_inspect_extended -v
 	@echo "=== oci2bin diff-fs tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_diff_fs -v
+	@echo "=== oci2bin freeze/thaw tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_freeze -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

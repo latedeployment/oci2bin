@@ -98,6 +98,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
   - [prune](#prune)
   - [diff](#diff)
   - [diff-fs](#diff-fs)
+  - [freeze / thaw](#freeze--thaw)
   - [reconstruct](#reconstruct)
   - [push](#push)
   - [sbom](#sbom)
@@ -1880,6 +1881,54 @@ Classification:
 
 Pass `--json` for a machine-readable list of `{"op", "path", "opaque"}`
 objects.
+
+### freeze / thaw
+
+Application-consistent volume quiesce for SQLite-backed containers
+(Vaultwarden, ntfy, Headscale, Miniflux, etc.). Wrap an external backup
+tool with `oci2bin freeze NAME -- CMD ARGS...` so the backup sees a
+consistent snapshot file instead of a database mid-write:
+
+```bash
+# Take consistent snapshots, back up the volume, auto-clean.
+oci2bin freeze vaultwarden -- \
+    restic -r b2:my-bucket backup ~/vw-data
+```
+
+What it does: walks `/proc/<container-pid>/root/` for `*.db` / `*.sqlite`
+/ `*.sqlite3` files (depth ≤ 6, skipping `/proc`, `/sys`, `/usr`, etc.),
+then runs `sqlite3 <db> '.backup <db>.oci2bin-snap'` inside the
+container's mount + PID namespace via `nsenter`. The resulting
+`*.oci2bin-snap` files are crash-consistent. Your backup tool can read
+them safely while the live DB keeps accepting writes.
+
+For cron-style workflows where the snapshot and the backup are not
+adjacent in time, use the standalone form. `freeze` writes a token to
+`~/.local/share/oci2bin/freeze/NAME.json` recording the snapshot files;
+`thaw` removes the snaps and the token:
+
+```bash
+oci2bin freeze vaultwarden
+# ... your separate backup process runs ...
+oci2bin thaw vaultwarden
+```
+
+The standalone `thaw` refuses to run if the container's current PID
+doesn't match the token (so stale tokens for a recycled container can't
+trick us into nsentering an unrelated process). If no SQLite database is
+found and a command was passed, the command still runs — your volume
+may not be sqlite-backed and the wrap-and-restore lifecycle is still
+useful.
+
+**Limitations** (planned follow-ups):
+
+- Only handles SQLite today. Postgres (`pg_start_backup`/`pg_stop_backup`)
+  and a kernel-level `fsfreeze` fallback for arbitrary filesystems are
+  not yet wired in.
+- The container image must include `sqlite3` (Vaultwarden, ntfy, and
+  most sqlite-using images already do). If not, freeze fails fast with
+  a clear message.
+- Requires `nsenter` on the host.
 
 ### reconstruct
 

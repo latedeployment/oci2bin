@@ -6,6 +6,22 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`oci2bin freeze NAME [-- CMD]` / `oci2bin thaw NAME`** —
+  application-consistent volume quiesce for SQLite-backed containers
+  (Vaultwarden, ntfy, Headscale, Miniflux, etc.). Walks
+  `/proc/<pid>/root/` for `*.db` / `*.sqlite` / `*.sqlite3` files
+  (depth ≤ 6, skipping system prefixes) and runs `sqlite3 <db> '.backup
+  <db>.oci2bin-snap'` inside the container's mount + PID namespace via
+  `nsenter`. The crash-consistent snapshot files are readable from the
+  host while the live DB keeps writing. Two lifecycle shapes:
+  `freeze NAME -- CMD ARGS` (atomic — runs CMD then auto-removes snaps
+  on exit, regardless of CMD's exit code) and the standalone
+  `freeze NAME` / `thaw NAME` pair (token at
+  `~/.local/share/oci2bin/freeze/NAME.json`). Standalone `thaw` refuses
+  to run if the container's current PID no longer matches the token —
+  stale tokens on a recycled container won't trick us into nsentering
+  an unrelated process. 16 new Python unit tests.
+
 - **`oci2bin diff-fs OVERLAY_PATH`** — walks an overlayfs upperdir and
   prints `docker diff`-style A/D classification for each entry.
   Designed to be used after a `--overlay-persist DIR` run, but accepts
