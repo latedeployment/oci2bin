@@ -10638,6 +10638,19 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                     }
                     fclose(f);
                 }
+                /* Clamp total_kb before multiplying by 1024 to avoid
+                 * signed overflow on a hostile or corrupt /proc/meminfo.
+                 * Even a "beefy" host fits well inside 64 EiB, so capping
+                 * at 1 PiB (1<<50 bytes = 1<<40 kB) is more than enough
+                 * before we then clamp the container limit to 4 GiB. */
+                if (total_kb < 0)
+                {
+                    total_kb = 0;
+                }
+                if (total_kb > (1LL << 40))
+                {
+                    total_kb = (1LL << 40);
+                }
                 mem_bytes = total_kb > 0
                             ? (total_kb * 1024LL) / 2LL
                             : (1024LL * 1024 * 1024);

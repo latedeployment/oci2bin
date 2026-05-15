@@ -52,6 +52,19 @@ from pathlib import Path
 
 VALID_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$')
 DB_SUFFIXES = ('.db', '.sqlite', '.sqlite3')
+# Absolute candidate paths for nsenter — never trust $PATH for a
+# privileged-adjacent helper. Same pattern as notify_resolve_curl() in
+# src/loader.c.
+NSENTER_CANDIDATES = ('/usr/bin/nsenter', '/usr/sbin/nsenter', '/bin/nsenter')
+
+
+def _resolve_nsenter():
+    """Return the first absolute path to nsenter that is executable, or
+    None. Mirrors notify_resolve_curl() in loader.c."""
+    for p in NSENTER_CANDIDATES:
+        if os.access(p, os.X_OK):
+            return p
+    return None
 WALK_SKIP_PREFIXES = (
     'proc', 'sys', 'dev', 'run', 'tmp', 'var/cache', 'var/tmp',
     'usr', 'lib', 'lib64', 'bin', 'sbin', 'boot',
@@ -60,20 +73,27 @@ WALK_SKIP_PREFIXES = (
 MAX_DEPTH = 6
 
 
-def _state_dir():
+def _validated_home():
+    """Return HOME after the same checks the bash wrapper performs:
+    must be set, absolute, and free of '..' components. Mirrors
+    container_state_dir_or_die / checkpoints_dir_or_die in oci2bin."""
     home = os.environ.get('HOME', '')
     if not home or not os.path.isabs(home):
         print("oci2bin: HOME must be an absolute path", file=sys.stderr)
         sys.exit(1)
-    return Path(home) / '.cache' / 'oci2bin' / 'containers'
+    if any(part == '..' for part in home.split('/') if part):
+        print("oci2bin: HOME must not contain '..' components",
+              file=sys.stderr)
+        sys.exit(1)
+    return home
+
+
+def _state_dir():
+    return Path(_validated_home()) / '.cache' / 'oci2bin' / 'containers'
 
 
 def _freeze_token_dir():
-    home = os.environ.get('HOME', '')
-    if not home or not os.path.isabs(home):
-        print("oci2bin: HOME must be an absolute path", file=sys.stderr)
-        sys.exit(1)
-    return Path(home) / '.local' / 'share' / 'oci2bin' / 'freeze'
+    return Path(_validated_home()) / '.local' / 'share' / 'oci2bin' / 'freeze'
 
 
 def load_state(name):
@@ -175,16 +195,20 @@ def snapshot_one(pid, ctr_path):
     abort or skip).
     """
     snap_path = f'{ctr_path}.oci2bin-snap'
+    nsenter = _resolve_nsenter()
+    if nsenter is None:
+        print("oci2bin: 'nsenter' not found in /usr/bin /usr/sbin /bin",
+              file=sys.stderr)
+        sys.exit(1)
     cmd = [
-        'nsenter', '-t', str(pid), '-m', '-p', '--',
+        nsenter, '-t', str(pid), '-m', '-p', '--',
         'sqlite3', ctr_path, f'.backup {snap_path}',
     ]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=60, check=False)
     except FileNotFoundError:
-        print("oci2bin: 'nsenter' not found on the host PATH",
-              file=sys.stderr)
+        print(f"oci2bin: '{nsenter}' not found", file=sys.stderr)
         sys.exit(1)
     except subprocess.TimeoutExpired:
         print(f"oci2bin: sqlite3 .backup of {ctr_path} timed out after 60s",
@@ -205,8 +229,11 @@ def snapshot_one(pid, ctr_path):
 
 def remove_snapshot(pid, snap_ctr_path):
     """Best-effort delete of a snapshot file inside the container ns."""
+    nsenter = _resolve_nsenter()
+    if nsenter is None:
+        return
     cmd = [
-        'nsenter', '-t', str(pid), '-m', '-p', '--',
+        nsenter, '-t', str(pid), '-m', '-p', '--',
         'rm', '-f', snap_ctr_path,
     ]
     try:
