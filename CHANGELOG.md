@@ -6,6 +6,17 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`oci2bin diff-fs OVERLAY_PATH`** — walks an overlayfs upperdir and
+  prints `docker diff`-style A/D classification for each entry.
+  Designed to be used after a `--overlay-persist DIR` run, but accepts
+  either the upperdir directly or a parent containing `upper/`
+  (auto-descends). Detects overlayfs whiteout char devices
+  (`makedev(0,0)`) as `D` and the `trusted.overlay.opaque=y` xattr as a
+  trailing `(opaque)` annotation. Supports `--json` for machine
+  consumption. 8 new Python unit tests (one is skipped when the host
+  kernel/userns forbids creating whiteout char devices or setting the
+  trusted xattr).
+
 - **Air-gap seal `--offline-only`** — build-time flag that refuses any
   registry fetch (the image must already be in the local store or
   supplied via `--oci-dir` / `--tar`), implies `--reproducible` and

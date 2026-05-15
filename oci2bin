@@ -121,6 +121,8 @@
 #   list [--json]         List all cached binaries with image name, size, date
 #   prune [--dry-run]     Remove outdated cache entries (keep newest per image)
 #   diff <b1> <b2>        Show filesystem diff between two oci2bin binaries
+#   diff-fs OVERLAY_PATH  Show A/D classification of an overlayfs upperdir
+#                         (use after a --overlay-persist DIR run)
 #   run IMAGE [...]       Build to a temp file and execute it once
 #   systemd BINARY        Emit a ready-to-use systemd unit file
 #   healthcheck BINARY    Run the embedded OCI HEALTHCHECK command
@@ -593,6 +595,20 @@ if [[ "${1:-}" == "diff" ]]; then
         exit 1
     fi
     exec python3 "$OCI2BIN_HOME/scripts/diff_images.py" "$1" "$2"
+fi
+
+# ── diff-fs subcommand ────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "diff-fs" ]]; then
+    shift
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: oci2bin diff-fs OVERLAY_PATH [--json]" >&2
+        echo "       OVERLAY_PATH is either an overlayfs upper dir or a parent" >&2
+        echo "       containing an 'upper/' subdirectory (the layout produced by" >&2
+        echo "       --overlay-persist DIR)." >&2
+        exit 1
+    fi
+    exec python3 "$OCI2BIN_HOME/scripts/diff_fs.py" "$@"
 fi
 
 # ── reconstruct subcommand ───────────────────────────────────────────────

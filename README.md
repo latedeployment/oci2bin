@@ -97,6 +97,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
   - [list](#list)
   - [prune](#prune)
   - [diff](#diff)
+  - [diff-fs](#diff-fs)
   - [reconstruct](#reconstruct)
   - [push](#push)
   - [sbom](#sbom)
@@ -1845,6 +1846,40 @@ When you already have generated profiles (e.g. from CI), use `--from-profile` to
 ```bash
 oci2bin diff --syscalls --from-profile ./old.seccomp.json ./new.seccomp.json
 ```
+
+### diff-fs
+
+Walk an overlayfs upperdir and print `docker diff`-style A/D classification
+for each entry. Use this after a run with `--overlay-persist DIR` to find
+what changed on disk relative to the image — answers the self-host
+question "what should I `-v` mount on the next run?":
+
+```bash
+./myapp --overlay-persist ./state/myapp /bin/sh -c 'echo hi > /var/log/app.log'
+oci2bin diff-fs ./state/myapp
+# A /var
+# A /var/log
+# A /var/log/app.log
+```
+
+The argument can be the upperdir directly OR a parent that contains an
+`upper/` subdir (the layout `--overlay-persist DIR` produces — diff-fs
+auto-descends). Output is sorted by path and stable across runs.
+
+Classification:
+
+- `A path` — the entry exists in the upperdir. Without comparing to the
+  original lowerdir we cannot distinguish "added" from "modified" — both
+  collapse to `A`. For a self-host operator deciding what to `-v` mount,
+  the distinction usually doesn't matter.
+- `D path` — the entry is an overlayfs whiteout (a `(0,0)` character
+  device). The lower-layer entry is hidden from the container, i.e.
+  effectively "deleted".
+- Trailing `(opaque)` — a directory with the `trusted.overlay.opaque=y`
+  xattr; it replaces the lower version instead of merging.
+
+Pass `--json` for a machine-readable list of `{"op", "path", "opaque"}`
+objects.
 
 ### reconstruct
 
