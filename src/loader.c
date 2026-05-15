@@ -682,6 +682,12 @@ struct container_opts
     int   notify_kinds[MAX_NOTIFY];
     int   n_notify;
     char* notify_name; /* optional human label embedded in payloads */
+
+    /* --no-hint: silence the first-run env-var hint block.
+     * --require-hint: when the image declares empty-value env vars and the
+     *                 caller did not pass any -e, abort instead of continuing. */
+    int no_hint;
+    int require_hint;
 };
 #define LANDLOCK_MODE_AUTO  0
 #define LANDLOCK_MODE_ON    1
@@ -3399,6 +3405,113 @@ static void free_oci_config(struct oci_config* c)
     free(c->workdir);
     free(c->user);
     memset(c, 0, sizeof(*c));
+}
+
+/*
+ * Return 1 if a KEY string smells like a credential — used by the
+ * first-run hint to label empty-value env vars as "looks like a
+ * credential". Case-insensitive substring match against common names.
+ */
+static int looks_like_credential(const char* name)
+{
+    if (!name || !name[0])
+    {
+        return 0;
+    }
+    size_t len = strlen(name);
+    if (len >= 128)
+    {
+        return 0;
+    }
+    char up[128];
+    for (size_t i = 0; i < len; i++)
+    {
+        unsigned char c = (unsigned char)name[i];
+        up[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : (char)c;
+    }
+    up[len] = '\0';
+    static const char* needles[] =
+    {
+        "PASSWORD", "PASSWD", "PWD",
+        "TOKEN", "SECRET",
+        "APIKEY", "API_KEY",
+        "ACCESS_KEY", "PRIVATE_KEY",
+        NULL
+    };
+    for (int i = 0; needles[i]; i++)
+    {
+        if (strstr(up, needles[i]))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Print a hint block to stderr listing image-declared env vars that
+ * have an empty default value, on the assumption the image author
+ * left those for the caller to provide. Skipped when --no-hint, when
+ * the caller already passed any -e, or when no candidates exist.
+ *
+ * Returns the number of suggestions emitted, or -1 if --require-hint
+ * was set and at least one suggestion was emitted (caller should abort).
+ */
+static int print_first_run_hint(const char* rootfs,
+                                const struct container_opts* opts)
+{
+    if (!opts || opts->no_hint || opts->n_env > 0)
+    {
+        return 0;
+    }
+    struct oci_config cfg;
+    if (read_oci_config(rootfs, &cfg) < 0)
+    {
+        return 0;
+    }
+    int suggestions = 0;
+    if (cfg.env_json && strcmp(cfg.env_json, "null") != 0
+            && strcmp(cfg.env_json, "[]") != 0)
+    {
+        char* envs[MAX_ENV];
+        int n = json_parse_string_array(cfg.env_json, envs, MAX_ENV);
+        for (int i = 0; i < n; i++)
+        {
+            if (!envs[i])
+            {
+                continue;
+            }
+            char* eq = strchr(envs[i], '=');
+            if (eq && *(eq + 1) == '\0')
+            {
+                /* Empty-value KEY= → image author asks for a value. */
+                if (suggestions == 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: this image suggests setting:\n");
+                }
+                *eq = '\0';
+                int cred = looks_like_credential(envs[i]);
+                fprintf(stderr, "  -e %s=...   %s\n", envs[i],
+                        cred ? "(required, looks like a credential)"
+                        : "(required, no default)");
+                suggestions++;
+            }
+            free(envs[i]);
+        }
+    }
+    if (suggestions > 0)
+    {
+        fprintf(stderr,
+                "Continuing anyway. Pass --no-hint to silence,"
+                " or --require-hint to abort when hints are present.\n");
+    }
+    free_oci_config(&cfg);
+    if (suggestions > 0 && opts->require_hint)
+    {
+        return -1;
+    }
+    return suggestions;
 }
 
 /*
@@ -9873,6 +9986,14 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             }
             opts->notify_name = argv[i];
         }
+        else if (strcmp(argv[i], "--no-hint") == 0)
+        {
+            opts->no_hint = 1;
+        }
+        else if (strcmp(argv[i], "--require-hint") == 0)
+        {
+            opts->require_hint = 1;
+        }
         else if (strcmp(argv[i], "--metrics-socket") == 0)
         {
             if (i + 1 >= argc)
@@ -14282,6 +14403,20 @@ int main(int argc, char* argv[])
                 close(master_fd);
             }
         }
+    }
+
+    /* First-run env hint: if the image declares empty-value env vars
+     * and the caller didn't pass any -e, surface them on stderr. */
+    if (print_first_run_hint(rootfs, &opts) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --require-hint set and image declared"
+                " required env vars; aborting.\n");
+        if (saved_termios_ok)
+        {
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
+        }
+        return 64;
     }
 
     /* 12. Fork for PID namespace (child becomes PID 1).

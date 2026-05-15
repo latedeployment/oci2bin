@@ -6,6 +6,17 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **First-run env hint** — when launched without any `-e KEY=VAL` and the
+  image declares one or more empty-value env vars (the standard OCI
+  convention for "this is required, please supply it"), the loader prints
+  a one-block suggestion listing each required var before starting the
+  container. Names matching common credential patterns (`PASSWORD`,
+  `TOKEN`, `SECRET`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`, etc.) are
+  labeled as credentials so the operator knows what to actually set. New
+  flags: `--no-hint` (silence the block, still run) and `--require-hint`
+  (abort with exit 64 if any required vars are unset — useful for CI and
+  for shipping binaries to less-technical users). 28 new C unit tests.
+
 - **Notifications on container events** — `--notify URL` (repeatable, up to 8)
   fires fire-and-forget HTTP POST to a notification sink on
   `container_start`, `container_exit`, `oom_kill`, and `sig_mismatch`.

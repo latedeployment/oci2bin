@@ -81,6 +81,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
   - [Debugging with gdb](#debugging-with-gdb)
   - [Clock offset (time namespace)](#clock-offset-time-namespace)
   - [Audit logging](#audit-logging)
+  - [First-run env hint](#first-run-env-hint)
   - [Notifications on container events](#notifications-on-container-events)
   - [Running as non-root](#running-as-non-root)
   - [Custom hostname](#custom-hostname)
@@ -1138,6 +1139,32 @@ Example lines:
 
 `exit` records either `exit_code` or `signal`, depending on how the workload
 finished. `stop` records the final container stop status after cleanup.
+
+### First-run env hint
+
+When the binary is launched without any `-e KEY=VAL` flags and the image
+declares one or more env vars with an empty default value (the standard
+OCI convention for "this is required, please supply it"), oci2bin prints
+a one-block suggestion before starting the container:
+
+```
+$ ./vault
+oci2bin: this image suggests setting:
+  -e DB_HOST=...   (required, no default)
+  -e ADMIN_PASSWORD=...   (required, looks like a credential)
+Continuing anyway. Pass --no-hint to silence, or --require-hint to abort
+when hints are present.
+```
+
+Env names matching common credential patterns (`PASSWORD`, `PASSWD`,
+`PWD`, `TOKEN`, `SECRET`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`) are
+labeled as such so the operator can identify what to actually set.
+
+Flags:
+- `--no-hint` — silence the hint block (still continues the run).
+- `--require-hint` — abort with exit 64 when any empty-value env var is
+  declared and the caller passed no `-e`. Useful for CI guards and for
+  shipping binaries to less-technical users who must not skip configuration.
 
 ### Notifications on container events
 

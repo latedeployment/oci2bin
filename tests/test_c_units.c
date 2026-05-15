@@ -3269,6 +3269,177 @@ static void test_notify_build_body(void)
     for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
 }
 
+static void test_looks_like_credential(void)
+{
+    ASSERT(looks_like_credential("ADMIN_PASSWORD"),
+           "looks_like_credential: ADMIN_PASSWORD matches");
+    ASSERT(looks_like_credential("api_token"),
+           "looks_like_credential: api_token (case-insensitive)");
+    ASSERT(looks_like_credential("DB_SECRET"),
+           "looks_like_credential: DB_SECRET");
+    ASSERT(looks_like_credential("MY_API_KEY"),
+           "looks_like_credential: MY_API_KEY");
+    ASSERT(looks_like_credential("AWS_ACCESS_KEY"),
+           "looks_like_credential: ACCESS_KEY substring");
+    ASSERT(looks_like_credential("MYSQL_PWD"),
+           "looks_like_credential: PWD");
+    ASSERT(!looks_like_credential("PATH"),
+           "looks_like_credential: PATH does NOT match");
+    ASSERT(!looks_like_credential("HOME"),
+           "looks_like_credential: HOME does NOT match");
+    ASSERT(!looks_like_credential(""),
+           "looks_like_credential: empty string is false");
+    ASSERT(!looks_like_credential(NULL),
+           "looks_like_credential: NULL is false");
+}
+
+/* Helper: write a .oci2bin_config into a fresh tmp rootfs and run
+ * print_first_run_hint. Returns the function's return value and
+ * captures stderr into *out_stderr (caller frees). */
+static int run_hint_with_env(const char* env_json_array,
+                             int n_env, int no_hint, int require_hint,
+                             char** out_stderr)
+{
+    /* Make a tmp dir for the rootfs. */
+    char tmpl[] = "/tmp/oci2bin-hint-XXXXXX";
+    char* dir = mkdtemp(tmpl);
+    if (!dir)
+    {
+        return -2;
+    }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.oci2bin_config", dir);
+    FILE* f = fopen(path, "w");
+    if (!f)
+    {
+        return -2;
+    }
+    fprintf(f, "{\"Cmd\":null,\"Entrypoint\":null,\"Env\":%s,"
+            "\"WorkingDir\":null,\"User\":null}",
+            env_json_array ? env_json_array : "null");
+    fclose(f);
+
+    /* Capture stderr into a memory buffer via tmpfile. */
+    fflush(stderr);
+    int saved_err = dup(STDERR_FILENO);
+    FILE* tf = tmpfile();
+    if (!tf)
+    {
+        unlink(path);
+        rmdir(dir);
+        return -2;
+    }
+    int tf_fd = fileno(tf);
+    dup2(tf_fd, STDERR_FILENO);
+
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.n_env = n_env;
+    opts.no_hint = no_hint;
+    opts.require_hint = require_hint;
+    int rc = print_first_run_hint(dir, &opts);
+
+    fflush(stderr);
+    dup2(saved_err, STDERR_FILENO);
+    close(saved_err);
+
+    fseek(tf, 0, SEEK_SET);
+    char buf[4096];
+    size_t got = fread(buf, 1, sizeof(buf) - 1, tf);
+    buf[got] = '\0';
+    fclose(tf);
+    *out_stderr = strdup(buf);
+
+    unlink(path);
+    rmdir(dir);
+    return rc;
+}
+
+static void test_print_first_run_hint(void)
+{
+    char* err = NULL;
+    int rc;
+
+    /* No empty-value vars → 0 suggestions, no output. */
+    rc = run_hint_with_env("[\"PATH=/usr/bin\",\"HOME=/root\"]", 0, 0, 0,
+                           &err);
+    ASSERT_INT_EQ(rc, 0,
+                  "print_first_run_hint: zero suggestions when all set");
+    ASSERT(err && err[0] == '\0',
+           "print_first_run_hint: silent when nothing to suggest");
+    free(err);
+
+    /* Two empty-value vars, one credential, one not. */
+    err = NULL;
+    rc = run_hint_with_env(
+             "[\"DB_HOST=\",\"ADMIN_PASSWORD=\",\"PATH=/usr/bin\"]",
+             0, 0, 0, &err);
+    ASSERT_INT_EQ(rc, 2,
+                  "print_first_run_hint: counts empty-value vars");
+    ASSERT_NOT_NULL(err, "print_first_run_hint: stderr captured");
+    ASSERT(strstr(err, "-e DB_HOST=...") != NULL,
+           "print_first_run_hint: lists DB_HOST suggestion");
+    ASSERT(strstr(err, "-e ADMIN_PASSWORD=...") != NULL,
+           "print_first_run_hint: lists ADMIN_PASSWORD suggestion");
+    ASSERT(strstr(err, "looks like a credential") != NULL,
+           "print_first_run_hint: flags credential-named vars");
+    ASSERT(strstr(err, "no default") != NULL,
+           "print_first_run_hint: labels non-credential as no-default");
+    free(err);
+
+    /* --no-hint silences output. */
+    err = NULL;
+    rc = run_hint_with_env("[\"DB_HOST=\"]", 0, 1, 0, &err);
+    ASSERT_INT_EQ(rc, 0, "print_first_run_hint: --no-hint silences");
+    ASSERT(err && err[0] == '\0',
+           "print_first_run_hint: --no-hint emits nothing");
+    free(err);
+
+    /* Caller already passed -e → skip hints. */
+    err = NULL;
+    rc = run_hint_with_env("[\"DB_HOST=\"]", 1, 0, 0, &err);
+    ASSERT_INT_EQ(rc, 0, "print_first_run_hint: skipped when n_env>0");
+    ASSERT(err && err[0] == '\0',
+           "print_first_run_hint: silent when caller set env");
+    free(err);
+
+    /* --require-hint with suggestions → returns -1. */
+    err = NULL;
+    rc = run_hint_with_env("[\"DB_HOST=\"]", 0, 0, 1, &err);
+    ASSERT_INT_EQ(rc, -1,
+                  "print_first_run_hint: --require-hint returns -1");
+    free(err);
+
+    /* --require-hint with no suggestions → returns 0. */
+    err = NULL;
+    rc = run_hint_with_env("[\"PATH=/usr/bin\"]", 0, 0, 1, &err);
+    ASSERT_INT_EQ(rc, 0,
+                  "print_first_run_hint: --require-hint stays 0 if clean");
+    free(err);
+}
+
+static void test_parse_opts_hint_flags(void)
+{
+    struct container_opts opts;
+
+    {
+        char* argv[] = {"prog", "--no-hint", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --no-hint returns 0");
+        ASSERT_INT_EQ(opts.no_hint, 1,
+                      "parse_opts: --no-hint sets no_hint=1");
+    }
+    {
+        char* argv[] = {"prog", "--require-hint", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --require-hint returns 0");
+        ASSERT_INT_EQ(opts.require_hint, 1,
+                      "parse_opts: --require-hint sets require_hint=1");
+    }
+}
+
 static void test_parse_opts_notify(void)
 {
     struct container_opts opts;
@@ -3403,6 +3574,9 @@ int main(void)
     test_notify_parse_url();
     test_notify_build_body();
     test_parse_opts_notify();
+    test_looks_like_credential();
+    test_print_first_run_hint();
+    test_parse_opts_hint_flags();
 
     printf("1..%d\n", tap_test_num);
 
