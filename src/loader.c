@@ -165,7 +165,18 @@ static volatile unsigned long INITRAMFS_DATA_PATCHED = 0x6B6B6B6B6B6B6B6BUL;
 #define MAX_SECRETS   32
 #define MAX_ARGS      64
 #define MAX_ENV       64
+#define MAX_NOTIFY     8
 #define BUF_SIZE    65536
+
+/* Notification sink kinds (see notify_parse_url). */
+enum
+{
+    NOTIFY_KIND_NTFY    = 1,
+    NOTIFY_KIND_GOTIFY  = 2,
+    NOTIFY_KIND_DISCORD = 3,
+    NOTIFY_KIND_SLACK   = 4,
+    NOTIFY_KIND_WEBHOOK = 5,
+};
 #define USERNS_REMAP_CONTAINER_IDS 65535UL
 #ifndef CAP_SETGID
 #define CAP_SETGID 6
@@ -657,6 +668,20 @@ struct container_opts
      * which subtrees to lock down. */
     char* deny_write[MAX_VOLUMES];
     int   n_deny_write;
+
+    /* --notify URL (repeatable): fire-and-forget HTTP POST to a notification
+     * sink on container lifecycle events. URL schemes:
+     *   ntfy://server/topic            (ntfy.sh, default HTTPS)
+     *   ntfy+http://server/topic       (ntfy.sh, plaintext)
+     *   gotify://server/<token>        (Gotify)
+     *   gotify+http://server/<token>
+     *   discord://<webhook-host>/<path>
+     *   slack://<webhook-host>/<path>
+     *   https://host/path or http://host/path  (generic JSON webhook) */
+    char* notify_urls[MAX_NOTIFY]; /* canonical http(s)://... target */
+    int   notify_kinds[MAX_NOTIFY];
+    int   n_notify;
+    char* notify_name; /* optional human label embedded in payloads */
 };
 #define LANDLOCK_MODE_AUTO  0
 #define LANDLOCK_MODE_ON    1
@@ -697,6 +722,559 @@ static void audit_emit_exec_event(const char* path)
     audit_escape_string(path, escaped, sizeof(escaped));
     snprintf(extra, sizeof(extra), "\"path\":\"%s\"", escaped);
     audit_emit("exec", extra);
+}
+
+/* ── notification sinks (--notify URL) ──────────────────────────────────── */
+/*
+ * Lifecycle event notifier for container_start / container_exit /
+ * oom_kill / healthcheck_fail / sig_mismatch / freeze_failed.
+ *
+ * Each --notify URL is parsed into (kind, canonical http(s):// URL) pair.
+ * Delivery is fire-and-forget: a double-fork hands a grandchild off to
+ * init, then execs an absolute-path curl with the body piped on stdin.
+ * The container is never blocked on a slow or dead sink.
+ *
+ * Bodies are tiny (<4 KiB) so the pipe write completes before exec.
+ */
+
+/* Reject control bytes / non-ASCII / oversize values. URLs go straight to
+ * curl as argv[], so a newline could let a caller smuggle an extra header
+ * argument or trick a shell-wrapping tool. We require printable ASCII. */
+static int notify_url_token_safe(const char* s, size_t max_len)
+{
+    if (!s || s[0] == '\0')
+    {
+        return 0;
+    }
+    size_t len = strlen(s);
+    if (len > max_len)
+    {
+        return 0;
+    }
+    for (size_t i = 0; i < len; i++)
+    {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7f || c >= 0x80)
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * Parse one --notify URL spec.
+ * Returns one of NOTIFY_KIND_* on success and writes a freshly-allocated
+ * canonical http(s):// target URL into *out_url. Returns -1 on bad input.
+ *
+ * Recognized prefixes:
+ *   ntfy://host/topic             → https://host/topic
+ *   ntfy+https://host/topic       → https://host/topic
+ *   ntfy+http://host/topic        → http://host/topic
+ *   gotify://host/<TOKEN>         → https://host/message?token=<TOKEN>
+ *   gotify+http://host/<TOKEN>    → http://host/message?token=<TOKEN>
+ *   gotify+https://host/<TOKEN>   → https://host/message?token=<TOKEN>
+ *   discord://<webhook-path>      → https://<webhook-path>
+ *   slack://<webhook-path>        → https://<webhook-path>
+ *   https://host/path             → https://host/path  (generic webhook)
+ *   http://host/path              → http://host/path   (generic webhook)
+ */
+static int notify_parse_url(const char* spec, char** out_url)
+{
+    *out_url = NULL;
+    if (!notify_url_token_safe(spec, 2047))
+    {
+        return -1;
+    }
+
+    int kind = 0;
+    const char* rest = NULL;
+    const char* scheme_out = "https://"; /* default for kind-prefixed URLs */
+    int compose_gotify = 0;
+
+    if (strncmp(spec, "ntfy+https://", 13) == 0)
+    {
+        kind = NOTIFY_KIND_NTFY;
+        rest = spec + 13;
+        scheme_out = "https://";
+    }
+    else if (strncmp(spec, "ntfy+http://", 12) == 0)
+    {
+        kind = NOTIFY_KIND_NTFY;
+        rest = spec + 12;
+        scheme_out = "http://";
+    }
+    else if (strncmp(spec, "ntfy://", 7) == 0)
+    {
+        kind = NOTIFY_KIND_NTFY;
+        rest = spec + 7;
+        scheme_out = "https://";
+    }
+    else if (strncmp(spec, "gotify+https://", 15) == 0)
+    {
+        kind = NOTIFY_KIND_GOTIFY;
+        rest = spec + 15;
+        scheme_out = "https://";
+        compose_gotify = 1;
+    }
+    else if (strncmp(spec, "gotify+http://", 14) == 0)
+    {
+        kind = NOTIFY_KIND_GOTIFY;
+        rest = spec + 14;
+        scheme_out = "http://";
+        compose_gotify = 1;
+    }
+    else if (strncmp(spec, "gotify://", 9) == 0)
+    {
+        kind = NOTIFY_KIND_GOTIFY;
+        rest = spec + 9;
+        scheme_out = "https://";
+        compose_gotify = 1;
+    }
+    else if (strncmp(spec, "discord://", 10) == 0)
+    {
+        kind = NOTIFY_KIND_DISCORD;
+        rest = spec + 10;
+        scheme_out = "https://";
+    }
+    else if (strncmp(spec, "slack://", 8) == 0)
+    {
+        kind = NOTIFY_KIND_SLACK;
+        rest = spec + 8;
+        scheme_out = "https://";
+    }
+    else if (strncmp(spec, "https://", 8) == 0)
+    {
+        kind = NOTIFY_KIND_WEBHOOK;
+        *out_url = strdup(spec);
+        return *out_url ? kind : -1;
+    }
+    else if (strncmp(spec, "http://", 7) == 0)
+    {
+        kind = NOTIFY_KIND_WEBHOOK;
+        *out_url = strdup(spec);
+        return *out_url ? kind : -1;
+    }
+    else
+    {
+        return -1;
+    }
+
+    if (!rest || rest[0] == '\0' || rest[0] == '/' )
+    {
+        /* missing host */
+        return -1;
+    }
+
+    size_t cap = strlen(scheme_out) + strlen(rest) + 64;
+    char* url = (char*)malloc(cap);
+    if (!url)
+    {
+        return -1;
+    }
+
+    if (compose_gotify)
+    {
+        /* gotify://host/path/<TOKEN> → SCHEME://host/path/message?token=<TOKEN>
+         * The token is the last non-empty path segment. If only the host is
+         * given (no token), reject. */
+        const char* last_slash = strrchr(rest, '/');
+        if (!last_slash || last_slash == rest || last_slash[1] == '\0')
+        {
+            free(url);
+            return -1;
+        }
+        size_t host_len = (size_t)(last_slash - rest);
+        const char* token = last_slash + 1;
+        /* token must be URL-safe-ish: letters/digits/_-.~ */
+        for (const char* p = token; *p; p++)
+        {
+            char c = *p;
+            int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                     || (c >= '0' && c <= '9')
+                     || c == '_' || c == '-' || c == '.' || c == '~';
+            if (!ok)
+            {
+                free(url);
+                return -1;
+            }
+        }
+        int n = snprintf(url, cap, "%s%.*s/message?token=%s",
+                         scheme_out, (int)host_len, rest, token);
+        if (n <= 0 || (size_t)n >= cap)
+        {
+            free(url);
+            return -1;
+        }
+    }
+    else
+    {
+        int n = snprintf(url, cap, "%s%s", scheme_out, rest);
+        if (n <= 0 || (size_t)n >= cap)
+        {
+            free(url);
+            return -1;
+        }
+    }
+
+    *out_url = url;
+    return kind;
+}
+
+/* Compose a human-readable summary line shared across backends. detail_json
+ * is an optional JSON-fragment with key:value pairs (no surrounding braces)
+ * which is also embedded verbatim in the generic-webhook payload. */
+static void notify_summary(char* dst, size_t dstsz, const char* event,
+                           const char* name, const char* detail_json)
+{
+    if (name && name[0])
+    {
+        snprintf(dst, dstsz, "oci2bin %s [%s]%s%s",
+                 event ? event : "event", name,
+                 (detail_json && detail_json[0]) ? " " : "",
+                 (detail_json && detail_json[0]) ? detail_json : "");
+    }
+    else
+    {
+        snprintf(dst, dstsz, "oci2bin %s%s%s",
+                 event ? event : "event",
+                 (detail_json && detail_json[0]) ? " " : "",
+                 (detail_json && detail_json[0]) ? detail_json : "");
+    }
+}
+
+/*
+ * Build the HTTP request body for a given backend.
+ *
+ *   kind            one of NOTIFY_KIND_*
+ *   event           event name (e.g. "container_exit")
+ *   name            optional container/binary label (may be NULL/empty)
+ *   detail_json     optional JSON-fragment "key1:val1,key2:val2"
+ *
+ * On success returns a heap-allocated body, *content_type_out is set to a
+ * static string ("text/plain" or "application/json"), and up to *n_hdrs_io
+ * extra "Header: value" strings are written to extra_hdrs (heap-allocated;
+ * caller frees). NULL is returned on allocation failure.
+ *
+ * Caller frees the returned body and every extra_hdrs[i].
+ */
+static char* notify_build_body(int kind, const char* event,
+                               const char* name, const char* detail_json,
+                               const char** content_type_out,
+                               char** extra_hdrs, int* n_hdrs_io)
+{
+    int max_hdrs = n_hdrs_io ? *n_hdrs_io : 0;
+    if (n_hdrs_io)
+    {
+        *n_hdrs_io = 0;
+    }
+
+    char summary[768];
+    notify_summary(summary, sizeof(summary), event, name, detail_json);
+
+    char* body = NULL;
+
+    if (kind == NOTIFY_KIND_NTFY)
+    {
+        if (content_type_out)
+        {
+            *content_type_out = "text/plain";
+        }
+        body = strdup(summary);
+        if (!body)
+        {
+            return NULL;
+        }
+        /* Title + Priority + Tags via HTTP headers (ntfy-specific). */
+        if (max_hdrs >= 1 && extra_hdrs)
+        {
+            char hdr[256];
+            snprintf(hdr, sizeof(hdr), "Title: oci2bin %s",
+                     event ? event : "event");
+            extra_hdrs[0] = strdup(hdr);
+            if (extra_hdrs[0] && n_hdrs_io)
+            {
+                (*n_hdrs_io)++;
+            }
+        }
+        if (max_hdrs >= 2 && extra_hdrs)
+        {
+            /* default priority 3 (default); 4 for warnings, 5 for failures */
+            int prio = 3;
+            if (event && (strstr(event, "fail") || strstr(event, "oom")
+                          || strstr(event, "mismatch")))
+            {
+                prio = 5;
+            }
+            char hdr[32];
+            snprintf(hdr, sizeof(hdr), "Priority: %d", prio);
+            extra_hdrs[1] = strdup(hdr);
+            if (extra_hdrs[1] && n_hdrs_io)
+            {
+                (*n_hdrs_io)++;
+            }
+        }
+        return body;
+    }
+
+    if (content_type_out)
+    {
+        *content_type_out = "application/json";
+    }
+
+    /* Escape event + name + summary for JSON. */
+    char ev_esc[128], name_esc[256], sum_esc[1024];
+    audit_escape_string(event ? event : "event", ev_esc, sizeof(ev_esc));
+    audit_escape_string(name ? name : "", name_esc, sizeof(name_esc));
+    audit_escape_string(summary, sum_esc, sizeof(sum_esc));
+
+    if (kind == NOTIFY_KIND_GOTIFY)
+    {
+        int prio = 5;
+        if (event && (strstr(event, "fail") || strstr(event, "oom")
+                      || strstr(event, "mismatch")))
+        {
+            prio = 8;
+        }
+        size_t cap = strlen(sum_esc) + strlen(ev_esc) + 128;
+        body = (char*)malloc(cap);
+        if (!body)
+        {
+            return NULL;
+        }
+        snprintf(body, cap,
+                 "{\"title\":\"oci2bin %s\",\"message\":\"%s\","
+                 "\"priority\":%d}",
+                 ev_esc, sum_esc, prio);
+        return body;
+    }
+
+    if (kind == NOTIFY_KIND_DISCORD)
+    {
+        size_t cap = strlen(sum_esc) + 32;
+        body = (char*)malloc(cap);
+        if (!body)
+        {
+            return NULL;
+        }
+        snprintf(body, cap, "{\"content\":\"%s\"}", sum_esc);
+        return body;
+    }
+
+    if (kind == NOTIFY_KIND_SLACK)
+    {
+        size_t cap = strlen(sum_esc) + 32;
+        body = (char*)malloc(cap);
+        if (!body)
+        {
+            return NULL;
+        }
+        snprintf(body, cap, "{\"text\":\"%s\"}", sum_esc);
+        return body;
+    }
+
+    /* Generic webhook: full structured JSON. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    time_t t = ts.tv_sec;
+    struct tm tm_buf;
+    gmtime_r(&t, &tm_buf);
+    char timebuf[32];
+    strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+
+    /* detail_json is a comma-separated set of "key":val pairs WITHOUT outer
+     * braces — same shape as audit_emit's extra. We embed it verbatim under
+     * the "detail" key as a JSON object. */
+    const char* detail = (detail_json && detail_json[0]) ? detail_json : "";
+    size_t cap = strlen(ev_esc) + strlen(name_esc) + strlen(detail)
+                 + strlen(timebuf) + 128;
+    body = (char*)malloc(cap);
+    if (!body)
+    {
+        return NULL;
+    }
+    snprintf(body, cap,
+             "{\"event\":\"%s\",\"time\":\"%s\",\"pid\":%d,"
+             "\"name\":\"%s\",\"detail\":{%s}}",
+             ev_esc, timebuf, (int)getpid(), name_esc, detail);
+    return body;
+}
+
+/* Find an absolute curl path. Returns a static string or NULL. */
+static const char* notify_resolve_curl(void)
+{
+    static const char* candidates[] =
+    {
+        "/usr/bin/curl",
+        "/usr/local/bin/curl",
+        "/bin/curl",
+        NULL
+    };
+    for (int i = 0; candidates[i]; i++)
+    {
+        if (access(candidates[i], X_OK) == 0)
+        {
+            return candidates[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Fire one POST asynchronously. Returns immediately. Best-effort delivery —
+ * if curl is missing the call is silently skipped (with a debug_log line so
+ * --debug users can see why). Bodies must be <= 60 KiB (well under the
+ * pipe buffer) so the synchronous in-process write completes before exec.
+ */
+static void notify_post_one(int kind, const char* url, const char* body,
+                            size_t body_len, const char* content_type,
+                            char* const* extra_hdrs, int n_hdrs)
+{
+    (void)kind;
+    if (!url || !body || body_len > 60 * 1024)
+    {
+        return;
+    }
+    const char* curl_path = notify_resolve_curl();
+    if (!curl_path)
+    {
+        debug_log("notify.skip", "curl not found in /usr/bin /usr/local/bin /bin");
+        return;
+    }
+
+    int fds[2];
+    if (pipe(fds) != 0)
+    {
+        return;
+    }
+    /* Pre-load the pipe with the body before forking. The body fits in the
+     * default pipe buffer (64 KiB) so this never blocks. */
+    ssize_t written = 0;
+    while ((size_t)written < body_len)
+    {
+        ssize_t w = write(fds[1], body + written, body_len - written);
+        if (w < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            close(fds[0]);
+            close(fds[1]);
+            return;
+        }
+        written += w;
+    }
+    close(fds[1]);
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(fds[0]);
+        return;
+    }
+    if (pid == 0)
+    {
+        /* Immediate child: double-fork to detach. */
+        pid_t grandchild = fork();
+        if (grandchild < 0)
+        {
+            _exit(127);
+        }
+        if (grandchild != 0)
+        {
+            /* Parent of grandchild exits → grandchild reparents to init. */
+            _exit(0);
+        }
+        /* In grandchild. Wire pipe → stdin, /dev/null → stdout/stderr. */
+        if (dup2(fds[0], STDIN_FILENO) < 0)
+        {
+            _exit(127);
+        }
+        close(fds[0]);
+        int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2)
+            {
+                close(devnull);
+            }
+        }
+        /* Build argv: curl -fsS --max-time 5 -X POST
+         *   -H "Content-Type: …"  [-H "Extra: …"]*
+         *   --data-binary @-  URL                         */
+        char* argv[32];
+        int n = 0;
+        argv[n++] = (char*)curl_path;
+        argv[n++] = (char*)"-fsS";
+        argv[n++] = (char*)"--max-time";
+        argv[n++] = (char*)"5";
+        argv[n++] = (char*)"-X";
+        argv[n++] = (char*)"POST";
+        char ct_hdr[96];
+        snprintf(ct_hdr, sizeof(ct_hdr), "Content-Type: %s",
+                 content_type ? content_type : "application/json");
+        argv[n++] = (char*)"-H";
+        argv[n++] = ct_hdr;
+        for (int i = 0; i < n_hdrs && n + 4 < 32; i++)
+        {
+            if (extra_hdrs[i])
+            {
+                argv[n++] = (char*)"-H";
+                argv[n++] = extra_hdrs[i];
+            }
+        }
+        argv[n++] = (char*)"--data-binary";
+        argv[n++] = (char*)"@-";
+        argv[n++] = (char*)url;
+        argv[n]   = NULL;
+        execv(curl_path, argv);
+        _exit(127);
+    }
+    /* Parent: reap immediate child quickly; grandchild keeps running. */
+    close(fds[0]);
+    int st;
+    waitpid(pid, &st, 0);
+}
+
+/*
+ * Fire one event to every configured sink. detail_json may be NULL or "".
+ * It is a JSON fragment of "key1":val1,"key2":val2 (no surrounding braces),
+ * the same shape audit_emit() takes. Never blocks the workload.
+ */
+static void notify_event(const struct container_opts* opts,
+                         const char* event, const char* detail_json)
+{
+    if (!opts || opts->n_notify <= 0 || !event)
+    {
+        return;
+    }
+    for (int i = 0; i < opts->n_notify; i++)
+    {
+        if (!opts->notify_urls[i])
+        {
+            continue;
+        }
+        const char* ct = NULL;
+        char* hdrs[4] = {0};
+        int n_hdrs = 4;
+        char* body = notify_build_body(opts->notify_kinds[i], event,
+                                       opts->notify_name,
+                                       detail_json, &ct, hdrs, &n_hdrs);
+        if (!body)
+        {
+            continue;
+        }
+        notify_post_one(opts->notify_kinds[i], opts->notify_urls[i],
+                        body, strlen(body), ct, hdrs, n_hdrs);
+        free(body);
+        for (int j = 0; j < 4; j++)
+        {
+            free(hdrs[j]);
+        }
+    }
 }
 
 static int argv_has_debug_flag(int argc, char* argv[])
@@ -9246,6 +9824,55 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             }
             opts->audit_log = argv[++i];
         }
+        else if (strcmp(argv[i], "--notify") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --notify requires URL argument\n");
+                return -1;
+            }
+            i++;
+            if (opts->n_notify >= MAX_NOTIFY)
+            {
+                fprintf(stderr,
+                        "oci2bin: too many --notify flags (max %d)\n",
+                        MAX_NOTIFY);
+                return -1;
+            }
+            char* url = NULL;
+            int kind = notify_parse_url(argv[i], &url);
+            if (kind < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --notify: unrecognized or unsafe URL"
+                        " (need ntfy://, gotify://, discord://, slack://,"
+                        " or http(s)://): %s\n", argv[i]);
+                return -1;
+            }
+            opts->notify_urls[opts->n_notify]  = url;
+            opts->notify_kinds[opts->n_notify] = kind;
+            opts->n_notify++;
+        }
+        else if (strcmp(argv[i], "--notify-name") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --notify-name requires NAME argument\n");
+                return -1;
+            }
+            i++;
+            /* Same input restrictions as resolver tokens: printable ASCII,
+             * no control bytes, reasonable cap. */
+            if (!is_resolver_token_safe(argv[i], 252))
+            {
+                fprintf(stderr,
+                        "oci2bin: --notify-name: rejecting unsafe value\n");
+                return -1;
+            }
+            opts->notify_name = argv[i];
+        }
         else if (strcmp(argv[i], "--metrics-socket") == 0)
         {
             if (i + 1 >= argc)
@@ -13247,6 +13874,8 @@ int main(int argc, char* argv[])
     {
         if (verify_signature(self_path, opts.verify_key) < 0)
         {
+            notify_event(&opts, "sig_mismatch",
+                         "\"key\":\"verify-key supplied\"");
             return 1;
         }
     }
@@ -13280,6 +13909,7 @@ int main(int argc, char* argv[])
 
     /* Emit audit start event now that opts are fully resolved */
     audit_emit_start_event(self_path, &opts);
+    notify_event(&opts, "container_start", NULL);
 
     /* 4. Extract OCI image into rootfs */
 #ifdef __NR_userfaultfd
@@ -13758,6 +14388,36 @@ int main(int argc, char* argv[])
         audit_emit_wait_status("exit", child, status);
     }
     audit_emit_wait_status("stop", child, status);
+
+    /* Notify exit and OOM (best-effort: cgroup OOM kill is detected by
+     * reading the parent cgroup's memory.events file if --memory was set). */
+    {
+        char detail[160];
+        if (WIFEXITED(status))
+        {
+            snprintf(detail, sizeof(detail),
+                     "\"exit_code\":%d", WEXITSTATUS(status));
+        }
+        else if (WIFSIGNALED(status))
+        {
+            snprintf(detail, sizeof(detail),
+                     "\"signal\":%d", WTERMSIG(status));
+        }
+        else
+        {
+            snprintf(detail, sizeof(detail),
+                     "\"status_raw\":%d", status);
+        }
+        notify_event(&opts, "container_exit", detail);
+        if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL
+                && opts.cg_memory_bytes > 0)
+        {
+            /* SIGKILL on a memory-limited container is the canonical OOM
+             * signal. We surface this as a separate event so subscribers
+             * can route OOMs to a louder channel. */
+            notify_event(&opts, "oom_kill", detail);
+        }
+    }
 
     /* Cleanup: remove the whole tmpdir without forking.
      * rootfs = tmpdir + "/rootfs"; strip the last component to get tmpdir.

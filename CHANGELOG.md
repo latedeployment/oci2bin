@@ -4,6 +4,22 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Notifications on container events** — `--notify URL` (repeatable, up to 8)
+  fires fire-and-forget HTTP POST to a notification sink on
+  `container_start`, `container_exit`, `oom_kill`, and `sig_mismatch`.
+  Supported URL schemes: `ntfy://`, `ntfy+http://`, `gotify://`,
+  `gotify+http://`, `discord://`, `slack://`, and bare `http(s)://` for a
+  generic JSON webhook. Delivery runs in a detached grandchild that execs
+  `curl` from a fixed absolute path with `--max-time 5`; the container is
+  never blocked on a slow or dead sink. Per-backend payload shapes match
+  each provider's native expectations. `--notify-name NAME` adds a short
+  label to every payload so multi-binary setups can distinguish events.
+  URLs containing newlines, control bytes, or non-ASCII bytes are rejected
+  at parse time. 35 new C unit tests covering URL parsing, per-backend
+  body shape, header emission for ntfy, and parse_opts integration.
+
 ## [0.11.0] - 2026-04-20
 
 ### Added

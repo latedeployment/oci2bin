@@ -39,6 +39,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | MCP server for AI agent integration | `oci2bin mcp-serve` |
 | Reconstruct binary from registry | `oci2bin reconstruct myapp.bin` |
 | Reload into Docker | `docker load < myapp.bin` |
+| Notify ntfy / Gotify / Discord / Slack / webhook on events | `./myapp --notify ntfy://homelab.local/oci2bin` |
 
 
 
@@ -80,6 +81,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
   - [Debugging with gdb](#debugging-with-gdb)
   - [Clock offset (time namespace)](#clock-offset-time-namespace)
   - [Audit logging](#audit-logging)
+  - [Notifications on container events](#notifications-on-container-events)
   - [Running as non-root](#running-as-non-root)
   - [Custom hostname](#custom-hostname)
   - [Exposing host devices](#exposing-host-devices)
@@ -1136,6 +1138,48 @@ Example lines:
 
 `exit` records either `exit_code` or `signal`, depending on how the workload
 finished. `stop` records the final container stop status after cleanup.
+
+### Notifications on container events
+
+`--notify URL` (repeatable, up to 8) fires a fire-and-forget HTTPS POST to a
+notification sink on lifecycle events: `container_start`, `container_exit`
+(with `exit_code` or `signal`), `oom_kill` (when a memory-limited container
+ends on `SIGKILL`), and `sig_mismatch` (when `--verify-key` fails). Delivery
+runs in a detached grandchild that execs `curl` with `--max-time 5`, so the
+container is never blocked on a slow or dead sink. If `curl` is not installed
+the call is silently skipped (run with `--debug` to see why).
+
+Add `--notify-name NAME` to embed a short human label in every payload so
+multi-binary self-hosted setups can tell the events apart.
+
+Recognized URL schemes:
+
+| Scheme | Maps to |
+|--------|---------|
+| `ntfy://server/topic` | `POST https://server/topic` (plain-text body, `Title:` + `Priority:` headers) |
+| `ntfy+http://server/topic` | `POST http://server/topic` (plaintext for ntfy on a LAN) |
+| `gotify://server/<TOKEN>` | `POST https://server/message?token=<TOKEN>` (JSON `{title,message,priority}`) |
+| `gotify+http://server/<TOKEN>` | `POST http://server/message?token=<TOKEN>` |
+| `discord://discord.com/api/webhooks/.../...` | `POST https://discord.com/api/webhooks/...` (JSON `{content}`) |
+| `slack://hooks.slack.com/services/.../...` | `POST https://hooks.slack.com/services/...` (JSON `{text}`) |
+| `https://host/path` or `http://host/path` | Generic webhook — `POST` of a structured JSON event document |
+
+The generic webhook body shape is:
+
+```json
+{"event":"container_exit","time":"2026-05-12T03:15:42Z","pid":12345,
+ "name":"vault","detail":{"exit_code":0}}
+```
+
+Newlines, control bytes, and non-ASCII bytes in `--notify` URLs are rejected
+at parse time to prevent header injection into the outbound request.
+
+```bash
+./vault --notify ntfy://homelab.local/oci2bin --notify-name vault
+./vault --notify gotify://gotify.lan/AbCdEf12 \
+        --notify slack://hooks.slack.com/services/T0/B0/X0
+./vault --notify https://my-webhook.local/post   # generic JSON
+```
 
 #### AppArmor and SELinux confinement
 

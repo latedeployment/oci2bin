@@ -3039,6 +3039,320 @@ static void test_parse_opts_profile(void)
     }
 }
 
+static void test_notify_parse_url(void)
+{
+    char* out = NULL;
+    int kind;
+
+    /* ntfy:// → https:// */
+    kind = notify_parse_url("ntfy://ntfy.example.com/topic", &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_NTFY,
+                  "notify_parse_url: ntfy:// kind=NTFY");
+    ASSERT_STR_EQ(out, "https://ntfy.example.com/topic",
+                  "notify_parse_url: ntfy:// → https URL");
+    free(out);
+    out = NULL;
+
+    /* ntfy+http:// → http:// */
+    kind = notify_parse_url("ntfy+http://ntfy.example.com/t", &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_NTFY,
+                  "notify_parse_url: ntfy+http kind=NTFY");
+    ASSERT_STR_EQ(out, "http://ntfy.example.com/t",
+                  "notify_parse_url: ntfy+http URL");
+    free(out);
+    out = NULL;
+
+    /* ntfy+https:// (alias) */
+    kind = notify_parse_url("ntfy+https://s/t", &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_NTFY,
+                  "notify_parse_url: ntfy+https kind=NTFY");
+    ASSERT_STR_EQ(out, "https://s/t",
+                  "notify_parse_url: ntfy+https URL");
+    free(out);
+    out = NULL;
+
+    /* gotify://host/TOKEN → SCHEME://host/message?token=TOKEN */
+    kind = notify_parse_url("gotify://srv.local/AbCdEf-12", &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_GOTIFY,
+                  "notify_parse_url: gotify kind");
+    ASSERT_STR_EQ(out, "https://srv.local/message?token=AbCdEf-12",
+                  "notify_parse_url: gotify URL composes token query");
+    free(out);
+    out = NULL;
+
+    /* gotify+http variant */
+    kind = notify_parse_url("gotify+http://srv:8080/Tok", &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_GOTIFY,
+                  "notify_parse_url: gotify+http kind");
+    ASSERT_STR_EQ(out, "http://srv:8080/message?token=Tok",
+                  "notify_parse_url: gotify+http URL");
+    free(out);
+    out = NULL;
+
+    /* discord:// */
+    kind = notify_parse_url("discord://discord.com/api/webhooks/1/abc",
+                            &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_DISCORD,
+                  "notify_parse_url: discord kind");
+    ASSERT_STR_EQ(out, "https://discord.com/api/webhooks/1/abc",
+                  "notify_parse_url: discord URL");
+    free(out);
+    out = NULL;
+
+    /* slack:// */
+    kind = notify_parse_url("slack://hooks.slack.com/services/T/B/X",
+                            &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_SLACK,
+                  "notify_parse_url: slack kind");
+    ASSERT_STR_EQ(out, "https://hooks.slack.com/services/T/B/X",
+                  "notify_parse_url: slack URL");
+    free(out);
+    out = NULL;
+
+    /* generic https:// webhook */
+    kind = notify_parse_url("https://example.com/hook", &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_WEBHOOK,
+                  "notify_parse_url: https webhook kind");
+    ASSERT_STR_EQ(out, "https://example.com/hook",
+                  "notify_parse_url: https webhook URL passthrough");
+    free(out);
+    out = NULL;
+
+    /* generic http:// webhook */
+    kind = notify_parse_url("http://example.com/hook", &out);
+    ASSERT_INT_EQ(kind, NOTIFY_KIND_WEBHOOK,
+                  "notify_parse_url: http webhook kind");
+    ASSERT_STR_EQ(out, "http://example.com/hook",
+                  "notify_parse_url: http webhook URL passthrough");
+    free(out);
+    out = NULL;
+
+    /* reject newline injection */
+    kind = notify_parse_url("https://x\nX-Inject: 1", &out);
+    ASSERT_INT_EQ(kind, -1,
+                  "notify_parse_url: rejects newline injection");
+    ASSERT_NULL(out, "notify_parse_url: newline returns NULL out");
+
+    /* reject control byte */
+    kind = notify_parse_url("ntfy://x/\x01topic", &out);
+    ASSERT_INT_EQ(kind, -1,
+                  "notify_parse_url: rejects control byte");
+
+    /* reject high byte / non-ASCII */
+    kind = notify_parse_url("ntfy://server/topic\xc3\xa9", &out);
+    ASSERT_INT_EQ(kind, -1,
+                  "notify_parse_url: rejects non-ASCII bytes");
+
+    /* reject unknown scheme */
+    kind = notify_parse_url("ftp://example.com", &out);
+    ASSERT_INT_EQ(kind, -1,
+                  "notify_parse_url: rejects unknown scheme");
+
+    /* reject empty */
+    kind = notify_parse_url("", &out);
+    ASSERT_INT_EQ(kind, -1, "notify_parse_url: rejects empty");
+
+    /* reject NULL */
+    kind = notify_parse_url(NULL, &out);
+    ASSERT_INT_EQ(kind, -1, "notify_parse_url: rejects NULL");
+
+    /* reject gotify without token */
+    kind = notify_parse_url("gotify://host/", &out);
+    ASSERT_INT_EQ(kind, -1,
+                  "notify_parse_url: rejects gotify without token");
+
+    /* reject gotify with unsafe token characters */
+    kind = notify_parse_url("gotify://host/path/bad token", &out);
+    ASSERT_INT_EQ(kind, -1,
+                  "notify_parse_url: rejects gotify space in token");
+}
+
+static void test_notify_build_body(void)
+{
+    char* body = NULL;
+    const char* ct = NULL;
+    char* hdrs[4] = {0};
+    int n_hdrs = 4;
+
+    /* ntfy: plain text body + Title/Priority headers */
+    body = notify_build_body(NOTIFY_KIND_NTFY, "container_exit",
+                             "vault", "\"exit_code\":0",
+                             &ct, hdrs, &n_hdrs);
+    ASSERT_NOT_NULL(body, "notify_build_body: ntfy body non-NULL");
+    ASSERT_STR_EQ(ct, "text/plain",
+                  "notify_build_body: ntfy content-type plain");
+    ASSERT(strstr(body, "container_exit") != NULL,
+           "notify_build_body: ntfy body has event");
+    ASSERT(strstr(body, "vault") != NULL,
+           "notify_build_body: ntfy body has name");
+    ASSERT(n_hdrs >= 1, "notify_build_body: ntfy emits ≥1 header");
+    int has_title = 0, has_prio = 0;
+    for (int i = 0; i < n_hdrs; i++)
+    {
+        if (hdrs[i] && strncmp(hdrs[i], "Title:", 6) == 0)
+        {
+            has_title = 1;
+        }
+        if (hdrs[i] && strncmp(hdrs[i], "Priority:", 9) == 0)
+        {
+            has_prio = 1;
+        }
+        free(hdrs[i]);
+        hdrs[i] = NULL;
+    }
+    ASSERT(has_title, "notify_build_body: ntfy has Title header");
+    ASSERT(has_prio, "notify_build_body: ntfy has Priority header");
+    free(body);
+
+    /* webhook: JSON body */
+    ct = NULL;
+    n_hdrs = 4;
+    body = notify_build_body(NOTIFY_KIND_WEBHOOK, "container_start",
+                             "redis", "\"image\":\"r\"",
+                             &ct, hdrs, &n_hdrs);
+    ASSERT_NOT_NULL(body, "notify_build_body: webhook body non-NULL");
+    ASSERT_STR_EQ(ct, "application/json",
+                  "notify_build_body: webhook content-type json");
+    ASSERT(body[0] == '{',
+           "notify_build_body: webhook body starts with {");
+    ASSERT(strstr(body, "\"event\":\"container_start\"") != NULL,
+           "notify_build_body: webhook embeds event field");
+    ASSERT(strstr(body, "\"name\":\"redis\"") != NULL,
+           "notify_build_body: webhook embeds name field");
+    ASSERT(strstr(body, "\"detail\":{\"image\":\"r\"}") != NULL,
+           "notify_build_body: webhook embeds detail as object");
+    ASSERT_INT_EQ(n_hdrs, 0,
+                  "notify_build_body: webhook emits 0 extra headers");
+    free(body);
+    for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
+
+    /* gotify: JSON with title/message/priority */
+    ct = NULL;
+    n_hdrs = 4;
+    body = notify_build_body(NOTIFY_KIND_GOTIFY, "oom_kill",
+                             "", "\"exit_code\":137",
+                             &ct, hdrs, &n_hdrs);
+    ASSERT_NOT_NULL(body, "notify_build_body: gotify body non-NULL");
+    ASSERT_STR_EQ(ct, "application/json",
+                  "notify_build_body: gotify content-type json");
+    ASSERT(strstr(body, "\"title\":") != NULL,
+           "notify_build_body: gotify has title");
+    ASSERT(strstr(body, "\"message\":") != NULL,
+           "notify_build_body: gotify has message");
+    ASSERT(strstr(body, "\"priority\":8") != NULL,
+           "notify_build_body: gotify elevates priority for oom");
+    free(body);
+    for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
+
+    /* discord: JSON {"content": "..."} */
+    ct = NULL;
+    n_hdrs = 4;
+    body = notify_build_body(NOTIFY_KIND_DISCORD, "container_exit",
+                             "app", "\"exit_code\":1",
+                             &ct, hdrs, &n_hdrs);
+    ASSERT_NOT_NULL(body, "notify_build_body: discord body non-NULL");
+    ASSERT(strstr(body, "\"content\":") != NULL,
+           "notify_build_body: discord has content field");
+    free(body);
+    for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
+
+    /* slack: JSON {"text": "..."} */
+    ct = NULL;
+    n_hdrs = 4;
+    body = notify_build_body(NOTIFY_KIND_SLACK, "container_exit",
+                             "app", "",
+                             &ct, hdrs, &n_hdrs);
+    ASSERT_NOT_NULL(body, "notify_build_body: slack body non-NULL");
+    ASSERT(strstr(body, "\"text\":") != NULL,
+           "notify_build_body: slack has text field");
+    free(body);
+    for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
+}
+
+static void test_parse_opts_notify(void)
+{
+    struct container_opts opts;
+
+    /* --notify with a single ntfy URL */
+    {
+        char url[] = "ntfy://srv.local/topic";
+        char* argv[] = {"prog", "--notify", url, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --notify accepts ntfy://");
+        ASSERT_INT_EQ(opts.n_notify, 1, "parse_opts: --notify n_notify=1");
+        ASSERT_INT_EQ(opts.notify_kinds[0], NOTIFY_KIND_NTFY,
+                      "parse_opts: --notify kind=NTFY");
+        ASSERT_STR_EQ(opts.notify_urls[0], "https://srv.local/topic",
+                      "parse_opts: --notify canonicalizes URL");
+        free(opts.notify_urls[0]);
+    }
+
+    /* --notify with two sinks (ntfy + webhook) */
+    {
+        char u1[] = "ntfy://s1/t1";
+        char u2[] = "https://hooks.example.com/post";
+        char* argv[] = {"prog", "--notify", u1, "--notify", u2, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(5, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: two --notify returns 0");
+        ASSERT_INT_EQ(opts.n_notify, 2,
+                      "parse_opts: two --notify n_notify=2");
+        ASSERT_INT_EQ(opts.notify_kinds[1], NOTIFY_KIND_WEBHOOK,
+                      "parse_opts: second sink kind=WEBHOOK");
+        free(opts.notify_urls[0]);
+        free(opts.notify_urls[1]);
+    }
+
+    /* --notify with bad URL (unknown scheme) */
+    {
+        char bad[] = "ftp://x/y";
+        char* argv[] = {"prog", "--notify", bad, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --notify rejects ftp://");
+    }
+
+    /* --notify with newline injection */
+    {
+        char bad[] = "https://x\nX-Inject: 1";
+        char* argv[] = {"prog", "--notify", bad, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --notify rejects newline injection");
+    }
+
+    /* --notify missing argument */
+    {
+        char* argv[] = {"prog", "--notify", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --notify missing arg returns -1");
+    }
+
+    /* --notify-name accepted */
+    {
+        char nm[] = "homelab-vault";
+        char* argv[] = {"prog", "--notify-name", nm, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --notify-name accepts plain name");
+        ASSERT_STR_EQ(opts.notify_name, "homelab-vault",
+                      "parse_opts: --notify-name value stored");
+    }
+
+    /* --notify-name rejects newline */
+    {
+        char nm[] = "bad\nname";
+        char* argv[] = {"prog", "--notify-name", nm, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --notify-name rejects newline");
+    }
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -3086,6 +3400,9 @@ int main(void)
     test_parse_opts_resolver_injection();
     test_parse_opts_strict();
     test_parse_opts_profile();
+    test_notify_parse_url();
+    test_notify_build_body();
+    test_parse_opts_notify();
 
     printf("1..%d\n", tap_test_num);
 
