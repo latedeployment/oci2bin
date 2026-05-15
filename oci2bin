@@ -1750,6 +1750,7 @@ REQUIRE_COSIGN=0
 COSIGN_KEY=""
 DO_SQUASH=0
 COMPRESS_FORMAT=""
+OFFLINE_ONLY=0
 # Auto-detect libkrun; --no-libkrun opts out
 if pkg-config --exists libkrun 2>/dev/null || ldconfig -p 2>/dev/null | grep -q libkrun; then
     USE_LIBKRUN=1
@@ -1881,6 +1882,14 @@ while [[ $# -gt 0 ]]; do
             COSIGN_KEY="$2"; shift 2 ;;
         --squash)
             DO_SQUASH=1; shift ;;
+        --offline-only)
+            # Air-gap seal: refuse any registry fetch, force a reproducible
+            # epoch, and embed Hermetic: yes in OCI2BIN_META. The image
+            # must already exist in the local docker store or be supplied
+            # via --oci-dir / --tar.
+            OFFLINE_ONLY=1
+            : "${SOURCE_DATE_EPOCH:=0}"; export SOURCE_DATE_EPOCH
+            shift ;;
         --compress)
             [[ $# -lt 2 ]] && { echo "oci2bin: --compress requires gzip|zstd" >&2; exit 1; }
             case "$2" in
@@ -2073,6 +2082,11 @@ else
 # ── pull image if not local ───────────────────────────────────────────────
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    if [[ "$OFFLINE_ONLY" -eq 1 ]]; then
+        echo "oci2bin: --offline-only set but image '$IMAGE' is not in the local store." >&2
+        echo "         Run 'docker pull $IMAGE' before building, or use --oci-dir / --tar." >&2
+        exit 1
+    fi
     echo "oci2bin: pulling $IMAGE..."
     docker pull "$IMAGE"
 fi
@@ -2166,6 +2180,10 @@ if [[ "${#LAYER_IMAGES[@]}" -gt 0 ]]; then
     idx=0
     for layer_img in "${LAYER_IMAGES[@]}"; do
         if ! docker image inspect "$layer_img" >/dev/null 2>&1; then
+            if [[ "$OFFLINE_ONLY" -eq 1 ]]; then
+                echo "oci2bin: --offline-only set but layer image '$layer_img' is not in the local store." >&2
+                exit 1
+            fi
             echo "oci2bin: pulling layer image $layer_img..."
             docker pull "$layer_img"
         fi
@@ -2280,6 +2298,7 @@ EMBED_LOADER_ARG=()
 [[ -n "$PIN_DIGEST"       ]] && EMBED_LOADER_ARG+=(--pin-digest "$PIN_DIGEST")
 [[ "$NO_LAYER_CACHE" -eq 1 ]] && EMBED_LOADER_ARG+=(--no-cache)
 [[ "$REPRODUCIBLE_BUILD" -eq 1 ]] && EMBED_LOADER_ARG+=(--reproducible)
+[[ "$OFFLINE_ONLY"        -eq 1 ]] && EMBED_LOADER_ARG+=(--offline-only)
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \

@@ -388,6 +388,34 @@ sha256sum repro_v1 repro_v2   # identical hashes
 
 `--reproducible` does **not** rewrite content-addressed blob filenames — if your upstream `docker save` produces a different layer SHA on each run (e.g. because the source image's gzip layer mtime differs), the input is non-equivalent regardless of the flag. Combine `--reproducible` with `--tar fixed.tar` (or use [`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/docs/source-date-epoch/) when invoking `docker buildx`) to give the builder content-stable input.
 
+#### Air-gap seal — `--offline-only`
+
+For air-gapped homelab and industrial / regulated builds, `--offline-only`
+adds three guarantees on top of `--reproducible`:
+
+- **No registry fetch.** The image must already be in the local Docker
+  store, or supplied via `--oci-dir DIR` / `--tar FILE`. Any path that
+  would call `docker pull` (including the `--layer` per-image pulls)
+  refuses to run and prints what to do instead.
+- **Reproducible by default.** `--offline-only` implies `--reproducible`
+  and sets `SOURCE_DATE_EPOCH=0` if unset, so two runs of the same input
+  produce byte-identical binaries without an extra flag.
+- **Hermetic marker in metadata.** The embedded `OCI2BIN_META` block
+  records `"hermetic":"yes"`, `"network_used":"no"`, and `"build_epoch":0`.
+  `oci2bin inspect` and `oci2bin explain` surface this so downstream
+  auditors can see the binary was produced in air-gap mode.
+
+```bash
+# Pre-stage the image (only thing that talks to the network)
+docker pull alpine:3.20
+
+# Disconnect the network, then:
+oci2bin --offline-only alpine:3.20
+
+# Or from a fully-staged OCI layout dir:
+oci2bin --offline-only --oci-dir ./image-layout/ alpine:3.20
+```
+
 ### VM-mode binaries (oci2vm)
 
 `oci2vm` is a symlink to `oci2bin` that builds binaries which run in VM mode by default — no `--vm` flag needed at runtime. The output is named `oci2vm_<image>` so that the embedded loader detects the invocation name and enables VM mode automatically.

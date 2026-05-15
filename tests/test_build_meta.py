@@ -73,6 +73,32 @@ class TestBuildMetaBlock(unittest.TestCase):
         with self.assertRaises(ValueError):
             bp.build_meta_block('demo:latest', pin_digest='sha384:auto')
 
+    def test_offline_only_embeds_hermetic_markers(self):
+        block = bp.build_meta_block('demo:latest', offline_only=True)
+        payload = block[4 + len(bp.META_MAGIC):-1]
+        meta = json.loads(payload)
+        self.assertEqual(meta['hermetic'], 'yes')
+        self.assertEqual(meta['network_used'], 'no')
+        self.assertEqual(meta['build_epoch'], 0)
+        # offline_only forces the reproducible timestamp regardless of
+        # the reproducible flag — two builds of the same input are
+        # byte-identical.
+        self.assertEqual(meta['timestamp'], bp.REPRODUCIBLE_TIMESTAMP)
+
+    def test_default_omits_hermetic_marker(self):
+        block = bp.build_meta_block('demo:latest')
+        payload = block[4 + len(bp.META_MAGIC):-1]
+        meta = json.loads(payload)
+        self.assertNotIn('hermetic', meta)
+        self.assertNotIn('network_used', meta)
+        self.assertNotIn('build_epoch', meta)
+
+    def test_offline_only_two_builds_byte_identical(self):
+        a = bp.build_meta_block('demo:latest', offline_only=True)
+        b = bp.build_meta_block('demo:latest', offline_only=True)
+        self.assertEqual(a, b,
+                         '--offline-only meta blocks must be deterministic')
+
 
 if __name__ == '__main__':
     unittest.main()

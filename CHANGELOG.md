@@ -6,6 +6,17 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **Air-gap seal `--offline-only`** — build-time flag that refuses any
+  registry fetch (the image must already be in the local store or
+  supplied via `--oci-dir` / `--tar`), implies `--reproducible` and
+  sets `SOURCE_DATE_EPOCH=0` if unset, and embeds
+  `"hermetic":"yes"`/`"network_used":"no"`/`"build_epoch":0` into the
+  `OCI2BIN_META` block. `oci2bin inspect` and `oci2bin explain` surface
+  the hermetic marker. Useful for air-gapped homelabs and regulated /
+  industrial environments where the build pipeline must be sealed.
+  4 new Python unit tests covering the marker presence, absence by
+  default, forced-reproducible timestamp, and byte-identical re-builds.
+
 - **Resource sizing presets** — `--size NAME` bundles sensible defaults for
   `--memory`, `--cpus`, and `--pids-limit`:
   `pi-zero` (256 MiB / 1 / 64), `pi4` (1 GiB / 4 / 256),

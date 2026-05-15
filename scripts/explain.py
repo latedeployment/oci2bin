@@ -182,6 +182,9 @@ def main():
             for k in ("image", "digest", "timestamp", "version"):
                 if k in meta:
                     print(f"  {k:<12}{meta[k]}")
+            if meta.get("hermetic") == "yes":
+                print(f"  {'hermetic':<12}yes (built with --offline-only,"
+                      f" no network used)")
         else:
             print("  (no OCI2BIN_META block — older builder)")
         print()

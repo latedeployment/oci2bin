@@ -362,6 +362,9 @@ def main():
             print(f"  Built:     {meta['timestamp']}")
         if 'version' in meta:
             print(f"  oci2bin:   {meta['version']}")
+        if meta.get('hermetic') == 'yes':
+            print(f"  Hermetic:  yes (built with --offline-only,"
+                  f" no network used)")
 
 
 if __name__ == '__main__':

@@ -607,13 +607,20 @@ REPRODUCIBLE_TIMESTAMP = '1970-01-01T00:00:00Z'
 
 
 def build_meta_block(image_name, digest=None, self_update_url=None,
-                     pin_digest=None, reproducible=False):
+                     pin_digest=None, reproducible=False,
+                     offline_only=False):
     """
     Build the OCI2BIN_META block appended to the end of the output binary.
     Format: uint32_le(total_size) + META_MAGIC + json_bytes + b'\\x00'
-    total_size counts from the start of the uint32 field to the end of the block.
+    total_size counts from the start of the uint32 field to the end of
+    the block.
+
+    When offline_only is True the block records a "hermetic" marker that
+    the inspect/explain subcommands surface to users. The timestamp is
+    forced to the reproducible epoch so two air-gap-sealed builds of the
+    same input are byte-identical.
     """
-    if reproducible:
+    if reproducible or offline_only:
         timestamp = REPRODUCIBLE_TIMESTAMP
     else:
         timestamp = datetime.datetime.now(
@@ -634,6 +641,10 @@ def build_meta_block(image_name, digest=None, self_update_url=None,
             meta['pin_digest'] = _format_digest_value(algorithm, placeholder)
         else:
             meta['pin_digest'] = _format_digest_value(algorithm, digest_value)
+    if offline_only:
+        meta['hermetic']     = 'yes'
+        meta['network_used'] = 'no'
+        meta['build_epoch']  = 0
     json_bytes = json.dumps(meta, separators=(',', ':')).encode() + b'\x00'
     total_size = 4 + len(META_MAGIC) + len(json_bytes)
     return struct.pack('<I', total_size) + META_MAGIC + json_bytes
@@ -961,7 +972,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    loader_dir=DEFAULT_LOADER_DIR,
                    label_prefix=DEFAULT_LABEL_PREFIX,
                    self_update_url=None, pin_digest=None,
-                   use_layer_cache=True, reproducible=False):
+                   use_layer_cache=True, reproducible=False,
+                   offline_only=False):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -1205,7 +1217,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     meta_block = build_meta_block(meta_image, digest,
                                   self_update_url=self_update_url,
                                   pin_digest=pin_digest,
-                                  reproducible=reproducible)
+                                  reproducible=reproducible,
+                                  offline_only=offline_only)
     with open(output_path, 'wb') as f:
         f.write(polyglot)
         f.write(meta_block)
@@ -1297,6 +1310,13 @@ def main():
                              'members, mtime=0, zeroed uid/gid/uname/gname, '
                              'gzip mtime=0 in each layer; pin the metadata '
                              'block timestamp to 1970-01-01T00:00:00Z.')
+    parser.add_argument('--offline-only', action='store_true', default=False,
+                        help='Air-gap seal: embed a Hermetic: yes marker in '
+                             'OCI2BIN_META, force reproducible build mode, '
+                             'and pin the build epoch to 0. Used by the '
+                             'oci2bin wrapper to refuse any registry fetch '
+                             'and mark the resulting binary as hermetic '
+                             'for downstream inspect/explain.')
 
     args = parser.parse_args()
 
@@ -1360,7 +1380,8 @@ def main():
                    self_update_url=args.self_update_url,
                    pin_digest=args.pin_digest,
                    use_layer_cache=not args.no_cache,
-                   reproducible=args.reproducible)
+                   reproducible=args.reproducible or args.offline_only,
+                   offline_only=args.offline_only)
 
 
 if __name__ == '__main__':
