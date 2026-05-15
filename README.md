@@ -612,6 +612,31 @@ The loader creates `/sys/fs/cgroup/oci2bin-<pid>/`, moves itself in, sets the
 limits, then calls `unshare(CLONE_NEWCGROUP)` so the container only sees its
 own cgroup subtree. The cgroup dir is removed on exit.
 
+#### Resource sizing presets — `--size`
+
+For homelab and self-hosted setups, `--size NAME` bundles sensible defaults
+for `--memory`, `--cpus`, and `--pids-limit` so a Pi Zero doesn't OOM and a
+beefy box isn't pointlessly restricted:
+
+| Preset | Memory | CPUs | PIDs |
+|--------|-------:|-----:|-----:|
+| `pi-zero` | 256 MiB | 1 | 64 |
+| `pi4` | 1 GiB | 4 | 256 |
+| `vps-small` | 1 GiB | 1 | 256 |
+| `vps-medium` | 4 GiB | 2 | 1024 |
+| `beefy` | 16 GiB | 8 | 4096 |
+| `auto` | half of host RAM, clamped to 256 MiB–4 GiB | half of host CPUs, clamped 1–8 | 1024 |
+
+Each preset only fills fields that aren't already set, so any explicit
+`--memory`, `--cpus`, or `--pids-limit` before or after `--size` wins:
+
+```bash
+./my-app --size pi-zero
+./my-app --size auto                       # detect host RAM/CPU and split
+./my-app --size pi4 --memory 512m          # explicit --memory overrides
+./my-app --memory 2g --size pi-zero        # earlier explicit --memory wins
+```
+
 ### Prometheus metrics socket
 
 `--metrics-socket PATH` starts a small Unix-domain socket server that exports

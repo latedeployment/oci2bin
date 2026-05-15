@@ -3440,6 +3440,127 @@ static void test_parse_opts_hint_flags(void)
     }
 }
 
+static void test_parse_opts_size(void)
+{
+    struct container_opts opts;
+
+    /* pi-zero: 256 MiB, 1 CPU, 64 pids */
+    {
+        char* argv[] = {"prog", "--size", "pi-zero", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --size pi-zero returns 0");
+        ASSERT_INT_EQ((int)(opts.cg_memory_bytes / (1024 * 1024)), 256,
+                      "parse_opts: --size pi-zero memory=256 MiB");
+        ASSERT_INT_EQ((int)opts.cg_cpu_quota, 100000,
+                      "parse_opts: --size pi-zero cpu_quota=100000");
+        ASSERT_INT_EQ((int)opts.cg_pids, 64,
+                      "parse_opts: --size pi-zero pids=64");
+    }
+    /* pi4: 1 GiB, 4 CPUs, 256 pids */
+    {
+        char* argv[] = {"prog", "--size", "pi4", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --size pi4 returns 0");
+        ASSERT_INT_EQ((int)(opts.cg_memory_bytes / (1024 * 1024 * 1024)), 1,
+                      "parse_opts: --size pi4 memory=1 GiB");
+        ASSERT_INT_EQ((int)opts.cg_cpu_quota, 400000,
+                      "parse_opts: --size pi4 cpu_quota=400000");
+        ASSERT_INT_EQ((int)opts.cg_pids, 256,
+                      "parse_opts: --size pi4 pids=256");
+    }
+    /* vps-small */
+    {
+        char* argv[] = {"prog", "--size", "vps-small", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --size vps-small returns 0");
+        ASSERT_INT_EQ((int)opts.cg_cpu_quota, 100000,
+                      "parse_opts: vps-small cpu_quota=1");
+        ASSERT_INT_EQ((int)opts.cg_pids, 256,
+                      "parse_opts: vps-small pids=256");
+    }
+    /* vps-medium */
+    {
+        char* argv[] = {"prog", "--size", "vps-medium", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --size vps-medium returns 0");
+        ASSERT_INT_EQ((int)opts.cg_cpu_quota, 200000,
+                      "parse_opts: vps-medium cpu_quota=2");
+        ASSERT_INT_EQ((int)opts.cg_pids, 1024,
+                      "parse_opts: vps-medium pids=1024");
+    }
+    /* beefy */
+    {
+        char* argv[] = {"prog", "--size", "beefy", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --size beefy returns 0");
+        ASSERT_INT_EQ((int)(opts.cg_memory_bytes / (1024 * 1024 * 1024)), 16,
+                      "parse_opts: beefy memory=16 GiB");
+        ASSERT_INT_EQ((int)opts.cg_cpu_quota, 800000,
+                      "parse_opts: beefy cpu_quota=8");
+        ASSERT_INT_EQ((int)opts.cg_pids, 4096,
+                      "parse_opts: beefy pids=4096");
+    }
+    /* auto: at minimum returns 0 and sets non-zero values within bounds */
+    {
+        char* argv[] = {"prog", "--size", "auto", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --size auto returns 0");
+        ASSERT(opts.cg_memory_bytes >= 256LL * 1024 * 1024,
+               "parse_opts: --size auto memory ≥ 256 MiB");
+        ASSERT(opts.cg_memory_bytes <= 4LL * 1024 * 1024 * 1024,
+               "parse_opts: --size auto memory ≤ 4 GiB");
+        ASSERT(opts.cg_cpu_quota >= 100000,
+               "parse_opts: --size auto cpu_quota ≥ 1");
+        ASSERT(opts.cg_cpu_quota <= 800000,
+               "parse_opts: --size auto cpu_quota ≤ 8");
+        ASSERT_INT_EQ((int)opts.cg_pids, 1024,
+                      "parse_opts: --size auto pids=1024");
+    }
+    /* Later explicit --memory overrides --size */
+    {
+        char* argv[] = {"prog", "--size", "pi-zero", "--memory", "512m",
+                        NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(5, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --size + later --memory returns 0");
+        ASSERT_INT_EQ((int)(opts.cg_memory_bytes / (1024 * 1024)), 512,
+                      "parse_opts: later --memory beats --size preset");
+    }
+    /* Earlier explicit --memory survives --size */
+    {
+        char* argv[] = {"prog", "--memory", "2g", "--size", "pi-zero",
+                        NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(5, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: earlier --memory + --size returns 0");
+        ASSERT_INT_EQ((int)(opts.cg_memory_bytes / (1024 * 1024 * 1024)), 2,
+                      "parse_opts: earlier --memory survives --size");
+    }
+    /* Unknown preset */
+    {
+        char* argv[] = {"prog", "--size", "potato", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1,
+                      "parse_opts: --size rejects unknown preset");
+    }
+    /* Missing arg */
+    {
+        char* argv[] = {"prog", "--size", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --size missing arg returns -1");
+    }
+}
+
 static void test_parse_opts_notify(void)
 {
     struct container_opts opts;
@@ -3577,6 +3698,7 @@ int main(void)
     test_looks_like_credential();
     test_print_first_run_hint();
     test_parse_opts_hint_flags();
+    test_parse_opts_size();
 
     printf("1..%d\n", tap_test_num);
 

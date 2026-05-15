@@ -9127,6 +9127,13 @@ static void usage(const char* prog)
             "                                 setgid/net_bind_service/kill), default seccomp\n"
             "                     locked-down prod plus --landlock, --strict, --pids-limit 512,\n"
             "                                 --memory 1g\n"
+            "  --size NAME         Resource sizing preset (sets defaults; later flags override)\n"
+            "                     pi-zero    256 MiB / 1 CPU / 64 pids\n"
+            "                     pi4        1 GiB / 4 CPUs / 256 pids\n"
+            "                     vps-small  1 GiB / 1 CPU / 256 pids\n"
+            "                     vps-medium 4 GiB / 2 CPUs / 1024 pids\n"
+            "                     beefy      16 GiB / 8 CPUs / 4096 pids\n"
+            "                     auto       half of host RAM (clamped 256m–4g) and CPUs (1–8)\n"
             "  --strict            Fail closed on every security-relevant degradation\n"
             "                     (seccomp install / NO_NEW_PRIVS / landlock-unsupported /\n"
             "                     cap drop/add rejected) — never silently continue\n"
@@ -10552,6 +10559,135 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         "oci2bin: --profile: unknown profile %s"
                         " (use dev, prod, or locked-down)\n", name);
                 return -1;
+            }
+        }
+        else if (strcmp(argv[i], "--size") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --size requires a NAME"
+                        " (pi-zero|pi4|vps-small|vps-medium|beefy|auto)\n");
+                return -1;
+            }
+            i++;
+            const char* name = argv[i];
+            /* Preset values — applied as defaults. An explicit --memory,
+             * --cpus, or --pids-limit either before or after --size will
+             * win because the explicit setters in parse_opts overwrite
+             * the field unconditionally, and we only set fields that are
+             * still 0 here. */
+            long long mem_bytes = 0;
+            long      cpu_quota = 0;
+            double    cpu_dbl   = 0.0;
+            long      pids      = 0;
+            if (strcmp(name, "pi-zero") == 0)
+            {
+                mem_bytes = 256LL * 1024 * 1024;
+                cpu_quota = 100000;     /* 1 CPU */
+                cpu_dbl   = 1.0;
+                pids      = 64;
+            }
+            else if (strcmp(name, "pi4") == 0)
+            {
+                mem_bytes = 1024LL * 1024 * 1024;
+                cpu_quota = 400000;     /* 4 CPUs */
+                cpu_dbl   = 4.0;
+                pids      = 256;
+            }
+            else if (strcmp(name, "vps-small") == 0)
+            {
+                mem_bytes = 1024LL * 1024 * 1024;
+                cpu_quota = 100000;     /* 1 CPU */
+                cpu_dbl   = 1.0;
+                pids      = 256;
+            }
+            else if (strcmp(name, "vps-medium") == 0)
+            {
+                mem_bytes = 4LL * 1024 * 1024 * 1024;
+                cpu_quota = 200000;     /* 2 CPUs */
+                cpu_dbl   = 2.0;
+                pids      = 1024;
+            }
+            else if (strcmp(name, "beefy") == 0)
+            {
+                mem_bytes = 16LL * 1024 * 1024 * 1024;
+                cpu_quota = 800000;     /* 8 CPUs */
+                cpu_dbl   = 8.0;
+                pids      = 4096;
+            }
+            else if (strcmp(name, "auto") == 0)
+            {
+                /* Detect host RAM + CPU at parse time. The container gets
+                 * half of host RAM (clamped to [256 MiB, 4 GiB]) and half
+                 * the online CPUs (clamped to [1, 8]). This leaves room
+                 * for the host plus other tenants without needing to
+                 * coordinate via the container state directory. */
+                long long total_kb = 0;
+                FILE* f = fopen("/proc/meminfo", "r");
+                if (f)
+                {
+                    char line[256];
+                    while (fgets(line, sizeof(line), f))
+                    {
+                        if (strncmp(line, "MemTotal:", 9) == 0)
+                        {
+                            sscanf(line, "MemTotal: %lld kB", &total_kb);
+                            break;
+                        }
+                    }
+                    fclose(f);
+                }
+                mem_bytes = total_kb > 0
+                            ? (total_kb * 1024LL) / 2LL
+                            : (1024LL * 1024 * 1024);
+                if (mem_bytes < 256LL * 1024 * 1024)
+                {
+                    mem_bytes = 256LL * 1024 * 1024;
+                }
+                if (mem_bytes > 4LL * 1024 * 1024 * 1024)
+                {
+                    mem_bytes = 4LL * 1024 * 1024 * 1024;
+                }
+
+                long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+                if (ncpu < 2)
+                {
+                    ncpu = 2;
+                }
+                long half = ncpu / 2;
+                if (half < 1)
+                {
+                    half = 1;
+                }
+                if (half > 8)
+                {
+                    half = 8;
+                }
+                cpu_quota = half * 100000L;
+                cpu_dbl   = (double)half;
+                pids      = 1024;
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: --size: unknown preset %s"
+                        " (use pi-zero, pi4, vps-small, vps-medium,"
+                        " beefy, or auto)\n", name);
+                return -1;
+            }
+            if (opts->cg_memory_bytes == 0)
+            {
+                opts->cg_memory_bytes = mem_bytes;
+            }
+            if (opts->cg_cpu_quota == 0)
+            {
+                opts->cg_cpu_quota = cpu_quota;
+                opts->vm_cpus      = cpu_dbl;
+            }
+            if (opts->cg_pids == 0)
+            {
+                opts->cg_pids = pids;
             }
         }
         else if (strcmp(argv[i], "--lazy") == 0)

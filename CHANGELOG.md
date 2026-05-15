@@ -6,6 +6,16 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **Resource sizing presets** — `--size NAME` bundles sensible defaults for
+  `--memory`, `--cpus`, and `--pids-limit`:
+  `pi-zero` (256 MiB / 1 / 64), `pi4` (1 GiB / 4 / 256),
+  `vps-small` (1 GiB / 1 / 256), `vps-medium` (4 GiB / 2 / 1024),
+  `beefy` (16 GiB / 8 / 4096), and `auto` (half of host RAM clamped to
+  256 MiB–4 GiB, half of host CPUs clamped to 1–8, 1024 pids). Each
+  preset only fills fields that aren't already set, so an explicit
+  `--memory` / `--cpus` / `--pids-limit` before or after `--size` wins.
+  30 new C unit tests.
+
 - **First-run env hint** — when launched without any `-e KEY=VAL` and the
   image declares one or more empty-value env vars (the standard OCI
   convention for "this is required, please supply it"), the loader prints
