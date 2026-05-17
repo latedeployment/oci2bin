@@ -111,10 +111,31 @@ def load_state(name):
               file=sys.stderr)
         sys.exit(1)
     with state_file.open(encoding='utf-8') as f:
-        data = json.load(f)
-    pid = int(data.get('pid', 0))
+        try:
+            data = json.load(f)
+        except (ValueError, OSError) as exc:
+            print(f"oci2bin: state file for '{name}' is malformed: {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+    try:
+        pid = int(data.get('pid', 0))
+        start_ticks = int(data.get('start_ticks', 0))
+    except (TypeError, ValueError):
+        print(f"oci2bin: state file for '{name}' has non-numeric"
+              " pid/start_ticks", file=sys.stderr)
+        sys.exit(1)
+    # PIDs are kernel int (pid_max <= 2^22 on Linux); clamp the
+    # accepted range to a sane signed-int window so os.kill / readlink
+    # do not raise OverflowError on a tampered state file.
+    if pid > 0x7FFFFFFF or start_ticks < 0 or start_ticks > 0x7FFFFFFFFFFFFFFF:
+        print(f"oci2bin: state file for '{name}' has out-of-range"
+              " pid/start_ticks", file=sys.stderr)
+        sys.exit(1)
     binary = data.get('binary', '')
-    start_ticks = int(data.get('start_ticks', 0))
+    if not isinstance(binary, str):
+        print(f"oci2bin: state file for '{name}' has non-string binary",
+              file=sys.stderr)
+        sys.exit(1)
     if pid <= 0 or not binary:
         print(f"oci2bin: state file for '{name}' is malformed",
               file=sys.stderr)
@@ -313,12 +334,22 @@ def cmd_thaw(name):
     if not VALID_NAME.match(name):
         print(f"oci2bin: invalid container name '{name}'", file=sys.stderr)
         return 1
-    token = _read_token(name)
+    try:
+        token = _read_token(name)
+    except (ValueError, OSError) as exc:
+        print(f"oci2bin thaw: malformed token for '{name}': {exc}",
+              file=sys.stderr)
+        return 1
     if token is None:
         print(f"oci2bin thaw: no freeze token for '{name}'", file=sys.stderr)
         return 1
-    pid = int(token.get('pid', 0))
-    if pid <= 0:
+    try:
+        pid = int(token.get('pid', 0))
+    except (TypeError, ValueError):
+        print(f"oci2bin thaw: token for '{name}' has non-numeric pid",
+              file=sys.stderr)
+        return 1
+    if pid <= 0 or pid > 0x7FFFFFFF:
         print(f"oci2bin thaw: malformed token for '{name}'", file=sys.stderr)
         return 1
     # Re-resolve and verify the PID still belongs to the same container —
