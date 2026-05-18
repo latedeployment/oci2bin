@@ -64,6 +64,18 @@ def _resolve_upper(arg):
     return arg
 
 
+def _walk_warn(exc):
+    """Surface walk-time errors (typically EACCES on a chmod-0 subtree)
+    on stderr so an audit-tool user notices that part of the upperdir
+    was silently skipped. Without this callback `os.walk` swallows the
+    failing branch entirely — the unreadable directory would not appear
+    in the A/D report at all, hiding changes from the operator."""
+    name = getattr(exc, 'filename', '?')
+    msg = getattr(exc, 'strerror', str(exc))
+    print(f"oci2bin diff-fs: skipping unreadable {name}: {msg}",
+          file=sys.stderr)
+
+
 def walk_upper(upper_root):
     """
     Yield (op, rel_path, extra) tuples in deterministic sort order.
@@ -73,7 +85,9 @@ def walk_upper(upper_root):
     extra    None, or 'opaque' for directories with the opaque xattr
     """
     entries = []
-    for dirpath, dirnames, filenames in os.walk(upper_root, followlinks=False):
+    for dirpath, dirnames, filenames in os.walk(upper_root,
+                                                followlinks=False,
+                                                onerror=_walk_warn):
         dirnames.sort()
         filenames.sort()
         rel_dir = os.path.relpath(dirpath, upper_root)

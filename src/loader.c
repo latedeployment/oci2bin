@@ -11601,6 +11601,32 @@ static void cleanup_cgroup(void)
 }
 
 /*
+ * Remove the extracted OCI rootfs tmpdir on process exit. Safe to call
+ * more than once (the second call is a no-op). Used both inline at the
+ * normal-exit cleanup point and via atexit() so every early-return path
+ * in main() — including --require-hint abort, signature failure, fork
+ * errors, etc. — releases the tmpdir instead of leaking it under /tmp.
+ */
+static int s_oci_rootfs_cleaned = 0;
+
+static void cleanup_oci_rootfs(void)
+{
+    if (s_oci_rootfs_cleaned || s_oci_rootfs[0] == '\0')
+    {
+        return;
+    }
+    s_oci_rootfs_cleaned = 1;
+    /* s_oci_rootfs points at "<tmpdir>/rootfs"; strip the suffix and
+     * remove the whole tmpdir. rm_rf_dir is a no-op on a missing path. */
+    char* last_slash = strrchr(s_oci_rootfs, '/');
+    if (last_slash)
+    {
+        *last_slash = '\0';
+        rm_rf_dir(s_oci_rootfs);
+    }
+}
+
+/*
  * Set up a cgroup v2 leaf for this process.  Called before unshare().
  * On failure: prints a warning and returns 0 (non-fatal).
  * Returns 1 if a cgroup namespace unshare should be done, 0 otherwise.
@@ -14214,6 +14240,11 @@ int main(int argc, char* argv[])
         fprintf(stderr, "oci2bin: failed to extract OCI rootfs\n");
         return 1;
     }
+    /* Ensure the tmpdir is removed on every exit path — explicit returns
+     * from main, exit() from helpers, and normal completion. The normal
+     * cleanup below also calls this; the s_oci_rootfs_cleaned guard makes
+     * a second call a no-op. */
+    atexit(cleanup_oci_rootfs);
     debug_log("main.rootfs", "path=%s", rootfs);
 
     /* 4b. VM dispatch: after rootfs extraction so rootfs is available */
@@ -14703,16 +14734,13 @@ int main(int argc, char* argv[])
         }
     }
 
-    /* Cleanup: remove the whole tmpdir without forking.
-     * rootfs = tmpdir + "/rootfs"; strip the last component to get tmpdir.
-     * Cannot use fork() here: after CLONE_NEWPID the child PID namespace is
-     * destroyed when the container exits, so fork() returns ENOMEM. */
-    char* last_slash = strrchr(rootfs, '/');
-    if (last_slash)
-    {
-        *last_slash = '\0'; /* rootfs now points to tmpdir */
-        rm_rf_dir(rootfs);
-    }
+    /* Cleanup: remove the whole tmpdir without forking. The atexit()
+     * handler will run this too on any unusual exit; doing it inline
+     * here means the cleanup completes before main returns so an
+     * external observer (test harness, parent process) sees the rmdir.
+     * Cannot use fork() here: after CLONE_NEWPID the child PID namespace
+     * is destroyed when the container exits, so fork() returns ENOMEM. */
+    cleanup_oci_rootfs();
 
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }

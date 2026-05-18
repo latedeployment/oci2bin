@@ -131,6 +131,29 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('not a directory', result.stderr)
 
+    def test_unreadable_subdir_warns_to_stderr(self):
+        """os.walk silently skips EACCES subtrees by default — that hides
+        additions inside chmod-0 directories from an audit report. The
+        onerror callback must surface those skips on stderr."""
+        if os.geteuid() == 0:
+            self.skipTest('chmod 0 is bypassed by root')
+        with tempfile.TemporaryDirectory() as upper:
+            sub = os.path.join(upper, 'locked')
+            os.makedirs(sub)
+            with open(os.path.join(sub, 'hidden.txt'), 'w') as f:
+                f.write('h\n')
+            os.chmod(sub, 0o000)
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / 'scripts' / 'diff_fs.py'),
+                     upper],
+                    capture_output=True, text=True)
+            finally:
+                os.chmod(sub, 0o700)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn('skipping unreadable', result.stderr)
+            self.assertIn('locked', result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()
