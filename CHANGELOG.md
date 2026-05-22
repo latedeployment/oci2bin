@@ -4,6 +4,8 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-22
+
 ### Added
 
 - **`oci2bin freeze NAME [-- CMD]` / `oci2bin thaw NAME`** —
@@ -781,6 +783,7 @@ Initial public release.
   `snprintf` truncation checks on all `PATH_MAX` buffers, no `system()`/`popen()`
   anywhere in the codebase.
 
+[0.14.0]: https://github.com/latedeployment/oci2bin/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/latedeployment/oci2bin/compare/v0.12.0...v0.13.0
 [0.3.0]: https://github.com/latedeployment/oci2bin/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/latedeployment/oci2bin/compare/v0.1.0...v0.2.0
