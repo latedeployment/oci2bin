@@ -1651,6 +1651,27 @@ static void test_json_escape_string(void)
     char tiny[3];
     ASSERT_INT_EQ(json_escape_string("a\"b", tiny, 3), -1,
                   "json_escape_string: buffer too small returns -1");
+
+    /* Newline / tab / CR map to short escapes, not raw control bytes. */
+    ASSERT_INT_EQ(json_escape_string("a\nb\tc\rd", buf, sizeof(buf)), 0,
+                  "json_escape_string: control shortcuts return 0");
+    ASSERT_STR_EQ(buf, "a\\nb\\tc\\rd",
+                  "json_escape_string: \\n \\t \\r escaped");
+
+    /* Other control bytes become \u00XX (here 0x01 and 0x1f). */
+    ASSERT_INT_EQ(json_escape_string("x\x01y\x1f", buf, sizeof(buf)), 0,
+                  "json_escape_string: \\u escaping returns 0");
+    ASSERT_STR_EQ(buf, "x\\u0001y\\u001f",
+                  "json_escape_string: control bytes become \\u00XX");
+
+    /* Truncation must still NUL-terminate (no unterminated buffer for
+     * callers that ignore the return value). A lone \u00XX needs 6 bytes;
+     * a 4-byte buffer cannot hold it, so output stays empty + terminated. */
+    char trunc[4] = { 'Z', 'Z', 'Z', 'Z' };
+    ASSERT_INT_EQ(json_escape_string("\x01", trunc, sizeof(trunc)), -1,
+                  "json_escape_string: \\u overflow returns -1");
+    ASSERT_STR_EQ(trunc, "",
+                  "json_escape_string: overflow still NUL-terminates");
 }
 
 static int raw_probe_clone3_expected(void)

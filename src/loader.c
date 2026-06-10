@@ -1798,29 +1798,83 @@ static int json_parse_string_array(const char* arr, char** out, int max)
  * Returns 0 on success, -1 if the output would be truncated. */
 static int json_escape_string(const char* src, char* dst, size_t dstsz)
 {
+    static const char hex[] = "0123456789abcdef";
+    if (dstsz == 0)
+    {
+        return -1;
+    }
     size_t out = 0;
+    int    truncated = 0;
     for (const char* p = src; *p; p++)
     {
-        if (*p == '"' || *p == '\\')
+        unsigned char c = (unsigned char)*p;
+        char   seq[6];
+        size_t seqlen;
+        switch (c)
         {
-            if (out + 2 >= dstsz)
-            {
-                return -1;
-            }
-            dst[out++] = '\\';
-            dst[out++] = *p;
+            case '"':
+            case '\\':
+                seq[0] = '\\';
+                seq[1] = (char)c;
+                seqlen = 2;
+                break;
+            case '\n':
+                seq[0] = '\\';
+                seq[1] = 'n';
+                seqlen = 2;
+                break;
+            case '\r':
+                seq[0] = '\\';
+                seq[1] = 'r';
+                seqlen = 2;
+                break;
+            case '\t':
+                seq[0] = '\\';
+                seq[1] = 't';
+                seqlen = 2;
+                break;
+            case '\b':
+                seq[0] = '\\';
+                seq[1] = 'b';
+                seqlen = 2;
+                break;
+            case '\f':
+                seq[0] = '\\';
+                seq[1] = 'f';
+                seqlen = 2;
+                break;
+            default:
+                if (c < 0x20)
+                {
+                    /* Other control bytes must be escaped as \u00XX. */
+                    seq[0] = '\\';
+                    seq[1] = 'u';
+                    seq[2] = '0';
+                    seq[3] = '0';
+                    seq[4] = hex[(c >> 4) & 0xf];
+                    seq[5] = hex[c & 0xf];
+                    seqlen = 6;
+                }
+                else
+                {
+                    seq[0] = (char)c;
+                    seqlen = 1;
+                }
+                break;
         }
-        else
+        /* Leave room for the byte sequence and the trailing NUL. */
+        if (out + seqlen >= dstsz)
         {
-            if (out + 1 >= dstsz)
-            {
-                return -1;
-            }
-            dst[out++] = *p;
+            truncated = 1;
+            break;
         }
+        memcpy(dst + out, seq, seqlen);
+        out += seqlen;
     }
+    /* Always NUL-terminate: out < dstsz holds here, so callers that ignore
+     * the return value never read past an unterminated buffer. */
     dst[out] = '\0';
-    return 0;
+    return truncated ? -1 : 0;
 }
 
 /* ── file helpers ────────────────────────────────────────────────────────── */
