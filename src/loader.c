@@ -3807,6 +3807,154 @@ static pid_t spawn_daemon(char* const argv[])
 /* File-level static so the returned pointer is never to stack memory. */
 static char s_oci_rootfs[PATH_MAX];
 
+/* age ciphertext header sentinels (see https://age-encryption.org/v1).
+ * A binary age file begins with the literal "age-encryption.org/v1\n";
+ * an ASCII-armored one begins with the PEM-style BEGIN line. We detect
+ * either so an --encrypt'd payload is self-describing and no extra build
+ * marker is needed. */
+#define AGE_MAGIC_BINARY "age-encryption.org/v1"
+#define AGE_MAGIC_ARMOR  "-----BEGIN AGE ENCRYPTED FILE-----"
+
+/* Return 1 if the file at `path` looks like an age-encrypted blob, 0 if
+ * not, -1 on read error. */
+static int blob_is_age_encrypted(const char* path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    char head[64];
+    ssize_t n = read(fd, head, sizeof(head) - 1);
+    close(fd);
+    if (n < 0)
+    {
+        return -1;
+    }
+    head[n] = '\0';
+    if ((size_t)n >= strlen(AGE_MAGIC_BINARY) &&
+            memcmp(head, AGE_MAGIC_BINARY, strlen(AGE_MAGIC_BINARY)) == 0)
+    {
+        return 1;
+    }
+    if ((size_t)n >= strlen(AGE_MAGIC_ARMOR) &&
+            memcmp(head, AGE_MAGIC_ARMOR, strlen(AGE_MAGIC_ARMOR)) == 0)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/* Resolve the age identity file used to decrypt an encrypted image.
+ * Order: $OCI2BIN_IDENTITY, then a few conventional defaults. Writes the
+ * chosen readable path into `out` and returns 0, or -1 if none is found. */
+static int resolve_age_identity(char* out, size_t outsz)
+{
+    const char* env = getenv("OCI2BIN_IDENTITY");
+    if (env && env[0])
+    {
+        if (snprintf(out, outsz, "%s", env) >= (int)outsz)
+        {
+            return -1;
+        }
+        if (access(out, R_OK) == 0)
+        {
+            return 0;
+        }
+        fprintf(stderr,
+                "oci2bin: OCI2BIN_IDENTITY=%s is not readable\n", env);
+        return -1;
+    }
+
+    const char* home = getenv("HOME");
+    if (!home || !home[0])
+    {
+        return -1;
+    }
+    static const char* rels[] =
+    {
+        "/.config/oci2bin/identity",
+        "/.ssh/id_ed25519",
+        "/.ssh/id_rsa",
+    };
+    for (size_t i = 0; i < sizeof(rels) / sizeof(rels[0]); i++)
+    {
+        int n = snprintf(out, outsz, "%s%s", home, rels[i]);
+        if (n < 0 || (size_t)n >= outsz)
+        {
+            continue;
+        }
+        if (access(out, R_OK) == 0)
+        {
+            return 0;
+        }
+    }
+    out[0] = '\0';
+    return -1;
+}
+
+/*
+ * If `in_path` holds an age-encrypted payload, decrypt it with the `age`
+ * helper into `out_path` (under `tmpdir`) and return 1. If it is plaintext,
+ * return 0 (caller keeps using `in_path`). Return -1 on error (message
+ * already printed). The decrypted tar is written inside the runtime tmpdir,
+ * which should live on a tmpfs; it is removed with the rest of the tmpdir.
+ */
+static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
+                                  char* out_path, size_t out_sz)
+{
+    int enc = blob_is_age_encrypted(in_path);
+    if (enc < 0)
+    {
+        perror("oci2bin: reading embedded payload");
+        return -1;
+    }
+    if (enc == 0)
+    {
+        return 0;    /* plaintext — nothing to do */
+    }
+
+    char identity[PATH_MAX];
+    if (resolve_age_identity(identity, sizeof(identity)) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: image is encrypted; set OCI2BIN_IDENTITY to your "
+                "age identity file (or place one at ~/.config/oci2bin/identity)\n");
+        return -1;
+    }
+
+    if (path_join_suffix(out_path, out_sz, tmpdir, "/image.dec.tar") < 0)
+    {
+        fprintf(stderr, "oci2bin: decrypted tar path too long\n");
+        return -1;
+    }
+
+    debug_log("decrypt.begin", "identity=%s out=%s", identity, out_path);
+    char* age_argv[] =
+    {
+        "age", "--decrypt", "-i", identity,
+        "-o", out_path, (char*)in_path, NULL
+    };
+    int rc = run_cmd(age_argv);
+    if (rc == 127)
+    {
+        fprintf(stderr,
+                "oci2bin: 'age' not found in PATH; it is required to decrypt "
+                "this image (https://age-encryption.org)\n");
+        return -1;
+    }
+    if (rc != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: age decryption failed (wrong identity for this "
+                "image's recipients?)\n");
+        /* Do not leave a partial/empty plaintext file behind. */
+        unlink(out_path);
+        return -1;
+    }
+    return 1;
+}
+
 /*
  * Extract the OCI tar data from ourselves into a temp directory,
  * then parse manifest.json and extract layers into a rootfs.
@@ -3869,6 +4017,22 @@ static char* extract_oci_rootfs(const char* self_path)
     close(self_fd);
     close(out_fd);
 
+    /* 1a. If the embedded payload is age-encrypted (--encrypt), decrypt it
+     * to a plaintext tar before any tar parsing. tar_input then points at
+     * whichever tar we should actually read. */
+    char decrypted_path[PATH_MAX];
+    const char* tar_input = oci_tar_path;
+    int dec = maybe_decrypt_oci_blob(oci_tar_path, tmpdir,
+                                     decrypted_path, sizeof(decrypted_path));
+    if (dec < 0)
+    {
+        return NULL;    /* error already reported */
+    }
+    if (dec == 1)
+    {
+        tar_input = decrypted_path;
+    }
+
     /* 2. Extract the OCI tar into tmpdir/oci/ */
     char oci_dir[PATH_MAX];
     if (path_join_suffix(oci_dir, sizeof(oci_dir), tmpdir, "/oci") < 0)
@@ -3882,13 +4046,13 @@ static char* extract_oci_rootfs(const char* self_path)
         return NULL;
     }
 
-    if (tar_layer_prescan(oci_tar_path) < 0)
+    if (tar_layer_prescan(tar_input) < 0)
     {
         fprintf(stderr,
                 "oci2bin: OCI tar contains unsafe entry names; refusing\n");
         return NULL;
     }
-    char* tar_argv[] = {"tar", "xf", oci_tar_path, "-C", oci_dir,
+    char* tar_argv[] = {"tar", "xf", (char*)tar_input, "-C", oci_dir,
                         "--no-same-permissions", "--no-same-owner", NULL
                        };
     if (run_cmd(tar_argv) != 0)
@@ -13697,6 +13861,22 @@ static int inspect_image_main(const char* self_path)
         close(out_fd);
     }
 
+    /* Decrypt the payload first if it is age-encrypted (--encrypt). */
+    char dec_path[PATH_MAX];
+    const char* tar_input = tar_path;
+    {
+        int dec = maybe_decrypt_oci_blob(tar_path, tmpdir,
+                                         dec_path, sizeof(dec_path));
+        if (dec < 0)
+        {
+            goto out;
+        }
+        if (dec == 1)
+        {
+            tar_input = dec_path;
+        }
+    }
+
     /* Extract OCI tar */
     char oci_dir[PATH_MAX];
     if (snprintf(oci_dir, sizeof(oci_dir), "%s/oci", tmpdir)
@@ -13711,7 +13891,7 @@ static int inspect_image_main(const char* self_path)
     {
         char* tar_argv[] =
         {
-            "tar", "xf", tar_path, "-C", oci_dir,
+            "tar", "xf", (char*)tar_input, "-C", oci_dir,
             "--no-same-permissions", "--no-same-owner", NULL
         };
         if (run_cmd(tar_argv) != 0)

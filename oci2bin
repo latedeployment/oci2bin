@@ -64,6 +64,11 @@
 #                         (default: oci2bin.loader; change to avoid naming conflicts)
 #   --label KEY=VAL       Add an image config label (repeatable); matchable by
 #                         'ps'/'list --filter label=KEY=VAL' and shown by inspect
+#   --encrypt             Encrypt the embedded OCI image with age (opaque at
+#                         rest); requires --recipient/--recipients-file
+#   --recipient AGE_PUB   age recipient (age1.../ssh-ed25519 ...), repeatable
+#   --recipients-file F   File of age recipients, one per line (repeatable)
+#                         Runtime: set OCI2BIN_IDENTITY to the age identity file
 #   --self-update-url URL Embed a signed update-manifest URL into the binary
 #   --pin-digest DIGEST|ALGO:auto
 #                         Embed a pinned canonical digest for runtime integrity checks
@@ -1173,12 +1178,12 @@ if [[ "${1:-}" == "run" ]]; then
     RUN_IMAGE=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest)
+            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest|--recipient|--recipients-file)
                 [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
                 BUILD_ARGS+=("$1" "$2")
                 shift 2
                 ;;
-            --cache|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash)
+            --cache|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash|--encrypt)
                 BUILD_ARGS+=("$1")
                 shift
                 ;;
@@ -1884,6 +1889,9 @@ LABEL_CHUNK_SIZE=""
 LOADER_DIR=""
 LABEL_PREFIX=""
 USER_LABELS=()
+ENCRYPT=0
+ENCRYPT_RECIPIENTS=()
+ENCRYPT_RECIPIENTS_FILES=()
 SELF_UPDATE_URL=""
 PIN_DIGEST=""
 VERIFY_COSIGN=0
@@ -2011,6 +2019,22 @@ while [[ $# -gt 0 ]]; do
                 *) echo "oci2bin: --label must be KEY=VAL, got '$2'" >&2; exit 1 ;;
             esac
             USER_LABELS+=("$2")
+            shift 2
+            ;;
+        --encrypt)
+            ENCRYPT=1
+            shift
+            ;;
+        --recipient)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --recipient requires an age recipient" >&2; exit 1; }
+            ENCRYPT=1
+            ENCRYPT_RECIPIENTS+=("$2")
+            shift 2
+            ;;
+        --recipients-file)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --recipients-file requires a PATH" >&2; exit 1; }
+            ENCRYPT=1
+            ENCRYPT_RECIPIENTS_FILES+=("$2")
             shift 2
             ;;
         --self-update-url)
@@ -2450,6 +2474,9 @@ EMBED_LOADER_ARG=()
 [[ "$REPRODUCIBLE_BUILD" -eq 1 ]] && EMBED_LOADER_ARG+=(--reproducible)
 [[ "$OFFLINE_ONLY"        -eq 1 ]] && EMBED_LOADER_ARG+=(--offline-only)
 for _lbl in "${USER_LABELS[@]}"; do EMBED_LOADER_ARG+=(--label "$_lbl"); done
+[[ "$ENCRYPT" -eq 1 ]] && EMBED_LOADER_ARG+=(--encrypt)
+for _r in "${ENCRYPT_RECIPIENTS[@]}"; do EMBED_LOADER_ARG+=(--recipient "$_r"); done
+for _rf in "${ENCRYPT_RECIPIENTS_FILES[@]}"; do EMBED_LOADER_ARG+=(--recipients-file "$_rf"); done
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \

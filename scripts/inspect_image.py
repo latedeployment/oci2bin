@@ -33,6 +33,18 @@ META_MAGIC = b'OCI2BIN_META\x00'
 SIG_MAGIC   = b'OCI2BIN_SIG\x00'
 SIG_TRAILER = b'OCI2BIN_SIG_END\x00'
 
+# age ciphertext header (Feature: --encrypt). An encrypted payload is opaque,
+# so inspect reports it as such instead of trying to parse it as a tar.
+AGE_MAGIC_BINARY = b'age-encryption.org/v1'
+AGE_MAGIC_ARMOR  = b'-----BEGIN AGE ENCRYPTED FILE-----'
+
+
+def oci_is_encrypted(oci_bytes):
+    """True if the embedded OCI payload is an age-encrypted blob."""
+    return bool(oci_bytes) and (
+        oci_bytes.startswith(AGE_MAGIC_BINARY)
+        or oci_bytes.startswith(AGE_MAGIC_ARMOR))
+
 
 def has_signature(binary_path):
     """Return True if the binary has an embedded OCI2BIN_SIG block."""
@@ -266,6 +278,7 @@ def build_inspect_root(binary_path):
         'Config': cfg,
         'Signature': 'present' if has_signature(binary_path) else 'absent',
         'SBOM': 'embedded' if has_sbom(binary_path) else 'absent',
+        'Encrypted': oci_is_encrypted(oci_bytes),
         'Size': file_size,
         'ExtractedSize': estimated_extracted_size(oci_bytes),
         'Meta': meta,
@@ -412,10 +425,30 @@ def main():
         meta['extracted_size_bytes'] = estimated_extracted_size(oci_bytes)
         meta['signature_present'] = has_signature(binary_path)
         meta['sbom_present'] = has_sbom(binary_path)
+        meta['encrypted'] = oci_is_encrypted(oci_bytes)
         print(json.dumps(meta))
         return
 
     oci_bytes = read_oci_data(binary_path)
+
+    if oci_is_encrypted(oci_bytes):
+        # The payload is opaque at rest; config/layers are not readable
+        # without the recipient's identity. Show what we still can.
+        meta = read_meta_block(binary_path) or {}
+        print(f"Image:        {meta.get('image', '(encrypted)')}")
+        print("Payload:      encrypted (age) — config/layers not readable "
+              "without the matching identity")
+        print(f"Signature:    "
+              f"{'present' if has_signature(binary_path) else 'absent'}")
+        if meta:
+            print()
+            print("Build metadata:")
+            for label, key in (("Image", "image"), ("Digest", "digest"),
+                               ("Built", "timestamp"), ("oci2bin", "version")):
+                if key in meta:
+                    print(f"  {label + ':':10} {meta[key]}")
+        return
+
     repo_tags, layers, config = parse_config(oci_bytes)
 
     cfg = config.get('config', config)  # docker save puts it under 'config' key

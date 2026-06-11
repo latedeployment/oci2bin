@@ -2486,6 +2486,60 @@ static void test_copy_n_bytes(void)
     unlink(dst_path);
 }
 
+/* ── test_blob_is_age_encrypted ───────────────────────────────────────────── */
+
+static void write_tmp(char* path_tmpl, const void* data, size_t len)
+{
+    int fd = mkstemp(path_tmpl);
+    if (fd >= 0)
+    {
+        write_all_fd(fd, data, len);
+        close(fd);
+    }
+}
+
+static void test_blob_is_age_encrypted(void)
+{
+    /* binary age magic */
+    char p1[] = "/tmp/oci2bin-age1-XXXXXX";
+    const char* bin = "age-encryption.org/v1\n-> X25519 ...";
+    write_tmp(p1, bin, strlen(bin));
+    ASSERT_INT_EQ(blob_is_age_encrypted(p1), 1,
+                  "blob_is_age_encrypted: detects binary age header");
+    unlink(p1);
+
+    /* armored age magic */
+    char p2[] = "/tmp/oci2bin-age2-XXXXXX";
+    const char* arm = "-----BEGIN AGE ENCRYPTED FILE-----\nYWdl\n";
+    write_tmp(p2, arm, strlen(arm));
+    ASSERT_INT_EQ(blob_is_age_encrypted(p2), 1,
+                  "blob_is_age_encrypted: detects armored age header");
+    unlink(p2);
+
+    /* a plain tar (ustar magic at offset 257) is NOT age */
+    char p3[] = "/tmp/oci2bin-age3-XXXXXX";
+    char tarhdr[512];
+    memset(tarhdr, 0, sizeof(tarhdr));
+    memcpy(tarhdr, "manifest.json", 13);
+    memcpy(tarhdr + 257, "ustar", 5);
+    write_tmp(p3, tarhdr, sizeof(tarhdr));
+    ASSERT_INT_EQ(blob_is_age_encrypted(p3), 0,
+                  "blob_is_age_encrypted: plain tar is not age");
+    unlink(p3);
+
+    /* short file that only partially matches the magic is NOT age */
+    char p4[] = "/tmp/oci2bin-age4-XXXXXX";
+    const char* shortish = "age-enc";
+    write_tmp(p4, shortish, strlen(shortish));
+    ASSERT_INT_EQ(blob_is_age_encrypted(p4), 0,
+                  "blob_is_age_encrypted: partial magic is not age");
+    unlink(p4);
+
+    /* nonexistent path returns -1 */
+    ASSERT_INT_EQ(blob_is_age_encrypted("/nonexistent/oci2bin/age/x"), -1,
+                  "blob_is_age_encrypted: missing file returns -1");
+}
+
 /* ── test_lookup_passwd_group ─────────────────────────────────────────────── */
 
 static void test_lookup_passwd_group(void)
@@ -4832,6 +4886,7 @@ int main(void)
     test_read_write_all_fd();
     test_read_write_file();
     test_copy_n_bytes();
+    test_blob_is_age_encrypted();
     test_lookup_passwd_group();
     test_openat_beneath();
     test_misc_helpers();

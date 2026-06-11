@@ -983,6 +983,41 @@ def apply_user_labels(oci_data, labels):
     return new_oci
 
 
+def age_encrypt(plaintext, recipients, recipients_files):
+    """Encrypt `plaintext` to the given age recipients via the `age` CLI.
+
+    `recipients` is a list of age recipient strings (age1.../ssh-ed25519 ...);
+    `recipients_files` is a list of files holding one recipient per line.
+    Returns the ciphertext bytes (age binary format). Exits on error.
+
+    The result replaces the embedded OCI payload, so the binary becomes
+    opaque at rest: `docker load`, `inspect`, `reconstruct`, and label
+    filtering can no longer read it without the matching identity at runtime.
+    """
+    if not recipients and not recipients_files:
+        print('--encrypt requires at least one --recipient or '
+              '--recipients-file', file=sys.stderr)
+        sys.exit(1)
+    argv = ['age', '--encrypt']
+    for r in recipients:
+        argv += ['-r', r]
+    for f in recipients_files:
+        argv += ['-R', f]
+    argv += ['-o', '-']
+    try:
+        proc = subprocess.run(argv, input=plaintext,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        print("error: 'age' not found; install it to use --encrypt "
+              "(https://age-encryption.org)", file=sys.stderr)
+        sys.exit(1)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr.decode('utf-8', 'replace'))
+        print('error: age encryption failed', file=sys.stderr)
+        sys.exit(1)
+    return proc.stdout
+
+
 def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    digest=None, image_name_for_meta=None,
                    kernel_path=None, initramfs_path=None,
@@ -992,7 +1027,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    label_prefix=DEFAULT_LABEL_PREFIX,
                    self_update_url=None, pin_digest=None,
                    use_layer_cache=True, reproducible=False,
-                   offline_only=False, user_labels=None):
+                   offline_only=False, user_labels=None,
+                   encrypt_recipients=None, encrypt_recipients_files=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -1062,6 +1098,19 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     # makes two builds of the same input produce byte-identical output.
     if reproducible:
         oci_data = repack_oci_tar_reproducible(oci_data)
+
+    # 2c. Encrypt the OCI payload with age (must be the LAST transform: the
+    # ciphertext is no longer a tar). The loader detects the age header at
+    # runtime and decrypts with the recipient's identity before extraction.
+    if encrypt_recipients or encrypt_recipients_files:
+        if reproducible:
+            print('  note: --encrypt makes the output non-reproducible '
+                  '(age uses a fresh ephemeral key per build)',
+                  file=sys.stderr)
+        oci_data = age_encrypt(oci_data, encrypt_recipients or [],
+                               encrypt_recipients_files or [])
+        print(f'  Encrypted embedded image with age '
+              f'({len(oci_data)} bytes ciphertext)', file=sys.stderr)
 
     oci_size = len(oci_data)
 
@@ -1332,6 +1381,20 @@ def main():
                         help='Add an image config label (repeatable). Visible '
                              'to `oci2bin inspect` and matchable by '
                              '`ps`/`list --filter label=KEY=VAL`.')
+    parser.add_argument('--encrypt', action='store_true', default=False,
+                        help='Encrypt the embedded OCI image with age. '
+                             'Requires at least one --recipient or '
+                             '--recipients-file. The binary becomes opaque at '
+                             'rest; decryption needs the matching identity at '
+                             'run time (OCI2BIN_IDENTITY).')
+    parser.add_argument('--recipient', action='append', default=None,
+                        dest='recipients', metavar='AGE_RECIPIENT',
+                        help='age recipient (age1... or ssh-ed25519 ...), '
+                             'repeatable. Implies --encrypt.')
+    parser.add_argument('--recipients-file', action='append', default=None,
+                        dest='recipients_files', metavar='FILE',
+                        help='File of age recipients (one per line), '
+                             'repeatable. Implies --encrypt.')
     parser.add_argument('--reproducible', action='store_true', default=False,
                         help='Produce a byte-identical output across runs of '
                              'the same input: re-emit the OCI tar with sorted '
@@ -1405,6 +1468,11 @@ def main():
             sys.exit(1)
         user_labels[key] = val
 
+    if args.encrypt and not (args.recipients or args.recipients_files):
+        print('--encrypt requires at least one --recipient or '
+              '--recipients-file', file=sys.stderr)
+        sys.exit(1)
+
     image_name_for_meta = args.image_name if args.image_name else (args.image or 'unknown')
     build_polyglot(args.loader, args.image or '', args.output,
                    tar_path=args.tar,
@@ -1422,7 +1490,9 @@ def main():
                    use_layer_cache=not args.no_cache,
                    reproducible=args.reproducible or args.offline_only,
                    offline_only=args.offline_only,
-                   user_labels=user_labels)
+                   user_labels=user_labels,
+                   encrypt_recipients=args.recipients,
+                   encrypt_recipients_files=args.recipients_files)
 
 
 if __name__ == '__main__':

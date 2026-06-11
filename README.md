@@ -349,6 +349,51 @@ oci2bin --require-cosign --cosign-key /etc/keys/trusted.pub redis:7-alpine
 
 Requires the `cosign` binary to be installed. With `--require-cosign`, the build aborts if `cosign` is not found.
 
+### Encrypting the embedded image (--encrypt)
+
+By default the embedded OCI image is stored in the clear — anyone with the
+binary can `tar xf ./app` and read every layer. `--encrypt` seals the embedded
+image with [age](https://age-encryption.org) so the binary is **opaque at
+rest**: it can still be copied anywhere, but the payload can only be read by a
+holder of a matching identity.
+
+Encrypt to one or more recipients at build time:
+
+```bash
+# age recipients (X25519) or SSH public keys both work
+oci2bin --encrypt --recipient age1ql3z7hjy54pw3hyww5ay9z…  redis:7-alpine myredis
+oci2bin --encrypt --recipient "$(cat alice.pub)" --recipient "$(cat bob.pub)" \
+        redis:7-alpine myredis
+oci2bin --encrypt --recipients-file team.recipients  redis:7-alpine myredis
+```
+
+At run time the loader detects the age header and decrypts the payload to the
+runtime tmpdir (ideally a tmpfs) before extraction. It looks for the identity
+in this order:
+
+1. `$OCI2BIN_IDENTITY` — path to an age identity file (or SSH private key)
+2. `~/.config/oci2bin/identity`
+3. `~/.ssh/id_ed25519`, then `~/.ssh/id_rsa`
+
+```bash
+OCI2BIN_IDENTITY=~/keys/alice.key ./myredis
+```
+
+Notes and limitations:
+
+- Requires the `age` binary at **both** build time (to encrypt) and run time
+  (to decrypt). With no readable identity, an encrypted binary refuses to run
+  with a clear message.
+- An encrypted binary is opaque to `docker load`, `oci2bin reconstruct`,
+  `sbom`, and `ps`/`list --filter label=…` (the labels live inside the
+  encrypted payload). `oci2bin inspect` reports `Payload: encrypted (age)` and
+  still shows the unencrypted `OCI2BIN_META` build metadata.
+- `--encrypt` makes the output **non-reproducible** (age uses a fresh ephemeral
+  key per build), so it does not combine with `--reproducible`.
+- This protects the image **at rest**. Once decrypted to run, the rootfs is on
+  the host like any other container; pair with `--vm` for stronger runtime
+  isolation.
+
 ### Using OCI image layout (no Docker daemon)
 
 Use `--oci-dir DIR` to build from an OCI image layout directory instead of pulling via Docker. This works with `skopeo`, `crane`, `buildah`, or any tool that produces OCI layout output:
