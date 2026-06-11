@@ -221,4 +221,8 @@ not a single global percentage.
 | 6 | symlink-rejection fs helpers | **done** (open_path_nofollow 84.8%, mkdir_p_secure 74.2%, ensure_bind_mount_target 66.7%) | 32.71% |
 | 7 | tar_layer_prescan + safe_extract_layer | **done** (prescan 85.7%, extract 75%) | 34.39% |
 | 8 | safe_merge_walk top-up | **done** (47%->59.4% fn; rest = fault-injection/unreachable) | 34.63% |
-| 9 | mkdir*_in_root top-up | todo | — |
+| 9 | mkdir*_in_root top-up | **done** (mkdirat 82.8%, mkdir_p 80.0%) | 34.75% |
+
+**All items complete.** loader.c unit-test coverage: 25.6% → **34.75%** (+9.2 pts);
+C unit assertions 849 → 1009. Remaining headroom is the privileged runtime
+layer (Not-in-scope) plus fault-injection-only error branches.

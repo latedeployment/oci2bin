@@ -4713,6 +4713,89 @@ static void test_tar_layer_prescan_and_extract(void)
     rm_rf_dir(tdir);
 }
 
+/* ── test_mkdir_in_root ───────────────────────────────────────────────────── */
+
+static void test_mkdir_in_root(void)
+{
+    char tmpl[] = "/tmp/oci2bin-mir-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "mkdir_in_root: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+    int rfd = open(tdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT(rfd >= 0, "mkdir_in_root: rootfs fd opened");
+    if (rfd < 0)
+    {
+        rm_rf_dir(tdir);
+        return;
+    }
+    struct stat st;
+    char p[320];
+
+    /* mkdirat_in_root: NULL/empty → EINVAL/-1. */
+    ASSERT_INT_EQ(mkdirat_in_root(rfd, NULL, 0755), -1,
+                  "mkdirat_in_root: NULL -> -1");
+    ASSERT_INT_EQ(mkdirat_in_root(rfd, "", 0755), -1,
+                  "mkdirat_in_root: empty -> -1");
+
+    /* "./" resolves to root → 0, no dir made. */
+    ASSERT_INT_EQ(mkdirat_in_root(rfd, "./", 0755), 0,
+                  "mkdirat_in_root: ./ -> 0");
+
+    /* top-level dir created, then idempotent (EEXIST). */
+    ASSERT_INT_EQ(mkdirat_in_root(rfd, "top", 0755), 0,
+                  "mkdirat_in_root: top-level created");
+    snprintf(p, sizeof(p), "%s/top", tdir);
+    ASSERT(lstat(p, &st) == 0 && S_ISDIR(st.st_mode),
+           "mkdirat_in_root: top dir exists");
+    ASSERT_INT_EQ(mkdirat_in_root(rfd, "top", 0755), 0,
+                  "mkdirat_in_root: EEXIST tolerated");
+
+    /* leading "./" stripped then created. */
+    ASSERT_INT_EQ(mkdirat_in_root(rfd, "./dotdir", 0755), 0,
+                  "mkdirat_in_root: ./ prefix stripped");
+    snprintf(p, sizeof(p), "%s/dotdir", tdir);
+    ASSERT(lstat(p, &st) == 0 && S_ISDIR(st.st_mode),
+           "mkdirat_in_root: dotdir created");
+
+    /* nested under an existing parent. */
+    ASSERT_INT_EQ(mkdirat_in_root(rfd, "top/sub", 0755), 0,
+                  "mkdirat_in_root: nested under existing parent");
+    snprintf(p, sizeof(p), "%s/top/sub", tdir);
+    ASSERT(lstat(p, &st) == 0 && S_ISDIR(st.st_mode),
+           "mkdirat_in_root: nested dir exists");
+
+    /* nested with a missing parent → openat2 parent fails → -1. */
+    ASSERT_INT_EQ(mkdirat_in_root(rfd, "missing/child", 0755), -1,
+                  "mkdirat_in_root: missing parent -> -1");
+
+    /* mkdir_p_in_root: NULL/empty → 0. */
+    ASSERT_INT_EQ(mkdir_p_in_root(rfd, NULL), 0,
+                  "mkdir_p_in_root: NULL -> 0");
+    ASSERT_INT_EQ(mkdir_p_in_root(rfd, ""), 0, "mkdir_p_in_root: empty -> 0");
+
+    /* whole chain created, then idempotent. */
+    ASSERT_INT_EQ(mkdir_p_in_root(rfd, "x/y/z"), 0,
+                  "mkdir_p_in_root: deep chain created");
+    snprintf(p, sizeof(p), "%s/x/y/z", tdir);
+    ASSERT(lstat(p, &st) == 0 && S_ISDIR(st.st_mode),
+           "mkdir_p_in_root: deep leaf exists");
+    ASSERT_INT_EQ(mkdir_p_in_root(rfd, "x/y/z"), 0,
+                  "mkdir_p_in_root: idempotent");
+
+    /* leading "./" chain. */
+    ASSERT_INT_EQ(mkdir_p_in_root(rfd, "./q/r"), 0,
+                  "mkdir_p_in_root: ./ prefix chain");
+    snprintf(p, sizeof(p), "%s/q/r", tdir);
+    ASSERT(lstat(p, &st) == 0 && S_ISDIR(st.st_mode),
+           "mkdir_p_in_root: ./ chain created");
+
+    close(rfd);
+    rm_rf_dir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -4779,6 +4862,7 @@ int main(void)
     test_mkdir_p_secure();
     test_ensure_bind_mount_target();
     test_tar_layer_prescan_and_extract();
+    test_mkdir_in_root();
 
     printf("1..%d\n", tap_test_num);
 
