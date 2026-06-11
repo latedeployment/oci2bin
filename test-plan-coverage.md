@@ -220,5 +220,5 @@ not a single global percentage.
 | 5 | plan_userns_map | **done** (70.4% fn; rest = host caps/subid paths) | 31.42% |
 | 6 | symlink-rejection fs helpers | **done** (open_path_nofollow 84.8%, mkdir_p_secure 74.2%, ensure_bind_mount_target 66.7%) | 32.71% |
 | 7 | tar_layer_prescan + safe_extract_layer | **done** (prescan 85.7%, extract 75%) | 34.39% |
-| 8 | safe_merge_walk top-up | todo | — |
+| 8 | safe_merge_walk top-up | **done** (47%->59.4% fn; rest = fault-injection/unreachable) | 34.63% |
 | 9 | mkdir*_in_root top-up | todo | — |

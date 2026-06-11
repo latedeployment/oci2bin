@@ -2906,6 +2906,119 @@ static void test_safe_merge_layer_blocks_escape(void)
     rmdir(tdir);
 }
 
+/* ── test_safe_merge_walk_contents ────────────────────────────────────────── */
+/* Complements the escape test by exercising the non-symlink branches:
+ * regular-file copy, nested-directory recursion, and special-file skip. */
+
+static void test_safe_merge_walk_contents(void)
+{
+    char tmpl[] = "/tmp/oci2bin-mwalk-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "safe_merge_walk: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    char rootfs[256], stage[256];
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs", tdir);
+    snprintf(stage, sizeof(stage), "%s/stage", tdir);
+    mkdir(rootfs, 0755);
+    mkdir(stage, 0755);
+
+    /* A regular file with content. */
+    char f1[320];
+    snprintf(f1, sizeof(f1), "%s/top.txt", stage);
+    FILE* a = fopen(f1, "w");
+    if (a)
+    {
+        fputs("hello", a);
+        fclose(a);
+    }
+
+    /* Nested dirs a/b with a file (exercises dir recursion + mkdir_p). */
+    char d1[320];
+    snprintf(d1, sizeof(d1), "%s/a", stage);
+    mkdir(d1, 0755);
+    char d2[340];
+    snprintf(d2, sizeof(d2), "%s/a/b", stage);
+    mkdir(d2, 0755);
+    char f2[360];
+    snprintf(f2, sizeof(f2), "%s/a/b/deep.txt", stage);
+    FILE* b = fopen(f2, "w");
+    if (b)
+    {
+        fputs("deep", b);
+        fclose(b);
+    }
+
+    /* A nested symlink to exercise the symlink branch that has a parent
+     * directory (mkdir_p_in_root + openat2_in_root parent + symlinkat). */
+    char sld[320];
+    snprintf(sld, sizeof(sld), "%s/sub", stage);
+    mkdir(sld, 0755);
+    char sl[340];
+    snprintf(sl, sizeof(sl), "%s/sub/link", stage);
+    symlink("target", sl);
+
+    /* A special file (FIFO) that must be skipped, not copied. */
+    char fifo[320];
+    snprintf(fifo, sizeof(fifo), "%s/pipe", stage);
+    int have_fifo = (mkfifo(fifo, 0644) == 0);
+
+    int rfd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT(rfd >= 0, "safe_merge_walk: rootfs fd opened");
+    int rc = safe_merge_layer(rfd, stage);
+    ASSERT_INT_EQ(rc, 0, "safe_merge_walk: merge returns 0");
+    close(rfd);
+
+    struct stat st;
+
+    /* Regular file copied with content intact. */
+    char r1[320];
+    snprintf(r1, sizeof(r1), "%s/top.txt", rootfs);
+    ASSERT(lstat(r1, &st) == 0 && S_ISREG(st.st_mode),
+           "safe_merge_walk: regular file copied");
+    char buf[16];
+    int rf = open(r1, O_RDONLY);
+    ssize_t n = (rf >= 0) ? read(rf, buf, sizeof(buf) - 1) : -1;
+    if (rf >= 0)
+    {
+        close(rf);
+    }
+    if (n > 0)
+    {
+        buf[n] = '\0';
+        ASSERT_STR_EQ(buf, "hello", "safe_merge_walk: file content preserved");
+    }
+
+    /* Nested directory + file recursed into the rootfs. */
+    char r2[340];
+    snprintf(r2, sizeof(r2), "%s/a/b/deep.txt", rootfs);
+    ASSERT(lstat(r2, &st) == 0 && S_ISREG(st.st_mode),
+           "safe_merge_walk: nested file recursed");
+
+    /* Nested symlink recreated in the rootfs as a symlink. */
+    char r3[340];
+    snprintf(r3, sizeof(r3), "%s/sub/link", rootfs);
+    ASSERT(lstat(r3, &st) == 0 && S_ISLNK(st.st_mode),
+           "safe_merge_walk: nested symlink recreated");
+
+    /* FIFO skipped: must not appear in the rootfs. */
+    if (have_fifo)
+    {
+        char rp[320];
+        snprintf(rp, sizeof(rp), "%s/pipe", rootfs);
+        ASSERT(lstat(rp, &st) != 0, "safe_merge_walk: special file skipped");
+    }
+    else
+    {
+        ASSERT(1, "safe_merge_walk: fifo creation unavailable (skipped)");
+    }
+
+    rm_rf_dir(tdir);
+}
+
 static void test_is_resolver_token_safe(void)
 {
     ASSERT_INT_EQ(is_resolver_token_safe(NULL, 100),  0,
@@ -4643,6 +4756,7 @@ int main(void)
     test_kernel_feature_state();
     test_tar_entry_name_unsafe();
     test_safe_merge_layer_blocks_escape();
+    test_safe_merge_walk_contents();
     test_is_resolver_token_safe();
     test_parse_opts_resolver_injection();
     test_parse_opts_strict();
