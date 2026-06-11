@@ -964,6 +964,25 @@ def embed_loader_as_labels(oci_data, loader_bytes, arch,
     return new_oci
 
 
+def apply_user_labels(oci_data, labels):
+    """Merge user-supplied KEY=VAL labels into the image config's Labels map.
+
+    `labels` is a dict of {key: value}. Returns updated OCI tar bytes. These
+    labels are visible to `oci2bin inspect` (.Config.Labels) and are what the
+    `ps`/`list --filter label=...` selectors match against, so they are the
+    intended home for fleet-management metadata. Existing keys are overwritten.
+    """
+    if not labels:
+        return oci_data
+    manifest, old_config_path, config, _ = _parse_oci_manifest_and_config(
+        oci_data)
+    config.setdefault('config', {}).setdefault('Labels', {}).update(labels)
+    new_oci, _ = _rebuild_oci_with_new_config(
+        oci_data, manifest, old_config_path, config)
+    print(f'  Applied {len(labels)} image label(s)', file=sys.stderr)
+    return new_oci
+
+
 def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    digest=None, image_name_for_meta=None,
                    kernel_path=None, initramfs_path=None,
@@ -973,7 +992,7 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    label_prefix=DEFAULT_LABEL_PREFIX,
                    self_update_url=None, pin_digest=None,
                    use_layer_cache=True, reproducible=False,
-                   offline_only=False):
+                   offline_only=False, user_labels=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -1032,6 +1051,10 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                                           arch_name,
                                           chunk_bytes=label_chunk_bytes,
                                           label_prefix=label_prefix)
+
+    # 2b. Merge user-supplied --label KEY=VAL pairs into the image config.
+    if user_labels:
+        oci_data = apply_user_labels(oci_data, user_labels)
 
     # --reproducible: re-emit the OCI tar with sorted members, mtime=0,
     # zeroed uid/gid/uname/gname, and gzip mtime=0 in each layer header.
@@ -1304,6 +1327,11 @@ def main():
                         metavar='PREFIX',
                         help=f'Label key prefix for all oci2bin.loader.* labels '
                              f'(default: {DEFAULT_LABEL_PREFIX!r})')
+    parser.add_argument('--label', action='append', default=None,
+                        metavar='KEY=VAL', dest='labels',
+                        help='Add an image config label (repeatable). Visible '
+                             'to `oci2bin inspect` and matchable by '
+                             '`ps`/`list --filter label=KEY=VAL`.')
     parser.add_argument('--reproducible', action='store_true', default=False,
                         help='Produce a byte-identical output across runs of '
                              'the same input: re-emit the OCI tar with sorted '
@@ -1365,6 +1393,18 @@ def main():
             print(exc, file=sys.stderr)
             sys.exit(1)
 
+    user_labels = {}
+    for item in (args.labels or []):
+        if '=' not in item:
+            print(f"--label must be KEY=VAL, got {item!r}", file=sys.stderr)
+            sys.exit(1)
+        key, val = item.split('=', 1)
+        key = key.strip()
+        if not key:
+            print(f"--label key must not be empty: {item!r}", file=sys.stderr)
+            sys.exit(1)
+        user_labels[key] = val
+
     image_name_for_meta = args.image_name if args.image_name else (args.image or 'unknown')
     build_polyglot(args.loader, args.image or '', args.output,
                    tar_path=args.tar,
@@ -1381,7 +1421,8 @@ def main():
                    pin_digest=args.pin_digest,
                    use_layer_cache=not args.no_cache,
                    reproducible=args.reproducible or args.offline_only,
-                   offline_only=args.offline_only)
+                   offline_only=args.offline_only,
+                   user_labels=user_labels)
 
 
 if __name__ == '__main__':

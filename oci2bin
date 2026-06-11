@@ -62,6 +62,8 @@
 #                         (default: .oci2bin; applies to --embed-loader-layer)
 #   --label-prefix PREFIX Label key prefix for all embed metadata labels
 #                         (default: oci2bin.loader; change to avoid naming conflicts)
+#   --label KEY=VAL       Add an image config label (repeatable); matchable by
+#                         'ps'/'list --filter label=KEY=VAL' and shown by inspect
 #   --self-update-url URL Embed a signed update-manifest URL into the binary
 #   --pin-digest DIGEST|ALGO:auto
 #                         Embed a pinned canonical digest for runtime integrity checks
@@ -415,9 +417,17 @@ if [[ "${1:-}" == "list" ]]; then
     shift
     CACHE_ROOT="$HOME/.cache/oci2bin"
     LIST_JSON=0
+    LIST_FILTERS=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --json) LIST_JSON=1; shift ;;
+            --filter)
+                [[ $# -lt 2 ]] && { echo "oci2bin list: --filter requires label=KEY[=VAL]" >&2; exit 1; }
+                case "$2" in
+                    label=*) LIST_FILTERS+=("$2") ;;
+                    *) echo "oci2bin list: only 'label=' filters are supported, got '$2'" >&2; exit 1 ;;
+                esac
+                shift 2 ;;
             *) echo "oci2bin list: unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -425,12 +435,13 @@ if [[ "${1:-}" == "list" ]]; then
         echo "oci2bin: no cache found at $CACHE_ROOT" >&2
         exit 0
     fi
-    python3 - "$CACHE_ROOT" "$LIST_JSON" "$OCI2BIN_HOME" <<'PYEOF'
+    python3 - "$CACHE_ROOT" "$LIST_JSON" "$OCI2BIN_HOME" "${LIST_FILTERS[@]}" <<'PYEOF'
 import json, os, sys
 
 cache_root = sys.argv[1]
 want_json  = sys.argv[2] == "1"
 home       = sys.argv[3]
+filters    = sys.argv[4:]
 inspect    = os.path.join(home, "scripts", "inspect_image.py")
 
 import importlib.util, types
@@ -440,6 +451,32 @@ spec = importlib.util.spec_from_file_location("inspect_image", inspect)
 mod  = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
+
+def parse_label_filters(items):
+    """Each item is 'label=KEY' or 'label=KEY=VAL'. Returns a list of
+    (key, value-or-None) pairs; value None means 'key present, any value'."""
+    out = []
+    for it in items:
+        spec = it[len("label="):]
+        if "=" in spec:
+            k, v = spec.split("=", 1)
+            out.append((k, v))
+        else:
+            out.append((spec, None))
+    return out
+
+
+def matches(labels, label_filters):
+    for k, v in label_filters:
+        if k not in labels:
+            return False
+        if v is not None and labels[k] != v:
+            return False
+    return True
+
+
+label_filters = parse_label_filters(filters)
+
 entries = []
 for name in sorted(os.listdir(cache_root)):
     out = os.path.join(cache_root, name, "output")
@@ -448,13 +485,17 @@ for name in sorted(os.listdir(cache_root)):
     file_size = os.path.getsize(out)
     mtime = os.path.getmtime(out)
     meta = mod.read_meta_block(out) or {}
-    if "image" not in meta:
+    labels = {}
+    if "image" not in meta or label_filters:
         try:
             oci = mod.read_oci_data(out)
-            tags, _, _ = mod.parse_config(oci)
-            meta["image"] = tags[0] if tags else "unknown"
+            tags, _, config = mod.parse_config(oci)
+            meta.setdefault("image", tags[0] if tags else "unknown")
+            labels = (config.get("config", config) or {}).get("Labels") or {}
         except SystemExit:
-            meta["image"] = "unknown"
+            meta.setdefault("image", "unknown")
+    if label_filters and not matches(labels, label_filters):
+        continue
     meta["size"]  = file_size
     meta["mtime"] = mtime
     meta["cache_dir"] = name
@@ -830,13 +871,68 @@ fi
 
 if [[ "${1:-}" == "ps" ]]; then
     shift
+    PS_FILTERS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --filter)
+                [[ $# -lt 2 ]] && { echo "oci2bin ps: --filter requires label=KEY[=VAL]" >&2; exit 1; }
+                case "$2" in
+                    label=*) PS_FILTERS+=("$2") ;;
+                    *) echo "oci2bin ps: only 'label=' filters are supported, got '$2'" >&2; exit 1 ;;
+                esac
+                shift 2 ;;
+            *) echo "oci2bin ps: unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
     CTR_DIR="$(container_state_dir_or_die)"
-    python3 - "$CTR_DIR" <<'PYEOF'
+    python3 - "$CTR_DIR" "$OCI2BIN_HOME" "${PS_FILTERS[@]}" <<'PYEOF'
 import json, os, sys
 ctr_dir = sys.argv[1]
+home    = sys.argv[2]
+filters = sys.argv[3:]
 if not os.path.isdir(ctr_dir):
     print("No containers", file=sys.stderr)
     sys.exit(0)
+
+# Only load inspect_image (and read each binary's embedded labels) when a
+# label filter is active — otherwise ps stays a cheap state-file scan.
+label_filters = []
+mod = None
+if filters:
+    import importlib.util
+    inspect = os.path.join(home, "scripts", "inspect_image.py")
+    spec = importlib.util.spec_from_file_location("inspect_image", inspect)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for it in filters:
+        s = it[len("label="):]
+        if "=" in s:
+            k, v = s.split("=", 1)
+            label_filters.append((k, v))
+        else:
+            label_filters.append((s, None))
+
+
+def binary_labels(binary_path):
+    if not mod or not binary_path or not os.path.isfile(binary_path):
+        return {}
+    try:
+        oci = mod.read_oci_data(binary_path)
+        _, _, config = mod.parse_config(oci)
+        return (config.get("config", config) or {}).get("Labels") or {}
+    except (SystemExit, OSError, ValueError):
+        return {}
+
+
+def matches(labels):
+    for k, v in label_filters:
+        if k not in labels:
+            return False
+        if v is not None and labels[k] != v:
+            return False
+    return True
+
+
 fmt = "%-20s %-8s %-8s %-30s %s"
 print(fmt % ("NAME", "PID", "STATUS", "BINARY", "STARTED"))
 print("-" * 76)
@@ -851,6 +947,8 @@ for name in sorted(os.listdir(ctr_dir)):
             d = json.load(f)
         pid = int(d.get('pid', 0))
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        continue
+    if label_filters and not matches(binary_labels(d.get('binary'))):
         continue
     try:
         os.kill(pid, 0)
@@ -1075,7 +1173,7 @@ if [[ "${1:-}" == "run" ]]; then
     RUN_IMAGE=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest)
+            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest)
                 [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
                 BUILD_ARGS+=("$1" "$2")
                 shift 2
@@ -1785,6 +1883,7 @@ EMBED_LOADER_LABELS=0
 LABEL_CHUNK_SIZE=""
 LOADER_DIR=""
 LABEL_PREFIX=""
+USER_LABELS=()
 SELF_UPDATE_URL=""
 PIN_DIGEST=""
 VERIFY_COSIGN=0
@@ -1903,6 +2002,15 @@ while [[ $# -gt 0 ]]; do
         --label-prefix)
             [[ $# -lt 2 ]] && { echo "oci2bin: --label-prefix requires a PREFIX argument" >&2; exit 1; }
             LABEL_PREFIX="$2"
+            shift 2
+            ;;
+        --label)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --label requires KEY=VAL" >&2; exit 1; }
+            case "$2" in
+                *=*) : ;;
+                *) echo "oci2bin: --label must be KEY=VAL, got '$2'" >&2; exit 1 ;;
+            esac
+            USER_LABELS+=("$2")
             shift 2
             ;;
         --self-update-url)
@@ -2341,6 +2449,7 @@ EMBED_LOADER_ARG=()
 [[ "$NO_LAYER_CACHE" -eq 1 ]] && EMBED_LOADER_ARG+=(--no-cache)
 [[ "$REPRODUCIBLE_BUILD" -eq 1 ]] && EMBED_LOADER_ARG+=(--reproducible)
 [[ "$OFFLINE_ONLY"        -eq 1 ]] && EMBED_LOADER_ARG+=(--offline-only)
+for _lbl in "${USER_LABELS[@]}"; do EMBED_LOADER_ARG+=(--label "$_lbl"); done
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \

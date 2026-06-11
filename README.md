@@ -310,6 +310,23 @@ oci2bin --squash --compress zstd ubuntu:22.04 ubuntu-squashed
 
 `--compress zstd` requires the `zstd` binary to be installed. Whiteout entries are processed correctly so the squashed layer faithfully represents the final filesystem state.
 
+### Image labels (for fleet management)
+
+`--label KEY=VAL` (repeatable) writes arbitrary labels into the binary's
+embedded image config. They show up in `oci2bin inspect` (and its
+`--format '{{.Config.Labels}}'`) and are what `oci2bin ps`/`oci2bin list`
+match against with `--filter label=...`, so they are the place to put
+metadata you want to slice your fleet by (team, tier, environment, owner):
+
+```bash
+oci2bin --label team=infra --label tier=cache redis:7-alpine myredis
+oci2bin list --filter label=team=infra
+oci2bin ps   --filter label=team=infra --filter label=tier=cache
+```
+
+Existing keys are overwritten. Labels are plain image-config metadata — they
+are not secret and are visible to anyone who can run `inspect` on the binary.
+
 ### Verifying image signatures (cosign)
 
 `--verify-cosign` checks the OCI image's Sigstore/cosign signature before packaging:
@@ -1808,6 +1825,16 @@ nginx:alpine                     deadbeef1234     8.1 MB  2026-03-10T11:00:00Z
 alpine:latest                    cafebabe9876     3.2 MB  2026-03-09T08:30:00Z
 ```
 
+Filter by image label with `--filter label=KEY=VAL` (exact match) or
+`--filter label=KEY` (key present, any value). Repeat `--filter` to require
+all of them. Labels come from the binary's embedded image config — see
+[`--label`](#image-labels-for-fleet-management) for setting them at build time:
+
+```bash
+oci2bin list --filter label=team=infra
+oci2bin list --filter label=team=infra --filter label=tier=cache
+```
+
 ### prune
 
 Remove outdated cache entries, keeping only the most recently built binary for each image name:
@@ -2059,6 +2086,14 @@ oci2bin ps
 NAME                 PID      STATUS   BINARY                         STARTED
 myredis              12345    running  redis_7-alpine                 2026-03-21T10:00:00
 myweb                12346    stopped  nginx_alpine                   2026-03-21T09:00:00
+```
+
+Filter by image label with `--filter label=KEY=VAL` (exact match) or
+`--filter label=KEY` (key present); repeat to require all. Labels are read
+from each container's binary, so a label filter makes `ps` read those binaries:
+
+```bash
+oci2bin ps --filter label=team=infra --filter label=tier=cache
 ```
 
 ### stop
