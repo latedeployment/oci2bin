@@ -219,6 +219,6 @@ not a single global percentage.
 | 4 | resolve_user + passwd lookup | **done** (resolve_user 90.9%, lookup_name 88.6%, in_rootfs 81.1%) | 30.74% |
 | 5 | plan_userns_map | **done** (70.4% fn; rest = host caps/subid paths) | 31.42% |
 | 6 | symlink-rejection fs helpers | **done** (open_path_nofollow 84.8%, mkdir_p_secure 74.2%, ensure_bind_mount_target 66.7%) | 32.71% |
-| 7 | tar_layer_prescan + safe_extract_layer | todo | — |
+| 7 | tar_layer_prescan + safe_extract_layer | **done** (prescan 85.7%, extract 75%) | 34.39% |
 | 8 | safe_merge_walk top-up | todo | — |
 | 9 | mkdir*_in_root top-up | todo | — |

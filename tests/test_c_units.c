@@ -4477,6 +4477,129 @@ static void test_ensure_bind_mount_target(void)
     rm_rf_dir(tdir);
 }
 
+/* Build a tar archive at `path` holding a single zero-length regular file
+ * whose stored name is `entry`. Used to exercise the prescan reject path
+ * with names (../, /abs) that GNU tar would sanitize away on create. */
+static int write_tar_one_entry(const char* path, const char* entry)
+{
+    unsigned char block[512];
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    memset(block, 0, sizeof(block));
+    snprintf((char*)block, 100, "%s", entry);          /* name[100]   */
+    memcpy(block + 100, "0000644", 8);                 /* mode        */
+    memcpy(block + 108, "0000000", 8);                 /* uid         */
+    memcpy(block + 116, "0000000", 8);                 /* gid         */
+    memcpy(block + 124, "00000000000", 11);            /* size = 0    */
+    memcpy(block + 136, "00000000000", 11);            /* mtime       */
+    memset(block + 148, ' ', 8);                       /* chksum=blank*/
+    block[156] = '0';                                  /* typeflag reg*/
+    memcpy(block + 257, "ustar", 6);                   /* magic       */
+    memcpy(block + 263, "00", 2);                      /* version     */
+    unsigned int sum = 0;
+    for (int i = 0; i < 512; i++)
+    {
+        sum += block[i];
+    }
+    char ck[8];
+    snprintf(ck, sizeof(ck), "%06o", sum);
+    memcpy(block + 148, ck, 6);
+    block[154] = '\0';
+    block[155] = ' ';
+    int ok = (write(fd, block, 512) == 512);
+    memset(block, 0, sizeof(block));                   /* two zero EOF blocks */
+    ok = ok && (write(fd, block, 512) == 512);
+    ok = ok && (write(fd, block, 512) == 512);
+    close(fd);
+    return ok ? 0 : -1;
+}
+
+/* ── test_tar_layer_prescan_and_extract ───────────────────────────────────── */
+
+static void test_tar_layer_prescan_and_extract(void)
+{
+    /* These exercise tar_layer_prescan / safe_extract_layer, which shell out
+     * to the system tar. Skip cleanly if tar is not installed. */
+    if (access("/usr/bin/tar", X_OK) != 0 && access("/bin/tar", X_OK) != 0)
+    {
+        ASSERT(1, "tar_layer_prescan: skipped (tar not installed)");
+        return;
+    }
+
+    char tmpl[] = "/tmp/oci2bin-tar-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "tar_layer_prescan: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    /* Build a benign layer: stage/hello.txt -> good.tar via real tar. */
+    char stage[256];
+    snprintf(stage, sizeof(stage), "%s/stg", tdir);
+    mkdir(stage, 0755);
+    char sfile[320];
+    write_fixture(stage, "hello.txt", "hi", sfile, sizeof(sfile));
+    char goodtar[256];
+    snprintf(goodtar, sizeof(goodtar), "%s/good.tar", tdir);
+    char* mk[] = {"tar", "cf", goodtar, "-C", stage, ".", NULL};
+    run_cmd(mk);
+    struct stat st;
+    if (lstat(goodtar, &st) != 0)
+    {
+        ASSERT(1, "tar_layer_prescan: skipped (tar create failed)");
+        rm_rf_dir(tdir);
+        return;
+    }
+
+    /* 1. Clean tar passes the prescan. */
+    ASSERT_INT_EQ(tar_layer_prescan(goodtar), 0,
+                  "tar_layer_prescan: clean tar accepted");
+
+    /* 2. Nonexistent archive → tar errors → -1. */
+    ASSERT_INT_EQ(tar_layer_prescan("/nonexistent/oci2bin-x.tar"), -1,
+                  "tar_layer_prescan: unreadable tar -> -1");
+
+    /* 3. Archive with a '..' entry is rejected. */
+    char badtar[256];
+    snprintf(badtar, sizeof(badtar), "%s/bad.tar", tdir);
+    ASSERT_INT_EQ(write_tar_one_entry(badtar, "../evil"), 0,
+                  "tar_layer_prescan: crafted bad tar written");
+    ASSERT_INT_EQ(tar_layer_prescan(badtar), -1,
+                  "tar_layer_prescan: rejects ../ entry");
+
+    /* 4. safe_extract_layer merges a benign layer into the rootfs. */
+    char rootfs[256];
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs", tdir);
+    mkdir(rootfs, 0755);
+    int rfd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT(rfd >= 0, "safe_extract_layer: rootfs fd opened");
+    if (rfd >= 0)
+    {
+        ASSERT_INT_EQ(safe_extract_layer(rfd, goodtar, tdir, 0), 0,
+                      "safe_extract_layer: benign layer extracts");
+        char extracted[320];
+        snprintf(extracted, sizeof(extracted), "%s/hello.txt", rootfs);
+        ASSERT(lstat(extracted, &st) == 0 && S_ISREG(st.st_mode),
+               "safe_extract_layer: file merged into rootfs");
+        close(rfd);
+    }
+
+    /* 5. safe_extract_layer rejects a malicious layer (prescan fails). */
+    int rfd2 = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rfd2 >= 0)
+    {
+        ASSERT_INT_EQ(safe_extract_layer(rfd2, badtar, tdir, 1), -1,
+                      "safe_extract_layer: rejects malicious layer");
+        close(rfd2);
+    }
+
+    rm_rf_dir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -4541,6 +4664,7 @@ int main(void)
     test_open_path_nofollow();
     test_mkdir_p_secure();
     test_ensure_bind_mount_target();
+    test_tar_layer_prescan_and_extract();
 
     printf("1..%d\n", tap_test_num);
 
