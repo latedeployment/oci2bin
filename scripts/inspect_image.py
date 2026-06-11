@@ -239,6 +239,116 @@ def read_meta_block(binary_path):
         return None
 
 
+def build_inspect_root(binary_path):
+    """Build a Docker-like structured object for --format templates.
+
+    The shape mirrors `docker image inspect` closely enough that common
+    templates such as '{{.Config.User}}' or '{{json .Config.Labels}}' work.
+    Env values are redacted exactly as in the human/--json output so secrets
+    never leak through a format string.
+    """
+    meta = read_meta_block(binary_path) or {}
+    file_size = os.path.getsize(binary_path)
+    oci_bytes = b''
+    repo_tags, layers, config = [], [], {}
+    try:
+        oci_bytes = read_oci_data(binary_path)
+        repo_tags, layers, config = parse_config(oci_bytes)
+    except SystemExit:
+        pass
+    cfg = dict(config.get('config', config) or {})
+    cfg['Env'] = redact_env(cfg.get('Env') or [])
+    return {
+        'Image': repo_tags[0] if repo_tags else 'unknown',
+        'RepoTags': repo_tags,
+        'Architecture': config.get('architecture', 'unknown'),
+        'Layers': len(layers),
+        'Config': cfg,
+        'Signature': 'present' if has_signature(binary_path) else 'absent',
+        'SBOM': 'embedded' if has_sbom(binary_path) else 'absent',
+        'Size': file_size,
+        'ExtractedSize': estimated_extracted_size(oci_bytes),
+        'Meta': meta,
+    }
+
+
+def _resolve_path(root, path):
+    """Resolve a dotted '.A.B.C' template path against root. Returns None
+    for any missing key (mirrors Go template's <no value> for nil)."""
+    cur = root
+    for part in path.split('.'):
+        if part == '':
+            continue
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _render_value(val):
+    """Render a resolved value: scalars as-is, containers as compact JSON,
+    None as Go's '<no value>'."""
+    if val is None:
+        return '<no value>'
+    if isinstance(val, (dict, list)):
+        return json.dumps(val)
+    if isinstance(val, bool):
+        return 'true' if val else 'false'
+    return str(val)
+
+
+def render_format(template, root):
+    """Evaluate a minimal Go-template subset against root.
+
+    Supported actions inside {{ }}:
+      {{.A.B}}            field traversal
+      {{json .A.B}}       JSON-encode the resolved value
+      {{index .A "key"}}  index a map/list by a literal key
+    Anything else is a template error (exit 1). Text outside {{ }} is
+    emitted verbatim. A literal '\\n' / '\\t' in the template is honored.
+    """
+    import re as _re
+    template = template.replace('\\n', '\n').replace('\\t', '\t')
+    out = []
+    pos = 0
+    for m in _re.finditer(r'\{\{(.*?)\}\}', template):
+        out.append(template[pos:m.start()])
+        pos = m.end()
+        expr = m.group(1).strip()
+        toks = expr.split()
+        if not toks:
+            raise ValueError('empty template action')
+        if toks[0] == 'json':
+            if len(toks) != 2 or not toks[1].startswith('.'):
+                raise ValueError(f'bad json action: {expr!r}')
+            out.append(json.dumps(_resolve_path(root, toks[1][1:])))
+        elif toks[0] == 'index':
+            if len(toks) != 3 or not toks[1].startswith('.'):
+                raise ValueError(f'bad index action: {expr!r}')
+            base = _resolve_path(root, toks[1][1:])
+            key = toks[2].strip('"')
+            val = None
+            if isinstance(base, dict):
+                val = base.get(key)
+            elif isinstance(base, list):
+                try:
+                    val = base[int(key)]
+                except (ValueError, IndexError):
+                    val = None
+            out.append(_render_value(val))
+        elif toks[0].startswith('.'):
+            if len(toks) != 1:
+                raise ValueError(f'unexpected tokens in action: {expr!r}')
+            out.append(_render_value(_resolve_path(root, toks[0][1:])))
+        else:
+            raise ValueError(f'unsupported template action: {expr!r}')
+    out.append(template[pos:])
+    return ''.join(out)
+
+
 def main():
     import argparse as _argparse
     parser = _argparse.ArgumentParser(
@@ -248,6 +358,13 @@ def main():
     parser.add_argument('binary', help='Path to the oci2bin binary')
     parser.add_argument('--json', action='store_true',
                         help='Output metadata as JSON (for machine parsing)')
+    parser.add_argument('-o', '--output', choices=('text', 'json'),
+                        default=None,
+                        help='Output format (text or json); -o json equals --json')
+    parser.add_argument('-f', '--format', dest='format', default=None,
+                        metavar='TEMPLATE',
+                        help="Go-template over a Docker-like object, e.g. "
+                             "'{{.Config.User}}' or '{{json .Config.Labels}}'")
     args = parser.parse_args()
 
     binary_path = args.binary
@@ -255,7 +372,16 @@ def main():
         print(f"inspect: file not found: {binary_path}", file=sys.stderr)
         sys.exit(1)
 
-    if args.json:
+    if args.format is not None:
+        root = build_inspect_root(binary_path)
+        try:
+            print(render_format(args.format, root))
+        except ValueError as e:
+            print(f"inspect: template error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.json or args.output == 'json':
         # JSON mode: return meta block + the same extended fields the
         # human output shows, so tooling can consume one source of truth.
         meta = read_meta_block(binary_path) or {}

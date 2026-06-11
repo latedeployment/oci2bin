@@ -65,5 +65,71 @@ class RedactEnvTest(unittest.TestCase):
         self.assertIn("DB_PASSWORD=<redacted>", out)
 
 
+class RenderFormatTest(unittest.TestCase):
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "inspect_image", _SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _root(self):
+        return {
+            "Image": "redis:7",
+            "Architecture": "amd64",
+            "Layers": 3,
+            "Config": {
+                "User": "redis",
+                "Env": ["PATH=/bin"],
+                "Labels": {"team": "infra", "tier": "cache"},
+                "ExposedPorts": {"6379/tcp": {}},
+            },
+            "Signature": "present",
+        }
+
+    def test_field_path(self):
+        mod = self._mod()
+        root = self._root()
+        self.assertEqual(mod.render_format("{{.Config.User}}", root), "redis")
+        self.assertEqual(
+            mod.render_format("{{.Architecture}}", root), "amd64")
+        self.assertEqual(mod.render_format("{{.Layers}}", root), "3")
+
+    def test_missing_field_is_no_value(self):
+        mod = self._mod()
+        self.assertEqual(
+            mod.render_format("{{.Config.Nope}}", self._root()),
+            "<no value>")
+
+    def test_json_action(self):
+        mod = self._mod()
+        out = mod.render_format("{{json .Config.Labels}}", self._root())
+        self.assertEqual(json.loads(out), {"team": "infra", "tier": "cache"})
+
+    def test_index_action(self):
+        mod = self._mod()
+        self.assertEqual(
+            mod.render_format('{{index .Config.Labels "team"}}',
+                              self._root()),
+            "infra")
+
+    def test_literal_and_mixed_text(self):
+        mod = self._mod()
+        out = mod.render_format(
+            "user={{.Config.User}} arch={{.Architecture}}", self._root())
+        self.assertEqual(out, "user=redis arch=amd64")
+
+    def test_map_renders_as_json(self):
+        mod = self._mod()
+        out = mod.render_format("{{.Config.Labels}}", self._root())
+        self.assertEqual(json.loads(out), {"team": "infra", "tier": "cache"})
+
+    def test_bad_action_raises(self):
+        mod = self._mod()
+        with self.assertRaises(ValueError):
+            mod.render_format("{{bogus .Config}}", self._root())
+
+
 if __name__ == "__main__":
     unittest.main()

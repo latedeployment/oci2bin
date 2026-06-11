@@ -1729,6 +1729,8 @@ Display metadata embedded in any oci2bin binary without running it:
 ```bash
 oci2bin inspect ./redis_7-alpine
 oci2bin inspect ./redis_7-alpine --json
+oci2bin inspect ./redis_7-alpine --format '{{.Config.User}}'
+oci2bin inspect ./redis_7-alpine -f '{{json .Config.Labels}}'
 ```
 
 The default human output includes:
@@ -1746,8 +1748,27 @@ The default human output includes:
 - the `OCI2BIN_META` build metadata block (image name, digest,
   build timestamp, oci2bin version)
 
-`--json` produces the same fields as a single object for scripting.
-Use `oci2bin explain` if you also want host-capability checks.
+`--json` (or `-o json`) produces the same fields as a single object for
+scripting.
+
+For one-value scripting, `--format`/`-f` evaluates a Go-template subset over a
+Docker-like object so you don't have to pipe through `jq`:
+
+```bash
+oci2bin inspect ./app -f '{{.Config.User}}'           # → redis
+oci2bin inspect ./app -f '{{.Architecture}}'          # → amd64
+oci2bin inspect ./app -f '{{json .Config.Labels}}'    # → {"team":"infra"}
+oci2bin inspect ./app -f '{{index .Config.Labels "team"}}'
+```
+
+Supported template root fields: `.Image`, `.RepoTags`, `.Architecture`,
+`.Layers`, `.Config` (with `.User`, `.Env`, `.Entrypoint`, `.Cmd`,
+`.WorkingDir`, `.ExposedPorts`, `.Healthcheck`, `.Volumes`, `.Labels`),
+`.Signature`, `.SBOM`, `.Size`, `.ExtractedSize`, and `.Meta`. Supported
+actions are field paths (`{{.A.B}}`), `{{json .A.B}}`, and
+`{{index .A.B "key"}}`. Missing fields render as `<no value>`; `.Config.Env`
+is redacted exactly as in the human output, so a format string cannot leak a
+secret. Use `oci2bin explain` if you also want host-capability checks.
 
 ```
 Image:        redis:7-alpine
