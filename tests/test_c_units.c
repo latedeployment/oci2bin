@@ -4264,6 +4264,34 @@ static void test_resolve_user_in_rootfs(void)
     rm_rf_dir(tdir);
 }
 
+/* ── test_plan_userns_map ─────────────────────────────────────────────────── */
+
+static void test_plan_userns_map(void)
+{
+    struct container_opts opts;
+    struct userns_map_plan plan;
+
+    /* 1. Explicit no-remap → single-id mode; plan is zeroed internally even
+     *    though we hand it poisoned memory. */
+    memset(&opts, 0, sizeof(opts));
+    opts.no_userns_remap = 1;
+    memset(&plan, 0xAB, sizeof(plan));
+    plan_userns_map(&opts, 1000, &plan);
+    ASSERT_INT_EQ(plan.use_subid_remap, 0,
+                  "plan_userns_map: no_userns_remap -> single id");
+    ASSERT_INT_EQ((int)plan.newuidmap_path[0], 0,
+                  "plan_userns_map: plan zeroed (no helper path)");
+
+    /* 2. Default path: exercises the cap check + helper/subid lookups. The
+     *    exact result depends on host caps and /etc/subuid, so we only assert
+     *    the call completes and leaves a valid 0/1 flag (no crash). */
+    memset(&opts, 0, sizeof(opts));
+    memset(&plan, 0, sizeof(plan));
+    plan_userns_map(&opts, getuid(), &plan);
+    ASSERT(plan.use_subid_remap == 0 || plan.use_subid_remap == 1,
+           "plan_userns_map: default path yields a valid flag");
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -4324,6 +4352,7 @@ int main(void)
     test_resolve_user();
     test_lookup_user_name_from_passwd();
     test_resolve_user_in_rootfs();
+    test_plan_userns_map();
 
     printf("1..%d\n", tap_test_num);
 

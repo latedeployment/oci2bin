@@ -217,7 +217,7 @@ not a single global percentage.
 | 2 | load_env_file | **done** (75.4% fn; rest = malloc/read fault paths) | 28.05% |
 | 3 | json_parse_names_array | **done** (88.1% fn) | 28.94% |
 | 4 | resolve_user + passwd lookup | **done** (resolve_user 90.9%, lookup_name 88.6%, in_rootfs 81.1%) | 30.74% |
-| 5 | plan_userns_map | todo | — |
+| 5 | plan_userns_map | **done** (70.4% fn; rest = host caps/subid paths) | 31.42% |
 | 6 | symlink-rejection fs helpers | todo | — |
 | 7 | tar_layer_prescan + safe_extract_layer | todo | — |
 | 8 | safe_merge_walk top-up | todo | — |
