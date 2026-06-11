@@ -4125,6 +4125,145 @@ static void test_json_parse_names_array(void)
     ASSERT(1, "json_parse_names_array: truncated input did not crash");
 }
 
+/* ── test_resolve_user ────────────────────────────────────────────────────── */
+
+static void test_resolve_user(void)
+{
+    uid_t uid = 99;
+    gid_t gid = 99;
+
+    /* numeric uid only → gid defaults to 0 */
+    ASSERT_INT_EQ(resolve_user("1000", &uid, &gid), 0,
+                  "resolve_user: numeric uid ok");
+    ASSERT_INT_EQ((int)uid, 1000, "resolve_user: uid parsed");
+    ASSERT_INT_EQ((int)gid, 0, "resolve_user: gid defaults to 0");
+
+    /* uid:gid split */
+    ASSERT_INT_EQ(resolve_user("1000:2000", &uid, &gid), 0,
+                  "resolve_user: uid:gid ok");
+    ASSERT_INT_EQ((int)uid, 1000, "resolve_user: split uid");
+    ASSERT_INT_EQ((int)gid, 2000, "resolve_user: split gid");
+
+    /* 0:0 */
+    ASSERT_INT_EQ(resolve_user("0:0", &uid, &gid), 0, "resolve_user: 0:0 ok");
+    ASSERT_INT_EQ((int)uid, 0, "resolve_user: root uid");
+
+    /* empty / NULL → -1 */
+    ASSERT_INT_EQ(resolve_user("", &uid, &gid), -1, "resolve_user: empty -> -1");
+    ASSERT_INT_EQ(resolve_user(NULL, &uid, &gid), -1,
+                  "resolve_user: NULL -> -1");
+
+    /* out-of-range numeric uid → -1 */
+    ASSERT_INT_EQ(resolve_user("99999", &uid, &gid), -1,
+                  "resolve_user: uid>65534 -> -1");
+
+    /* malformed numeric → -1 */
+    ASSERT_INT_EQ(resolve_user("12ab", &uid, &gid), -1,
+                  "resolve_user: trailing garbage -> -1");
+
+    /* out-of-range numeric gid → -1 */
+    ASSERT_INT_EQ(resolve_user("1000:99999", &uid, &gid), -1,
+                  "resolve_user: gid>65534 -> -1");
+
+    /* over-long spec → -1 */
+    char longspec[300];
+    memset(longspec, '1', sizeof(longspec) - 1);
+    longspec[sizeof(longspec) - 1] = '\0';
+    ASSERT_INT_EQ(resolve_user(longspec, &uid, &gid), -1,
+                  "resolve_user: over-long spec -> -1");
+
+    /* name lookup via host /etc/passwd — root is uid 0 universally. */
+    uid = 99;
+    gid = 99;
+    int rr = resolve_user("root", &uid, &gid);
+    ASSERT_INT_EQ(rr, 0, "resolve_user: name 'root' resolves");
+    if (rr == 0)
+    {
+        ASSERT_INT_EQ((int)uid, 0, "resolve_user: root -> uid 0");
+    }
+}
+
+/* ── test_lookup_user_name_from_passwd ────────────────────────────────────── */
+
+static void test_lookup_user_name_from_passwd(void)
+{
+    char name[64];
+
+    /* root is uid 0 on every Linux system. */
+    ASSERT_INT_EQ(lookup_user_name_from_passwd(0, name, sizeof(name)), 0,
+                  "lookup_user_name_from_passwd: uid 0 found");
+    ASSERT_STR_EQ(name, "root", "lookup_user_name_from_passwd: uid 0 -> root");
+
+    /* an absurd uid is not present → -1 */
+    ASSERT_INT_EQ(lookup_user_name_from_passwd(4000000, name, sizeof(name)), -1,
+                  "lookup_user_name_from_passwd: unknown uid -> -1");
+
+    /* bad args → -1 */
+    ASSERT_INT_EQ(lookup_user_name_from_passwd(0, NULL, 64), -1,
+                  "lookup_user_name_from_passwd: NULL out -> -1");
+    ASSERT_INT_EQ(lookup_user_name_from_passwd(0, name, 0), -1,
+                  "lookup_user_name_from_passwd: zero size -> -1");
+
+    /* output buffer too small for "root" → truncation path -> -1 */
+    char tiny[2];
+    ASSERT_INT_EQ(lookup_user_name_from_passwd(0, tiny, sizeof(tiny)), -1,
+                  "lookup_user_name_from_passwd: name truncation -> -1");
+}
+
+/* ── test_resolve_user_in_rootfs ──────────────────────────────────────────── */
+
+static void test_resolve_user_in_rootfs(void)
+{
+    char out[64];
+
+    /* numeric spec copied as-is, no file access. */
+    ASSERT_INT_EQ(resolve_user_in_rootfs("/nonexistent", "1000",
+                                         out, sizeof(out)), 0,
+                  "resolve_user_in_rootfs: numeric passthrough ok");
+    ASSERT_STR_EQ(out, "1000", "resolve_user_in_rootfs: numeric copied");
+
+    /* empty spec → -1 */
+    ASSERT_INT_EQ(resolve_user_in_rootfs("/x", "", out, sizeof(out)), -1,
+                  "resolve_user_in_rootfs: empty spec -> -1");
+
+    /* name lookup against a fake rootfs/etc/passwd. */
+    char tmpl[] = "/tmp/oci2bin-usr-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "resolve_user_in_rootfs: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+    char etcdir[256];
+    snprintf(etcdir, sizeof(etcdir), "%s/etc", tdir);
+    mkdir(etcdir, 0755);
+    char pw[256];
+    write_fixture(etcdir, "passwd",
+                  "root:x:0:0:root:/root:/bin/sh\n"
+                  "appuser:x:1234:5678:App:/home/appuser:/bin/sh\n",
+                  pw, sizeof(pw));
+
+    ASSERT_INT_EQ(resolve_user_in_rootfs(tdir, "appuser", out, sizeof(out)), 0,
+                  "resolve_user_in_rootfs: name resolved");
+    ASSERT_STR_EQ(out, "1234:5678",
+                  "resolve_user_in_rootfs: uid:gid from passwd");
+
+    /* unknown name → -1 */
+    ASSERT_INT_EQ(resolve_user_in_rootfs(tdir, "nobodyx", out, sizeof(out)), -1,
+                  "resolve_user_in_rootfs: unknown name -> -1");
+
+    /* rootfs without etc/passwd → -1 */
+    char tmpl2[] = "/tmp/oci2bin-usr2-XXXXXX";
+    char* tdir2 = mkdtemp(tmpl2);
+    if (tdir2)
+    {
+        ASSERT_INT_EQ(resolve_user_in_rootfs(tdir2, "root", out, sizeof(out)),
+                      -1, "resolve_user_in_rootfs: missing passwd -> -1");
+        rm_rf_dir(tdir2);
+    }
+    rm_rf_dir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -4182,6 +4321,9 @@ int main(void)
     test_build_merged_argv();
     test_load_env_file();
     test_json_parse_names_array();
+    test_resolve_user();
+    test_lookup_user_name_from_passwd();
+    test_resolve_user_in_rootfs();
 
     printf("1..%d\n", tap_test_num);
 
