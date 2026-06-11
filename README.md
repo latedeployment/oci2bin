@@ -29,7 +29,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Fat binaries (x86 + arm in one file) | `oci2bin --arch all alpine:latest` |
 | Volume mounts | `./myapp -v /data:/data` |
 | Read-only container | `./myapp --read-only` |
-| Custom seccomp profile | `./myapp --seccomp profile.json` |
+| Custom seccomp profile | `./myapp --seccomp-profile profile.json` |
 | Diff two image binaries | `oci2bin diff image_v1 image_v2` |
 | Sign and verify the binary | `oci2bin sign myapp.bin --key priv.pem` |
 | OCI health check | `oci2bin healthcheck myapp.bin` |
@@ -2098,7 +2098,10 @@ The display reports CPU percentage, memory, PID count, uptime, and binary name f
 ```bash
 make test-unit               # unit tests only, no Docker required (~5s)
 make test                    # full suite, requires Docker and a built image
+make test-all                # x86_64 unit tests + aarch64 C unit tests (no Docker)
+make test-all-fuzz           # test-all, then the local fuzz sweep (FUZZ_SECONDS per harness)
 make test-c                  # C unit tests (TAP, x86_64)
+make test-c-aarch64          # C unit tests cross-compiled and run under qemu (aarch64)
 make test-python             # Python unit tests
 make test-shellcheck         # shellcheck on all shell scripts
 make test-integration        # all integration tests (runtime, build, Redis, nginx)
@@ -2107,27 +2110,60 @@ make test-integration-nginx  # nginx HTTP 200 smoke test
 make test-integration-services  # Redis (container+VM) + 5 service images (container+VM)
 ```
 
-### Fuzzing
+> All testing and fuzzing runs locally — there is no hosted/remote CI.
 
-libFuzzer harnesses target the JSON helpers and MCP JSON-RPC parser. Requires clang with `-fsanitize=fuzzer`.
+### Coverage
+
+Measure how much of `src/loader.c` the C unit tests exercise. Uses `gcov`
+(always shipped with gcc); if `lcov` + `genhtml` are installed it also emits a
+browsable HTML report.
 
 ```bash
-make fuzz-json       # fuzz JSON helpers (json_get_string, json_get_array, etc.)
-make fuzz-seccomp    # fuzz seccomp profile parser
-make fuzz-parse-opts # fuzz parse_opts + load_env_file
-make fuzz-mcp        # fuzz MCP JSON-RPC parser (mcp-serve input surface)
-make fuzz-all        # build all harnesses
+make coverage-c        # src/loader.c line coverage from the C unit tests (gcov)
+make coverage-python   # Python coverage via coverage.py (skipped if not installed)
+make coverage          # both of the above
 ```
 
-Run a harness against the seed corpus:
+`make coverage-c` prints a per-file summary and leaves `build/cov/loader.c.gcov`
+for line-by-line inspection (lines marked `#####` were never executed).
+
+### Fuzzing
+
+Five libFuzzer harnesses cover the untrusted-input surfaces of `src/loader.c`.
+Requires clang with `-fsanitize=fuzzer,address,undefined`.
+
+```bash
+make fuzz-json        # JSON helpers (json_get_string, json_get_array, names array, etc.)
+make fuzz-seccomp     # seccomp profile parser (apply_seccomp_profile)
+make fuzz-parse-opts  # parse_opts + load_env_file
+make fuzz-mcp         # MCP JSON-RPC parser (mcp-serve input surface)
+make fuzz-layer-merge # in-process OCI layer merge (safe_merge_layer / rootfs-escape path)
+make fuzz-all         # build all harnesses
+```
+
+Run the whole suite with the orchestrator — it builds every harness, runs each
+for the given number of seconds against its seed corpus, and exits non-zero if
+any crash / leak / OOM / timeout artifact is produced (written under
+`build/fuzz-out/<harness>/`):
+
+```bash
+bash scripts/fuzz_run.sh 300      # 300s per harness (default if omitted)
+```
+
+Or drive a single harness directly against its seed corpus:
 
 ```bash
 ./build/fuzz_mcp_jsonrpc tests/fuzz/corpus/mcp -max_len=65536 -jobs=4
+./build/fuzz_layer_merge tests/fuzz/corpus/layer_merge -max_len=8192 -jobs=4
 ```
 
-Seed inputs for the MCP fuzzer live in `tests/fuzz/corpus/mcp/` and cover:
-empty input, truncated JSON, deeply nested objects, oversized strings, null bytes
-mid-string, invalid UTF-8, and method names at maximum length.
+Seed corpora live under `tests/fuzz/corpus/<harness>/` (one directory per
+harness: `json`, `seccomp`, `parse_opts`, `env_file`, `mcp`, `layer_merge`). The
+MCP seeds cover empty input, truncated JSON, deeply nested objects, oversized
+strings, null bytes mid-string, invalid UTF-8, and method names at maximum
+length. The layer-merge harness materializes a staging tree (files, dirs, and
+symlinks with attacker-chosen targets) and merges it into a throwaway rootfs,
+using a sibling canary file as a rootfs-escape oracle on top of ASan/UBSan.
 
 ### Security linting
 
