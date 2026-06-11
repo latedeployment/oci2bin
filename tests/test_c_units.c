@@ -4292,6 +4292,191 @@ static void test_plan_userns_map(void)
            "plan_userns_map: default path yields a valid flag");
 }
 
+/* ── test_open_path_nofollow ──────────────────────────────────────────────── */
+
+static void test_open_path_nofollow(void)
+{
+    char tmpl[] = "/tmp/oci2bin-opf-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "open_path_nofollow: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    /* 1. NULL / relative paths rejected. */
+    ASSERT_INT_EQ(open_path_nofollow(NULL, O_RDONLY, 0), -1,
+                  "open_path_nofollow: NULL path -> -1");
+    ASSERT_INT_EQ(open_path_nofollow("relative/path", O_RDONLY, 0), -1,
+                  "open_path_nofollow: relative path -> -1");
+
+    /* 2. "/" alone → EISDIR/-1. */
+    ASSERT_INT_EQ(open_path_nofollow("/", O_RDONLY, 0), -1,
+                  "open_path_nofollow: root path -> -1");
+
+    /* 3. Open an existing regular file. */
+    char realf[256];
+    snprintf(realf, sizeof(realf), "%s/realfile", tdir);
+    int wf = open(realf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (wf >= 0)
+    {
+        if (write(wf, "x", 1) != 1)
+        {
+            /* ignore */
+        }
+        close(wf);
+    }
+    int fd = open_path_nofollow(realf, O_RDONLY, 0);
+    ASSERT(fd >= 0, "open_path_nofollow: opens regular file");
+    if (fd >= 0)
+    {
+        close(fd);
+    }
+
+    /* 4. Final component is a symlink → refused (O_NOFOLLOW). */
+    char lnk[256];
+    snprintf(lnk, sizeof(lnk), "%s/link", tdir);
+    symlink(realf, lnk);
+    ASSERT_INT_EQ(open_path_nofollow(lnk, O_RDONLY, 0), -1,
+                  "open_path_nofollow: refuses final symlink");
+
+    /* 5. Intermediate component is a symlink → refused. */
+    char dlink[256];
+    snprintf(dlink, sizeof(dlink), "%s/dlink", tdir);
+    symlink(tdir, dlink);
+    char through[320];
+    snprintf(through, sizeof(through), "%s/realfile", dlink);
+    ASSERT_INT_EQ(open_path_nofollow(through, O_RDONLY, 0), -1,
+                  "open_path_nofollow: refuses symlink dir component");
+
+    /* 6. O_CREAT creates a new file. */
+    char newf[256];
+    snprintf(newf, sizeof(newf), "%s/created", tdir);
+    int cf = open_path_nofollow(newf, O_WRONLY | O_CREAT, 0644);
+    ASSERT(cf >= 0, "open_path_nofollow: O_CREAT creates file");
+    if (cf >= 0)
+    {
+        close(cf);
+    }
+    struct stat st;
+    ASSERT_INT_EQ(lstat(newf, &st), 0,
+                  "open_path_nofollow: created file exists");
+
+    rm_rf_dir(tdir);
+}
+
+/* ── test_mkdir_p_secure ──────────────────────────────────────────────────── */
+
+static void test_mkdir_p_secure(void)
+{
+    char tmpl[] = "/tmp/oci2bin-mps-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "mkdir_p_secure: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+    struct stat st;
+
+    /* 1. Create a nested path. */
+    char nested[256];
+    snprintf(nested, sizeof(nested), "%s/a/b/c", tdir);
+    ASSERT_INT_EQ(mkdir_p_secure(nested, 0755, "test"), 0,
+                  "mkdir_p_secure: creates nested dirs");
+    ASSERT(lstat(nested, &st) == 0 && S_ISDIR(st.st_mode),
+           "mkdir_p_secure: leaf dir exists");
+
+    /* 2. Idempotent on existing dirs. */
+    ASSERT_INT_EQ(mkdir_p_secure(nested, 0755, "test"), 0,
+                  "mkdir_p_secure: idempotent on existing dirs");
+
+    /* 3. Symlink component rejected. */
+    char link[256];
+    snprintf(link, sizeof(link), "%s/link", tdir);
+    symlink("/tmp", link);
+    char viasym[320];
+    snprintf(viasym, sizeof(viasym), "%s/link/x", tdir);
+    ASSERT_INT_EQ(mkdir_p_secure(viasym, 0755, "test"), -1,
+                  "mkdir_p_secure: rejects symlink component");
+
+    /* 4. Non-directory component rejected. */
+    char afile[256];
+    snprintf(afile, sizeof(afile), "%s/afile", tdir);
+    int wf = open(afile, O_WRONLY | O_CREAT, 0644);
+    if (wf >= 0)
+    {
+        close(wf);
+    }
+    char viafile[320];
+    snprintf(viafile, sizeof(viafile), "%s/afile/x", tdir);
+    ASSERT_INT_EQ(mkdir_p_secure(viafile, 0755, "test"), -1,
+                  "mkdir_p_secure: rejects non-dir component");
+
+    rm_rf_dir(tdir);
+}
+
+/* ── test_ensure_bind_mount_target ────────────────────────────────────────── */
+
+static void test_ensure_bind_mount_target(void)
+{
+    char tmpl[] = "/tmp/oci2bin-ebt-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "ensure_bind_mount_target: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+    struct stat st;
+
+    char srcdir[256];
+    snprintf(srcdir, sizeof(srcdir), "%s/srcdir", tdir);
+    mkdir(srcdir, 0755);
+    char srcfile[256];
+    snprintf(srcfile, sizeof(srcfile), "%s/srcfile", tdir);
+    int wf = open(srcfile, O_WRONLY | O_CREAT, 0644);
+    if (wf >= 0)
+    {
+        close(wf);
+    }
+
+    /* 1. dir src → dst created as a directory (parent made on the way). */
+    char dstdir[320];
+    snprintf(dstdir, sizeof(dstdir), "%s/root/mnt_dir", tdir);
+    ASSERT_INT_EQ(ensure_bind_mount_target(srcdir, dstdir, "test"), 0,
+                  "ensure_bind_mount_target: dir target created");
+    ASSERT(lstat(dstdir, &st) == 0 && S_ISDIR(st.st_mode),
+           "ensure_bind_mount_target: dst is a dir");
+
+    /* 2. file src → dst created as a file. */
+    char dstfile[320];
+    snprintf(dstfile, sizeof(dstfile), "%s/root/mnt_file", tdir);
+    ASSERT_INT_EQ(ensure_bind_mount_target(srcfile, dstfile, "test"), 0,
+                  "ensure_bind_mount_target: file target created");
+    ASSERT(lstat(dstfile, &st) == 0 && S_ISREG(st.st_mode),
+           "ensure_bind_mount_target: dst is a file");
+
+    /* 3. nonexistent src → -1. */
+    char nosrc[256];
+    snprintf(nosrc, sizeof(nosrc), "%s/nope", tdir);
+    char dst3[320];
+    snprintf(dst3, sizeof(dst3), "%s/root/x", tdir);
+    ASSERT_INT_EQ(ensure_bind_mount_target(nosrc, dst3, "test"), -1,
+                  "ensure_bind_mount_target: missing src -> -1");
+
+    /* 4. existing dst that is a symlink → -1. */
+    char dstlink[320];
+    snprintf(dstlink, sizeof(dstlink), "%s/root/lnk", tdir);
+    symlink("/tmp", dstlink);
+    ASSERT_INT_EQ(ensure_bind_mount_target(srcfile, dstlink, "test"), -1,
+                  "ensure_bind_mount_target: symlink dst -> -1");
+
+    /* 5. existing regular dst → returns 0 (idempotent). */
+    ASSERT_INT_EQ(ensure_bind_mount_target(srcfile, dstfile, "test"), 0,
+                  "ensure_bind_mount_target: existing dst -> 0");
+
+    rm_rf_dir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -4353,6 +4538,9 @@ int main(void)
     test_lookup_user_name_from_passwd();
     test_resolve_user_in_rootfs();
     test_plan_userns_map();
+    test_open_path_nofollow();
+    test_mkdir_p_secure();
+    test_ensure_bind_mount_target();
 
     printf("1..%d\n", tap_test_num);
 
