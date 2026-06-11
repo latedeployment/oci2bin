@@ -1247,7 +1247,8 @@ static void test_parse_opts_misc_flags(void)
         char a1[] = "/etc";
         char a2[] = "/var/lib/secret";
         char* argv[] = {"prog", "--seccomp-deny-write", a1,
-                        "--seccomp-deny-write", a2, NULL};
+                        "--seccomp-deny-write", a2, NULL
+                       };
         memset(&opts, 0, sizeof(opts));
         int r = parse_opts(5, argv, &opts);
         ASSERT_INT_EQ(r, 0,
@@ -1514,7 +1515,8 @@ static void test_json_get_string_edge(void)
     char json_buf[700];
     snprintf(json_buf, sizeof(json_buf), "{\"%s\":\"value\"}", long_key);
     char* v = json_get_string(json_buf, long_key);
-    ASSERT_NULL(v, "json_get_string: key > 254 chars returns NULL (needle overflow guard)");
+    ASSERT_NULL(v,
+                "json_get_string: key > 254 chars returns NULL (needle overflow guard)");
 
     /* Unterminated string value — no closing quote: must return NULL */
     const char* bad = "{\"Key\":\"no closing quote}";
@@ -1946,8 +1948,8 @@ static void test_userns_subid_helpers(void)
     close(fd);
 
     ASSERT_INT_EQ(lookup_subid_range_in_file(path, "omer", 1000,
-                                             USERNS_REMAP_CONTAINER_IDS,
-                                             &start, &count),
+                  USERNS_REMAP_CONTAINER_IDS,
+                  &start, &count),
                   0,
                   "userns subid: lookup_subid_range_in_file finds named range");
     ASSERT(start == 700000UL,
@@ -1956,8 +1958,8 @@ static void test_userns_subid_helpers(void)
            "userns subid: named lookup count");
 
     ASSERT_INT_EQ(lookup_subid_range_in_file(path, NULL, 1001,
-                                             USERNS_REMAP_CONTAINER_IDS,
-                                             &start, &count),
+                  USERNS_REMAP_CONTAINER_IDS,
+                  &start, &count),
                   0,
                   "userns subid: lookup_subid_range_in_file finds numeric owner");
     ASSERT(start == 800000UL,
@@ -1966,8 +1968,8 @@ static void test_userns_subid_helpers(void)
            "userns subid: numeric lookup count");
 
     ASSERT_INT_EQ(lookup_subid_range_in_file(path, "tiny", 1002,
-                                             USERNS_REMAP_CONTAINER_IDS,
-                                             &start, &count),
+                  USERNS_REMAP_CONTAINER_IDS,
+                  &start, &count),
                   -1,
                   "userns subid: lookup_subid_range_in_file rejects short ranges");
 
@@ -2365,7 +2367,9 @@ static void test_read_write_all_fd(void)
     int fd = mkstemp(path);
     ASSERT(fd >= 0, "rwfd: mkstemp succeeds");
     if (fd < 0)
+    {
         return;
+    }
 
     const char* msg = "hello, read_all_fd world\n";
     size_t len = strlen(msg);
@@ -2399,7 +2403,9 @@ static void test_read_write_file(void)
     int fd = mkstemp(path);
     ASSERT(fd >= 0, "rwfile: mkstemp succeeds");
     if (fd < 0)
+    {
         return;
+    }
 
     const char* content = "line1\nline2\n";
     size_t clen = strlen(content);
@@ -2437,8 +2443,16 @@ static void test_copy_n_bytes(void)
     ASSERT(src_fd >= 0 && dst_fd >= 0, "copy_n_bytes: mkstemp succeeds");
     if (src_fd < 0 || dst_fd < 0)
     {
-        if (src_fd >= 0) { close(src_fd); unlink(src_path); }
-        if (dst_fd >= 0) { close(dst_fd); unlink(dst_path); }
+        if (src_fd >= 0)
+        {
+            close(src_fd);
+            unlink(src_path);
+        }
+        if (dst_fd >= 0)
+        {
+            close(dst_fd);
+            unlink(dst_path);
+        }
         return;
     }
 
@@ -2466,8 +2480,10 @@ static void test_copy_n_bytes(void)
     ASSERT_INT_EQ(copy_n_bytes(src_fd, dst_fd, dlen * 2), -1,
                   "copy_n_bytes: premature EOF returns -1");
 
-    close(src_fd); unlink(src_path);
-    close(dst_fd); unlink(dst_path);
+    close(src_fd);
+    unlink(src_path);
+    close(dst_fd);
+    unlink(dst_path);
 }
 
 /* ── test_lookup_passwd_group ─────────────────────────────────────────────── */
@@ -2481,8 +2497,16 @@ static void test_lookup_passwd_group(void)
     ASSERT(pw_fd >= 0 && gr_fd >= 0, "passwd/group: mkstemp succeeds");
     if (pw_fd < 0 || gr_fd < 0)
     {
-        if (pw_fd >= 0) { close(pw_fd); unlink(pw_path); }
-        if (gr_fd >= 0) { close(gr_fd); unlink(gr_path); }
+        if (pw_fd >= 0)
+        {
+            close(pw_fd);
+            unlink(pw_path);
+        }
+        if (gr_fd >= 0)
+        {
+            close(gr_fd);
+            unlink(gr_path);
+        }
         return;
     }
 
@@ -2502,7 +2526,8 @@ static void test_lookup_passwd_group(void)
                   "passwd/group: write group file");
     close(gr_fd);
 
-    uid_t uid; gid_t gid;
+    uid_t uid;
+    gid_t gid;
 
     ASSERT_INT_EQ(lookup_passwd_user(pw_path, "root", &uid, &gid), 0,
                   "passwd: lookup root returns 0");
@@ -2687,18 +2712,26 @@ static void test_openat_beneath(void)
     int root_fd = open(base, O_RDONLY | O_DIRECTORY);
     ASSERT(root_fd >= 0, "openat_beneath: open base dir");
     if (root_fd < 0)
+    {
         goto cleanup_ob;
+    }
 
     /* open nested file */
     int fd = openat_beneath(root_fd, "sub/file.txt", O_RDONLY, 0);
     ASSERT(fd >= 0, "openat_beneath: opens nested file");
-    if (fd >= 0) close(fd);
+    if (fd >= 0)
+    {
+        close(fd);
+    }
 
     /* open file in root */
     int wfd2 = openat_beneath(root_fd, "top.txt",
                               O_WRONLY | O_CREAT | O_TRUNC, 0644);
     ASSERT(wfd2 >= 0, "openat_beneath: creates top-level file");
-    if (wfd2 >= 0) close(wfd2);
+    if (wfd2 >= 0)
+    {
+        close(wfd2);
+    }
 
     /* missing file returns -1 */
     fd = openat_beneath(root_fd, "no-such-file", O_RDONLY, 0);
@@ -3031,7 +3064,8 @@ static void test_parse_opts_profile(void)
     /* later --net host overrides prod profile's --net none */
     {
         char* argv[] = {"prog", "--profile", "prod", "--net", "host",
-                        NULL};
+                        NULL
+                       };
         memset(&opts, 0, sizeof(opts));
         int r = parse_opts(5, argv, &opts);
         ASSERT_INT_EQ(r, 0,
@@ -3245,7 +3279,11 @@ static void test_notify_build_body(void)
     ASSERT_INT_EQ(n_hdrs, 0,
                   "notify_build_body: webhook emits 0 extra headers");
     free(body);
-    for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
+    for (int i = 0; i < 4; i++)
+    {
+        free(hdrs[i]);
+        hdrs[i] = NULL;
+    }
 
     /* gotify: JSON with title/message/priority */
     ct = NULL;
@@ -3263,7 +3301,11 @@ static void test_notify_build_body(void)
     ASSERT(strstr(body, "\"priority\":8") != NULL,
            "notify_build_body: gotify elevates priority for oom");
     free(body);
-    for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
+    for (int i = 0; i < 4; i++)
+    {
+        free(hdrs[i]);
+        hdrs[i] = NULL;
+    }
 
     /* discord: JSON {"content": "..."} */
     ct = NULL;
@@ -3275,7 +3317,11 @@ static void test_notify_build_body(void)
     ASSERT(strstr(body, "\"content\":") != NULL,
            "notify_build_body: discord has content field");
     free(body);
-    for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
+    for (int i = 0; i < 4; i++)
+    {
+        free(hdrs[i]);
+        hdrs[i] = NULL;
+    }
 
     /* slack: JSON {"text": "..."} */
     ct = NULL;
@@ -3287,7 +3333,11 @@ static void test_notify_build_body(void)
     ASSERT(strstr(body, "\"text\":") != NULL,
            "notify_build_body: slack has text field");
     free(body);
-    for (int i = 0; i < 4; i++) { free(hdrs[i]); hdrs[i] = NULL; }
+    for (int i = 0; i < 4; i++)
+    {
+        free(hdrs[i]);
+        hdrs[i] = NULL;
+    }
 }
 
 static void test_looks_like_credential(void)
@@ -3336,7 +3386,7 @@ static int run_hint_with_env(const char* env_json_array,
         return -2;
     }
     fprintf(f, "{\"Cmd\":null,\"Entrypoint\":null,\"Env\":%s,"
-            "\"WorkingDir\":null,\"User\":null}",
+               "\"WorkingDir\":null,\"User\":null}",
             env_json_array ? env_json_array : "null");
     fclose(f);
 
@@ -3546,7 +3596,8 @@ static void test_parse_opts_size(void)
     /* Later explicit --memory overrides --size */
     {
         char* argv[] = {"prog", "--size", "pi-zero", "--memory", "512m",
-                        NULL};
+                        NULL
+                       };
         memset(&opts, 0, sizeof(opts));
         int r = parse_opts(5, argv, &opts);
         ASSERT_INT_EQ(r, 0,
@@ -3557,7 +3608,8 @@ static void test_parse_opts_size(void)
     /* Earlier explicit --memory survives --size */
     {
         char* argv[] = {"prog", "--memory", "2g", "--size", "pi-zero",
-                        NULL};
+                        NULL
+                       };
         memset(&opts, 0, sizeof(opts));
         int r = parse_opts(5, argv, &opts);
         ASSERT_INT_EQ(r, 0,
@@ -3666,6 +3718,169 @@ static void test_parse_opts_notify(void)
     }
 }
 
+/* ── test_build_merged_argv ───────────────────────────────────────────────── */
+
+static void test_build_merged_argv(void)
+{
+    int out_argc = -1;
+
+    /* 1. No --config: argv returned unchanged, argc preserved. */
+    char* a1[] = {"oci2bin", "image.img", "arg1", NULL};
+    char** r1 = build_merged_argv(3, a1, &out_argc);
+    ASSERT(r1 == a1, "build_merged_argv: no --config returns argv unchanged");
+    ASSERT_INT_EQ(out_argc, 3, "build_merged_argv: no --config keeps argc");
+
+    /* 2. --config without a following PATH → NULL. */
+    char* a2[] = {"oci2bin", "--config", NULL};
+    ASSERT_NULL(build_merged_argv(2, a2, &out_argc),
+                "build_merged_argv: --config without PATH returns NULL");
+
+    /* 3. --config specified twice → NULL (validated before any file open). */
+    char* a3[] = {"oci2bin", "--config", "a.cfg", "--config", "b.cfg", NULL};
+    ASSERT_NULL(build_merged_argv(5, a3, &out_argc),
+                "build_merged_argv: duplicate --config returns NULL");
+
+    /* 4. --config with a '..' component → NULL. */
+    char* a4[] = {"oci2bin", "--config", "../evil.cfg", NULL};
+    ASSERT_NULL(build_merged_argv(3, a4, &out_argc),
+                "build_merged_argv: --config with .. returns NULL");
+
+    /* 5. --config pointing at a nonexistent file → NULL. */
+    char* a5[] = {"oci2bin", "--config", "/nonexistent/oci2bin-xyz.cfg", NULL};
+    ASSERT_NULL(build_merged_argv(3, a5, &out_argc),
+                "build_merged_argv: --config missing file returns NULL");
+
+    /* Fixture dir for real config files. */
+    char tmpl[] = "/tmp/oci2bin-cfg-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "build_merged_argv: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    /* 6. Valid config merged ahead of the image arg; comments/blanks skipped.
+     *    "env=FOO=bar" splits on the FIRST '=' → "--env" / "FOO=bar". */
+    char cfg6[256];
+    snprintf(cfg6, sizeof(cfg6), "%s/full.cfg", tdir);
+    FILE* f6 = fopen(cfg6, "w");
+    ASSERT_NOT_NULL(f6, "build_merged_argv: write full.cfg");
+    if (f6)
+    {
+        fputs("# comment line\n\n"
+              "env=FOO=bar\n"
+              "memory=256m\n"
+              "readonly\n", f6);
+        fclose(f6);
+    }
+    char* a6[] = {"oci2bin", "--config", cfg6, "image.img", NULL};
+    char** r6 = build_merged_argv(4, a6, &out_argc);
+    ASSERT_NOT_NULL(r6, "build_merged_argv: valid config returns argv");
+    if (r6)
+    {
+        ASSERT_INT_EQ(out_argc, 7, "build_merged_argv: merged argc = 1+5+1");
+        ASSERT_STR_EQ(r6[0], "oci2bin", "build_merged_argv: argv[0] preserved");
+        ASSERT_STR_EQ(r6[1], "--env", "build_merged_argv: key=val -> --key");
+        ASSERT_STR_EQ(r6[2], "FOO=bar",
+                      "build_merged_argv: value after first =");
+        ASSERT_STR_EQ(r6[3], "--memory", "build_merged_argv: second flag");
+        ASSERT_STR_EQ(r6[4], "256m", "build_merged_argv: second value");
+        ASSERT_STR_EQ(r6[5], "--readonly",
+                      "build_merged_argv: bare key -> --key");
+        ASSERT_STR_EQ(r6[6], "image.img",
+                      "build_merged_argv: original arg last");
+        ASSERT_NULL(r6[7], "build_merged_argv: NULL-terminated");
+        for (int j = 1; j <= 5; j++)
+        {
+            free(r6[j]);    /* the 5 config-derived tokens */
+        }
+        free(r6);
+    }
+
+    /* 7. --config stripped from the middle; trailing args preserved. */
+    char cfg7[256];
+    snprintf(cfg7, sizeof(cfg7), "%s/one.cfg", tdir);
+    FILE* f7 = fopen(cfg7, "w");
+    if (f7)
+    {
+        fputs("memory=128m\n", f7);
+        fclose(f7);
+    }
+    char* a7[] = {"oci2bin", "--config", cfg7, "image.img", "--debug", NULL};
+    char** r7 = build_merged_argv(5, a7, &out_argc);
+    ASSERT_NOT_NULL(r7, "build_merged_argv: config+args returns argv");
+    if (r7)
+    {
+        ASSERT_INT_EQ(out_argc, 5, "build_merged_argv: 1+2+2 merged argc");
+        ASSERT_STR_EQ(r7[1], "--memory", "build_merged_argv: config flag first");
+        ASSERT_STR_EQ(r7[2], "128m", "build_merged_argv: config value");
+        ASSERT_STR_EQ(r7[3], "image.img",
+                      "build_merged_argv: --config/PATH stripped");
+        ASSERT_STR_EQ(r7[4], "--debug", "build_merged_argv: trailing arg kept");
+        ASSERT_NULL(r7[5], "build_merged_argv: terminated");
+        for (int j = 1; j <= 2; j++)
+        {
+            free(r7[j]);
+        }
+        free(r7);
+    }
+
+    /* 8. Config file with only comments/blank lines → no tokens added. */
+    char cfg8[256];
+    snprintf(cfg8, sizeof(cfg8), "%s/empty.cfg", tdir);
+    FILE* f8 = fopen(cfg8, "w");
+    if (f8)
+    {
+        fputs("# only a comment\n   \n", f8);
+        fclose(f8);
+    }
+    char* a8[] = {"oci2bin", "--config", cfg8, "image.img", NULL};
+    char** r8 = build_merged_argv(4, a8, &out_argc);
+    ASSERT_NOT_NULL(r8, "build_merged_argv: comment-only config returns argv");
+    if (r8)
+    {
+        ASSERT_INT_EQ(out_argc, 2, "build_merged_argv: only argv0+image");
+        ASSERT_STR_EQ(r8[1], "image.img", "build_merged_argv: image preserved");
+        ASSERT_NULL(r8[2], "build_merged_argv: terminated");
+        free(r8);
+    }
+
+    /* 9. A config line longer than the 4092-char cap → NULL (cfg freed). */
+    char cfg9[256];
+    snprintf(cfg9, sizeof(cfg9), "%s/longline.cfg", tdir);
+    FILE* f9 = fopen(cfg9, "w");
+    if (f9)
+    {
+        for (int k = 0; k < 5000; k++)
+        {
+            fputc('a', f9);
+        }
+        fputc('\n', f9);
+        fclose(f9);
+    }
+    char* a9[] = {"oci2bin", "--config", cfg9, "image.img", NULL};
+    ASSERT_NULL(build_merged_argv(4, a9, &out_argc),
+                "build_merged_argv: over-long config line returns NULL");
+
+    /* 10. More config entries than the 256-token cap → NULL (cfg freed). */
+    char cfg10[256];
+    snprintf(cfg10, sizeof(cfg10), "%s/many.cfg", tdir);
+    FILE* f10 = fopen(cfg10, "w");
+    if (f10)
+    {
+        for (int k = 0; k < 200; k++)
+        {
+            fprintf(f10, "k%d=v%d\n", k, k);
+        }
+        fclose(f10);
+    }
+    char* a10[] = {"oci2bin", "--config", cfg10, "image.img", NULL};
+    ASSERT_NULL(build_merged_argv(4, a10, &out_argc),
+                "build_merged_argv: too many config entries returns NULL");
+
+    rm_rf_dir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -3720,6 +3935,7 @@ int main(void)
     test_print_first_run_hint();
     test_parse_opts_hint_flags();
     test_parse_opts_size();
+    test_build_merged_argv();
 
     printf("1..%d\n", tap_test_num);
 
