@@ -11209,6 +11209,130 @@ static int verify_pinned_digest(const char* self_path)
     return run_python_helper(script, self_path, NULL, NULL, NULL);
 }
 
+/*
+ * Self-enforcing signature policy (--require-signed). If the embedded
+ * OCI2BIN_META declares require_signed, the binary must carry a valid
+ * OCI2BIN_SIG signature from the embedded verify_pubkey or it refuses to
+ * run. Verification is self-contained: stdlib parses the signature block,
+ * `openssl` performs the ECDSA verify over the signed content (piped via
+ * stdin, so no large temp file). Fails closed on any error — a missing
+ * signature, missing openssl, or a mismatch all abort before extraction.
+ *
+ * Note: the trust anchor (verify_pubkey) is embedded in the binary it
+ * protects, so this enforces "won't run unsigned / foreign-signed" and
+ * guards against accidental corruption; for strong anti-tamper, pin the
+ * key out-of-band (see README).
+ */
+/* Cheap pre-check: only binaries that actually carry the policy marker pay
+ * for the python+openssl verification. Scans the trailing window of the file
+ * (the OCI2BIN_META block lives at/near the end) for the compact-JSON marker.
+ * Returns 1 if the marker is present, 0 if not, -1 on read error. */
+static int has_require_signed_marker(const char* self_path)
+{
+    static const char marker[] = "\"require_signed\":true";
+    const size_t mlen = sizeof(marker) - 1;
+    const size_t window = 256 * 1024;
+
+    int fd = open(self_path, O_RDONLY);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    off_t end = lseek(fd, 0, SEEK_END);
+    if (end < 0)
+    {
+        close(fd);
+        return -1;
+    }
+    size_t want = (size_t)end < window ? (size_t)end : window;
+    if (lseek(fd, end - (off_t)want, SEEK_SET) < 0)
+    {
+        close(fd);
+        return -1;
+    }
+    char* buf = malloc(want + 1);
+    if (!buf)
+    {
+        close(fd);
+        return -1;
+    }
+    ssize_t n = read_all_fd(fd, buf, want);
+    close(fd);
+    int found = 0;
+    if (n > 0 && (size_t)n >= mlen)
+    {
+        found = memmem(buf, (size_t)n, marker, mlen) != NULL ? 1 : 0;
+    }
+    free(buf);
+    return found;
+}
+
+static int enforce_require_signed(const char* self_path)
+{
+    /* Fast path: skip the python+openssl verifier entirely when the binary
+     * does not declare the policy (the common case). On read error, fall
+     * through to the verifier, which fails closed. */
+    if (has_require_signed_marker(self_path) == 0)
+    {
+        return 0;
+    }
+
+    static const char script[] =
+        "import json,os,struct,subprocess,sys,tempfile\n"
+        "MAGIC=b'OCI2BIN_META\\x00'\n"
+        "SIGMAGIC=b'OCI2BIN_SIG\\x00'\n"
+        "TRAILER=b'OCI2BIN_SIG_END\\x00'\n"
+        "ALGOS={1:'sha256',3:'sha512'}\n"
+        "data=open(sys.argv[1],'rb').read()\n"
+        "block_start=None\n"
+        "sig=None\n"
+        "algo='sha256'\n"
+        "if len(data)>=20 and data[-20:-4]==TRAILER:\n"
+        " tot=struct.unpack('>I',data[-4:])[0]\n"
+        " if 0<tot<=len(data):\n"
+        "  bs=len(data)-tot\n"
+        "  if data[bs:bs+len(SIGMAGIC)]==SIGMAGIC:\n"
+        "   block_start=bs\n"
+        "   off=bs+len(SIGMAGIC)\n"
+        "   ver=data[off];off+=1\n"
+        "   if ver>=2:\n"
+        "    algo=ALGOS.get(data[off],'sha256');off+=1\n"
+        "   off+=32\n"
+        "   siglen=struct.unpack('>H',data[off:off+2])[0];off+=2\n"
+        "   sig=data[off:off+siglen]\n"
+        "content=data[:block_start] if block_start is not None else data\n"
+        "m=content.rfind(MAGIC)\n"
+        "sys.exit(0) if m<4 else None\n"
+        "tot2=struct.unpack_from('<I',content,m-4)[0]\n"
+        "js=m+len(MAGIC);je=(m-4)+tot2\n"
+        "sys.exit(0) if je>len(content) or je<=js else None\n"
+        "try:\n"
+        " meta=json.loads(content[js:je].rstrip(b'\\x00'))\n"
+        "except Exception:\n"
+        " sys.exit(0)\n"
+        "if not meta.get('require_signed'):\n"
+        " sys.exit(0)\n"
+        "pub=meta.get('verify_pubkey','')\n"
+        "if not pub or sig is None:\n"
+        " sys.stderr.write('oci2bin: --require-signed: no valid signature "
+        "present; refusing to run\\n');sys.exit(1)\n"
+        "with tempfile.TemporaryDirectory(prefix='oci2bin-rs-') as td:\n"
+        " pf=os.path.join(td,'pub.pem');open(pf,'w').write(pub)\n"
+        " sf=os.path.join(td,'sig.der');open(sf,'wb').write(sig)\n"
+        " try:\n"
+        "  r=subprocess.run(['openssl','dgst','-'+algo,'-verify',pf,"
+        "'-signature',sf],input=content,stdout=subprocess.DEVNULL,"
+        "stderr=subprocess.DEVNULL)\n"
+        " except FileNotFoundError:\n"
+        "  sys.stderr.write('oci2bin: --require-signed: openssl not found; "
+        "cannot verify; refusing to run\\n');sys.exit(1)\n"
+        " if r.returncode!=0:\n"
+        "  sys.stderr.write('oci2bin: --require-signed: signature "
+        "verification failed; refusing to run\\n');sys.exit(1)\n"
+        "sys.exit(0)\n";
+    return run_python_helper(script, self_path, NULL, NULL, NULL);
+}
+
 static int run_self_update(const char* self_path, const char* key_path,
                            int apply_update, const char* helper_path)
 {
@@ -14412,6 +14536,15 @@ int main(int argc, char* argv[])
 
     if (verify_pinned_digest(self_path) != 0)
     {
+        return 1;
+    }
+
+    /* 3b. Self-enforcing signature policy (--require-signed): refuse to run
+     * unless a valid signature from the embedded trusted key is present. */
+    if (enforce_require_signed(self_path) != 0)
+    {
+        notify_event(&opts, "sig_mismatch",
+                     "\"key\":\"require-signed policy\"");
         return 1;
     }
 

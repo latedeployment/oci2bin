@@ -608,7 +608,7 @@ REPRODUCIBLE_TIMESTAMP = '1970-01-01T00:00:00Z'
 
 def build_meta_block(image_name, digest=None, self_update_url=None,
                      pin_digest=None, reproducible=False,
-                     offline_only=False):
+                     offline_only=False, require_signed_pubkey=None):
     """
     Build the OCI2BIN_META block appended to the end of the output binary.
     Format: uint32_le(total_size) + META_MAGIC + json_bytes + b'\\x00'
@@ -645,6 +645,13 @@ def build_meta_block(image_name, digest=None, self_update_url=None,
         meta['hermetic']     = 'yes'
         meta['network_used'] = 'no'
         meta['build_epoch']  = 0
+    if require_signed_pubkey:
+        # Self-enforcing signature policy: the loader refuses to run unless a
+        # valid OCI2BIN_SIG signature from this public key is present. The key
+        # is embedded *before* signing, so it is itself covered by the
+        # signature (see README for the trust-anchor caveat).
+        meta['require_signed'] = True
+        meta['verify_pubkey']  = require_signed_pubkey
     json_bytes = json.dumps(meta, separators=(',', ':')).encode() + b'\x00'
     total_size = 4 + len(META_MAGIC) + len(json_bytes)
     return struct.pack('<I', total_size) + META_MAGIC + json_bytes
@@ -1028,7 +1035,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    self_update_url=None, pin_digest=None,
                    use_layer_cache=True, reproducible=False,
                    offline_only=False, user_labels=None,
-                   encrypt_recipients=None, encrypt_recipients_files=None):
+                   encrypt_recipients=None, encrypt_recipients_files=None,
+                   require_signed_pubkey=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -1290,7 +1298,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                                   self_update_url=self_update_url,
                                   pin_digest=pin_digest,
                                   reproducible=reproducible,
-                                  offline_only=offline_only)
+                                  offline_only=offline_only,
+                                  require_signed_pubkey=require_signed_pubkey)
     with open(output_path, 'wb') as f:
         f.write(polyglot)
         f.write(meta_block)
@@ -1395,6 +1404,11 @@ def main():
                         dest='recipients_files', metavar='FILE',
                         help='File of age recipients (one per line), '
                              'repeatable. Implies --encrypt.')
+    parser.add_argument('--require-signed', default=None, metavar='PUBKEY.pem',
+                        help='Embed a self-enforcing signature policy: the '
+                             'loader refuses to run unless a valid OCI2BIN_SIG '
+                             'from this public key is present. Sign afterwards '
+                             'with `oci2bin sign --key PRIV.pem`.')
     parser.add_argument('--reproducible', action='store_true', default=False,
                         help='Produce a byte-identical output across runs of '
                              'the same input: re-emit the OCI tar with sorted '
@@ -1473,6 +1487,20 @@ def main():
               '--recipients-file', file=sys.stderr)
         sys.exit(1)
 
+    require_signed_pubkey = None
+    if args.require_signed:
+        try:
+            with open(args.require_signed, 'r', encoding='utf-8') as f:
+                require_signed_pubkey = f.read()
+        except OSError as e:
+            print(f'--require-signed: cannot read {args.require_signed}: {e}',
+                  file=sys.stderr)
+            sys.exit(1)
+        if 'PUBLIC KEY' not in require_signed_pubkey:
+            print('--require-signed: expected a PEM public key in '
+                  f'{args.require_signed}', file=sys.stderr)
+            sys.exit(1)
+
     image_name_for_meta = args.image_name if args.image_name else (args.image or 'unknown')
     build_polyglot(args.loader, args.image or '', args.output,
                    tar_path=args.tar,
@@ -1492,7 +1520,8 @@ def main():
                    offline_only=args.offline_only,
                    user_labels=user_labels,
                    encrypt_recipients=args.recipients,
-                   encrypt_recipients_files=args.recipients_files)
+                   encrypt_recipients_files=args.recipients_files,
+                   require_signed_pubkey=require_signed_pubkey)
 
 
 if __name__ == '__main__':

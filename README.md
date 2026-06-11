@@ -394,6 +394,38 @@ Notes and limitations:
   the host like any other container; pair with `--vm` for stronger runtime
   isolation.
 
+### Self-enforcing signature policy (--require-signed)
+
+`oci2bin sign`/`verify` let you sign and check a binary, but verification is a
+separate manual step. `--require-signed` bakes the policy into the binary so it
+**refuses to run unless a valid signature is present** — admission-policy
+semantics that travel with the binary.
+
+It is a two-step flow: embed the trusted public key at build time, then sign:
+
+```bash
+# 1. embed the policy + trusted public key
+oci2bin --require-signed release.pub redis:7-alpine myredis
+# 2. sign with the matching private key
+oci2bin sign --key release.key --in myredis
+```
+
+At every launch, before any extraction, the loader parses its own embedded
+`OCI2BIN_SIG` block and verifies it against the embedded public key (stdlib
+for parsing, `openssl` for the ECDSA check). If the signature is missing,
+mismatched, or `openssl` is unavailable, the binary **fails closed** and
+refuses to run. The check is self-contained, so it works for a binary copied
+anywhere (it needs only `python3` + `openssl`, both already used by the runtime).
+
+**Trust-anchor caveat.** The public key is embedded in the very binary it
+protects, so a determined attacker who rewrites the payload can also swap the
+key and re-sign. `--require-signed` therefore guarantees *"this binary will not
+launch an unsigned or foreign-signed payload"* and protects against accidental
+corruption — but it is **not** tamper-proof on its own. For strong anti-tamper,
+anchor trust outside the binary: distribute the binary over verified/read-only
+storage, or use `--verify-key PUB` at run time with a key the operator supplies
+independently. The two compose well.
+
 ### Using OCI image layout (no Docker daemon)
 
 Use `--oci-dir DIR` to build from an OCI image layout directory instead of pulling via Docker. This works with `skopeo`, `crane`, `buildah`, or any tool that produces OCI layout output:

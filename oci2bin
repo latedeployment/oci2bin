@@ -69,6 +69,9 @@
 #   --recipient AGE_PUB   age recipient (age1.../ssh-ed25519 ...), repeatable
 #   --recipients-file F   File of age recipients, one per line (repeatable)
 #                         Runtime: set OCI2BIN_IDENTITY to the age identity file
+#   --require-signed PUB  Embed a self-enforcing signature policy: refuse to run
+#                         unless a valid signature from PUB is present (then run
+#                         'oci2bin sign --key PRIV --in BINARY')
 #   --self-update-url URL Embed a signed update-manifest URL into the binary
 #   --pin-digest DIGEST|ALGO:auto
 #                         Embed a pinned canonical digest for runtime integrity checks
@@ -1178,7 +1181,7 @@ if [[ "${1:-}" == "run" ]]; then
     RUN_IMAGE=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest|--recipient|--recipients-file)
+            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest|--recipient|--recipients-file|--require-signed)
                 [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
                 BUILD_ARGS+=("$1" "$2")
                 shift 2
@@ -1892,6 +1895,7 @@ USER_LABELS=()
 ENCRYPT=0
 ENCRYPT_RECIPIENTS=()
 ENCRYPT_RECIPIENTS_FILES=()
+REQUIRE_SIGNED_KEY=""
 SELF_UPDATE_URL=""
 PIN_DIGEST=""
 VERIFY_COSIGN=0
@@ -2035,6 +2039,11 @@ while [[ $# -gt 0 ]]; do
             [[ $# -lt 2 ]] && { echo "oci2bin: --recipients-file requires a PATH" >&2; exit 1; }
             ENCRYPT=1
             ENCRYPT_RECIPIENTS_FILES+=("$2")
+            shift 2
+            ;;
+        --require-signed)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --require-signed requires PUBKEY.pem" >&2; exit 1; }
+            REQUIRE_SIGNED_KEY="$2"
             shift 2
             ;;
         --self-update-url)
@@ -2477,6 +2486,7 @@ for _lbl in "${USER_LABELS[@]}"; do EMBED_LOADER_ARG+=(--label "$_lbl"); done
 [[ "$ENCRYPT" -eq 1 ]] && EMBED_LOADER_ARG+=(--encrypt)
 for _r in "${ENCRYPT_RECIPIENTS[@]}"; do EMBED_LOADER_ARG+=(--recipient "$_r"); done
 for _rf in "${ENCRYPT_RECIPIENTS_FILES[@]}"; do EMBED_LOADER_ARG+=(--recipients-file "$_rf"); done
+[[ -n "$REQUIRE_SIGNED_KEY" ]] && EMBED_LOADER_ARG+=(--require-signed "$REQUIRE_SIGNED_KEY")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \
