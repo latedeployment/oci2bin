@@ -58,6 +58,7 @@ VMLINUX_OUT    = build/vmlinux
         test-unit-aarch64 test-integration test-integration-redis \
         test-integration-nginx test-integration-services \
         test-c test-c-aarch64 test-c-stubs test-python test-shellcheck \
+        test-all test-all-fuzz \
         test-vm-unit test-vm \
         lint lint-clang lint-semgrep lint-scan-build lint-shellcheck \
         fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-mcp fuzz-clean \
@@ -179,29 +180,41 @@ clean-all: clean
 
 # ── Coverage targets ───────────────────────────────────────────────────────────
 
-# C coverage: compile test binary with gcov instrumentation, run, then generate
-# an lcov HTML report.  Requires: lcov + genhtml (lcov package).
-# Note: gcov is incompatible with -static; we link dynamically here.
+# C coverage of src/loader.c exercised by the C unit tests. Compiles the test
+# binary with gcov instrumentation, runs it, then reports per-file line/branch
+# coverage. Works with bare gcov (always shipped with gcc); if lcov + genhtml
+# are installed it additionally emits a browsable HTML report.
+# Note: gcov is incompatible with -static, so we link dynamically here. The
+# .gcno/.gcda land next to test_c_units.o; gcov then resolves the #included
+# src/loader.c and prints its coverage. Covers the test_c_units suite only —
+# the stub tests (test-c-stubs) and Python tests are separate.
 coverage-c:
 	@mkdir -p build/cov
 	cd build/cov && $(CC_X86_64) --coverage -O0 -Wno-return-local-addr \
-	    -o test_c_units_cov ../../$(TESTS_DIR)/test_c_units.c && \
-	    TMPDIR=$(TEST_TMPDIR) OCI2BIN_TMPDIR=$(TEST_TMPDIR) ./test_c_units_cov
-	lcov --capture --directory build/cov \
-	     --output-file build/cov/coverage.info \
-	     --exclude '*/test_c_units.c' 2>/dev/null || \
-	  gcov -r build/cov/test_c_units.c-*.gcda && \
-	  lcov --capture --directory build/cov \
-	       --output-file build/cov/coverage.info
-	genhtml build/cov/coverage.info \
-	        --output-directory build/coverage-html \
-	        --title "oci2bin C coverage" --legend 2>/dev/null || true
-	@echo "=== C line/branch summary ==="
-	lcov --summary build/cov/coverage.info 2>/dev/null || true
-	@echo "HTML report: build/coverage-html/index.html"
+	    -c ../../$(TESTS_DIR)/test_c_units.c -o test_c_units.o
+	cd build/cov && $(CC_X86_64) --coverage test_c_units.o -o test_c_units_cov
+	cd build/cov && TMPDIR=$(TEST_TMPDIR) OCI2BIN_TMPDIR=$(TEST_TMPDIR) \
+	    ./test_c_units_cov
+	@echo "=== src/loader.c coverage (gcov) ==="
+	cd build/cov && gcov -r -o . test_c_units.o 2>/dev/null | \
+	    grep -A3 -i 'loader\.c' || true
+	@if command -v lcov >/dev/null 2>&1 && command -v genhtml >/dev/null 2>&1; then \
+	    lcov --capture --directory build/cov \
+	         --output-file build/cov/coverage.info \
+	         --exclude '*/test_c_units.c' >/dev/null 2>&1 && \
+	    genhtml build/cov/coverage.info --output-directory build/coverage-html \
+	            --title "oci2bin C coverage" --legend >/dev/null 2>&1 && \
+	    echo "HTML report: build/coverage-html/index.html"; \
+	  else \
+	    echo "(install lcov + genhtml for an HTML report; per-file *.gcov are in build/cov/)"; \
+	  fi
 
 # Python coverage: uses coverage.py (pip install coverage or python3-coverage).
 coverage-python:
+	@command -v python3 >/dev/null && python3 -c "import coverage" 2>/dev/null || { \
+	    echo "coverage.py not installed — skipping Python coverage"; \
+	    echo "  install with: pip install coverage   (or dnf install python3-coverage)"; \
+	    exit 0; }
 	@mkdir -p build/coverage-python-html
 	$(TEST_ENV) python3 -m coverage run --branch --source scripts,tests \
 	    -m unittest discover -s tests -p '*.py' -v 2>/dev/null || true
@@ -296,6 +309,17 @@ test: test-unit test-integration
 test-unit: test-c test-c-stubs test-python test-vm-unit test-shellcheck
 
 test-unit-aarch64: test-c-aarch64 test-python
+
+# Full unit sweep on both architectures: x86_64 (test-unit) + aarch64
+# (cross-compiled C unit tests run under qemu). No Docker required.
+test-all: test-unit test-c-aarch64
+	@echo "=== test-all: x86_64 + aarch64 unit tests complete ==="
+
+# test-all plus the local fuzz sweep. FUZZ_SECONDS is per-harness wall time
+# (default 300). Fuzzing is x86_64-native only — there is no aarch64 harness.
+FUZZ_SECONDS ?= 300
+test-all-fuzz: test-all
+	bash scripts/fuzz_run.sh $(FUZZ_SECONDS)
 
 test-c: $(TEST_C_BIN)
 	@echo "=== C unit tests (x86_64) ==="
