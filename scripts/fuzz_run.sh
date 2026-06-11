@@ -24,6 +24,8 @@ TARGETS=(
     "fuzz_json:tests/fuzz/corpus/json:-max_len=65536"
     "fuzz_seccomp:tests/fuzz/corpus/seccomp:-max_len=65536"
     "fuzz_parse_opts:tests/fuzz/corpus/parse_opts:-max_len=4096"
+    "fuzz_mcp_jsonrpc:tests/fuzz/corpus/mcp:-max_len=65536"
+    "fuzz_layer_merge:tests/fuzz/corpus/layer_merge:-max_len=8192"
 )
 
 PIDS=()
@@ -112,9 +114,11 @@ done
 echo ""
 if (( FOUND )); then
     echo "Replay a finding:"
-    echo "  ./build/fuzz_json      build/fuzz-out/fuzz_json/crash-<hash>"
-    echo "  ./build/fuzz_seccomp   build/fuzz-out/fuzz_seccomp/leak-<hash>"
-    echo "  ./build/fuzz_parse_opts build/fuzz-out/fuzz_parse_opts/leak-<hash>"
+    echo "  ./build/fuzz_json        build/fuzz-out/fuzz_json/crash-<hash>"
+    echo "  ./build/fuzz_seccomp     build/fuzz-out/fuzz_seccomp/leak-<hash>"
+    echo "  ./build/fuzz_parse_opts  build/fuzz-out/fuzz_parse_opts/leak-<hash>"
+    echo "  ./build/fuzz_mcp_jsonrpc build/fuzz-out/fuzz_mcp_jsonrpc/crash-<hash>"
+    echo "  ./build/fuzz_layer_merge build/fuzz-out/fuzz_layer_merge/crash-<hash>"
     echo ""
     echo "Add confirmed fixes to the regression corpus:"
     echo "  cp build/fuzz-out/<harness>/crash-<hash> tests/fuzz/corpus/<harness>/regression_<n>"

@@ -403,6 +403,7 @@ test-integration-services:
 #   make fuzz-seccomp    # fuzz seccomp profile parser
 #   make fuzz-parse-opts # fuzz parse_opts + load_env_file
 #   make fuzz-mcp        # fuzz MCP JSON-RPC parser
+#   make fuzz-layer-merge # fuzz the in-process OCI layer merge
 #   make fuzz-all        # build all fuzz binaries
 #
 # Run a harness (example):
@@ -410,6 +411,7 @@ test-integration-services:
 #   ./build/fuzz_seccomp tests/fuzz/corpus/seccomp -max_len=65536 -jobs=4
 #   ./build/fuzz_parse_opts tests/fuzz/corpus/parse_opts -max_len=4096 -jobs=4
 #   ./build/fuzz_mcp_jsonrpc tests/fuzz/corpus/mcp -max_len=65536 -jobs=4
+#   ./build/fuzz_layer_merge tests/fuzz/corpus/layer_merge -max_len=8192 -jobs=4
 #
 # Findings are written to crash-* / timeout-* / oom-* files in the CWD.
 # Replay a crash:
@@ -422,9 +424,10 @@ FUZZ_CFLAGS   = -g -O1 -fsanitize=fuzzer,address,undefined \
                 -Wno-return-local-addr
 
 FUZZ_BINS = build/fuzz_json build/fuzz_seccomp build/fuzz_parse_opts \
-            build/fuzz_mcp_jsonrpc
+            build/fuzz_mcp_jsonrpc build/fuzz_layer_merge
 
-.PHONY: fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-mcp fuzz-clean
+.PHONY: fuzz-all fuzz-json fuzz-seccomp fuzz-parse-opts fuzz-mcp \
+        fuzz-layer-merge fuzz-clean
 
 fuzz-all: $(FUZZ_BINS)
 
@@ -432,6 +435,7 @@ fuzz-json: build/fuzz_json
 fuzz-seccomp: build/fuzz_seccomp
 fuzz-parse-opts: build/fuzz_parse_opts
 fuzz-mcp: build/fuzz_mcp_jsonrpc
+fuzz-layer-merge: build/fuzz_layer_merge
 
 build/fuzz_json: tests/fuzz/fuzz_json.c src/loader.c
 	@mkdir -p build
@@ -446,6 +450,10 @@ build/fuzz_parse_opts: tests/fuzz/fuzz_parse_opts.c src/loader.c
 	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $<
 
 build/fuzz_mcp_jsonrpc: tests/fuzz/fuzz_mcp_jsonrpc.c src/loader.c
+	@mkdir -p build
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $<
+
+build/fuzz_layer_merge: tests/fuzz/fuzz_layer_merge.c src/loader.c
 	@mkdir -p build
 	$(FUZZ_CC) $(FUZZ_CFLAGS) -o $@ $<
 
