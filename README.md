@@ -958,6 +958,36 @@ network helper after `unshare(CLONE_NEWNET)`, sends it a ready signal, and
 waits for it to configure the `tap0` interface. On container exit the helper
 is sent `SIGTERM`.
 
+#### Default-deny egress allowlist (--allow-egress)
+
+By default a slirp/pasta container can reach the whole internet. `--allow-egress`
+flips that to **deny-by-default**: only the destinations you list are reachable.
+Each entry is `HOST:PORT` or `CIDR:PORT` and may be repeated:
+
+```bash
+./myapp --net slirp \
+        --allow-egress 10.0.0.0/8:5432 \
+        --allow-egress api.stripe.com:443
+```
+
+Inside the container's network namespace the loader installs an nftables
+`inet` table whose output chain is `policy drop`, then accepts established/
+related flows, loopback, and each listed destination (TCP and UDP) — nothing
+else leaves. Literal IPs and CIDRs are used directly; hostnames are **resolved
+once at launch and pinned**: every resolved address is added to the allowlist
+*and* written into the container's `/etc/hosts`, so name lookups return exactly
+those IPs with no DNS egress required. (Addresses that rotate after launch are
+not tracked — re-launch to re-pin.)
+
+Requirements and behavior:
+
+- Requires `--net slirp` or `--net pasta` (a private netns) and the `nft`
+  binary. It is **not** available with `--vm`.
+- **Fails closed**: a missing `nft`, an unresolvable hostname, or a failed
+  ruleset apply aborts the run rather than starting with egress open.
+- If your app needs DNS to other names at run time, allow the resolver
+  explicitly, e.g. `--allow-egress 10.0.0.53:53`.
+
 ### Sharing namespaces between containers
 
 Two containers can share the same network or IPC namespace using `--net container:<PID>` and `--ipc container:<PID>`. This is useful for sidecar patterns (e.g. a proxy sharing network with a service) or for processes that communicate via SysV shared memory or message queues.

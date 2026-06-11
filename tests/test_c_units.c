@@ -2540,6 +2540,98 @@ static void test_blob_is_age_encrypted(void)
                   "blob_is_age_encrypted: missing file returns -1");
 }
 
+/* ── test_egress (--allow-egress) ─────────────────────────────────────────── */
+
+static void test_egress_append_rule(void)
+{
+    char buf[512];
+    size_t off = 0;
+    buf[0] = '\0';
+    ASSERT_INT_EQ(egress_append_rule(buf, sizeof(buf), &off, 0,
+                                     "1.2.3.4", "443"), 0,
+                  "egress_append_rule: v4 returns 0");
+    ASSERT(strstr(buf, "ip daddr 1.2.3.4 tcp dport 443 accept") != NULL,
+           "egress_append_rule: v4 tcp rule present");
+    ASSERT(strstr(buf, "ip daddr 1.2.3.4 udp dport 443 accept") != NULL,
+           "egress_append_rule: v4 udp rule present");
+
+    off = 0;
+    buf[0] = '\0';
+    ASSERT_INT_EQ(egress_append_rule(buf, sizeof(buf), &off, 1,
+                                     "2001:db8::1", "53"), 0,
+                  "egress_append_rule: v6 returns 0");
+    ASSERT(strstr(buf, "ip6 daddr 2001:db8::1 tcp dport 53 accept") != NULL,
+           "egress_append_rule: v6 tcp rule present");
+
+    /* Overflow is reported, not written past the end. */
+    char small[16];
+    size_t soff = 0;
+    small[0] = '\0';
+    ASSERT_INT_EQ(egress_append_rule(small, sizeof(small), &soff, 0,
+                                     "10.0.0.1", "8080"), -1,
+                  "egress_append_rule: overflow returns -1");
+}
+
+static void test_parse_opts_egress(void)
+{
+    struct container_opts opts;
+
+    {
+        char a[] = "10.0.0.0/8:5432";
+        char* argv[] = {"prog", "--allow-egress", a, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --allow-egress CIDR:port accepted");
+        ASSERT_INT_EQ(opts.n_egress, 1, "parse_opts: n_egress incremented");
+        ASSERT_STR_EQ(opts.egress[0], "10.0.0.0/8:5432",
+                      "parse_opts: egress spec stored");
+    }
+
+    {
+        char a[] = "api.example.com:443";
+        char b[] = "1.2.3.4:80";
+        char* argv[] = {"prog", "--allow-egress", a,
+                        "--allow-egress", b, NULL
+                       };
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(5, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: two --allow-egress accepted");
+        ASSERT_INT_EQ(opts.n_egress, 2, "parse_opts: n_egress == 2");
+    }
+
+    {
+        char a[] = "nohostport";
+        char* argv[] = {"prog", "--allow-egress", a, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --allow-egress without port rejected");
+    }
+
+    {
+        char a[] = "host:notaport";
+        char* argv[] = {"prog", "--allow-egress", a, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --allow-egress non-numeric port rejected");
+    }
+
+    {
+        char a[] = "host:0";
+        char* argv[] = {"prog", "--allow-egress", a, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --allow-egress port 0 rejected");
+    }
+
+    {
+        char a[] = "host:99999";
+        char* argv[] = {"prog", "--allow-egress", a, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: --allow-egress port >65535 rejected");
+    }
+}
+
 /* ── test_lookup_passwd_group ─────────────────────────────────────────────── */
 
 static void test_lookup_passwd_group(void)
@@ -4887,6 +4979,8 @@ int main(void)
     test_read_write_file();
     test_copy_n_bytes();
     test_blob_is_age_encrypted();
+    test_egress_append_rule();
+    test_parse_opts_egress();
     test_lookup_passwd_group();
     test_openat_beneath();
     test_misc_helpers();

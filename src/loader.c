@@ -12,6 +12,7 @@
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -163,6 +164,7 @@ static volatile unsigned long INITRAMFS_DATA_PATCHED = 0x6B6B6B6B6B6B6B6BUL;
 #define MAX_LAYERS   128
 #define MAX_VOLUMES   32
 #define MAX_SECRETS   32
+#define MAX_EGRESS    32
 #define MAX_ARGS      64
 #define MAX_ENV       64
 #define MAX_NOTIFY     8
@@ -504,6 +506,11 @@ struct container_opts
     /* port-forwards for slirp mode: "HOST_PORT:CTR_PORT" strings */
     char* net_portfwd[16];
     int   n_portfwd;
+
+    /* --allow-egress HOST:PORT | CIDR:PORT  (default-deny outbound allowlist,
+     * enforced via nft in the netns; hostnames resolved+pinned at launch) */
+    char* egress[MAX_EGRESS];
+    int   n_egress;
 
     /* --ipc host|container:<PID>
      * host = share host IPC (default); container:<PID> = join that IPC ns */
@@ -4571,6 +4578,323 @@ static int find_helper_binary(const char* name, char* out, size_t outsz)
 
     out[0] = '\0';
     return -1;
+}
+
+/* ── --allow-egress: default-deny outbound allowlist ───────────────────────── */
+
+/* Append accept rules for a resolved/literal (family, addr-or-cidr, port). */
+static int egress_append_rule(char* buf, size_t cap, size_t* off,
+                              int is_v6, const char* addr, const char* port)
+{
+    const char* fam = is_v6 ? "ip6" : "ip";
+    int n = snprintf(buf + *off, cap - *off,
+                     "    %s daddr %s tcp dport %s accept\n"
+                     "    %s daddr %s udp dport %s accept\n",
+                     fam, addr, port, fam, addr, port);
+    if (n < 0 || (size_t)n >= cap - *off)
+    {
+        return -1;
+    }
+    *off += (size_t)n;
+    return 0;
+}
+
+/*
+ * Resolve `host` via `getent ahosts` and pin each distinct address. getent is
+ * used instead of getaddrinfo() because the loader is statically linked, where
+ * glibc's NSS-based getaddrinfo cannot dlopen resolver modules. For each
+ * address we append an nft accept rule and an /etc/hosts line. Returns the
+ * number of addresses pinned, or -1 on a hard error (buffer overflow).
+ */
+static int egress_resolve_and_pin(const char* host, const char* port,
+                                  char* rules, size_t rules_cap, size_t* off,
+                                  char* hosts_add, size_t hosts_cap,
+                                  size_t* hoff)
+{
+    char* getent_argv[] = { "getent", "ahosts", (char*)host, NULL };
+    size_t out_len = 0;
+    char* out = run_cmd_capture(getent_argv, &out_len);
+    if (!out)
+    {
+        fprintf(stderr,
+                "oci2bin: --allow-egress: cannot resolve '%s' "
+                "(getent ahosts failed)\n", host);
+        return 0;
+    }
+    char* s = malloc(out_len + 1);
+    if (!s)
+    {
+        free(out);
+        return -1;
+    }
+    memcpy(s, out, out_len);
+    s[out_len] = '\0';
+    free(out);
+
+    char seen[32][INET6_ADDRSTRLEN];
+    int nseen = 0;
+    int added = 0;
+    char* saveptr = NULL;
+    for (char* line = strtok_r(s, "\n", &saveptr); line;
+            line = strtok_r(NULL, "\n", &saveptr))
+    {
+        char ip[INET6_ADDRSTRLEN];
+        int i = 0;
+        while (line[i] && line[i] != ' ' && line[i] != '\t' &&
+                i < (int)sizeof(ip) - 1)
+        {
+            ip[i] = line[i];
+            i++;
+        }
+        ip[i] = '\0';
+        if (i == 0)
+        {
+            continue;
+        }
+        struct in_addr a4;
+        struct in6_addr a6;
+        int v6;
+        if (inet_pton(AF_INET, ip, &a4) == 1)
+        {
+            v6 = 0;
+        }
+        else if (inet_pton(AF_INET6, ip, &a6) == 1)
+        {
+            v6 = 1;
+        }
+        else
+        {
+            continue;
+        }
+        int dup = 0;
+        for (int k = 0; k < nseen; k++)
+        {
+            if (strcmp(seen[k], ip) == 0)
+            {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+        {
+            continue;
+        }
+        if (nseen < 32)
+        {
+            snprintf(seen[nseen], sizeof(seen[nseen]), "%s", ip);
+            nseen++;
+        }
+        if (egress_append_rule(rules, rules_cap, off, v6, ip, port) < 0)
+        {
+            free(s);
+            return -1;
+        }
+        int hn = snprintf(hosts_add + *hoff, hosts_cap - *hoff,
+                          "%s\t%s\n", ip, host);
+        if (hn > 0 && (size_t)hn < hosts_cap - *hoff)
+        {
+            *hoff += (size_t)hn;
+        }
+        added++;
+    }
+    free(s);
+    if (added == 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --allow-egress: no usable address for '%s'\n", host);
+    }
+    return added;
+}
+
+/*
+ * Install a default-deny outbound allowlist in the current network namespace
+ * via nftables. Each --allow-egress entry is HOST:PORT or CIDR:PORT; literal
+ * IPs/CIDRs are used directly, hostnames are resolved once and pinned (both
+ * into the ruleset and into the container's /etc/hosts so name lookups return
+ * the allowlisted IPs without any DNS egress). Must run after unshare(NEWNET).
+ * Fails closed: a missing nft, an unresolvable host, or a failed apply all
+ * abort the run rather than silently leaving egress open.
+ */
+static int apply_egress_allowlist(struct container_opts* opts,
+                                  const char* rootfs)
+{
+    if (opts->n_egress == 0)
+    {
+        return 0;
+    }
+    if (!opts->net ||
+            (strcmp(opts->net, "slirp") != 0 &&
+             strcmp(opts->net, "pasta") != 0))
+    {
+        fprintf(stderr,
+                "oci2bin: --allow-egress requires --net slirp or --net pasta "
+                "(a private network namespace)\n");
+        return -1;
+    }
+
+    char nft_bin[PATH_MAX];
+    if (find_helper_binary("nft", nft_bin, sizeof(nft_bin)) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --allow-egress requires 'nft' (nftables); refusing "
+                "to run without egress enforcement\n");
+        return -1;
+    }
+
+    static char rules[65536];
+    size_t off = 0;
+    int n = snprintf(rules, sizeof(rules),
+                     "table inet oci2bin_egress {\n"
+                     "  chain output {\n"
+                     "    type filter hook output priority 0; policy drop;\n"
+                     "    ct state established,related accept\n"
+                     "    oifname \"lo\" accept\n");
+    if (n < 0 || (size_t)n >= sizeof(rules))
+    {
+        return -1;
+    }
+    off = (size_t)n;
+
+    char hosts_add[8192];
+    size_t hoff = 0;
+    hosts_add[0] = '\0';
+
+    for (int e = 0; e < opts->n_egress; e++)
+    {
+        char spec[256];
+        if (snprintf(spec, sizeof(spec), "%s", opts->egress[e])
+                >= (int)sizeof(spec))
+        {
+            fprintf(stderr, "oci2bin: --allow-egress entry too long\n");
+            return -1;
+        }
+        char* colon = strrchr(spec, ':');
+        if (!colon)
+        {
+            return -1;    /* validated at parse time */
+        }
+        *colon = '\0';
+        const char* host = spec;
+        const char* port = colon + 1;
+
+        struct in_addr a4;
+        struct in6_addr a6;
+
+        if (strchr(host, '/'))
+        {
+            /* CIDR literal: validate the network part, keep the whole token. */
+            char netonly[200];
+            if (snprintf(netonly, sizeof(netonly), "%s", host)
+                    >= (int)sizeof(netonly))
+            {
+                return -1;
+            }
+            char* slash = strchr(netonly, '/');
+            *slash = '\0';
+            int v6 = strchr(netonly, ':') != NULL;
+            if ((v6 && inet_pton(AF_INET6, netonly, &a6) != 1) ||
+                    (!v6 && inet_pton(AF_INET, netonly, &a4) != 1))
+            {
+                fprintf(stderr,
+                        "oci2bin: --allow-egress: invalid CIDR '%s'\n", host);
+                return -1;
+            }
+            if (egress_append_rule(rules, sizeof(rules), &off, v6, host, port)
+                    < 0)
+            {
+                return -1;
+            }
+            continue;
+        }
+        if (inet_pton(AF_INET, host, &a4) == 1)
+        {
+            if (egress_append_rule(rules, sizeof(rules), &off, 0, host, port)
+                    < 0)
+            {
+                return -1;
+            }
+            continue;
+        }
+        if (inet_pton(AF_INET6, host, &a6) == 1)
+        {
+            if (egress_append_rule(rules, sizeof(rules), &off, 1, host, port)
+                    < 0)
+            {
+                return -1;
+            }
+            continue;
+        }
+
+        /* Hostname: resolve once (via getent) and pin every address. */
+        int added = egress_resolve_and_pin(host, port, rules, sizeof(rules),
+                                           &off, hosts_add, sizeof(hosts_add),
+                                           &hoff);
+        if (added <= 0)
+        {
+            return -1;
+        }
+    }
+
+    int n2 = snprintf(rules + off, sizeof(rules) - off, "  }\n}\n");
+    if (n2 < 0 || (size_t)n2 >= sizeof(rules) - off)
+    {
+        return -1;
+    }
+    off += (size_t)n2;
+
+    char rules_path[] = "/tmp/oci2bin-egress-XXXXXX";
+    int rfd = mkstemp(rules_path);
+    if (rfd < 0)
+    {
+        perror("oci2bin: --allow-egress: mkstemp");
+        return -1;
+    }
+    if (write_all_fd(rfd, rules, off) != 0)
+    {
+        close(rfd);
+        unlink(rules_path);
+        return -1;
+    }
+    close(rfd);
+
+    char* nft_argv[] = { nft_bin, "-f", rules_path, NULL };
+    int rc = run_cmd(nft_argv);
+    unlink(rules_path);
+    if (rc != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --allow-egress: failed to apply nftables ruleset "
+                "(rc=%d); refusing to run\n", rc);
+        return -1;
+    }
+
+    /* Best-effort: pin resolved hostnames in the container's /etc/hosts. The
+     * nft policy is the security guarantee; if this write fails, name lookups
+     * simply fail (deny), which is still safe. */
+    if (hoff > 0 && rootfs)
+    {
+        char hosts_path[PATH_MAX];
+        if (snprintf(hosts_path, sizeof(hosts_path), "%s/etc/hosts", rootfs)
+                < (int)sizeof(hosts_path))
+        {
+            int hfd = open(hosts_path,
+                           O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0644);
+            if (hfd >= 0)
+            {
+                write_all_fd(hfd, hosts_add, hoff);
+                close(hfd);
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: --allow-egress: warning: could not pin "
+                        "hostnames in /etc/hosts (%s)\n", strerror(errno));
+            }
+        }
+    }
+
+    debug_log("egress.applied", "entries=%d", opts->n_egress);
+    return 0;
 }
 
 static int parse_subid_line(const char* line,
@@ -9259,6 +9583,12 @@ static void usage(const char* prog)
             "                      (may be repeated)\n"
             "  --dns IP            Add a DNS server to resolv.conf (may be repeated)\n"
             "  --dns-search DOMAIN Add a DNS search domain (may be repeated)\n"
+            "  --allow-egress HOST:PORT|CIDR:PORT\n"
+            "                      Default-deny outbound: only allow these\n"
+            "                      destinations (nftables in the netns;\n"
+            "                      hostnames resolved+pinned at launch).\n"
+            "                      Requires --net slirp|pasta and 'nft'\n"
+            "                      (may be repeated)\n"
             "  --read-only         Mount rootfs read-only via overlayfs;\n"
             "                      auto-mounts /run as tmpfs (see --no-auto-tmpfs)\n"
             "  --no-auto-tmpfs     Do not auto-mount /run as tmpfs with --read-only\n"
@@ -9671,6 +10001,55 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             {
                 opts->net = "slirp";
             }
+        }
+        else if (strcmp(argv[i], "--allow-egress") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --allow-egress requires HOST:PORT or"
+                        " CIDR:PORT\n");
+                return -1;
+            }
+            if (opts->n_egress >= MAX_EGRESS)
+            {
+                fprintf(stderr,
+                        "oci2bin: too many --allow-egress flags (max %d)\n",
+                        MAX_EGRESS);
+                return -1;
+            }
+            i++;
+            char* spec = argv[i];
+            /* Split on the LAST ':' so HOST:PORT and CIDR:PORT both work
+             * (IPv4/hostname/CIDR; IPv6 literals are not supported in v1). */
+            char* colon = strrchr(spec, ':');
+            if (!colon || colon == spec || colon[1] == '\0')
+            {
+                fprintf(stderr,
+                        "oci2bin: --allow-egress: expected HOST:PORT, got"
+                        " '%s'\n", spec);
+                return -1;
+            }
+            for (const char* p = colon + 1; *p; p++)
+            {
+                if (!isdigit((unsigned char)*p))
+                {
+                    fprintf(stderr,
+                            "oci2bin: --allow-egress: port must be numeric:"
+                            " '%s'\n", spec);
+                    return -1;
+                }
+            }
+            long port = strtol(colon + 1, NULL, 10);
+            if (port < 1 || port > 65535)
+            {
+                fprintf(stderr,
+                        "oci2bin: --allow-egress: port out of range:"
+                        " '%s'\n", spec);
+                return -1;
+            }
+            opts->egress[opts->n_egress++] = spec;
+            continue;
         }
         else if (strcmp(argv[i], "--secret") == 0)
         {
@@ -14614,6 +14993,14 @@ int main(int argc, char* argv[])
     atexit(cleanup_oci_rootfs);
     debug_log("main.rootfs", "path=%s", rootfs);
 
+    if (opts.use_vm && opts.n_egress > 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --allow-egress is not supported with --vm; use "
+                "container mode with --net slirp or --net pasta\n");
+        return 1;
+    }
+
     /* 4b. VM dispatch: after rootfs extraction so rootfs is available */
     if (opts.use_vm)
     {
@@ -14877,6 +15264,15 @@ int main(int argc, char* argv[])
             perror("oci2bin: slirp: write sync pipe");
         }
         close(sync_pipe[1]);
+    }
+
+    /* 10d. Default-deny egress allowlist (--allow-egress): install the
+     * nftables policy now that we are in the network namespace. Fails closed
+     * so a missing nft or unresolvable host aborts rather than running with
+     * egress wide open. */
+    if (apply_egress_allowlist(&opts, rootfs) != 0)
+    {
+        return 1;
     }
 
     /* 11. Allocate a PTY so the container shell gets job control.
