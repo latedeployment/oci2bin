@@ -4024,6 +4024,107 @@ static void test_load_env_file(void)
     rm_rf_dir(tdir);
 }
 
+/* ── test_json_parse_names_array ──────────────────────────────────────────── */
+
+static void test_json_parse_names_array(void)
+{
+    int n = -1;
+
+    /* 1. Two names. */
+    char** a = json_parse_names_array("{\"names\":[\"read\",\"write\"]}",
+                                      "names", &n);
+    ASSERT_NOT_NULL(a, "json_parse_names_array: two-element array parsed");
+    ASSERT_INT_EQ(n, 2, "json_parse_names_array: count = 2");
+    if (a && n == 2)
+    {
+        ASSERT_STR_EQ(a[0], "read", "json_parse_names_array: first name");
+        ASSERT_STR_EQ(a[1], "write", "json_parse_names_array: second name");
+    }
+    if (a)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            free(a[i]);
+        }
+        free(a);
+    }
+
+    /* 2. Single name. */
+    a = json_parse_names_array("{\"names\":[\"close\"]}", "names", &n);
+    ASSERT_NOT_NULL(a, "json_parse_names_array: single-element parsed");
+    ASSERT_INT_EQ(n, 1, "json_parse_names_array: count = 1");
+    if (a && n >= 1)
+    {
+        ASSERT_STR_EQ(a[0], "close", "json_parse_names_array: name value");
+    }
+    if (a)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            free(a[i]);
+        }
+        free(a);
+    }
+
+    /* 3. Empty array → NULL, n=0. */
+    n = -1;
+    a = json_parse_names_array("{\"names\":[]}", "names", &n);
+    ASSERT_NULL(a, "json_parse_names_array: empty array returns NULL");
+    ASSERT_INT_EQ(n, 0, "json_parse_names_array: empty array n=0");
+
+    /* 4. Missing key → NULL. */
+    a = json_parse_names_array("{\"other\":[\"x\"]}", "names", &n);
+    ASSERT_NULL(a, "json_parse_names_array: missing key returns NULL");
+
+    /* 5. Value is not an array → NULL. */
+    a = json_parse_names_array("{\"names\":\"notarray\"}", "names", &n);
+    ASSERT_NULL(a, "json_parse_names_array: non-array value returns NULL");
+
+    /* 6. Whitespace/newlines between elements tolerated. */
+    a = json_parse_names_array("{\"names\":[ \"a\" ,\n \"b\" ]}", "names", &n);
+    ASSERT_NOT_NULL(a, "json_parse_names_array: spaced array parsed");
+    ASSERT_INT_EQ(n, 2, "json_parse_names_array: spaced count = 2");
+    if (a)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            free(a[i]);
+        }
+        free(a);
+    }
+
+    /* 7. Escaped quote inside a name kept as raw bytes (parser does not
+     *    unescape) — stored as a, backslash, quote, b. */
+    a = json_parse_names_array("{\"names\":[\"a\\\"b\"]}", "names", &n);
+    ASSERT_NOT_NULL(a, "json_parse_names_array: escaped-quote name parsed");
+    ASSERT_INT_EQ(n, 1, "json_parse_names_array: escaped name count = 1");
+    if (a && n >= 1)
+    {
+        ASSERT_STR_EQ(a[0], "a\\\"b",
+                      "json_parse_names_array: raw escaped bytes kept");
+    }
+    if (a)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            free(a[i]);
+        }
+        free(a);
+    }
+
+    /* 8. Truncated array (no closing ]) parses what is present, no crash. */
+    a = json_parse_names_array("{\"names\":[\"a\",\"b\"", "names", &n);
+    if (a)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            free(a[i]);
+        }
+        free(a);
+    }
+    ASSERT(1, "json_parse_names_array: truncated input did not crash");
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -4080,6 +4181,7 @@ int main(void)
     test_parse_opts_size();
     test_build_merged_argv();
     test_load_env_file();
+    test_json_parse_names_array();
 
     printf("1..%d\n", tap_test_num);
 
