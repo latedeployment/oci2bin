@@ -214,7 +214,7 @@ not a single global percentage.
 | # | Item | Status | loader.c % after |
 |---|------|--------|------------------|
 | 1 | build_merged_argv | **done** (86.9% fn) | 27.31% |
-| 2 | load_env_file | todo | — |
+| 2 | load_env_file | **done** (75.4% fn; rest = malloc/read fault paths) | 28.05% |
 | 3 | json_parse_names_array | todo | — |
 | 4 | resolve_user + passwd lookup | todo | — |
 | 5 | plan_userns_map | todo | — |

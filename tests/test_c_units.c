@@ -3881,6 +3881,149 @@ static void test_build_merged_argv(void)
     rm_rf_dir(tdir);
 }
 
+/* Write `content` to <dir>/<name>; store the full path in `out`. Shared by
+ * the file-fixture tests below. */
+static void write_fixture(const char* dir, const char* name,
+                          const char* content, char* out, size_t outsz)
+{
+    snprintf(out, outsz, "%s/%s", dir, name);
+    FILE* f = fopen(out, "w");
+    if (f)
+    {
+        if (content[0] != '\0')
+        {
+            fputs(content, f);
+        }
+        fclose(f);
+    }
+}
+
+/* ── test_load_env_file ───────────────────────────────────────────────────── */
+
+static void test_load_env_file(void)
+{
+    struct container_opts opts;
+    char tmpl[] = "/tmp/oci2bin-env-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "load_env_file: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+    char path[256];
+
+    /* 1. Well-formed: two vars stored verbatim. */
+    write_fixture(tdir, "ok.env", "FOO=bar\nBAZ=qux\n", path, sizeof(path));
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), 0,
+                  "load_env_file: well-formed returns 0");
+    ASSERT_INT_EQ(opts.n_env, 2, "load_env_file: two vars parsed");
+    ASSERT_STR_EQ(opts.env_vars[0], "FOO=bar", "load_env_file: first var");
+    ASSERT_STR_EQ(opts.env_vars[1], "BAZ=qux", "load_env_file: second var");
+    for (int j = 0; j < opts.n_env; j++)
+    {
+        free(opts.env_vars[j]);
+    }
+
+    /* 2. Comments and blank lines skipped. */
+    write_fixture(tdir, "comments.env", "# a comment\n\nFOO=bar\n",
+                  path, sizeof(path));
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), 0,
+                  "load_env_file: comments file returns 0");
+    ASSERT_INT_EQ(opts.n_env, 1, "load_env_file: blanks/comments skipped");
+    ASSERT_STR_EQ(opts.env_vars[0], "FOO=bar", "load_env_file: only real line");
+    for (int j = 0; j < opts.n_env; j++)
+    {
+        free(opts.env_vars[j]);
+    }
+
+    /* 3. CRLF line endings: trailing \r trimmed. */
+    write_fixture(tdir, "crlf.env", "FOO=bar\r\n", path, sizeof(path));
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), 0, "load_env_file: crlf returns 0");
+    ASSERT_STR_EQ(opts.env_vars[0], "FOO=bar",
+                  "load_env_file: trailing CR trimmed");
+    for (int j = 0; j < opts.n_env; j++)
+    {
+        free(opts.env_vars[j]);
+    }
+
+    /* 4. '=' inside the value: split on the FIRST '=', whole line kept. */
+    write_fixture(tdir, "eqval.env", "URL=a=b=c\n", path, sizeof(path));
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), 0,
+                  "load_env_file: value with = returns 0");
+    ASSERT_STR_EQ(opts.env_vars[0], "URL=a=b=c",
+                  "load_env_file: full KEY=VALUE stored");
+    for (int j = 0; j < opts.n_env; j++)
+    {
+        free(opts.env_vars[j]);
+    }
+
+    /* 5. Final line without trailing newline still parsed. */
+    write_fixture(tdir, "nonl.env", "FOO=bar", path, sizeof(path));
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), 0,
+                  "load_env_file: no trailing newline returns 0");
+    ASSERT_INT_EQ(opts.n_env, 1, "load_env_file: last line parsed");
+    ASSERT_STR_EQ(opts.env_vars[0], "FOO=bar",
+                  "load_env_file: unterminated line value");
+    for (int j = 0; j < opts.n_env; j++)
+    {
+        free(opts.env_vars[j]);
+    }
+
+    /* 6. Line missing '=' → -1 (earlier valid line was stored, free it). */
+    write_fixture(tdir, "noeq.env", "FOO=bar\nNOEQUALS\n", path, sizeof(path));
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), -1,
+                  "load_env_file: missing = returns -1");
+    for (int j = 0; j < opts.n_env; j++)
+    {
+        free(opts.env_vars[j]);
+    }
+
+    /* 7. Line starting with '=' → -1. */
+    write_fixture(tdir, "starteq.env", "=value\n", path, sizeof(path));
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), -1,
+                  "load_env_file: line starting with = returns -1");
+    for (int j = 0; j < opts.n_env; j++)
+    {
+        free(opts.env_vars[j]);
+    }
+
+    /* 8. Nonexistent path → -1. */
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file("/nonexistent/oci2bin-env.xyz", &opts), -1,
+                  "load_env_file: missing file returns -1");
+
+    /* 9. File larger than 1 MiB → -1 (sparse via ftruncate). */
+    snprintf(path, sizeof(path), "%s/big.env", tdir);
+    int bfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (bfd >= 0)
+    {
+        if (ftruncate(bfd, 1024 * 1024 + 1) != 0)
+        {
+            /* ignore */
+        }
+        close(bfd);
+    }
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(load_env_file(path, &opts), -1,
+                  "load_env_file: oversize file returns -1");
+
+    /* 10. MAX_ENV cap already reached → -1 before storing. */
+    write_fixture(tdir, "one.env", "FOO=bar\n", path, sizeof(path));
+    memset(&opts, 0, sizeof(opts));
+    opts.n_env = MAX_ENV;
+    ASSERT_INT_EQ(load_env_file(path, &opts), -1,
+                  "load_env_file: MAX_ENV cap returns -1");
+
+    rm_rf_dir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -3936,6 +4079,7 @@ int main(void)
     test_parse_opts_hint_flags();
     test_parse_opts_size();
     test_build_merged_argv();
+    test_load_env_file();
 
     printf("1..%d\n", tap_test_num);
 
