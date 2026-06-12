@@ -5545,11 +5545,15 @@ static int enter_userns_and_map(uid_t real_uid,
                 "oci2bin: user namespaces may be disabled on this kernel\n");
         goto done;
     }
-    /* Deny setgroups before the gid_map is written (required ordering). */
-    if (write_proc("/proc/self/setgroups", "deny", 4) < 0)
-    {
-        /* Non-fatal on older kernels. */
-    }
+    /* NOTE: deliberately do NOT write setgroups=deny here. That restriction is
+     * only required when writing gid_map directly as an unprivileged process;
+     * newgidmap holds CAP_SETGID and writes the map without it. Leaving
+     * setgroups enabled (as rootless podman does for subuid/subgid) lets the
+     * container entrypoint call setgroups() to drop to a non-root in-image user
+     * (gosu/su-exec — e.g. redis dropping to the "redis" user). The mapped gids
+     * are subordinate, so this does not reintroduce the negative-group bypass
+     * the deny was meant to prevent. The single-ID fallback still denies
+     * setgroups (it writes gid_map directly — see setup_single_uid_map). */
     /* Tell the mapper the namespace exists, then wait for the maps. */
     if (write(p2c[1], "1", 1) != 1)
     {

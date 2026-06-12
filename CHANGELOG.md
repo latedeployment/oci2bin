@@ -15,6 +15,15 @@ All notable changes to oci2bin are documented here.
   other rootless runtimes do it. Rootless `./app` now works without
   `--no-userns-remap` where it previously failed.
 
+- **Container user-switch in subordinate-ID mode (`failed switching to "redis":
+  operation not permitted`)** — the loader wrote `setgroups=deny` before
+  `newgidmap`, which made every in-container `setgroups()` fail with `EPERM` and
+  broke entrypoints that drop to a non-root in-image user (gosu/su-exec, e.g.
+  the official redis image dropping to the `redis` user). `setgroups=deny` is
+  only needed when writing `gid_map` directly as unprivileged; with `newgidmap`
+  (CAP_SETGID) it is unnecessary and is now left enabled in subid mode, as
+  rootless podman does. The single-ID fallback still denies setgroups.
+
 ## [0.15.0] - 2026-06-12
 
 ### Added
