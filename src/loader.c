@@ -5465,35 +5465,120 @@ static int run_newidmap(const char* helper_path,
     return 0;
 }
 
-static int setup_uid_map(uid_t real_uid,
-                         gid_t real_gid,
-                         const struct userns_map_plan* plan)
+/*
+ * Enter a new user namespace and install the UID/GID maps.
+ *
+ * Single-ID fallback: unshare here, then write /proc/self/uid_map directly
+ * (the kernel lets an unprivileged process map its own single id).
+ *
+ * Subordinate-ID remap: newuidmap/newgidmap must run from a process that is
+ * still in the PARENT user namespace — only there is the caller recognised as
+ * the owner of the new namespace and allowed to map both its own uid and the
+ * /etc/subuid range. Running them from inside the freshly-unshared (still
+ * unmapped) namespace is rejected by newuidmap with "uid range ... not
+ * allowed". So we fork a short-lived mapper that stays outside, unshare in the
+ * parent (which goes on to become the container's main process), and have the
+ * mapper write our maps via /proc/<pid>/{uid,gid}_map once the namespace
+ * exists.
+ */
+static int enter_userns_and_map(uid_t real_uid,
+                                gid_t real_gid,
+                                const struct userns_map_plan* plan)
 {
     if (!plan || !plan->use_subid_remap)
     {
+        if (unshare(CLONE_NEWUSER) < 0)
+        {
+            perror("unshare(CLONE_NEWUSER)");
+            fprintf(stderr, "oci2bin: user namespaces may be disabled on "
+                            "this kernel\n");
+            return -1;
+        }
         return setup_single_uid_map(real_uid, real_gid);
     }
 
+    int p2c[2];   /* parent -> mapper: "namespace is ready" */
+    int c2p[2];   /* mapper -> parent: "maps written (1) / failed (0)" */
+    if (pipe2(p2c, O_CLOEXEC) < 0 || pipe2(c2p, O_CLOEXEC) < 0)
+    {
+        perror("oci2bin: userns pipe");
+        return -1;
+    }
+
+    pid_t mapper = fork();
+    if (mapper < 0)
+    {
+        perror("oci2bin: userns fork");
+        return -1;
+    }
+    if (mapper == 0)
+    {
+        /* Mapper: stays in the parent user namespace as the real uid. Wait
+         * for the parent to unshare, then write its maps and report back. */
+        close(p2c[1]);
+        close(c2p[0]);
+        char b;
+        if (read(p2c[0], &b, 1) != 1)
+        {
+            _exit(1);
+        }
+        pid_t target = getppid();
+        int ok = (run_newidmap(plan->newuidmap_path, target,
+                               (unsigned long)real_uid,
+                               plan->subuid_start) == 0 &&
+                  run_newidmap(plan->newgidmap_path, target,
+                               (unsigned long)real_gid,
+                               plan->subgid_start) == 0);
+        (void)write(c2p[1], ok ? "1" : "0", 1);
+        _exit(ok ? 0 : 1);
+    }
+
+    /* Parent: becomes the container's main process. */
+    close(p2c[0]);
+    close(c2p[1]);
+
+    int rc = -1;
+    if (unshare(CLONE_NEWUSER) < 0)
+    {
+        perror("unshare(CLONE_NEWUSER)");
+        fprintf(stderr,
+                "oci2bin: user namespaces may be disabled on this kernel\n");
+        goto done;
+    }
+    /* Deny setgroups before the gid_map is written (required ordering). */
     if (write_proc("/proc/self/setgroups", "deny", 4) < 0)
     {
-        /* May fail on older kernels, non-fatal */
+        /* Non-fatal on older kernels. */
     }
-
-    if (run_newidmap(plan->newuidmap_path, getpid(),
-                     (unsigned long)real_uid,
-                     plan->subuid_start) < 0)
+    /* Tell the mapper the namespace exists, then wait for the maps. */
+    if (write(p2c[1], "1", 1) != 1)
     {
-        return -1;
+        fprintf(stderr, "oci2bin: failed to signal id-map helper\n");
+        goto done;
     }
-
-    if (run_newidmap(plan->newgidmap_path, getpid(),
-                     (unsigned long)real_gid,
-                     plan->subgid_start) < 0)
+    char res = '0';
+    if (read(c2p[0], &res, 1) == 1 && res == '1')
     {
-        return -1;
+        rc = 0;
+    }
+    else
+    {
+        fprintf(stderr,
+                "oci2bin: failed to write subordinate UID/GID maps via "
+                "newuidmap/newgidmap\n");
     }
 
-    return 0;
+done:
+    close(p2c[1]);
+    close(c2p[0]);
+    {
+        int st;
+        while (waitpid(mapper, &st, 0) < 0 && errno == EINTR)
+        {
+            ;
+        }
+    }
+    return rc;
 }
 
 /*
@@ -15257,16 +15342,11 @@ int main(int argc, char* argv[])
     debug_log("main.cgroup", "enabled=%d dir=%s", cg_did_setup,
               g_cgroup_dir[0] ? g_cgroup_dir : "(none)");
 
-    /* 7. Enter user namespace first (needed before we can map UIDs) */
-    if (unshare(CLONE_NEWUSER) < 0)
-    {
-        perror("unshare(CLONE_NEWUSER)");
-        fprintf(stderr, "oci2bin: user namespaces may be disabled on this kernel\n");
-        return 1;
-    }
-
-    /* 8. Map UID/GID */
-    if (setup_uid_map(real_uid, real_gid, &userns_plan) < 0)
+    /* 7-8. Enter the user namespace and install the UID/GID maps. For the
+     * subordinate-ID remap, newuidmap/newgidmap are run by a helper that stays
+     * in the parent user namespace — running them from inside the unmapped
+     * namespace is rejected by newuidmap. See enter_userns_and_map(). */
+    if (enter_userns_and_map(real_uid, real_gid, &userns_plan) < 0)
     {
         return 1;
     }

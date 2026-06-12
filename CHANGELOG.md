@@ -4,6 +4,17 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rootless subordinate-ID mapping (`newuidmap: ... not allowed`)** — the
+  loader unshared `CLONE_NEWUSER` and *then* ran `newuidmap`/`newgidmap` from
+  inside the still-unmapped namespace, which the helpers reject on hosts that
+  enforce the standard policy (mapping your own uid is only permitted from the
+  parent namespace). The maps are now written by a short-lived helper that
+  stays in the parent user namespace (`enter_userns_and_map`), matching how
+  other rootless runtimes do it. Rootless `./app` now works without
+  `--no-userns-remap` where it previously failed.
+
 ## [0.15.0] - 2026-06-12
 
 ### Added
