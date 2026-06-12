@@ -582,6 +582,13 @@ struct container_opts
     char* device_ctr[MAX_VOLUMES];   /* container paths (NULL = same as host) */
     int   n_devices;
 
+    /* --cdi-device KIND=DEVICE / --gpus SPEC  (Container Device Interface).
+     * Resolved at startup from /etc/cdi + /run/cdi JSON specs; the matching
+     * containerEdits (deviceNodes, mounts, env) are appended to the device,
+     * volume, and env arrays above and applied through the normal paths. */
+    char* cdi_devices[MAX_VOLUMES];
+    int   n_cdi;
+
     /* --init  (run a zombie-reaping init as PID 1) */
     int use_init;
 
@@ -1792,9 +1799,10 @@ static char* json_get_array(const char* json, const char* key)
 /* Find a JSON object value for a given key. Returns malloc'd string (with the
  * surrounding {}) or NULL.  String contents are skipped so that braces inside
  * quoted strings do not confuse the depth counter. */
-static char* json_get_object(const char* json, const char* key)
+/* Given a pointer at a '{', return the malloc'd balanced {...} object string
+ * (string contents and nesting honored), or NULL on truncation. */
+static char* extract_balanced_braces(const char* p)
 {
-    const char* p = json_skip_to_value(json, key);
     if (!p || *p != '{')
     {
         return NULL;
@@ -1851,6 +1859,194 @@ static char* json_get_object(const char* json, const char* key)
     memcpy(result, start, len);
     result[len] = '\0';
     return result;
+}
+
+static char* json_get_object(const char* json, const char* key)
+{
+    return extract_balanced_braces(json_skip_to_value(json, key));
+}
+
+/* Like json_skip_to_value but only matches a key at the top level (depth 1)
+ * of the root object; a nested key of the same name (e.g. a per-device
+ * "containerEdits" inside a "devices" array) is not matched. The matched key
+ * must be immediately followed by ':' so string values are not mistaken for
+ * keys. */
+static const char* json_skip_to_toplevel_value(const char* json,
+        const char* key)
+{
+    size_t klen = strlen(key);
+    if (klen == 0 || klen > 200)
+    {
+        return NULL;
+    }
+    const char* p = json;
+    while (*p && *p != '{')
+    {
+        p++;
+    }
+    if (*p != '{')
+    {
+        return NULL;
+    }
+    p++;                 /* enter the root object: depth 1 */
+    int depth = 1;
+    int in_str = 0;
+    while (*p)
+    {
+        char c = *p;
+        if (in_str)
+        {
+            if (c == '\\')
+            {
+                if (!p[1])
+                {
+                    break;
+                }
+                p += 2;
+                continue;
+            }
+            if (c == '"')
+            {
+                in_str = 0;
+            }
+            p++;
+            continue;
+        }
+        if (c == '"')
+        {
+            if (depth == 1 && strncmp(p + 1, key, klen) == 0
+                    && p[1 + klen] == '"')
+            {
+                const char* v = p + 1 + klen + 1;
+                while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r')
+                {
+                    v++;
+                }
+                if (*v == ':')
+                {
+                    v++;
+                    while (*v == ' ' || *v == '\t' || *v == '\n'
+                            || *v == '\r')
+                    {
+                        v++;
+                    }
+                    return v;
+                }
+            }
+            in_str = 1;
+            p++;
+            continue;
+        }
+        if (c == '{' || c == '[')
+        {
+            depth++;
+        }
+        else if (c == '}' || c == ']')
+        {
+            depth--;
+            if (depth == 0)
+            {
+                break;
+            }
+        }
+        p++;
+    }
+    return NULL;
+}
+
+static char* json_get_toplevel_object(const char* json, const char* key)
+{
+    return extract_balanced_braces(json_skip_to_toplevel_value(json, key));
+}
+
+/* Split a JSON array of objects into individual {...} object strings. Returns
+ * the count placed in out[] (each malloc'd; caller frees). Stops at the first
+ * non-object element. String contents and nesting are honored so braces inside
+ * quoted strings do not confuse the depth counter. Used for CDI deviceNodes /
+ * mounts / devices arrays. */
+static int json_split_object_array(const char* arr, char** out, int max)
+{
+    if (!arr)
+    {
+        return 0;
+    }
+    const char* p = arr;
+    while (*p && *p != '[')
+    {
+        p++;
+    }
+    if (*p != '[')
+    {
+        return 0;
+    }
+    p++;
+    int count = 0;
+    while (*p && count < max)
+    {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'
+                || *p == ',')
+        {
+            p++;
+        }
+        if (*p != '{')
+        {
+            break;    /* end of array (']') or a non-object element */
+        }
+        int depth = 0;
+        int in_str = 0;
+        const char* start = p;
+        while (*p)
+        {
+            char c = *p;
+            if (in_str)
+            {
+                if (c == '\\')
+                {
+                    if (!p[1])
+                    {
+                        break;
+                    }
+                    p++;
+                }
+                else if (c == '"')
+                {
+                    in_str = 0;
+                }
+            }
+            else if (c == '"')
+            {
+                in_str = 1;
+            }
+            else if (c == '{')
+            {
+                depth++;
+            }
+            else if (c == '}')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    p++;
+                    break;
+                }
+            }
+            p++;
+        }
+        if (depth != 0)
+        {
+            break;    /* truncated object */
+        }
+        size_t len = (size_t)(p - start);
+        char* obj = malloc(len + 1);
+        if (!obj)
+        {
+            break;
+        }
+        memcpy(obj, start, len);
+        obj[len] = '\0';
+        out[count++] = obj;
+    }
+    return count;
 }
 
 /* Read an integer (long long) JSON value for a given key.  Returns 0 and sets
@@ -10705,6 +10901,11 @@ static void usage(const char* prog)
             "  --cap-add CAP       Add an ambient capability (use after --cap-drop all)\n"
             "  --device /dev/PATH[:CONTAINER_PATH]\n"
             "                      Expose a host device inside the container\n"
+            "  --gpus all|N|CDI    Expose GPUs via CDI (sugar for"
+            " nvidia.com/gpu=...)\n"
+            "  --cdi-device KIND=DEVICE\n"
+            "                      Apply a CDI device from /etc/cdi or /run/cdi"
+            " (repeatable)\n"
             "  --init              Run a zombie-reaping init as PID 1\n"
             "  --restart POLICY    Supervise + relaunch the workload:"
             " no|on-failure[:N]|always|unless-stopped\n"
@@ -10991,6 +11192,326 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc)
      * They are heap-allocated and persist for the process lifetime —
      * the same lifetime as argv[] itself.  We exec shortly after. */
     return merged;
+}
+
+/* ── Container Device Interface (CDI) — --cdi-device / --gpus ──────────────── */
+
+/* Append a CDI deviceNode to opts->devices (reuses the --device apply path).
+ * host is the host node, ctr the container path. Both validated /dev/ + clean. */
+static int cdi_add_device(struct container_opts* opts, const char* host,
+                          const char* ctr)
+{
+    if (opts->n_devices >= MAX_VOLUMES)
+    {
+        fprintf(stderr, "oci2bin: CDI: too many device nodes (max %d)\n",
+                MAX_VOLUMES);
+        return -1;
+    }
+    if (!host || strncmp(host, "/dev/", 5) != 0
+            || path_has_dotdot_component(host))
+    {
+        fprintf(stderr, "oci2bin: CDI: refusing device node path '%s'\n",
+                host ? host : "(null)");
+        return -1;
+    }
+    if (ctr && (strncmp(ctr, "/dev/", 5) != 0
+                || path_has_dotdot_component(ctr)))
+    {
+        fprintf(stderr, "oci2bin: CDI: refusing device container path '%s'\n",
+                ctr);
+        return -1;
+    }
+    opts->devices[opts->n_devices] = strdup(host);
+    opts->device_ctr[opts->n_devices] = ctr ? strdup(ctr) : NULL;
+    if (!opts->devices[opts->n_devices])
+    {
+        return -1;
+    }
+    opts->n_devices++;
+    return 0;
+}
+
+/* Append a CDI mount to opts->vol_host/vol_ctr (reuses the -v bind path). */
+static int cdi_add_mount(struct container_opts* opts, const char* host,
+                         const char* ctr)
+{
+    if (opts->n_vols >= MAX_VOLUMES)
+    {
+        fprintf(stderr, "oci2bin: CDI: too many mounts (max %d)\n",
+                MAX_VOLUMES);
+        return -1;
+    }
+    if (!path_is_absolute_and_clean(host) || !path_is_absolute_and_clean(ctr))
+    {
+        fprintf(stderr, "oci2bin: CDI: refusing mount '%s' -> '%s'\n",
+                host ? host : "(null)", ctr ? ctr : "(null)");
+        return -1;
+    }
+    opts->vol_host[opts->n_vols] = strdup(host);
+    opts->vol_ctr[opts->n_vols] = strdup(ctr);
+    if (!opts->vol_host[opts->n_vols] || !opts->vol_ctr[opts->n_vols])
+    {
+        return -1;
+    }
+    opts->n_vols++;
+    return 0;
+}
+
+/* Append a CDI "KEY=VALUE" env entry to opts->env_vars. */
+static int cdi_add_env(struct container_opts* opts, const char* kv)
+{
+    if (!kv || !strchr(kv, '='))
+    {
+        return 0;    /* skip malformed entries */
+    }
+    if (opts->n_env >= MAX_ENV)
+    {
+        fprintf(stderr, "oci2bin: CDI: too many env vars (max %d)\n", MAX_ENV);
+        return -1;
+    }
+    opts->env_vars[opts->n_env] = strdup(kv);
+    if (!opts->env_vars[opts->n_env])
+    {
+        return -1;
+    }
+    opts->n_env++;
+    return 0;
+}
+
+/* Apply one CDI containerEdits object (deviceNodes, mounts, env) to opts. */
+static int cdi_apply_edits(const char* edits, struct container_opts* opts)
+{
+    if (!edits)
+    {
+        return 0;
+    }
+    int rc = 0;
+
+    char* dn = json_get_array(edits, "deviceNodes");
+    if (dn)
+    {
+        char* objs[MAX_VOLUMES];
+        int n = json_split_object_array(dn, objs, MAX_VOLUMES);
+        for (int i = 0; i < n; i++)
+        {
+            char* path = json_get_string(objs[i], "path");
+            char* host = json_get_string(objs[i], "hostPath");
+            const char* h = host ? host : path;
+            if (h && path && cdi_add_device(opts, h, path) < 0)
+            {
+                rc = -1;
+            }
+            free(path);
+            free(host);
+            free(objs[i]);
+        }
+        free(dn);
+    }
+
+    char* mn = json_get_array(edits, "mounts");
+    if (mn)
+    {
+        char* objs[MAX_VOLUMES];
+        int n = json_split_object_array(mn, objs, MAX_VOLUMES);
+        for (int i = 0; i < n; i++)
+        {
+            char* hp = json_get_string(objs[i], "hostPath");
+            char* cp = json_get_string(objs[i], "containerPath");
+            if (hp && cp && cdi_add_mount(opts, hp, cp) < 0)
+            {
+                rc = -1;
+            }
+            free(hp);
+            free(cp);
+            free(objs[i]);
+        }
+        free(mn);
+    }
+
+    char* ev = json_get_array(edits, "env");
+    if (ev)
+    {
+        char* envs[MAX_ENV];
+        int n = json_parse_string_array(ev, envs, MAX_ENV);
+        for (int i = 0; i < n; i++)
+        {
+            if (envs[i])
+            {
+                if (cdi_add_env(opts, envs[i]) < 0)
+                {
+                    rc = -1;
+                }
+                free(envs[i]);
+            }
+        }
+        free(ev);
+    }
+    return rc;
+}
+
+/* Resolve one CDI device "KIND=DEVICE" (e.g. "nvidia.com/gpu=all") by scanning
+ * JSON specs in the standard CDI directories and applying the matching spec's
+ * global containerEdits plus the named device's containerEdits. Returns 0 on
+ * success, -1 if the kind/device is not found or an edit was rejected. */
+static int resolve_cdi_device(const char* fullname,
+                              struct container_opts* opts)
+{
+    static const char* const CDI_DIRS[] =
+    {
+        "/etc/cdi", "/var/run/cdi", "/run/cdi", NULL
+    };
+    char namebuf[256];
+    int nn = snprintf(namebuf, sizeof(namebuf), "%s", fullname);
+    if (nn < 0 || (size_t)nn >= sizeof(namebuf))
+    {
+        fprintf(stderr, "oci2bin: CDI device name too long\n");
+        return -1;
+    }
+    char* eq = strchr(namebuf, '=');
+    if (!eq || eq == namebuf || eq[1] == '\0')
+    {
+        fprintf(stderr,
+                "oci2bin: --cdi-device must be KIND=DEVICE "
+                "(e.g. nvidia.com/gpu=all): %s\n", fullname);
+        return -1;
+    }
+    *eq = '\0';
+    const char* kind = namebuf;
+    const char* dev  = eq + 1;
+
+    /* $OCI2BIN_CDI_DIR (optional) is searched first, ahead of the standard
+     * directories, for custom or non-root CDI spec locations. */
+    const char* dirs[5];
+    int nd = 0;
+    const char* envdir = getenv("OCI2BIN_CDI_DIR");
+    if (envdir && envdir[0] == '/' && !path_has_dotdot_component(envdir))
+    {
+        dirs[nd++] = envdir;
+    }
+    for (int d = 0; CDI_DIRS[d]; d++)
+    {
+        dirs[nd++] = CDI_DIRS[d];
+    }
+
+    int found_kind = 0;
+    int applied    = 0;
+    int err        = 0;
+    for (int d = 0; d < nd && !applied && !err; d++)
+    {
+        DIR* dir = opendir(dirs[d]);
+        if (!dir)
+        {
+            continue;
+        }
+        struct dirent* de;
+        while ((de = readdir(dir)) != NULL && !applied && !err)
+        {
+            size_t l = strlen(de->d_name);
+            if (l < 6 || strcmp(de->d_name + l - 5, ".json") != 0)
+            {
+                continue;
+            }
+            char path[PATH_MAX];
+            int pn = snprintf(path, sizeof(path), "%s/%s",
+                              dirs[d], de->d_name);
+            if (pn < 0 || (size_t)pn >= sizeof(path))
+            {
+                continue;
+            }
+            char* spec = read_file(path, NULL);
+            if (!spec)
+            {
+                continue;
+            }
+            char* k = json_get_string(spec, "kind");
+            if (k && strcmp(k, kind) == 0)
+            {
+                found_kind = 1;
+                /* Apply global + device edits only from the spec that
+                 * actually defines the requested device. */
+                char* dev_edits = NULL;
+                char* devs = json_get_array(spec, "devices");
+                if (devs)
+                {
+                    char* objs[64];
+                    int n = json_split_object_array(devs, objs, 64);
+                    for (int i = 0; i < n; i++)
+                    {
+                        char* nm = json_get_string(objs[i], "name");
+                        if (!dev_edits && nm && strcmp(nm, dev) == 0)
+                        {
+                            dev_edits = json_get_object(objs[i],
+                                                        "containerEdits");
+                            applied = 1;
+                        }
+                        free(nm);
+                        free(objs[i]);
+                    }
+                    free(devs);
+                }
+                if (applied)
+                {
+                    char* glob = json_get_toplevel_object(spec,
+                                                          "containerEdits");
+                    if (glob)
+                    {
+                        if (cdi_apply_edits(glob, opts) < 0)
+                        {
+                            err = 1;
+                        }
+                        free(glob);
+                    }
+                    if (dev_edits)
+                    {
+                        if (cdi_apply_edits(dev_edits, opts) < 0)
+                        {
+                            err = 1;
+                        }
+                        free(dev_edits);
+                    }
+                }
+            }
+            free(k);
+            free(spec);
+        }
+        closedir(dir);
+    }
+
+    if (err)
+    {
+        return -1;
+    }
+    if (!found_kind)
+    {
+        fprintf(stderr,
+                "oci2bin: CDI: no spec found for kind '%s' in /etc/cdi, "
+                "/run/cdi%s\n", kind,
+                envdir ? " or $OCI2BIN_CDI_DIR" : "");
+        return -1;
+    }
+    if (!applied)
+    {
+        fprintf(stderr,
+                "oci2bin: CDI: device '%s' not found for kind '%s'\n",
+                dev, kind);
+        return -1;
+    }
+    fprintf(stderr, "oci2bin: CDI: applied %s\n", fullname);
+    return 0;
+}
+
+/* Resolve every --cdi-device / --gpus request. Called on the host before any
+ * namespace setup so /etc/cdi is reachable. Returns 0 on success. */
+static int apply_cdi_devices(struct container_opts* opts)
+{
+    for (int i = 0; i < opts->n_cdi; i++)
+    {
+        if (resolve_cdi_device(opts->cdi_devices[i], opts) < 0)
+        {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int parse_opts(int argc, char* argv[], struct container_opts *opts)
@@ -12132,6 +12653,62 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->cap_add_mask |= (uint64_t)1 << cn;
+        }
+        else if (strcmp(argv[i], "--cdi-device") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --cdi-device requires KIND=DEVICE "
+                        "(e.g. nvidia.com/gpu=all)\n");
+                return -1;
+            }
+            if (opts->n_cdi >= MAX_VOLUMES)
+            {
+                fprintf(stderr, "oci2bin: too many --cdi-device/--gpus "
+                                "(max %d)\n", MAX_VOLUMES);
+                return -1;
+            }
+            opts->cdi_devices[opts->n_cdi++] = argv[++i];
+        }
+        else if (strcmp(argv[i], "--gpus") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --gpus requires SPEC (all, N, or a CDI "
+                        "name like nvidia.com/gpu=0)\n");
+                return -1;
+            }
+            if (opts->n_cdi >= MAX_VOLUMES)
+            {
+                fprintf(stderr, "oci2bin: too many --cdi-device/--gpus "
+                                "(max %d)\n", MAX_VOLUMES);
+                return -1;
+            }
+            const char* spec = argv[++i];
+            char* full;
+            if (strchr(spec, '=') || strchr(spec, '/'))
+            {
+                full = strdup(spec);    /* already a full CDI name */
+            }
+            else
+            {
+                /* "all" or a device index -> nvidia.com/gpu=<spec> */
+                char buf[160];
+                int bn = snprintf(buf, sizeof(buf), "nvidia.com/gpu=%s", spec);
+                if (bn < 0 || (size_t)bn >= sizeof(buf))
+                {
+                    fprintf(stderr, "oci2bin: --gpus spec too long\n");
+                    return -1;
+                }
+                full = strdup(buf);
+            }
+            if (!full)
+            {
+                return -1;
+            }
+            opts->cdi_devices[opts->n_cdi++] = full;
         }
         else if (strcmp(argv[i], "--device") == 0)
         {
@@ -16057,6 +16634,15 @@ int main(int argc, char* argv[])
     {
         g_debug = 1;
     }
+
+    /* Resolve --cdi-device / --gpus from /etc/cdi + /run/cdi on the host
+     * before any namespace work, appending the device/mount/env edits to opts
+     * so they flow through the normal --device/-v/-e apply paths. */
+    if (opts.n_cdi > 0 && apply_cdi_devices(&opts) < 0)
+    {
+        return 1;
+    }
+
     debug_dump_opts(&opts);
 
     /* Seal loader text/rodata against future mmap/mprotect when supported.

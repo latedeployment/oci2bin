@@ -5259,6 +5259,149 @@ static void test_health_resolve(void)
                   "health_resolve: --health-retries overrides image");
 }
 
+/* ── test_json_toplevel_and_object_array (CDI helpers) ────────────────────── */
+
+static void test_json_toplevel_and_object_array(void)
+{
+    /* A nested key of the same name must NOT shadow the top-level one. */
+    const char* spec =
+        "{\"kind\":\"x\",\"devices\":[{\"name\":\"a\","
+        "\"containerEdits\":{\"env\":[\"NESTED=1\"]}}],"
+        "\"containerEdits\":{\"env\":[\"GLOBAL=1\"]}}";
+
+    char* nested = json_get_object(spec, "containerEdits");
+    ASSERT_NOT_NULL(nested, "json_get_object: finds first (nested) match");
+    ASSERT(strstr(nested, "NESTED") != NULL,
+           "json_get_object: first match is the nested one");
+    free(nested);
+
+    char* top = json_get_toplevel_object(spec, "containerEdits");
+    ASSERT_NOT_NULL(top, "json_get_toplevel_object: finds top-level object");
+    ASSERT(strstr(top, "GLOBAL") != NULL && strstr(top, "NESTED") == NULL,
+           "json_get_toplevel_object: skips nested same-named key");
+    free(top);
+
+    /* Split an array of objects. */
+    char* devs = json_get_array(spec, "devices");
+    char* objs[8];
+    int n = json_split_object_array(devs, objs, 8);
+    ASSERT_INT_EQ(n, 1, "json_split_object_array: one device object");
+    char* nm = json_get_string(objs[0], "name");
+    ASSERT_STR_EQ(nm, "a", "json_split_object_array: object content intact");
+    free(nm);
+    for (int i = 0; i < n; i++)
+    {
+        free(objs[i]);
+    }
+    free(devs);
+
+    /* Object with braces inside a string must not break splitting. */
+    const char* tricky = "[{\"p\":\"a}{b\"},{\"p\":\"c\"}]";
+    char* o2[8];
+    int n2 = json_split_object_array(tricky, o2, 8);
+    ASSERT_INT_EQ(n2, 2, "json_split_object_array: braces in strings ignored");
+    for (int i = 0; i < n2; i++)
+    {
+        free(o2[i]);
+    }
+}
+
+/* ── test_parse_opts_cdi ──────────────────────────────────────────────────── */
+
+static void test_parse_opts_cdi(void)
+{
+    struct container_opts opts;
+
+    {
+        char* argv[] = {"prog", "--gpus", "all", NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(3, argv, &opts), 0,
+                      "parse_opts: --gpus all accepted");
+        ASSERT_INT_EQ(opts.n_cdi, 1, "parse_opts: --gpus records one device");
+        ASSERT_STR_EQ(opts.cdi_devices[0], "nvidia.com/gpu=all",
+                      "parse_opts: --gpus all -> nvidia.com/gpu=all");
+    }
+    {
+        char a[] = "nvidia.com/gpu=0";
+        char* argv[] = {"prog", "--gpus", a, NULL};
+        memset(&opts, 0, sizeof(opts));
+        parse_opts(3, argv, &opts);
+        ASSERT_STR_EQ(opts.cdi_devices[0], "nvidia.com/gpu=0",
+                      "parse_opts: --gpus full CDI name passes through");
+    }
+    {
+        char a[] = "example.com/dev=zero";
+        char* argv[] = {"prog", "--cdi-device", a, NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(3, argv, &opts), 0,
+                      "parse_opts: --cdi-device accepted");
+        ASSERT_STR_EQ(opts.cdi_devices[0], "example.com/dev=zero",
+                      "parse_opts: --cdi-device stored verbatim");
+    }
+    {
+        char* argv[] = {"prog", "--cdi-device", NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(2, argv, &opts), -1,
+                      "parse_opts: --cdi-device missing arg rejected");
+    }
+}
+
+/* ── test_cdi_resolve ─────────────────────────────────────────────────────── */
+
+static void test_cdi_resolve(void)
+{
+    char tdir[] = "/tmp/oci2bin-cdi-XXXXXX";
+    if (!mkdtemp(tdir))
+    {
+        ASSERT(0, "test_cdi_resolve: mkdtemp");
+        return;
+    }
+    char spec_path[PATH_MAX];
+    snprintf(spec_path, sizeof(spec_path), "%s/spec.json", tdir);
+    const char* spec =
+        "{\"cdiVersion\":\"0.6.0\",\"kind\":\"example.com/dev\","
+        "\"devices\":[{\"name\":\"zero\",\"containerEdits\":{"
+        "\"deviceNodes\":[{\"path\":\"/dev/null\"}],"
+        "\"env\":[\"DEVICE_NAME=zero\"]}}],"
+        "\"containerEdits\":{\"env\":[\"GLOBAL=yes\"],"
+        "\"mounts\":[{\"hostPath\":\"/tmp\",\"containerPath\":\"/m\"}]}}";
+    int fd = open(spec_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0)
+    {
+        write_all_fd(fd, spec, strlen(spec));
+        close(fd);
+    }
+    setenv("OCI2BIN_CDI_DIR", tdir, 1);
+
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    int rc = resolve_cdi_device("example.com/dev=zero", &opts);
+    ASSERT_INT_EQ(rc, 0, "cdi: resolve known device returns 0");
+    ASSERT_INT_EQ(opts.n_devices, 1, "cdi: one device node applied (once)");
+    ASSERT_STR_EQ(opts.devices[0], "/dev/null", "cdi: device node path");
+    ASSERT_INT_EQ(opts.n_vols, 1, "cdi: one mount applied");
+    ASSERT_STR_EQ(opts.vol_ctr[0], "/m", "cdi: mount container path");
+    ASSERT(opts.n_env == 2, "cdi: global + device env applied");
+
+    /* Unknown device -> -1. */
+    struct container_opts opts2;
+    memset(&opts2, 0, sizeof(opts2));
+    ASSERT_INT_EQ(resolve_cdi_device("example.com/dev=ghost", &opts2), -1,
+                  "cdi: unknown device returns -1");
+    /* Unknown kind -> -1. */
+    memset(&opts2, 0, sizeof(opts2));
+    ASSERT_INT_EQ(resolve_cdi_device("nope.com/x=y", &opts2), -1,
+                  "cdi: unknown kind returns -1");
+    /* Missing '=' -> -1. */
+    memset(&opts2, 0, sizeof(opts2));
+    ASSERT_INT_EQ(resolve_cdi_device("badname", &opts2), -1,
+                  "cdi: name without '=' returns -1");
+
+    unsetenv("OCI2BIN_CDI_DIR");
+    unlink(spec_path);
+    rmdir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -5337,6 +5480,9 @@ int main(void)
     test_parse_opts_restart();
     test_parse_opts_health();
     test_health_resolve();
+    test_json_toplevel_and_object_array();
+    test_parse_opts_cdi();
+    test_cdi_resolve();
 
     printf("1..%d\n", tap_test_num);
 

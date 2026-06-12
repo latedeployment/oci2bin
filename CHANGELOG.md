@@ -6,6 +6,19 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`--gpus` / `--cdi-device` — Container Device Interface support** — expose
+  GPUs and other vendor devices with their full set of edits, not just a raw
+  device node. At startup the loader scans JSON CDI specs in `/etc/cdi` and
+  `/run/cdi` (override with `$OCI2BIN_CDI_DIR`), matches the requested
+  `KIND=DEVICE`, and applies the spec's global plus device `containerEdits`:
+  `deviceNodes` (exposed like `--device`, validated under `/dev/`), `mounts`
+  (bind-mounted like `-v`, for driver libraries), and `env`. `--gpus all|N` is
+  sugar for `nvidia.com/gpu=all|N`; a value with `/` or `=` is a full CDI name,
+  so `--gpus` works for any vendor. New JSON helpers (`json_get_toplevel_object`
+  to read a top-level key without a nested same-named key shadowing it,
+  `json_split_object_array`) and C unit tests for the helpers, flag parsing, and
+  end-to-end CDI resolution.
+
 - **`oci2bin up` / `down` / `stack` — declarative pod stacks** — a daemon-free,
   compose-lite runner over oci2bin binaries (`scripts/pod_stack.py`, stdlib
   only). A stack file (a small YAML subset, or JSON) lists services with

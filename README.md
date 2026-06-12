@@ -24,6 +24,8 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Kernel-protected secrets (no page cache, no swap) | automatic on Linux ≥ 5.14 via `memfd_secret` |
 | SSH agent forwarding in builds | `RUN --mount=type=ssh git clone git@github.com:org/repo` |
 | Persistent build cache across runs | `RUN --mount=type=cache,target=/var/cache/apt apt-get install ...` |
+| GPUs / CDI devices | `./myapp --gpus all` |
+| Declarative multi-binary stacks | `oci2bin up -f stack.yaml` |
 | Restart policy (supervise + relaunch) | `./myapp --restart on-failure:5` |
 | Run the image HEALTHCHECK at runtime | `./myapp --health --restart always` |
 | Shrink the binary with zstd | `oci2bin --compress-binary zstd redis:7-alpine` |
@@ -1591,6 +1593,42 @@ Only numeric UIDs/GIDs are accepted. Values must be ≤ 65534. If any of `setgro
 ```
 
 The host path must start with `/dev/`. The container path defaults to the same path if omitted. oci2bin first attempts `mknod` with the host device's `st_rdev`; if that fails it falls back to a bind mount. Failure is non-fatal. May be repeated.
+
+#### GPUs and CDI devices (--gpus / --cdi-device)
+
+For GPUs (and any other vendor device) the raw `--device` flag is rarely
+enough — a working GPU also needs driver libraries mounted and environment
+variables set. oci2bin reads [Container Device Interface
+(CDI)](https://github.com/cncf-tags/container-device-interface) specs and
+applies their full set of edits:
+
+```bash
+./my-app --gpus all                       # all NVIDIA GPUs
+./my-app --gpus 0                         # GPU index 0
+./my-app --cdi-device nvidia.com/gpu=all  # explicit CDI name (any vendor)
+./my-app --cdi-device intel.com/gpu=card0
+```
+
+`--gpus all` / `--gpus N` is sugar for `nvidia.com/gpu=all` / `nvidia.com/gpu=N`;
+a value containing `/` or `=` is treated as a full CDI device name, so `--gpus`
+works for non-NVIDIA vendors too. `--cdi-device KIND=DEVICE` is the general form
+and may be repeated.
+
+At startup (before any namespace setup) oci2bin scans `*.json` CDI specs in
+`/etc/cdi` and `/run/cdi` (and `/var/run/cdi`), finds the one whose `kind`
+matches, and applies that spec's **global** `containerEdits` plus the named
+device's edits:
+
+- `deviceNodes` → exposed like `--device` (validated to be under `/dev/`),
+- `mounts` → bind-mounted like `-v` (driver libraries, etc.),
+- `env` → set inside the container.
+
+Generate NVIDIA specs in JSON form with
+`nvidia-ctk cdi generate --format=json --output=/etc/cdi/nvidia.json`. Point at
+a non-standard location with `OCI2BIN_CDI_DIR=/path` (searched first). If the
+requested kind or device is not found, the run aborts with a clear message.
+Only JSON CDI specs are read (not YAML), and a single device's edits are capped
+at the runtime device/mount/env limits.
 
 ### Config file (--config)
 
