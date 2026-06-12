@@ -4,6 +4,8 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-12
+
 ### Added
 
 - **`oci2bin --passphrase` (symmetric image encryption)** — seals the
