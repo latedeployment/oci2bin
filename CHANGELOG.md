@@ -4,13 +4,26 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
-### Fixed
+## [0.15.0] - 2026-06-12
 
-- **Quieter age errors** — oci2bin no longer passes through age's noisy
-  "report unexpected or unhelpful errors at https://filippo.io/age/report"
-  footer (e.g. on a wrong passphrase/identity). The real age error line and
-  oci2bin's own message are kept; only the footer is dropped, in both the
-  loader (decrypt) and the builder (encrypt).
+### Added
+
+- **`oci2bin --passphrase` (symmetric image encryption)** — seals the
+  embedded OCI image with an age scrypt passphrase instead of recipients
+  (mutually exclusive with `--recipient`/`--recipients-file`). The
+  passphrase is taken from `--password-file FILE` (first line),
+  `$OCI2BIN_PASSWORD`, or an interactive prompt at build time, and from
+  `$OCI2BIN_PASSWORD_FILE`, `$OCI2BIN_PASSWORD`, or an interactive
+  prompt at run time. Because `age` reads passphrases only from a
+  terminal, both build and run drive `age` through a pty — the
+  passphrase never touches `age`'s argv or stdin. The loader
+  auto-detects the header (`-> scrypt` vs `-> X25519`) and routes to
+  passphrase or identity decryption; secrets are scrubbed with
+  `explicit_bzero`. New C unit tests (`blob_age_is_passphrase`,
+  `resolve_age_passphrase`) and Python tests (round-trip,
+  wrong-passphrase, password-file/env resolution).
+
+### Fixed
 
 - **Rootless subordinate-ID mapping (`newuidmap: ... not allowed`)** — the
   loader unshared `CLONE_NEWUSER` and *then* ran `newuidmap`/`newgidmap` from
@@ -30,24 +43,11 @@ All notable changes to oci2bin are documented here.
   (CAP_SETGID) it is unnecessary and is now left enabled in subid mode, as
   rootless podman does. The single-ID fallback still denies setgroups.
 
-## [0.15.0] - 2026-06-12
-
-### Added
-
-- **`oci2bin --passphrase` (symmetric image encryption)** — seals the
-  embedded OCI image with an age scrypt passphrase instead of recipients
-  (mutually exclusive with `--recipient`/`--recipients-file`). The
-  passphrase is taken from `--password-file FILE` (first line),
-  `$OCI2BIN_PASSWORD`, or an interactive prompt at build time, and from
-  `$OCI2BIN_PASSWORD_FILE`, `$OCI2BIN_PASSWORD`, or an interactive
-  prompt at run time. Because `age` reads passphrases only from a
-  terminal, both build and run drive `age` through a pty — the
-  passphrase never touches `age`'s argv or stdin. The loader
-  auto-detects the header (`-> scrypt` vs `-> X25519`) and routes to
-  passphrase or identity decryption; secrets are scrubbed with
-  `explicit_bzero`. New C unit tests (`blob_age_is_passphrase`,
-  `resolve_age_passphrase`) and Python tests (round-trip,
-  wrong-passphrase, password-file/env resolution).
+- **Quieter age errors** — oci2bin no longer passes through age's noisy
+  "report unexpected or unhelpful errors at https://filippo.io/age/report"
+  footer (e.g. on a wrong passphrase/identity). The real age error line and
+  oci2bin's own message are kept; only the footer is dropped, in both the
+  loader (decrypt) and the builder (encrypt).
 
 ### Security
 
