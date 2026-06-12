@@ -6,6 +6,22 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`oci2bin up` / `down` / `stack` — declarative pod stacks** — a daemon-free,
+  compose-lite runner over oci2bin binaries (`scripts/pod_stack.py`, stdlib
+  only). A stack file (a small YAML subset, or JSON) lists services with
+  `binary`, `command`, `ports`, `env`, `volumes`, `depends_on`, `restart`,
+  `health`/`health_cmd`, `aliases`, and `net`; `up` starts them in dependency
+  order (topologically sorted, cycle-detected), injects each service name as a
+  `127.0.0.1` `/etc/hosts` alias so services reach each other by name, and
+  monitors them (a non-zero exit tears the rest down). `up -d` forks a
+  self-contained backgrounded supervisor that records the real host PIDs of the
+  services and redirects per-service logs under
+  `$XDG_DATA_HOME/oci2bin/stacks/<name>/`; `down` signals each service's whole
+  process group (`SIGTERM`→`SIGKILL`, since a container PID 1 ignores
+  `SIGTERM`); `stack logs` tails them and `stack config` prints the resolved
+  plan. `net: shared` reuses the `pod run` pause-process model. 18 new unit
+  tests for the parser, topo-sort, argv construction, and validation.
+
 - **`--restart no|on-failure[:N]|always|unless-stopped`** — a supervising
   PID-1 inside the container now relaunches the workload on exit per a Docker-
   style restart policy, without needing systemd. `on-failure[:N]` restarts only

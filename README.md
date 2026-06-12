@@ -1149,6 +1149,70 @@ oci2bin pod run \
     ./myapp
 ```
 
+### Declarative stacks (oci2bin up)
+
+`oci2bin up` is a daemon-free, compose-lite runner: describe a set of oci2bin
+binaries in a stack file and bring them up as a unit, with startup ordering,
+per-service restart/health, ports, env, volumes, and service-name DNS.
+
+```yaml
+# stack.yaml
+name: blog
+net: host                 # host (default) | shared | none
+services:
+  db:
+    binary: ./postgres
+    env: { POSTGRES_PASSWORD: secret }
+    volumes: ["./pgdata:/var/lib/postgresql/data"]
+    restart: unless-stopped
+  app:
+    binary: ./ghost
+    depends_on: [db]        # started after db
+    env: { DB_HOST: db }    # 'db' resolves to the db service
+    ports: ["2368:2368"]
+    health: true            # run the image HEALTHCHECK; restart on unhealthy
+    restart: on-failure:5
+  proxy:
+    binary: ./caddy
+    depends_on: [app]
+    ports: ["80:80", "443:443"]
+    restart: always
+```
+
+```bash
+oci2bin up                       # foreground; uses ./stack.yaml
+oci2bin up -f blog.yaml -d        # start detached, return immediately
+oci2bin down blog                 # stop the detached stack (graceful, then kill)
+oci2bin stack logs blog app       # tail one service's logs (add -f to follow)
+oci2bin stack config -f blog.yaml # validate + print the resolved launch plan
+```
+
+Per-service keys: `binary` (required), `command` (argv override), `ports`
+(`-p`), `env` (mapping or `KEY=VALUE` list), `volumes` (`-v`), `depends_on`,
+`restart` (`no|on-failure[:N]|always|unless-stopped`), `health` /
+`health_cmd`, `aliases`, and `net` (per-service override). Each service name —
+and any `aliases` — resolves to `127.0.0.1` inside every service via injected
+`/etc/hosts` entries, so services reach each other by name.
+
+How it works and what to know:
+
+- **Ordering, not readiness.** `depends_on` controls *startup order* (a service
+  starts after its dependencies); it does not wait for them to become healthy.
+  Use `--start-delay SECONDS` to space out starts.
+- **Networking.** `net: host` (default) runs every service on the host network
+  — ports are bound directly and detached mode is supported. `net: shared`
+  uses a private shared namespace (a `pause` process, like `pod run`) so
+  services talk over loopback; it requires unprivileged user namespaces.
+- **Detached supervision is self-contained.** `up -d` forks a backgrounded
+  supervisor that tracks the real host PIDs of the services it starts and
+  redirects each service's output to a per-service log under
+  `$XDG_DATA_HOME/oci2bin/stacks/<name>/`. `down` signals each service's whole
+  process group (`SIGTERM`, then `SIGKILL` after a grace period, since a
+  container's PID 1 ignores `SIGTERM`). Restart/health are handled *inside*
+  each binary by its own supervisor.
+- **Format.** The stack file is a small YAML subset (block mappings, block and
+  flow scalar lists, `# comments`) — or plain JSON, which is always accepted.
+
 ### Read-only containers
 
 `--read-only` mounts the rootfs read-only via overlayfs. Writes go to a temporary upper layer discarded on exit. The on-disk rootfs is never modified.

@@ -393,6 +393,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_freeze -v
 	@echo "=== --compress-binary helper tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_compress_binary -v
+	@echo "=== pod-stack orchestrator tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_pod_stack -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

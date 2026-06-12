@@ -11,6 +11,9 @@
 #   oci2bin sign-file --key KEY.pem --in FILE --out SIG
 #   oci2bin verify-file --key PUB.pem --in FILE --sig SIG
 #   oci2bin pod run [--net shared] [--ipc shared] BINARY [BINARY ...]
+#   oci2bin up [-f stack.yaml] [-d] [--start-delay SEC]   (declarative stack)
+#   oci2bin down [STACK_NAME | -f stack.yaml]
+#   oci2bin stack {up|down|logs|config} ...
 #   oci2bin run [BUILD_OPTS...] IMAGE [-- RUNTIME_ARGS...]
 #   oci2bin systemd BINARY [--user] [--restart always|on-failure|no]
 #   oci2bin healthcheck BINARY [--pid PID]
@@ -385,6 +388,25 @@ if [[ "${1:-}" == "explain" ]]; then
         exit 1
     fi
     exec python3 "$OCI2BIN_HOME/scripts/explain.py" "$@"
+fi
+
+# ── pod-stack subcommands (up / down / stack) ─────────────────────────────
+# Declarative compose-lite over oci2bin binaries. `down`/`logs` reuse the
+# existing named-container lifecycle, so pass our own path for callbacks.
+
+if [[ "${1:-}" == "up" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/pod_stack.py" --oci2bin "$0" up "$@"
+fi
+
+if [[ "${1:-}" == "down" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/pod_stack.py" --oci2bin "$0" down "$@"
+fi
+
+if [[ "${1:-}" == "stack" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/pod_stack.py" --oci2bin "$0" "$@"
 fi
 
 # ── sign subcommand ───────────────────────────────────────────────────────
