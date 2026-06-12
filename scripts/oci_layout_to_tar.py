@@ -25,14 +25,33 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 
 
+def split_validated_digest(digest):
+    """Validate an OCI descriptor digest and return (alg, hex_val).
+
+    Digests come from attacker-controlled index/manifest content and are used
+    to build blobs/<alg>/<hex> paths, so reject anything that is not a plain
+    sha256:<64 lowercase hex> before use. Without this, a crafted descriptor
+    digest like "sha256:../../../../etc/passwd" would escape the blobs
+    directory (os.path.join honours '..' and absolute components) and read an
+    arbitrary build-host file into the produced image. Mirrors the digest
+    validation in dockerfile_build.py.
+    """
+    if not isinstance(digest, str) or ':' not in digest:
+        sys.exit(f'oci_layout_to_tar: invalid digest: {digest!r}')
+    alg, hex_val = digest.split(':', 1)
+    if alg != 'sha256' or not re.fullmatch(r'[0-9a-f]{64}', hex_val):
+        sys.exit(f'oci_layout_to_tar: invalid digest: {digest!r}')
+    return alg, hex_val
+
+
 def read_blob(oci_dir, descriptor):
     """Read a blob from blobs/<alg>/<hex> given a descriptor dict."""
-    digest = descriptor['digest']   # e.g. "sha256:abcdef..."
-    alg, hex_val = digest.split(':', 1)
+    alg, hex_val = split_validated_digest(descriptor['digest'])
     blob_path = os.path.join(oci_dir, 'blobs', alg, hex_val)
     if not os.path.isfile(blob_path):
         print(f"oci_layout_to_tar: blob not found: {blob_path}", file=sys.stderr)
@@ -43,8 +62,7 @@ def read_blob(oci_dir, descriptor):
 
 def read_blob_path(oci_dir, descriptor):
     """Return the filesystem path of a blob."""
-    digest = descriptor['digest']
-    alg, hex_val = digest.split(':', 1)
+    alg, hex_val = split_validated_digest(descriptor['digest'])
     return os.path.join(oci_dir, 'blobs', alg, hex_val)
 
 
@@ -88,7 +106,7 @@ def convert(oci_dir, output_tar, tag=None):
     config_bytes = read_blob(oci_dir, config_desc)
 
     # Build docker-save compatible names
-    config_digest_short = config_desc['digest'].split(':', 1)[1][:64]
+    config_digest_short = split_validated_digest(config_desc['digest'])[1]
     config_name = f'{config_digest_short}.json'
 
     # Determine repo tag
@@ -105,7 +123,7 @@ def convert(oci_dir, output_tar, tag=None):
     # Build layer name list for manifest.json
     layer_names = []
     for i, layer_desc in enumerate(layer_descs):
-        layer_hex = layer_desc['digest'].split(':', 1)[1]
+        _, layer_hex = split_validated_digest(layer_desc['digest'])
         layer_names.append(f'{layer_hex}/layer.tar')
 
     docker_manifest = [{
