@@ -2540,6 +2540,77 @@ static void test_blob_is_age_encrypted(void)
                   "blob_is_age_encrypted: missing file returns -1");
 }
 
+/* ── test_blob_age_is_passphrase ──────────────────────────────────────────── */
+
+static void test_blob_age_is_passphrase(void)
+{
+    /* passphrase (scrypt) header → 1 */
+    char p1[] = "/tmp/oci2bin-pass1-XXXXXX";
+    const char* scrypt = "age-encryption.org/v1\n-> scrypt abcd 18\nBODY";
+    write_tmp(p1, scrypt, strlen(scrypt));
+    ASSERT_INT_EQ(blob_age_is_passphrase(p1), 1,
+                  "blob_age_is_passphrase: detects scrypt stanza");
+    unlink(p1);
+
+    /* recipient (X25519) header → 0 */
+    char p2[] = "/tmp/oci2bin-pass2-XXXXXX";
+    const char* x25519 = "age-encryption.org/v1\n-> X25519 abcd\nBODY";
+    write_tmp(p2, x25519, strlen(x25519));
+    ASSERT_INT_EQ(blob_age_is_passphrase(p2), 0,
+                  "blob_age_is_passphrase: X25519 is not passphrase");
+    unlink(p2);
+
+    /* missing file → -1 */
+    ASSERT_INT_EQ(blob_age_is_passphrase("/nonexistent/oci2bin/pass/x"), -1,
+                  "blob_age_is_passphrase: missing file returns -1");
+}
+
+/* ── test_resolve_age_passphrase ──────────────────────────────────────────── */
+
+static void test_resolve_age_passphrase(void)
+{
+    char out[1024];
+
+    unsetenv("OCI2BIN_PASSWORD_FILE");
+    unsetenv("OCI2BIN_PASSWORD");
+
+    /* no source → 1 (interactive) */
+    ASSERT_INT_EQ(resolve_age_passphrase(out, sizeof(out)), 1,
+                  "resolve_age_passphrase: no source returns 1");
+
+    /* env var → 0 with value */
+    setenv("OCI2BIN_PASSWORD", "s3cr3t", 1);
+    ASSERT_INT_EQ(resolve_age_passphrase(out, sizeof(out)), 0,
+                  "resolve_age_passphrase: env var returns 0");
+    ASSERT(strcmp(out, "s3cr3t") == 0,
+           "resolve_age_passphrase: env var value copied");
+    unsetenv("OCI2BIN_PASSWORD");
+
+    /* password file (first line, trailing newline stripped) takes precedence */
+    char pf[] = "/tmp/oci2bin-pf-XXXXXX";
+    const char* body = "file-pass\nignored second line\n";
+    write_tmp(pf, body, strlen(body));
+    setenv("OCI2BIN_PASSWORD_FILE", pf, 1);
+    setenv("OCI2BIN_PASSWORD", "env-pass", 1);
+    ASSERT_INT_EQ(resolve_age_passphrase(out, sizeof(out)), 0,
+                  "resolve_age_passphrase: password file returns 0");
+    ASSERT(strcmp(out, "file-pass") == 0,
+           "resolve_age_passphrase: first line used, newline stripped, "
+           "file wins over env");
+    unlink(pf);
+    unsetenv("OCI2BIN_PASSWORD_FILE");
+    unsetenv("OCI2BIN_PASSWORD");
+
+    /* empty password file → -1 */
+    char pe[] = "/tmp/oci2bin-pe-XXXXXX";
+    write_tmp(pe, "\n", 1);
+    setenv("OCI2BIN_PASSWORD_FILE", pe, 1);
+    ASSERT_INT_EQ(resolve_age_passphrase(out, sizeof(out)), -1,
+                  "resolve_age_passphrase: empty password file returns -1");
+    unlink(pe);
+    unsetenv("OCI2BIN_PASSWORD_FILE");
+}
+
 /* ── test_egress (--allow-egress) ─────────────────────────────────────────── */
 
 static void test_egress_append_rule(void)
@@ -4979,6 +5050,8 @@ int main(void)
     test_read_write_file();
     test_copy_n_bytes();
     test_blob_is_age_encrypted();
+    test_blob_age_is_passphrase();
+    test_resolve_age_passphrase();
     test_egress_append_rule();
     test_parse_opts_egress();
     test_lookup_passwd_group();

@@ -21,11 +21,13 @@ Layout:
 import argparse
 import base64
 import datetime
+import getpass
 import gzip
 import hashlib
 import io
 import json
 import os
+import pty
 import stat as stat_module
 import struct
 import subprocess
@@ -1025,6 +1027,124 @@ def age_encrypt(plaintext, recipients, recipients_files):
     return proc.stdout
 
 
+def _age_pty_run(argv, passphrase, n_send):
+    """Run `age` under a pty and feed `passphrase` when it prompts.
+
+    age reads passphrases only from a terminal, never stdin/env, so we
+    allocate a pty and answer each prompt (encryption asks twice — enter +
+    confirm — so n_send=2; decryption asks once). Returns the child's exit
+    code (127 if age is not installed).
+    """
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp(argv[0], argv)
+        except OSError:
+            pass
+        os._exit(127)
+    sent = 0
+    buf = b''
+    while True:
+        try:
+            data = os.read(fd, 1024)
+        except OSError:
+            break
+        if not data:
+            break
+        buf += data
+        low = buf.lower()
+        # age prints "Enter passphrase ...:" / "Confirm passphrase:" — feed the
+        # answer once the accumulated output ends on the prompt colon.
+        while sent < n_send and b'passphrase' in low and low.rstrip().endswith(b':'):
+            os.write(fd, passphrase + b'\n')
+            sent += 1
+            buf = b''
+            low = b''
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+def age_passphrase_encrypt(plaintext, passphrase):
+    """Encrypt `plaintext` with age in passphrase (scrypt) mode.
+
+    Drives `age -p` through a pty (see `_age_pty_run`). The plaintext is fed
+    via a temp file and the ciphertext written to a temp file so the pty
+    carries only the prompt interaction, never the payload. Returns the age
+    ciphertext bytes. Exits on error.
+
+    The result is a symmetric counterpart to age_encrypt(): decryption at run
+    time needs the same passphrase (OCI2BIN_PASSWORD / OCI2BIN_PASSWORD_FILE,
+    or an interactive prompt) instead of a recipient identity.
+    """
+    if not passphrase:
+        print('--passphrase requires a non-empty passphrase', file=sys.stderr)
+        sys.exit(1)
+    with tempfile.TemporaryDirectory() as td:
+        in_path = os.path.join(td, 'payload.in')
+        out_path = os.path.join(td, 'payload.age')
+        with open(in_path, 'wb') as f:
+            f.write(plaintext)
+        argv = ['age', '--passphrase', '-o', out_path, in_path]
+        rc = _age_pty_run(argv, passphrase, n_send=2)
+        if rc == 127:
+            print("error: 'age' not found; install it to use --passphrase "
+                  "(https://age-encryption.org)", file=sys.stderr)
+            sys.exit(1)
+        if rc != 0:
+            print('error: age passphrase encryption failed', file=sys.stderr)
+            sys.exit(1)
+        with open(out_path, 'rb') as f:
+            return f.read()
+
+
+def resolve_build_passphrase(password_file):
+    """Resolve the passphrase for --passphrase encryption.
+
+    Order: --password-file (first line), then $OCI2BIN_PASSWORD, then an
+    interactive prompt (asked twice, must match). Returns the passphrase as
+    bytes. Exits on error.
+    """
+    if password_file:
+        try:
+            with open(password_file, 'rb') as f:
+                first = f.readline()
+        except OSError as e:
+            print(f'--password-file: cannot read {password_file}: {e}',
+                  file=sys.stderr)
+            sys.exit(1)
+        # Strip a single trailing newline (CRLF or LF); keep any other bytes.
+        if first.endswith(b'\n'):
+            first = first[:-1]
+        if first.endswith(b'\r'):
+            first = first[:-1]
+        if not first:
+            print(f'--password-file: {password_file} is empty', file=sys.stderr)
+            sys.exit(1)
+        return first
+
+    env = os.environ.get('OCI2BIN_PASSWORD')
+    if env:
+        return env.encode('utf-8')
+
+    try:
+        p1 = getpass.getpass('Passphrase for image encryption: ')
+        p2 = getpass.getpass('Confirm passphrase: ')
+    except (EOFError, KeyboardInterrupt):
+        print('\nerror: passphrase entry aborted', file=sys.stderr)
+        sys.exit(1)
+    if p1 != p2:
+        print('error: passphrases do not match', file=sys.stderr)
+        sys.exit(1)
+    if not p1:
+        print('error: passphrase must not be empty', file=sys.stderr)
+        sys.exit(1)
+    return p1.encode('utf-8')
+
+
 def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    digest=None, image_name_for_meta=None,
                    kernel_path=None, initramfs_path=None,
@@ -1036,6 +1156,7 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    use_layer_cache=True, reproducible=False,
                    offline_only=False, user_labels=None,
                    encrypt_recipients=None, encrypt_recipients_files=None,
+                   encrypt_passphrase=False, password_file=None,
                    require_signed_pubkey=None):
     """Build the TAR+ELF polyglot file.
 
@@ -1109,8 +1230,18 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
 
     # 2c. Encrypt the OCI payload with age (must be the LAST transform: the
     # ciphertext is no longer a tar). The loader detects the age header at
-    # runtime and decrypts with the recipient's identity before extraction.
-    if encrypt_recipients or encrypt_recipients_files:
+    # runtime and decrypts before extraction. Two mutually-exclusive modes:
+    #   - passphrase (symmetric, scrypt): decrypt with OCI2BIN_PASSWORD[_FILE]
+    #   - recipients (asymmetric, X25519): decrypt with OCI2BIN_IDENTITY
+    if encrypt_passphrase:
+        if reproducible:
+            print('  note: --passphrase makes the output non-reproducible '
+                  '(age uses a fresh random salt per build)', file=sys.stderr)
+        passphrase = resolve_build_passphrase(password_file)
+        oci_data = age_passphrase_encrypt(oci_data, passphrase)
+        print(f'  Encrypted embedded image with age passphrase '
+              f'({len(oci_data)} bytes ciphertext)', file=sys.stderr)
+    elif encrypt_recipients or encrypt_recipients_files:
         if reproducible:
             print('  note: --encrypt makes the output non-reproducible '
                   '(age uses a fresh ephemeral key per build)',
@@ -1404,6 +1535,17 @@ def main():
                         dest='recipients_files', metavar='FILE',
                         help='File of age recipients (one per line), '
                              'repeatable. Implies --encrypt.')
+    parser.add_argument('--passphrase', action='store_true', default=False,
+                        help='Encrypt the embedded OCI image with an age '
+                             'passphrase (symmetric, scrypt) instead of '
+                             'recipients. Decryption needs the same passphrase '
+                             'at run time (OCI2BIN_PASSWORD / '
+                             'OCI2BIN_PASSWORD_FILE, or an interactive prompt). '
+                             'Mutually exclusive with --recipient/'
+                             '--recipients-file.')
+    parser.add_argument('--password-file', default=None, metavar='FILE',
+                        help='Read the --passphrase from the first line of '
+                             'FILE instead of $OCI2BIN_PASSWORD or prompting.')
     parser.add_argument('--require-signed', default=None, metavar='PUBKEY.pem',
                         help='Embed a self-enforcing signature policy: the '
                              'loader refuses to run unless a valid OCI2BIN_SIG '
@@ -1482,9 +1624,23 @@ def main():
             sys.exit(1)
         user_labels[key] = val
 
-    if args.encrypt and not (args.recipients or args.recipients_files):
+    if args.passphrase and (args.recipients or args.recipients_files):
+        print('--passphrase is mutually exclusive with --recipient/'
+              '--recipients-file (passphrase is symmetric, recipients are '
+              'asymmetric)', file=sys.stderr)
+        sys.exit(1)
+    if args.password_file and not args.passphrase:
+        print('--password-file requires --passphrase', file=sys.stderr)
+        sys.exit(1)
+    if args.encrypt and not (args.recipients or args.recipients_files
+                             or args.passphrase):
         print('--encrypt requires at least one --recipient or '
-              '--recipients-file', file=sys.stderr)
+              '--recipients-file (or use --passphrase for symmetric '
+              'encryption)', file=sys.stderr)
+        sys.exit(1)
+    if args.password_file and not os.path.isfile(args.password_file):
+        print(f'--password-file not found: {args.password_file}',
+              file=sys.stderr)
         sys.exit(1)
 
     require_signed_pubkey = None
@@ -1521,6 +1677,8 @@ def main():
                    user_labels=user_labels,
                    encrypt_recipients=args.recipients,
                    encrypt_recipients_files=args.recipients_files,
+                   encrypt_passphrase=args.passphrase,
+                   password_file=args.password_file,
                    require_signed_pubkey=require_signed_pubkey)
 
 

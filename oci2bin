@@ -69,6 +69,10 @@
 #   --recipient AGE_PUB   age recipient (age1.../ssh-ed25519 ...), repeatable
 #   --recipients-file F   File of age recipients, one per line (repeatable)
 #                         Runtime: set OCI2BIN_IDENTITY to the age identity file
+#   --passphrase          Encrypt with an age passphrase (symmetric, scrypt)
+#                         instead of recipients. Runtime: set OCI2BIN_PASSWORD
+#                         or OCI2BIN_PASSWORD_FILE, else prompts on the terminal
+#   --password-file F     Read the --passphrase from the first line of F
 #   --require-signed PUB  Embed a self-enforcing signature policy: refuse to run
 #                         unless a valid signature from PUB is present (then run
 #                         'oci2bin sign --key PRIV --in BINARY')
@@ -1181,12 +1185,12 @@ if [[ "${1:-}" == "run" ]]; then
     RUN_IMAGE=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest|--recipient|--recipients-file|--require-signed)
+            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest|--recipient|--recipients-file|--password-file|--require-signed)
                 [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
                 BUILD_ARGS+=("$1" "$2")
                 shift 2
                 ;;
-            --cache|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash|--encrypt)
+            --cache|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash|--encrypt|--passphrase)
                 BUILD_ARGS+=("$1")
                 shift
                 ;;
@@ -1895,6 +1899,8 @@ USER_LABELS=()
 ENCRYPT=0
 ENCRYPT_RECIPIENTS=()
 ENCRYPT_RECIPIENTS_FILES=()
+ENCRYPT_PASSPHRASE=0
+ENCRYPT_PASSWORD_FILE=""
 REQUIRE_SIGNED_KEY=""
 SELF_UPDATE_URL=""
 PIN_DIGEST=""
@@ -2039,6 +2045,18 @@ while [[ $# -gt 0 ]]; do
             [[ $# -lt 2 ]] && { echo "oci2bin: --recipients-file requires a PATH" >&2; exit 1; }
             ENCRYPT=1
             ENCRYPT_RECIPIENTS_FILES+=("$2")
+            shift 2
+            ;;
+        --passphrase)
+            ENCRYPT=1
+            ENCRYPT_PASSPHRASE=1
+            shift
+            ;;
+        --password-file)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --password-file requires a PATH" >&2; exit 1; }
+            ENCRYPT=1
+            ENCRYPT_PASSPHRASE=1
+            ENCRYPT_PASSWORD_FILE="$2"
             shift 2
             ;;
         --require-signed)
@@ -2486,6 +2504,8 @@ for _lbl in "${USER_LABELS[@]}"; do EMBED_LOADER_ARG+=(--label "$_lbl"); done
 [[ "$ENCRYPT" -eq 1 ]] && EMBED_LOADER_ARG+=(--encrypt)
 for _r in "${ENCRYPT_RECIPIENTS[@]}"; do EMBED_LOADER_ARG+=(--recipient "$_r"); done
 for _rf in "${ENCRYPT_RECIPIENTS_FILES[@]}"; do EMBED_LOADER_ARG+=(--recipients-file "$_rf"); done
+[[ "$ENCRYPT_PASSPHRASE" -eq 1 ]] && EMBED_LOADER_ARG+=(--passphrase)
+[[ -n "$ENCRYPT_PASSWORD_FILE" ]] && EMBED_LOADER_ARG+=(--password-file "$ENCRYPT_PASSWORD_FILE")
 [[ -n "$REQUIRE_SIGNED_KEY" ]] && EMBED_LOADER_ARG+=(--require-signed "$REQUIRE_SIGNED_KEY")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then

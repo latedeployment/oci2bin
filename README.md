@@ -379,11 +379,45 @@ in this order:
 OCI2BIN_IDENTITY=~/keys/alice.key ./myredis
 ```
 
+#### Passphrase encryption (--passphrase)
+
+For a shared-secret workflow with no keypairs, `--passphrase` seals the image
+symmetrically (age scrypt mode). It is mutually exclusive with
+`--recipient`/`--recipients-file`.
+
+```bash
+# Prompts for the passphrase (asked twice) at build time:
+oci2bin --passphrase redis:7-alpine myredis
+
+# Non-interactive: from a file (first line) or the environment:
+oci2bin --passphrase --password-file ./secret.txt redis:7-alpine myredis
+OCI2BIN_PASSWORD='correct horse battery staple' oci2bin --passphrase \
+        redis:7-alpine myredis
+```
+
+At run time the loader detects the scrypt header and resolves the passphrase in
+this order:
+
+1. `$OCI2BIN_PASSWORD_FILE` — first line of the file
+2. `$OCI2BIN_PASSWORD`
+3. otherwise, age prompts interactively on the terminal
+
+```bash
+OCI2BIN_PASSWORD='correct horse battery staple' ./myredis
+# or, interactively:
+./myredis        # age prompts: Enter passphrase:
+```
+
+Because age reads passphrases only from a terminal, both build and run drive
+`age` through a pty to supply a non-interactive passphrase; the passphrase
+itself never touches `age`'s stdin or argv.
+
 Notes and limitations:
 
 - Requires the `age` binary at **both** build time (to encrypt) and run time
-  (to decrypt). With no readable identity, an encrypted binary refuses to run
-  with a clear message.
+  (to decrypt). With no readable identity (recipient mode) or no resolvable
+  passphrase (passphrase mode), an encrypted binary refuses to run with a clear
+  message.
 - An encrypted binary is opaque to `docker load`, `oci2bin reconstruct`,
   `sbom`, and `ps`/`list --filter label=…` (the labels live inside the
   encrypted payload). `oci2bin inspect` reports `Payload: encrypted (age)` and

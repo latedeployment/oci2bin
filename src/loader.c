@@ -25,6 +25,7 @@
 #include <sys/ioctl.h>
 #include <sys/un.h>
 #include <termios.h>
+#include <pty.h>
 #include <grp.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -3900,12 +3901,175 @@ static int resolve_age_identity(char* out, size_t outsz)
     return -1;
 }
 
+/* Return 1 if the age blob at `path` uses passphrase (scrypt) encryption,
+ * 0 if it uses recipient (X25519/ssh) encryption, -1 on read error. The age
+ * header lists its first stanza right after the version line: "-> scrypt ..."
+ * for passphrase mode, "-> X25519"/"-> ssh-..." for recipients. */
+static int blob_age_is_passphrase(const char* path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    char head[256];
+    ssize_t n = read(fd, head, sizeof(head) - 1);
+    close(fd);
+    if (n < 0)
+    {
+        return -1;
+    }
+    head[n] = '\0';
+    if (memmem(head, (size_t)n, "-> scrypt", 9) != NULL)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/* Resolve the passphrase used to decrypt a passphrase-encrypted image.
+ * Order: $OCI2BIN_PASSWORD_FILE (first line), then $OCI2BIN_PASSWORD. Writes
+ * the passphrase into `out` (NUL-terminated) and returns 0; returns 1 if no
+ * non-interactive source is set (the caller should let age prompt on the
+ * terminal); returns -1 on error. */
+static int resolve_age_passphrase(char* out, size_t outsz)
+{
+    const char* pf = getenv("OCI2BIN_PASSWORD_FILE");
+    if (pf && pf[0])
+    {
+        int fd = open(pf, O_RDONLY);
+        if (fd < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: cannot open OCI2BIN_PASSWORD_FILE=%s\n", pf);
+            return -1;
+        }
+        ssize_t n = read(fd, out, outsz - 1);
+        close(fd);
+        if (n < 0)
+        {
+            fprintf(stderr, "oci2bin: cannot read OCI2BIN_PASSWORD_FILE\n");
+            return -1;
+        }
+        out[n] = '\0';
+        /* Keep only the first line; drop a trailing CR if present. */
+        char* nl = strchr(out, '\n');
+        if (nl)
+        {
+            *nl = '\0';
+        }
+        size_t len = strlen(out);
+        if (len > 0 && out[len - 1] == '\r')
+        {
+            out[len - 1] = '\0';
+        }
+        if (out[0] == '\0')
+        {
+            fprintf(stderr, "oci2bin: OCI2BIN_PASSWORD_FILE is empty\n");
+            return -1;
+        }
+        return 0;
+    }
+
+    const char* pw = getenv("OCI2BIN_PASSWORD");
+    if (pw && pw[0])
+    {
+        if (snprintf(out, outsz, "%s", pw) >= (int)outsz)
+        {
+            fprintf(stderr, "oci2bin: OCI2BIN_PASSWORD too long\n");
+            return -1;
+        }
+        return 0;
+    }
+
+    out[0] = '\0';
+    return 1;    /* no non-interactive source — prompt interactively */
+}
+
+/* Decrypt `in_path` (a passphrase/scrypt age blob) to `out_path`, feeding
+ * `passphrase` to `age -d` over a pty. age reads passphrases only from a
+ * terminal, so a pty is required to supply one non-interactively. Returns the
+ * age exit code (127 if age is missing), or -1 on fork/pty failure. */
+static int age_pty_decrypt(const char* in_path, const char* out_path,
+                           const char* passphrase)
+{
+    int master = -1;
+    pid_t pid = forkpty(&master, NULL, NULL, NULL);
+    if (pid < 0)
+    {
+        perror("oci2bin: forkpty");
+        return -1;
+    }
+    if (pid == 0)
+    {
+        char* argv[] =
+        {
+            "age", "--decrypt", "-o", (char*)out_path, (char*)in_path, NULL
+        };
+        execvp("age", argv);
+        _exit(127);
+    }
+
+    /* Parent: answer the passphrase prompt once, then drain the pty until
+     * age exits. Only prompts/errors flow over the pty — the plaintext goes
+     * to out_path. */
+    size_t plen = strlen(passphrase);
+    int sent = 0;
+    char accbuf[256];
+    size_t acc = 0;
+    char buf[512];
+    for (;;)
+    {
+        ssize_t n = read(master, buf, sizeof(buf));
+        if (n <= 0)
+        {
+            break;
+        }
+        if (!sent)
+        {
+            for (ssize_t i = 0; i < n && acc < sizeof(accbuf) - 1; i++)
+            {
+                accbuf[acc++] = buf[i];
+            }
+            accbuf[acc] = '\0';
+            if (strcasestr(accbuf, "passphrase") != NULL)
+            {
+                if (write(master, passphrase, plen) == (ssize_t)plen &&
+                        write(master, "\n", 1) == 1)
+                {
+                    sent = 1;
+                }
+            }
+        }
+    }
+    close(master);
+    /* The pty echoes the passphrase back to the master; scrub both buffers
+     * so no copy of the secret lingers on the stack after return. */
+    explicit_bzero(accbuf, sizeof(accbuf));
+    explicit_bzero(buf, sizeof(buf));
+
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        perror("oci2bin: waitpid");
+        return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 /*
  * If `in_path` holds an age-encrypted payload, decrypt it with the `age`
  * helper into `out_path` (under `tmpdir`) and return 1. If it is plaintext,
  * return 0 (caller keeps using `in_path`). Return -1 on error (message
- * already printed). The decrypted tar is written inside the runtime tmpdir,
- * which should live on a tmpfs; it is removed with the rest of the tmpdir.
+ * already printed). Passphrase (scrypt) images decrypt with the passphrase
+ * from OCI2BIN_PASSWORD[_FILE] or an interactive prompt; recipient (X25519)
+ * images decrypt with the age identity from resolve_age_identity().
+ * The decrypted tar is written inside the runtime tmpdir, which should live
+ * on a tmpfs; it is removed with the rest of the tmpdir.
  */
 static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
                                   char* out_path, size_t out_sz)
@@ -3921,12 +4085,10 @@ static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
         return 0;    /* plaintext — nothing to do */
     }
 
-    char identity[PATH_MAX];
-    if (resolve_age_identity(identity, sizeof(identity)) < 0)
+    int pass_mode = blob_age_is_passphrase(in_path);
+    if (pass_mode < 0)
     {
-        fprintf(stderr,
-                "oci2bin: image is encrypted; set OCI2BIN_IDENTITY to your "
-                "age identity file (or place one at ~/.config/oci2bin/identity)\n");
+        perror("oci2bin: reading embedded payload");
         return -1;
     }
 
@@ -3936,13 +4098,55 @@ static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
         return -1;
     }
 
-    debug_log("decrypt.begin", "identity=%s out=%s", identity, out_path);
-    char* age_argv[] =
+    int rc;
+    if (pass_mode == 1)
     {
-        "age", "--decrypt", "-i", identity,
-        "-o", out_path, (char*)in_path, NULL
-    };
-    int rc = run_cmd(age_argv);
+        /* Symmetric (passphrase / scrypt) image. */
+        char passphrase[1024];
+        int pr = resolve_age_passphrase(passphrase, sizeof(passphrase));
+        if (pr < 0)
+        {
+            return -1;
+        }
+        if (pr == 0)
+        {
+            debug_log("decrypt.begin", "mode=passphrase out=%s", out_path);
+            rc = age_pty_decrypt(in_path, out_path, passphrase);
+            /* Scrub the passphrase from memory as soon as it is consumed. */
+            explicit_bzero(passphrase, sizeof(passphrase));
+        }
+        else
+        {
+            /* No non-interactive source: let age prompt on the terminal. */
+            debug_log("decrypt.begin", "mode=passphrase-interactive out=%s",
+                      out_path);
+            char* age_argv[] =
+            {
+                "age", "--decrypt", "-o", out_path, (char*)in_path, NULL
+            };
+            rc = run_cmd(age_argv);
+        }
+    }
+    else
+    {
+        /* Asymmetric (recipient / X25519) image. */
+        char identity[PATH_MAX];
+        if (resolve_age_identity(identity, sizeof(identity)) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: image is encrypted; set OCI2BIN_IDENTITY to your "
+                    "age identity file (or place one at ~/.config/oci2bin/identity)\n");
+            return -1;
+        }
+        debug_log("decrypt.begin", "identity=%s out=%s", identity, out_path);
+        char* age_argv[] =
+        {
+            "age", "--decrypt", "-i", identity,
+            "-o", out_path, (char*)in_path, NULL
+        };
+        rc = run_cmd(age_argv);
+    }
+
     if (rc == 127)
     {
         fprintf(stderr,
@@ -3953,8 +4157,8 @@ static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
     if (rc != 0)
     {
         fprintf(stderr,
-                "oci2bin: age decryption failed (wrong identity for this "
-                "image's recipients?)\n");
+                "oci2bin: age decryption failed (wrong %s for this image?)\n",
+                pass_mode == 1 ? "passphrase" : "identity");
         /* Do not leave a partial/empty plaintext file behind. */
         unlink(out_path);
         return -1;
