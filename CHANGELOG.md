@@ -4,6 +4,33 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`oci2bin --passphrase` (symmetric image encryption)** — seals the
+  embedded OCI image with an age scrypt passphrase instead of recipients
+  (mutually exclusive with `--recipient`/`--recipients-file`). The
+  passphrase is taken from `--password-file FILE` (first line),
+  `$OCI2BIN_PASSWORD`, or an interactive prompt at build time, and from
+  `$OCI2BIN_PASSWORD_FILE`, `$OCI2BIN_PASSWORD`, or an interactive
+  prompt at run time. Because `age` reads passphrases only from a
+  terminal, both build and run drive `age` through a pty — the
+  passphrase never touches `age`'s argv or stdin. The loader
+  auto-detects the header (`-> scrypt` vs `-> X25519`) and routes to
+  passphrase or identity decryption; secrets are scrubbed with
+  `explicit_bzero`. New C unit tests (`blob_age_is_passphrase`,
+  `resolve_age_passphrase`) and Python tests (round-trip,
+  wrong-passphrase, password-file/env resolution).
+
+### Security
+
+- **`oci_layout_to_tar.py`: validate blob digests** — `read_blob`/
+  `read_blob_path` built `blobs/<alg>/<hex>` paths directly from the
+  attacker-controlled descriptor digest. A crafted OCI layout with a
+  digest such as `sha256:../../../../etc/passwd` could escape the blobs
+  directory and read an arbitrary build-host file into the produced
+  image. Digests are now validated (`sha256:` + 64 lowercase hex)
+  before use, matching `dockerfile_build.py`.
+
 ## [0.14.0] - 2026-05-22
 
 ### Added
