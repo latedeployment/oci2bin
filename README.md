@@ -2324,22 +2324,34 @@ make test-c                  # C unit tests (TAP, x86_64)
 make test-c-aarch64          # C unit tests cross-compiled and run under qemu (aarch64)
 make test-python             # Python unit tests
 make test-shellcheck         # shellcheck on all shell scripts
-make test-integration        # all integration tests (runtime, build, Redis, nginx, encrypt)
+make test-integration        # all integration tests (runtime, build, Redis, nginx, encrypt, live)
 make test-integration-redis  # Redis PING/SET/GET smoke test
 make test-integration-nginx  # nginx HTTP 200 smoke test
+make test-integration-live      # build real images + run them live on the full path
 make test-integration-encrypt   # encrypted image, full rootless path, end-to-end
 make test-integration-services  # Redis (container+VM) + 5 service images (container+VM)
 ```
 
 > All testing and fuzzing runs locally — there is no hosted/remote CI.
 
-`make test-integration-encrypt` builds a real `--passphrase`-encrypted Redis
-binary and runs it on the **full** runtime path (no `--no-userns-remap`, no
-`--no-seccomp`): it verifies run-time decryption, subordinate-ID user-namespace
-mapping, the entrypoint dropping to a non-root in-image user (gosu/`setgroups`),
-and that a wrong passphrase fails closed. Unlike the unit tests, this exercises
-an actual built binary running an actual container; it needs Docker and `age`
-(it skips cleanly if `age` is absent).
+`make test-integration-live` and `make test-integration-encrypt` are the
+"build a real image and run it live" tests — they exercise an **actual built
+binary running an actual container** on the **full** runtime path (no
+`--no-userns-remap`, no `--no-seccomp`), which the unit tests cannot cover:
+
+- **`test-integration-live`** builds Alpine and Redis and checks rootless UID
+  mapping (`id` → `uid=0`), argument passthrough, `-e` env injection, `-v`
+  volume mounts, `--entrypoint` override, image-filesystem reads, and the Redis
+  entrypoint dropping to the non-root `redis` user (gosu/`setgroups`) and
+  serving `PING`.
+- **`test-integration-encrypt`** does the same for a `--passphrase`-encrypted
+  image: run-time decryption, the full rootless path, user-switch, and
+  wrong-passphrase fail-closed.
+
+Both need Docker (and `age` for the encrypt test) and skip cleanly when those
+are absent. The older `test-runtime`/`test-integration-redis`/`-nginx` tests
+pass `--no-userns-remap`/`--no-seccomp`, so they do not cover the rootless or
+seccomp paths — these two do.
 
 ### Coverage
 

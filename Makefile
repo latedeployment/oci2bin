@@ -59,7 +59,8 @@ VMLINUX_OUT    = build/vmlinux
 .PHONY: all clean clean-all polyglot loader loader-x86_64 loader-aarch64 loader-all \
         loader-libkrun kernel doc install uninstall test test-unit \
         test-unit-aarch64 test-integration test-integration-redis \
-        test-integration-nginx test-integration-encrypt test-integration-services \
+        test-integration-nginx test-integration-encrypt test-integration-live \
+        test-integration-services \
         test-c test-c-aarch64 test-c-stubs test-python test-shellcheck \
         test-all test-all-fuzz \
         test-vm-unit test-vm \
@@ -296,7 +297,7 @@ lint-semgrep:
 SHELL_SOURCES = oci2bin \
                 scripts/style.sh scripts/fetch_kernel.sh scripts/fuzz_run.sh \
                 tests/test_integration_redis.sh tests/test_integration_nginx.sh \
-                tests/test_integration_encrypt.sh \
+                tests/test_integration_encrypt.sh tests/test_integration_live.sh \
                 tests/test_runtime.sh tests/test_vm_integration.sh
 
 lint-shellcheck:
@@ -402,12 +403,17 @@ test-vm: test-vm-unit
 	fi
 	$(TEST_ENV) bash tests/test_vm_integration.sh
 
-test-integration: test-integration-redis test-integration-nginx test-integration-encrypt polyglot
+test-integration: test-integration-redis test-integration-nginx test-integration-encrypt test-integration-live polyglot
 	@echo "=== Runtime integration tests ==="
 	@mkdir -p $(TEST_TMPDIR)
 	@$(TEST_ENV) bash $(TESTS_DIR)/test_runtime.sh
 	@echo "=== Build integration tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_polyglot.TestBuildPolyglotIntegration -v
+
+test-integration-live:
+	@echo "=== Live build-and-run matrix (full rootless path) ==="
+	@mkdir -p $(TEST_TMPDIR)
+	@$(TEST_ENV) bash $(TESTS_DIR)/test_integration_live.sh
 
 test-integration-encrypt:
 	@echo "=== Encrypted + rootless end-to-end integration test ==="

@@ -6,6 +6,16 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`make test-integration-live`** — a live build-and-run matrix that builds
+  real Alpine and Redis images with oci2bin and runs them on the **full**
+  runtime path (no `--no-userns-remap`, no `--no-seccomp`): rootless UID
+  mapping, argument passthrough, `-e` env, `-v` volumes, `--entrypoint`
+  override, image-filesystem reads, and the Redis entrypoint dropping to the
+  non-root `redis` user (gosu/`setgroups`) and serving `PING`. The existing
+  `test-runtime`/redis/nginx tests pass `--no-userns-remap`/`--no-seccomp`, so
+  they never exercised the rootless or seccomp paths; this does. In
+  `make test-integration`; needs Docker, skips cleanly without it.
+
 - **`make test-integration-encrypt`** — an end-to-end integration test that
   builds a real `--passphrase`-encrypted Redis binary and runs it on the full
   runtime path (no `--no-userns-remap`, no `--no-seccomp`): run-time
