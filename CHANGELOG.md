@@ -4,6 +4,18 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`make test-integration-encrypt`** — an end-to-end integration test that
+  builds a real `--passphrase`-encrypted Redis binary and runs it on the full
+  runtime path (no `--no-userns-remap`, no `--no-seccomp`): run-time
+  decryption, subordinate-ID user-namespace mapping, the entrypoint dropping to
+  a non-root in-image user (gosu/`setgroups`), and wrong-passphrase
+  fail-closed. Unlike the unit tests it exercises an actual built binary
+  running an actual container, so regressions like the rootless mapping /
+  setgroups bugs would be caught. Included in `make test-integration`; needs
+  Docker + `age` and skips cleanly without `age`.
+
 ## [0.15.0] - 2026-06-12
 
 ### Added

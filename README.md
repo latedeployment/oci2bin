@@ -2324,13 +2324,22 @@ make test-c                  # C unit tests (TAP, x86_64)
 make test-c-aarch64          # C unit tests cross-compiled and run under qemu (aarch64)
 make test-python             # Python unit tests
 make test-shellcheck         # shellcheck on all shell scripts
-make test-integration        # all integration tests (runtime, build, Redis, nginx)
+make test-integration        # all integration tests (runtime, build, Redis, nginx, encrypt)
 make test-integration-redis  # Redis PING/SET/GET smoke test
 make test-integration-nginx  # nginx HTTP 200 smoke test
+make test-integration-encrypt   # encrypted image, full rootless path, end-to-end
 make test-integration-services  # Redis (container+VM) + 5 service images (container+VM)
 ```
 
 > All testing and fuzzing runs locally — there is no hosted/remote CI.
+
+`make test-integration-encrypt` builds a real `--passphrase`-encrypted Redis
+binary and runs it on the **full** runtime path (no `--no-userns-remap`, no
+`--no-seccomp`): it verifies run-time decryption, subordinate-ID user-namespace
+mapping, the entrypoint dropping to a non-root in-image user (gosu/`setgroups`),
+and that a wrong passphrase fails closed. Unlike the unit tests, this exercises
+an actual built binary running an actual container; it needs Docker and `age`
+(it skips cleanly if `age` is absent).
 
 ### Coverage
 
