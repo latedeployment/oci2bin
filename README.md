@@ -412,6 +412,29 @@ Because age reads passphrases only from a terminal, both build and run drive
 `age` through a pty to supply a non-interactive passphrase; the passphrase
 itself never touches `age`'s stdin or argv.
 
+**Decryption flow at run time.** When you run the binary, the loader:
+
+1. detects the age header, then sees the `-> scrypt` stanza → passphrase mode
+   (a recipient image would show `-> X25519` → identity mode instead);
+2. resolves the passphrase (`$OCI2BIN_PASSWORD_FILE` → `$OCI2BIN_PASSWORD` →
+   interactive prompt);
+3. runs `age --decrypt` into a tmpfs file, scrubs the passphrase from memory,
+   then extracts the rootfs and execs the entrypoint.
+
+**What happens on a wrong passphrase.** age scrypt mode is *authenticated*
+(ChaCha20-Poly1305), so an incorrect passphrase fails the integrity check
+rather than producing garbage — there is no "silently runs the wrong image"
+outcome. `age` exits non-zero and the loader prints:
+
+```
+oci2bin: age decryption failed (wrong passphrase for this image?)
+```
+
+then deletes the partial output and **aborts before any extraction** — no
+rootfs is built and the entrypoint never runs. The same fail-closed behaviour
+applies if `age` is not on `PATH` (exit 127, with a clear message) or if no
+passphrase is available and there is no terminal to prompt on.
+
 Notes and limitations:
 
 - Requires the `age` binary at **both** build time (to encrypt) and run time
