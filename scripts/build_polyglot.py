@@ -28,6 +28,7 @@ import io
 import json
 import os
 import pty
+import shutil
 import stat as stat_module
 import struct
 import subprocess
@@ -721,6 +722,39 @@ def patch_auto_pin_digest(output_path):
         f.write(repl)
 
 
+def repack_oci_tar_uncompress_layers(oci_data):
+    """Re-emit the OCI tar with every gzip-compressed layer blob inflated.
+
+    Used only before --compress-binary: per-layer gzip is undone so the whole
+    payload can be recompressed as one zstd-19 frame, which compresses the
+    combined rootfs far better than independent gzip-6 streams. The loader
+    extracts each layer with `tar xf`, which auto-detects compression, so plain
+    (uncompressed) layer tarballs extract identically. Member names and metadata
+    are preserved; only file contents (and sizes) change.
+    """
+    src = tarfile.open(fileobj=io.BytesIO(oci_data))
+    buf = io.BytesIO()
+    out = tarfile.open(fileobj=buf, mode='w', format=tarfile.GNU_FORMAT)
+    try:
+        for m in src.getmembers():
+            if m.isfile():
+                f = src.extractfile(m)
+                data = f.read() if f is not None else b''
+                if data[:2] == b'\x1f\x8b':
+                    try:
+                        data = gzip.decompress(data)
+                    except OSError:
+                        pass  # leave a non-gzip / corrupt blob untouched
+                m.size = len(data)
+                out.addfile(m, io.BytesIO(data))
+            else:
+                out.addfile(m)
+    finally:
+        out.close()
+        src.close()
+    return buf.getvalue()
+
+
 def repack_oci_tar_reproducible(oci_data):
     """
     Re-emit an OCI tar with all sources of non-determinism removed:
@@ -992,6 +1026,30 @@ def apply_user_labels(oci_data, labels):
     return new_oci
 
 
+def zstd_compress_payload(data, level=19):
+    """Compress the embedded OCI payload with the `zstd` CLI.
+
+    Returns the zstd frame bytes. The loader sniffs the zstd magic at runtime
+    and inflates with `zstd -d` before extraction, so a compressed binary is
+    opaque to `docker load`/`reconstruct` (like an encrypted one) and requires
+    `zstd` at run time. zstd frames embed no timestamp, so this stays
+    compatible with --reproducible. Exits on error.
+    """
+    if shutil.which('zstd') is None:
+        print("error: 'zstd' not found; install it to use --compress-binary",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        proc = subprocess.run(
+            ['zstd', f'-{level}', '-q', '-c'],
+            input=data, stdout=subprocess.PIPE, check=True)
+    except subprocess.CalledProcessError:
+        print('error: zstd compression of the embedded image failed',
+              file=sys.stderr)
+        sys.exit(1)
+    return proc.stdout
+
+
 def age_encrypt(plaintext, recipients, recipients_files):
     """Encrypt `plaintext` to the given age recipients via the `age` CLI.
 
@@ -1162,7 +1220,7 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    offline_only=False, user_labels=None,
                    encrypt_recipients=None, encrypt_recipients_files=None,
                    encrypt_passphrase=False, password_file=None,
-                   require_signed_pubkey=None):
+                   require_signed_pubkey=None, compress_binary=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -1232,6 +1290,20 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     # makes two builds of the same input produce byte-identical output.
     if reproducible:
         oci_data = repack_oci_tar_reproducible(oci_data)
+
+    # 2b'. Compress the OCI payload with zstd (--compress-binary). Runs before
+    # encryption so the ciphertext wraps the compressed bytes; the loader
+    # decrypts then inflates. zstd frames carry no timestamp, so this is
+    # reproducible. The compressed payload is no longer a tar, so the binary
+    # becomes opaque to `docker load`/`reconstruct` (like encryption).
+    if compress_binary == 'zstd':
+        before = len(oci_data)
+        # Inflate per-layer gzip first so zstd-19 compresses the whole rootfs
+        # as one stream (much better than recompressing already-gzipped layers).
+        oci_data = repack_oci_tar_uncompress_layers(oci_data)
+        oci_data = zstd_compress_payload(oci_data)
+        print(f'  Compressed embedded image with zstd '
+              f'({before} -> {len(oci_data)} bytes)', file=sys.stderr)
 
     # 2c. Encrypt the OCI payload with age (must be the LAST transform: the
     # ciphertext is no longer a tar). The loader detects the age header at
@@ -1556,6 +1628,14 @@ def main():
                              'loader refuses to run unless a valid OCI2BIN_SIG '
                              'from this public key is present. Sign afterwards '
                              'with `oci2bin sign --key PRIV.pem`.')
+    parser.add_argument('--compress-binary', nargs='?', const='zstd',
+                        choices=['zstd'], default=None,
+                        help='Compress the embedded OCI payload with zstd. '
+                             'Shrinks the output binary; the loader inflates '
+                             'it at run time (requires `zstd` at run time). '
+                             'Like --encrypt, the payload is no longer a tar, '
+                             'so the binary is opaque to docker load / '
+                             'reconstruct. Compatible with --reproducible.')
     parser.add_argument('--reproducible', action='store_true', default=False,
                         help='Produce a byte-identical output across runs of '
                              'the same input: re-emit the OCI tar with sorted '
@@ -1684,7 +1764,8 @@ def main():
                    encrypt_recipients_files=args.recipients_files,
                    encrypt_passphrase=args.passphrase,
                    password_file=args.password_file,
-                   require_signed_pubkey=require_signed_pubkey)
+                   require_signed_pubkey=require_signed_pubkey,
+                   compress_binary=args.compress_binary)
 
 
 if __name__ == '__main__':

@@ -73,6 +73,9 @@
 #                         instead of recipients. Runtime: set OCI2BIN_PASSWORD
 #                         or OCI2BIN_PASSWORD_FILE, else prompts on the terminal
 #   --password-file F     Read the --passphrase from the first line of F
+#   --compress-binary zstd
+#                         Compress the embedded OCI payload with zstd (shrinks
+#                         the binary; opaque to docker load). Runtime needs zstd.
 #   --require-signed PUB  Embed a self-enforcing signature policy: refuse to run
 #                         unless a valid signature from PUB is present (then run
 #                         'oci2bin sign --key PRIV --in BINARY')
@@ -1902,6 +1905,7 @@ ENCRYPT_RECIPIENTS_FILES=()
 ENCRYPT_PASSPHRASE=0
 ENCRYPT_PASSWORD_FILE=""
 REQUIRE_SIGNED_KEY=""
+COMPRESS_BINARY=""
 SELF_UPDATE_URL=""
 PIN_DIGEST=""
 VERIFY_COSIGN=0
@@ -2058,6 +2062,16 @@ while [[ $# -gt 0 ]]; do
             ENCRYPT_PASSPHRASE=1
             ENCRYPT_PASSWORD_FILE="$2"
             shift 2
+            ;;
+        --compress-binary)
+            # Optional value (defaults to zstd). Only consume the next token
+            # as the codec when it is a known codec, so positional IMAGE args
+            # are never swallowed.
+            if [[ "${2:-}" == "zstd" ]]; then
+                COMPRESS_BINARY="$2"; shift 2
+            else
+                COMPRESS_BINARY="zstd"; shift
+            fi
             ;;
         --require-signed)
             [[ $# -lt 2 ]] && { echo "oci2bin: --require-signed requires PUBKEY.pem" >&2; exit 1; }
@@ -2507,6 +2521,7 @@ for _rf in "${ENCRYPT_RECIPIENTS_FILES[@]}"; do EMBED_LOADER_ARG+=(--recipients-
 [[ "$ENCRYPT_PASSPHRASE" -eq 1 ]] && EMBED_LOADER_ARG+=(--passphrase)
 [[ -n "$ENCRYPT_PASSWORD_FILE" ]] && EMBED_LOADER_ARG+=(--password-file "$ENCRYPT_PASSWORD_FILE")
 [[ -n "$REQUIRE_SIGNED_KEY" ]] && EMBED_LOADER_ARG+=(--require-signed "$REQUIRE_SIGNED_KEY")
+[[ -n "$COMPRESS_BINARY" ]] && EMBED_LOADER_ARG+=(--compress-binary "$COMPRESS_BINARY")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \

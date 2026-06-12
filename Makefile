@@ -391,6 +391,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_diff_fs -v
 	@echo "=== oci2bin freeze/thaw tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_freeze -v
+	@echo "=== --compress-binary helper tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_compress_binary -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

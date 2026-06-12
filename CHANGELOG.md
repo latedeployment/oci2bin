@@ -6,6 +6,46 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`--restart no|on-failure[:N]|always|unless-stopped`** — a supervising
+  PID-1 inside the container now relaunches the workload on exit per a Docker-
+  style restart policy, without needing systemd. `on-failure[:N]` restarts only
+  on a non-zero exit (capped at N attempts when given); `always` and
+  `unless-stopped` restart on any exit, while an explicit SIGTERM/SIGINT stop
+  suppresses the relaunch. The supervisor also reaps orphaned grandchildren
+  (subsuming `--init`) and emits a `container_restart` `--notify` event with the
+  attempt number and last exit code. New C unit tests for the policy parser.
+
+- **`--health` / runtime HEALTHCHECK execution** — the image `HEALTHCHECK`
+  (previously only displayed by `inspect`) now actually runs. `--health`
+  probes the workload on the image's interval; `--health-cmd CMD` defines a
+  probe (`/bin/sh -c CMD`) when the image declares none, and
+  `--health-interval`, `--health-timeout`, `--health-retries`,
+  `--health-start-period` override the image durations (`--no-health` forces it
+  off). After the configured number of consecutive failures the container is
+  marked unhealthy: oci2bin logs the transition, fires the `healthcheck_fail`
+  `--notify` event, and — when a `--restart` policy is active — restarts the
+  workload. The image `Healthcheck` object is now carried in `.oci2bin_config`
+  and parsed at runtime. New C unit tests for `json_get_object`,
+  `json_get_longlong`, and `health_resolve`.
+
+- **`--compress-binary zstd`** — inflate the per-layer gzip and recompress the
+  entire embedded OCI payload as one zstd-19 frame at build time; the loader
+  sniffs the zstd frame magic and inflates it (after any decryption) before
+  extraction (layers extract via `tar`'s auto-detection). Compressing the whole
+  rootfs together beats independent gzip streams (e.g. Alpine ≈ 4.2 → 3.4 MB,
+  more on larger images). Requires `zstd` at run time. Like `--encrypt`, the
+  payload is no longer a plain tar, so a compressed binary is opaque to
+  `docker load` / `oci2bin reconstruct`. Compatible with `--reproducible` (zstd
+  frames embed no timestamp). New C unit test for the magic sniffer.
+
+- **`oci2bin sign --rekor [--rekor-url URL]`** — after signing, publish a Rekor
+  `hashedrekord` transparency-log entry for the binary (an independent sha256
+  ECDSA signature over the signed content, so it works regardless of the
+  embedded signature's hash algorithm) and write the receipt to
+  `<out>.rekor.json`. `oci2bin verify --rekor` confirms the recorded entry is
+  present in the log. Requires `rekor-cli`; this is an explicit, user-requested
+  public network publish of the artifact hash, signature, and public key.
+
 - **`make test-integration-live`** — a live build-and-run matrix that builds
   real Alpine and Redis images with oci2bin and runs them on the **full**
   runtime path (no `--no-userns-remap`, no `--no-seccomp`): rootless UID

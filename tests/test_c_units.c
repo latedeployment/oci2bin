@@ -5013,6 +5013,252 @@ static void test_mkdir_in_root(void)
     rm_rf_dir(tdir);
 }
 
+/* ── test_json_get_object / test_json_get_longlong ────────────────────────── */
+
+static void test_json_get_object(void)
+{
+    const char* j = "{\"Healthcheck\":{\"Test\":[\"CMD\",\"x\"],"
+                    "\"Retries\":3},\"User\":\"0\"}";
+    char* obj = json_get_object(j, "Healthcheck");
+    ASSERT_NOT_NULL(obj, "json_get_object: finds object value");
+    ASSERT_STR_EQ(obj, "{\"Test\":[\"CMD\",\"x\"],\"Retries\":3}",
+                  "json_get_object: balanced braces, array inside preserved");
+    free(obj);
+
+    /* braces inside a quoted string must not confuse the depth counter */
+    const char* j2 = "{\"H\":{\"Test\":[\"CMD-SHELL\",\"echo }{ ok\"]}}";
+    char* obj2 = json_get_object(j2, "H");
+    ASSERT_STR_EQ(obj2, "{\"Test\":[\"CMD-SHELL\",\"echo }{ ok\"]}",
+                  "json_get_object: braces inside strings ignored");
+    free(obj2);
+
+    ASSERT_NULL(json_get_object(j, "Nope"),
+                "json_get_object: missing key returns NULL");
+    /* value that is not an object returns NULL */
+    ASSERT_NULL(json_get_object("{\"x\":[1,2]}", "x"),
+                "json_get_object: non-object value returns NULL");
+}
+
+static void test_json_get_longlong(void)
+{
+    int ok = 0;
+    long long v = json_get_longlong("{\"Interval\":30000000000}",
+                                    "Interval", &ok);
+    ASSERT(ok == 1 && v == 30000000000LL,
+           "json_get_longlong: parses large ns value");
+
+    ok = 1;
+    v = json_get_longlong("{\"a\":1}", "missing", &ok);
+    ASSERT(ok == 0, "json_get_longlong: missing key sets ok=0");
+
+    ok = 1;
+    v = json_get_longlong("{\"s\":\"text\"}", "s", &ok);
+    ASSERT(ok == 0, "json_get_longlong: string value sets ok=0");
+
+    ok = 0;
+    v = json_get_longlong("{\"r\":-5}", "r", &ok);
+    ASSERT(ok == 1 && v == -5, "json_get_longlong: parses negative");
+}
+
+/* ── test_blob_is_zstd_compressed ─────────────────────────────────────────── */
+
+static void test_blob_is_zstd_compressed(void)
+{
+    char p1[] = "/tmp/oci2bin-zstd1-XXXXXX";
+    unsigned char magic[8] = {0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x01, 0x02, 0x03};
+    write_tmp(p1, magic, sizeof(magic));
+    ASSERT_INT_EQ(blob_is_zstd_compressed(p1), 1,
+                  "blob_is_zstd_compressed: detects zstd magic");
+    unlink(p1);
+
+    char p2[] = "/tmp/oci2bin-zstd2-XXXXXX";
+    char tarhdr[512];
+    memset(tarhdr, 0, sizeof(tarhdr));
+    memcpy(tarhdr, "manifest.json", 13);
+    write_tmp(p2, tarhdr, sizeof(tarhdr));
+    ASSERT_INT_EQ(blob_is_zstd_compressed(p2), 0,
+                  "blob_is_zstd_compressed: plain tar is not zstd");
+    unlink(p2);
+
+    ASSERT_INT_EQ(blob_is_zstd_compressed("/nonexistent/oci2bin/zstd/x"), -1,
+                  "blob_is_zstd_compressed: missing file returns -1");
+}
+
+/* ── test_parse_opts_restart ──────────────────────────────────────────────── */
+
+static void test_parse_opts_restart(void)
+{
+    struct container_opts opts;
+
+    struct
+    {
+        const char* val;
+        int         policy;
+        int         max;
+    } cases[] =
+    {
+        {"no", RESTART_NO, 0},
+        {"always", RESTART_ALWAYS, 0},
+        {"unless-stopped", RESTART_UNLESS_STOPPED, 0},
+        {"on-failure", RESTART_ON_FAILURE, 0},
+        {"on-failure:5", RESTART_ON_FAILURE, 5},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        char arg[64];
+        snprintf(arg, sizeof(arg), "%s", cases[i].val);
+        char* argv[] = {"prog", "--restart", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --restart valid policy accepted");
+        ASSERT_INT_EQ(opts.restart_policy, cases[i].policy,
+                      "parse_opts: --restart policy stored");
+        ASSERT_INT_EQ(opts.restart_max, cases[i].max,
+                      "parse_opts: --restart max stored");
+    }
+
+    /* unknown policy rejected */
+    {
+        char arg[] = "sometimes";
+        char* argv[] = {"prog", "--restart", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(3, argv, &opts), -1,
+                      "parse_opts: --restart unknown policy rejected");
+    }
+    /* on-failure with bad count rejected */
+    {
+        char arg[] = "on-failure:-1";
+        char* argv[] = {"prog", "--restart", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(3, argv, &opts), -1,
+                      "parse_opts: --restart on-failure:-1 rejected");
+    }
+    /* missing argument rejected */
+    {
+        char* argv[] = {"prog", "--restart", NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(2, argv, &opts), -1,
+                      "parse_opts: --restart missing arg rejected");
+    }
+}
+
+/* ── test_parse_opts_health ───────────────────────────────────────────────── */
+
+static void test_parse_opts_health(void)
+{
+    struct container_opts opts;
+
+    {
+        char* argv[] = {"prog", "--health", NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(2, argv, &opts), 0,
+                      "parse_opts: --health accepted");
+        ASSERT_INT_EQ(opts.health_enabled, 1,
+                      "parse_opts: --health sets health_enabled");
+    }
+    {
+        char cmd[] = "curl -f http://localhost/ || exit 1";
+        char* argv[] = {"prog", "--health-cmd", cmd, NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(3, argv, &opts), 0,
+                      "parse_opts: --health-cmd accepted");
+        ASSERT_INT_EQ(opts.health_enabled, 1,
+                      "parse_opts: --health-cmd implies --health");
+        ASSERT_STR_EQ(opts.health_cmd, cmd,
+                      "parse_opts: --health-cmd stored");
+    }
+    {
+        char iv[] = "15";
+        char* argv[] = {"prog", "--health-interval", iv, NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(3, argv, &opts), 0,
+                      "parse_opts: --health-interval accepted");
+        ASSERT_INT_EQ((int)opts.health_interval_s, 15,
+                      "parse_opts: --health-interval value stored");
+    }
+    {
+        char bad[] = "-3";
+        char* argv[] = {"prog", "--health-retries", bad, NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(3, argv, &opts), -1,
+                      "parse_opts: --health-retries negative rejected");
+    }
+    {
+        char* argv[] = {"prog", "--no-health", NULL};
+        memset(&opts, 0, sizeof(opts));
+        ASSERT_INT_EQ(parse_opts(2, argv, &opts), 0,
+                      "parse_opts: --no-health accepted");
+        ASSERT_INT_EQ(opts.health_disabled, 1,
+                      "parse_opts: --no-health sets health_disabled");
+    }
+}
+
+/* ── test_health_resolve ──────────────────────────────────────────────────── */
+
+static void test_health_resolve(void)
+{
+    struct container_opts opts;
+    struct health_state hs;
+
+    /* No --health, no image healthcheck → disabled. */
+    memset(&opts, 0, sizeof(opts));
+    health_resolve(&opts, NULL, &hs);
+    ASSERT_INT_EQ(hs.enabled, 0,
+                  "health_resolve: off without --health or image HC");
+
+    /* Image CMD-SHELL HEALTHCHECK + --health → /bin/sh -c probe. */
+    memset(&opts, 0, sizeof(opts));
+    opts.health_enabled = 1;
+    const char* hc = "{\"Test\":[\"CMD-SHELL\",\"true\"],"
+                     "\"Interval\":5000000000,\"Timeout\":2000000000,"
+                     "\"Retries\":2}";
+    health_resolve(&opts, hc, &hs);
+    ASSERT_INT_EQ(hs.enabled, 1, "health_resolve: enabled with image HC");
+    ASSERT_STR_EQ(hs.argv[0], "/bin/sh", "health_resolve: CMD-SHELL argv[0]");
+    ASSERT_STR_EQ(hs.argv[1], "-c", "health_resolve: CMD-SHELL argv[1]");
+    ASSERT_STR_EQ(hs.argv[2], "true", "health_resolve: CMD-SHELL argv[2]");
+    ASSERT_INT_EQ((int)hs.interval_s, 5, "health_resolve: ns->s interval");
+    ASSERT_INT_EQ((int)hs.timeout_s, 2, "health_resolve: ns->s timeout");
+    ASSERT_INT_EQ(hs.retries, 2, "health_resolve: retries from image");
+
+    /* CMD form drops the "CMD" prefix. */
+    memset(&opts, 0, sizeof(opts));
+    opts.health_enabled = 1;
+    health_resolve(&opts, "{\"Test\":[\"CMD\",\"/bin/true\",\"-q\"]}", &hs);
+    ASSERT_INT_EQ(hs.enabled, 1, "health_resolve: CMD form enabled");
+    ASSERT_STR_EQ(hs.argv[0], "/bin/true", "health_resolve: CMD argv[0]");
+    ASSERT_STR_EQ(hs.argv[1], "-q", "health_resolve: CMD argv[1]");
+    ASSERT_INT_EQ((int)hs.interval_s, 30,
+                  "health_resolve: default interval when image omits it");
+
+    /* Test ["NONE"] disables even with --health. */
+    memset(&opts, 0, sizeof(opts));
+    opts.health_enabled = 1;
+    health_resolve(&opts, "{\"Test\":[\"NONE\"]}", &hs);
+    ASSERT_INT_EQ(hs.enabled, 0, "health_resolve: Test=[NONE] disables");
+
+    /* --no-health wins over an image healthcheck. */
+    memset(&opts, 0, sizeof(opts));
+    opts.health_enabled = 1;
+    opts.health_disabled = 1;
+    health_resolve(&opts, hc, &hs);
+    ASSERT_INT_EQ(hs.enabled, 0, "health_resolve: --no-health forces off");
+
+    /* --health-cmd overrides image Test; flag overrides win on durations. */
+    memset(&opts, 0, sizeof(opts));
+    opts.health_cmd = "myprobe";
+    opts.health_interval_s = 9;
+    opts.health_retries = 7;
+    health_resolve(&opts, hc, &hs);
+    ASSERT_INT_EQ(hs.enabled, 1, "health_resolve: --health-cmd enables");
+    ASSERT_STR_EQ(hs.argv[2], "myprobe",
+                  "health_resolve: --health-cmd is the shell line");
+    ASSERT_INT_EQ((int)hs.interval_s, 9,
+                  "health_resolve: --health-interval overrides image");
+    ASSERT_INT_EQ(hs.retries, 7,
+                  "health_resolve: --health-retries overrides image");
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -5085,6 +5331,12 @@ int main(void)
     test_ensure_bind_mount_target();
     test_tar_layer_prescan_and_extract();
     test_mkdir_in_root();
+    test_json_get_object();
+    test_json_get_longlong();
+    test_blob_is_zstd_compressed();
+    test_parse_opts_restart();
+    test_parse_opts_health();
+    test_health_resolve();
 
     printf("1..%d\n", tap_test_num);
 

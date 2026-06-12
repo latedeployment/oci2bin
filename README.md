@@ -24,6 +24,10 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Kernel-protected secrets (no page cache, no swap) | automatic on Linux ≥ 5.14 via `memfd_secret` |
 | SSH agent forwarding in builds | `RUN --mount=type=ssh git clone git@github.com:org/repo` |
 | Persistent build cache across runs | `RUN --mount=type=cache,target=/var/cache/apt apt-get install ...` |
+| Restart policy (supervise + relaunch) | `./myapp --restart on-failure:5` |
+| Run the image HEALTHCHECK at runtime | `./myapp --health --restart always` |
+| Shrink the binary with zstd | `oci2bin --compress-binary zstd redis:7-alpine` |
+| Publish a Rekor transparency-log entry | `oci2bin sign --key priv.pem --rekor --in myapp.bin` |
 | Run as a lightweight VM | `oci2vm alpine:latest` |
 | Cross-architecture builds | `oci2bin --arch aarch64 alpine:latest` |
 | Fat binaries (x86 + arm in one file) | `oci2bin --arch all alpine:latest` |
@@ -53,6 +57,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
   - [Merging image layers](#merging-image-layers)
   - [Stripping images](#stripping-images)
   - [Squashing layers](#squashing-layers)
+  - [Compressing the binary](#compressing-the-binary---compress-binary)
   - [Verifying image signatures (cosign)](#verifying-image-signatures-cosign)
   - [Using OCI image layout](#using-oci-image-layout-no-docker-daemon)
   - [Caching builds](#caching-builds)
@@ -89,6 +94,8 @@ oci2bin alpine:latest    # produces ./alpine_latest
 - [Process management](#process-management)
   - [Init process and zombie reaping](#init-process-and-zombie-reaping)
   - [Running in background](#running-in-background)
+  - [Restart policy](#restart-policy)
+  - [Health checks](#health-checks)
   - [Named containers and lifecycle management](#named-containers-and-lifecycle-management)
   - [Interactive and TTY mode](#interactive-and-tty-mode)
 - [Subcommands](#subcommands)
@@ -309,6 +316,36 @@ oci2bin --squash --compress zstd ubuntu:22.04 ubuntu-squashed
 ```
 
 `--compress zstd` requires the `zstd` binary to be installed. Whiteout entries are processed correctly so the squashed layer faithfully represents the final filesystem state.
+
+### Compressing the binary (--compress-binary)
+
+`--compress` above re-compresses *individual layers*. `--compress-binary zstd`
+instead inflates the per-layer gzip and recompresses the **entire embedded OCI
+payload** as one zstd-19 frame, which compresses the whole rootfs together far
+better than independent gzip streams:
+
+```bash
+oci2bin --compress-binary zstd redis:7-alpine myredis
+```
+
+How much it saves depends on the image: already-gzipped base images shrink
+modestly (Alpine ≈ 4.2 → 3.4 MB), while images with bulky, related, or poorly
+gzip-compressed content shrink substantially more. The win grows with image
+size, which is exactly when a smaller artifact matters.
+
+At run time the loader detects the zstd frame magic and inflates the payload
+(after any decryption) before extracting the rootfs — so the only added runtime
+dependency is the `zstd` binary, much like `age` for `--encrypt`. If `zstd` is
+not on `PATH` at run time the binary refuses to run with a clear message.
+
+Because the compressed payload is no longer a valid tar, a `--compress-binary`
+binary is **opaque** to `docker load`, `oci2bin reconstruct`, and `sbom` — the
+same trade-off as [`--encrypt`](#encrypting-the-embedded-image---encrypt).
+`oci2bin inspect` still reads it (the loader inflates internally). zstd frames
+carry no timestamp, so `--compress-binary` combines cleanly with
+[`--reproducible`](#reproducible-builds-and-digest-pinning), and it composes
+with `--encrypt` (compressed first, then encrypted; the loader decrypts then
+inflates).
 
 ### Image labels (for fleet management)
 
@@ -1543,6 +1580,71 @@ kill "$PID"
 
 The child calls `setsid()` to detach from the terminal and redirects stdin from `/dev/null`. Combine with `--init` for a fully-managed background service.
 
+### Restart policy
+
+`--restart POLICY` makes the binary supervise its own workload and relaunch it
+on exit — a daemon-free alternative to a systemd `Restart=` unit (see
+[systemd](#systemd) if you do want a unit file). A supervising PID 1 inside the
+container forks the workload, reaps zombies (so this also subsumes `--init`),
+and decides whether to restart it each time it exits:
+
+| Policy | Restarts when… |
+|--------|----------------|
+| `no` (default) | never |
+| `on-failure[:N]` | the workload exits non-zero; at most `N` times when `N` is given (unlimited otherwise) |
+| `always` | the workload exits for any reason |
+| `unless-stopped` | like `always`, but an explicit `SIGTERM`/`SIGINT` stop suppresses the relaunch |
+
+```bash
+./myapp --restart on-failure:5            # retry up to 5 times on crash
+./myapp --restart always --detach --name myapp
+./myapp --restart unless-stopped
+```
+
+A one-second backoff separates attempts to avoid a hot crash loop. Each restart
+fires a `container_restart` [notification](#notifications-on-container-events)
+carrying the attempt number and the last exit code. When the supervisor finally
+returns, its exit code is the workload's last exit code. An explicit stop
+(`SIGTERM`/`SIGINT`, e.g. from `oci2bin stop`) always wins over `always` /
+`unless-stopped`.
+
+### Health checks
+
+`--health` runs the image's `HEALTHCHECK` on its declared interval (the same
+`Test`/`Interval`/`Timeout`/`Retries`/`StartPeriod` shown by
+[`inspect`](#inspect)) and acts on the result. After the configured number of
+consecutive failures the container is marked **unhealthy**: oci2bin logs the
+transition, fires the `healthcheck_fail`
+[notification](#notifications-on-container-events), and — when a
+[`--restart`](#restart-policy) policy is active — restarts the workload.
+
+```bash
+# Use the image's own HEALTHCHECK and restart it if it goes unhealthy
+./myapp --health --restart always
+
+# Define a probe when the image declares none (run via /bin/sh -c)
+./myapp --health-cmd 'curl -fsS http://localhost:8080/healthz || exit 1' \
+        --health-interval 10 --health-retries 3 --restart on-failure
+```
+
+| Flag | Description |
+|------|-------------|
+| `--health` | Run the image `HEALTHCHECK` (no-op if the image declares none and no `--health-cmd` is given) |
+| `--health-cmd CMD` | Probe command run as `/bin/sh -c CMD`; implies `--health` |
+| `--health-interval N` | Seconds between probes (default: image value or 30) |
+| `--health-timeout N` | Per-probe timeout in seconds; a timed-out probe counts as a failure (default: image value or 30) |
+| `--health-retries N` | Consecutive failures before "unhealthy" (default: image value or 3) |
+| `--health-start-period N` | Grace seconds after start before failures are counted (default: image value or 0) |
+| `--no-health` | Disable health monitoring even if the image declares a `HEALTHCHECK` |
+
+A `HEALTHCHECK` of `["NONE"]` (the image opting out) disables monitoring even
+with `--health`. Probe output is sent to `/dev/null`. Because the supervisor
+runs inside the container, the `healthcheck_fail` notification is best-effort
+in the same way other in-container notifications are (it needs `curl` and
+outbound networking — both available with the default `--net host`); the
+healthy↔unhealthy transitions are always written to the container log, visible
+via [`oci2bin logs`](#logs) for named/detached containers.
+
 ### Named containers and lifecycle management
 
 `--name NAME` assigns a name to the container. Combined with `--detach`, it writes a JSON state file to `$HOME/.cache/oci2bin/containers/<name>.json` and redirects the container's stdout/stderr to a log file at the same location. This enables the `ps`, `stop`, and `logs` subcommands.
@@ -1617,6 +1719,40 @@ oci2bin verify-file --key signing.pub --in ./update.json --sig ./update.json.sig
 `--verify-key` checks the signature at startup, before any rootfs extraction.
 If verification fails the process exits immediately without writing a single byte
 to disk.
+
+#### Rekor transparency log
+
+`oci2bin sign --rekor` additionally publishes a [Rekor](https://docs.sigstore.dev/rekor/overview/)
+`hashedrekord` transparency-log entry for the signed binary, so a tamper-evident
+public record exists that this key signed this artifact at this time:
+
+```bash
+oci2bin sign --key signing.key --rekor --in ./redis_7-alpine
+# Signed: ./redis_7-alpine (keyid: ...)
+# Rekor: logged to https://rekor.sigstore.dev (index 123456789); receipt
+#        written to ./redis_7-alpine.rekor.json
+```
+
+The receipt (`<binary>.rekor.json`) records the Rekor server, log index, entry
+UUID, and the sha256 of the signed content. Point at a private/self-hosted log
+with `--rekor-url URL` (default `https://rekor.sigstore.dev`). The embedded
+binary signature may use sha512, but Rekor's `hashedrekord` is sha256-based, so
+oci2bin uploads an **independent** sha256 ECDSA signature over the same signed
+content — the embedded trailer is unchanged.
+
+Confirm a binary's entry is in the log later with:
+
+```bash
+oci2bin verify --key signing.pub --rekor --in ./redis_7-alpine
+# Verified OK: ./redis_7-alpine (keyid: ..., hash: sha512)
+# Rekor: entry <uuid> confirmed in https://rekor.sigstore.dev
+```
+
+Both require the [`rekor-cli`](https://docs.sigstore.dev/rekor/installation/)
+binary. **`--rekor` is an explicit, opt-in network publish**: the artifact hash,
+signature, and public key become publicly visible in the transparency log and
+may be cached or indexed even if you later try to remove them. It pairs
+naturally with `--attest`.
 
 #### SLSA / in-toto provenance
 

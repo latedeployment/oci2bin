@@ -696,7 +696,39 @@ struct container_opts
      *                 caller did not pass any -e, abort instead of continuing. */
     int no_hint;
     int require_hint;
+
+    /* --restart no|on-failure[:N]|always|unless-stopped
+     * A supervising parent re-launches the workload on exit per policy.
+     *   RESTART_NO             never restart (default)
+     *   RESTART_ON_FAILURE     restart only on non-zero exit, up to restart_max
+     *   RESTART_ALWAYS         always restart (even on clean exit)
+     *   RESTART_UNLESS_STOPPED like always, but a SIGTERM/SIGINT stop wins
+     * restart_max applies only to on-failure (0 = unlimited). */
+    int restart_policy;
+    int restart_max;
+
+    /* --health and friends: run the image HEALTHCHECK (or --health-cmd) inside
+     * the container on an interval, surface status in `ps`, fire the --notify
+     * healthcheck_fail sink on the healthy→unhealthy transition, and (when a
+     * restart policy is active) restart the workload once it is unhealthy.
+     *   health_enabled        1 when --health (or --health-cmd) was given
+     *   health_cmd            override Test as a /bin/sh -c command (or NULL)
+     *   health_interval_s     seconds between probes (0 = use image/default)
+     *   health_timeout_s      per-probe timeout in seconds (0 = default)
+     *   health_retries        consecutive failures before "unhealthy" (0=def)
+     *   health_start_period_s grace seconds after start before counting fails */
+    int   health_enabled;
+    int   health_disabled; /* --no-health: force off even if image has one */
+    char* health_cmd;
+    long  health_interval_s;
+    long  health_timeout_s;
+    int   health_retries;
+    long  health_start_period_s;
 };
+#define RESTART_NO             0
+#define RESTART_ON_FAILURE     1
+#define RESTART_ALWAYS         2
+#define RESTART_UNLESS_STOPPED 3
 #define LANDLOCK_MODE_AUTO  0
 #define LANDLOCK_MODE_ON    1
 #define LANDLOCK_MODE_OFF   2
@@ -1755,6 +1787,102 @@ static char* json_get_array(const char* json, const char* key)
     memcpy(result, start, len);
     result[len] = '\0';
     return result;
+}
+
+/* Find a JSON object value for a given key. Returns malloc'd string (with the
+ * surrounding {}) or NULL.  String contents are skipped so that braces inside
+ * quoted strings do not confuse the depth counter. */
+static char* json_get_object(const char* json, const char* key)
+{
+    const char* p = json_skip_to_value(json, key);
+    if (!p || *p != '{')
+    {
+        return NULL;
+    }
+    int depth = 0;
+    int in_str = 0;
+    const char* start = p;
+    while (*p)
+    {
+        char c = *p;
+        if (in_str)
+        {
+            if (c == '\\')
+            {
+                if (!*(p + 1))
+                {
+                    break;    /* truncated escape */
+                }
+                p++; /* skip the escaped char */
+            }
+            else if (c == '"')
+            {
+                in_str = 0;
+            }
+        }
+        else if (c == '"')
+        {
+            in_str = 1;
+        }
+        else if (c == '{')
+        {
+            depth++;
+        }
+        else if (c == '}')
+        {
+            depth--;
+            if (depth == 0)
+            {
+                break;
+            }
+        }
+        p++;
+    }
+    if (depth != 0 || *p != '}')
+    {
+        return NULL;    /* unmatched '{', string was truncated */
+    }
+    size_t len = (size_t)(p - start) + 1;
+    char* result = malloc(len + 1);
+    if (!result)
+    {
+        return NULL;
+    }
+    memcpy(result, start, len);
+    result[len] = '\0';
+    return result;
+}
+
+/* Read an integer (long long) JSON value for a given key.  Returns 0 and sets
+ * *ok to 1 on success, or leaves *ok = 0 when the key is absent or non-numeric.
+ * Accepts a leading '-'.  Used for HEALTHCHECK ns durations / retry counts. */
+static long long json_get_longlong(const char* json, const char* key, int* ok)
+{
+    if (ok)
+    {
+        *ok = 0;
+    }
+    const char* p = json_skip_to_value(json, key);
+    if (!p)
+    {
+        return 0;
+    }
+    if (*p != '-' && (*p < '0' || *p > '9'))
+    {
+        return 0;
+    }
+    errno = 0;
+    char* endp = NULL;
+    long long v = strtoll(p, &endp, 10);
+    if (endp == p || errno != 0)
+    {
+        return 0;
+    }
+    if (ok)
+    {
+        *ok = 1;
+    }
+    return v;
 }
 
 /* Parse a JSON array of strings into an array. Returns count. */
@@ -3428,6 +3556,7 @@ struct oci_config
     char* env_json;        /* "Env" array or NULL */
     char* workdir;         /* "WorkingDir" string or NULL */
     char* user;            /* "User" string or NULL */
+    char* healthcheck_json;/* "Healthcheck" object or NULL */
 };
 
 /*
@@ -3455,6 +3584,7 @@ static int read_oci_config(const char* rootfs, struct oci_config* out)
     out->env_json        = json_get_array(cfg, "Env");
     out->workdir         = json_get_string(cfg, "WorkingDir");
     out->user            = json_get_string(cfg, "User");
+    out->healthcheck_json = json_get_object(cfg, "Healthcheck");
     free(cfg);
     return 0;
 }
@@ -3466,6 +3596,7 @@ static void free_oci_config(struct oci_config* c)
     free(c->env_json);
     free(c->workdir);
     free(c->user);
+    free(c->healthcheck_json);
     memset(c, 0, sizeof(*c));
 }
 
@@ -3918,6 +4049,32 @@ static int blob_is_age_encrypted(const char* path)
     return 0;
 }
 
+/* Return 1 if the blob at `path` begins with the zstd frame magic
+ * (0x28 0xB5 0x2F 0xFD, written by --compress-binary), 0 if not, -1 on error.
+ * A plain embedded OCI tar starts with an ASCII filename, never this magic,
+ * so the sniff is unambiguous. */
+static int blob_is_zstd_compressed(const char* path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    unsigned char head[4];
+    ssize_t n = read(fd, head, sizeof(head));
+    close(fd);
+    if (n < 0)
+    {
+        return -1;
+    }
+    if (n == 4 && head[0] == 0x28 && head[1] == 0xB5
+            && head[2] == 0x2F && head[3] == 0xFD)
+    {
+        return 1;
+    }
+    return 0;
+}
+
 /* Resolve the age identity file used to decrypt an encrypted image.
  * Order: $OCI2BIN_IDENTITY, then a few conventional defaults. Writes the
  * chosen readable path into `out` and returns 0, or -1 if none is found. */
@@ -4232,6 +4389,53 @@ static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
 }
 
 /*
+ * If the (already-decrypted) blob at in_path is zstd-compressed
+ * (--compress-binary zstd), inflate it with the `zstd` CLI into
+ * tmpdir/image.unz.tar and report the new path via out_path.
+ * Returns 1 when decompressed, 0 when the blob is a plain tar, -1 on error.
+ */
+static int maybe_decompress_oci_blob(const char* in_path, const char* tmpdir,
+                                     char* out_path, size_t out_sz)
+{
+    int z = blob_is_zstd_compressed(in_path);
+    if (z < 0)
+    {
+        perror("oci2bin: reading embedded payload");
+        return -1;
+    }
+    if (z == 0)
+    {
+        return 0;    /* not compressed — nothing to do */
+    }
+    if (path_join_suffix(out_path, out_sz, tmpdir, "/image.unz.tar") < 0)
+    {
+        fprintf(stderr, "oci2bin: decompressed tar path too long\n");
+        return -1;
+    }
+    debug_log("decompress.begin", "out=%s", out_path);
+    char* zstd_argv[] =
+    {
+        "zstd", "-d", "-q", "-f", "-o", out_path, (char*)in_path, NULL
+    };
+    int rc = run_cmd(zstd_argv);
+    if (rc == 127)
+    {
+        fprintf(stderr,
+                "oci2bin: 'zstd' not found in PATH; it is required to "
+                "decompress this image (built with --compress-binary)\n");
+        return -1;
+    }
+    if (rc != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: zstd decompression of the embedded image failed\n");
+        unlink(out_path);
+        return -1;
+    }
+    return 1;
+}
+
+/*
  * Extract the OCI tar data from ourselves into a temp directory,
  * then parse manifest.json and extract layers into a rootfs.
  *
@@ -4307,6 +4511,21 @@ static char* extract_oci_rootfs(const char* self_path)
     if (dec == 1)
     {
         tar_input = decrypted_path;
+    }
+
+    /* 1b. If the payload is zstd-compressed (--compress-binary), inflate it
+     * after any decryption. tar_input then points at the plain tar. */
+    char decompressed_path[PATH_MAX];
+    int unz = maybe_decompress_oci_blob(tar_input, tmpdir,
+                                        decompressed_path,
+                                        sizeof(decompressed_path));
+    if (unz < 0)
+    {
+        return NULL;    /* error already reported */
+    }
+    if (unz == 1)
+    {
+        tar_input = decompressed_path;
     }
 
     /* 2. Extract the OCI tar into tmpdir/oci/ */
@@ -4453,6 +4672,7 @@ static char* extract_oci_rootfs(const char* self_path)
         char* env_json   = json_get_array(config, "Env");
         char* workdir    = json_get_string(config, "WorkingDir");
         char* img_user   = json_get_string(config, "User");
+        char* health     = json_get_object(config, "Healthcheck");
 
         /* Allocate generously — Env arrays can be large */
         size_t bufsz = 16384;
@@ -4493,7 +4713,7 @@ static char* extract_oci_rootfs(const char* self_path)
             int n = snprintf(info_buf, bufsz,
                              "{\"Cmd\":%s,\"Entrypoint\":%s,"
                              "\"Env\":%s,\"WorkingDir\":%s%s%s,"
-                             "\"User\":%s%s%s}",
+                             "\"User\":%s%s%s,\"Healthcheck\":%s}",
                              cmd        ? cmd        : "null",
                              entrypoint ? entrypoint : "null",
                              env_json   ? env_json   : "null",
@@ -4502,7 +4722,8 @@ static char* extract_oci_rootfs(const char* self_path)
                              wdir_safe  ? "\""       : "",
                              user_safe  ? "\""       : "null",
                              user_safe  ? user_safe  : "",
-                             user_safe  ? "\""       : "");
+                             user_safe  ? "\""       : "",
+                             health     ? health     : "null");
             if (n > 0 && (size_t)n < bufsz)
             {
                 int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -4521,6 +4742,7 @@ static char* extract_oci_rootfs(const char* self_path)
         free(env_json);
         free(workdir);
         free(img_user);
+        free(health);
         free(config);
     }
 
@@ -6526,6 +6748,475 @@ static int run_as_init(char** exec_args,
     }
     audit_emit_wait_status("exit", child, child_status);
     return 1;
+}
+
+/* ── restart + health supervisor ─────────────────────────────────────────── */
+
+#define MAX_HEALTH_ARGS 64
+
+/*
+ * Resolved health-probe configuration, derived once from the image
+ * HEALTHCHECK (the raw "Healthcheck" object JSON) plus any --health-*
+ * overrides.  argv is NULL-terminated; argv[] entries are strdup'd / taken
+ * ownership of and live for the process lifetime.
+ */
+struct health_state
+{
+    int   enabled;
+    char* argv[MAX_HEALTH_ARGS + 1];
+    int   argc;
+    long  interval_s;
+    long  timeout_s;
+    int   retries;
+    long  start_period_s;
+};
+
+/* Convert a HEALTHCHECK nanosecond duration to whole seconds, flooring a
+ * positive value to at least 1s.  Non-positive input yields 0 (= use default). */
+static long health_ns_to_s(long long ns)
+{
+    if (ns <= 0)
+    {
+        return 0;
+    }
+    long s = (long)(ns / 1000000000LL);
+    return s < 1 ? 1 : s;
+}
+
+/*
+ * Populate *hs from the image HEALTHCHECK plus --health-* overrides.
+ * hs->enabled stays 0 when health monitoring should not run (no --health,
+ * --no-health, Test of ["NONE"], or no resolvable probe command).
+ */
+static void health_resolve(const struct container_opts* opts,
+                           const char* healthcheck_json,
+                           struct health_state* hs)
+{
+    memset(hs, 0, sizeof(*hs));
+    hs->interval_s     = 30;
+    hs->timeout_s      = 30;
+    hs->retries        = 3;
+    hs->start_period_s = 0;
+
+    if (!opts || opts->health_disabled)
+    {
+        return;
+    }
+    if (!opts->health_enabled && !opts->health_cmd)
+    {
+        return;
+    }
+
+    /* Durations come from the image HEALTHCHECK (nanoseconds); explicit
+     * --health-* flags win over them. */
+    if (healthcheck_json && strcmp(healthcheck_json, "null") != 0)
+    {
+        int ok = 0;
+        long s;
+        s = health_ns_to_s(json_get_longlong(healthcheck_json,
+                                             "Interval", &ok));
+        if (ok && s > 0)
+        {
+            hs->interval_s = s;
+        }
+        s = health_ns_to_s(json_get_longlong(healthcheck_json,
+                                             "Timeout", &ok));
+        if (ok && s > 0)
+        {
+            hs->timeout_s = s;
+        }
+        s = health_ns_to_s(json_get_longlong(healthcheck_json,
+                                             "StartPeriod", &ok));
+        if (ok && s > 0)
+        {
+            hs->start_period_s = s;
+        }
+        long long r = json_get_longlong(healthcheck_json, "Retries", &ok);
+        if (ok && r > 0 && r < 1000)
+        {
+            hs->retries = (int)r;
+        }
+    }
+    if (opts->health_interval_s > 0)
+    {
+        hs->interval_s = opts->health_interval_s;
+    }
+    if (opts->health_timeout_s > 0)
+    {
+        hs->timeout_s = opts->health_timeout_s;
+    }
+    if (opts->health_retries > 0)
+    {
+        hs->retries = opts->health_retries;
+    }
+    if (opts->health_start_period_s > 0)
+    {
+        hs->start_period_s = opts->health_start_period_s;
+    }
+
+    /* Build the probe argv.  --health-cmd overrides the image Test. */
+    if (opts->health_cmd)
+    {
+        hs->argv[0] = strdup("/bin/sh");
+        hs->argv[1] = strdup("-c");
+        hs->argv[2] = strdup(opts->health_cmd);
+        hs->argv[3] = NULL;
+        hs->argc    = (hs->argv[0] && hs->argv[1] && hs->argv[2]) ? 3 : 0;
+    }
+    else if (healthcheck_json && strcmp(healthcheck_json, "null") != 0)
+    {
+        char* test = json_get_array(healthcheck_json, "Test");
+        if (test)
+        {
+            char* parts[MAX_HEALTH_ARGS];
+            int np = json_parse_string_array(test, parts, MAX_HEALTH_ARGS);
+            free(test);
+            if (np > 0 && parts[0] && strcmp(parts[0], "NONE") == 0)
+            {
+                for (int i = 0; i < np; i++)
+                {
+                    free(parts[i]);
+                }
+            }
+            else if (np >= 2 && parts[0]
+                     && strcmp(parts[0], "CMD-SHELL") == 0)
+            {
+                hs->argv[0] = strdup("/bin/sh");
+                hs->argv[1] = strdup("-c");
+                hs->argv[2] = parts[1]; /* take ownership of the shell line */
+                hs->argv[3] = NULL;
+                hs->argc    = (hs->argv[0] && hs->argv[1]) ? 3 : 0;
+                free(parts[0]);
+                for (int i = 2; i < np; i++)
+                {
+                    free(parts[i]);
+                }
+            }
+            else if (np > 0 && parts[0])
+            {
+                /* CMD form (drop the "CMD" prefix) or a bare argv array. */
+                int start = (strcmp(parts[0], "CMD") == 0) ? 1 : 0;
+                int j = 0;
+                for (int i = start; i < np && j < MAX_HEALTH_ARGS; i++)
+                {
+                    hs->argv[j++] = parts[i]; /* take ownership */
+                }
+                hs->argv[j] = NULL;
+                hs->argc    = j;
+                if (start == 1)
+                {
+                    free(parts[0]);
+                }
+                for (int i = start + j; i < np; i++)
+                {
+                    free(parts[i]); /* uncopied overflow tail */
+                }
+            }
+            else
+            {
+                for (int i = 0; i < np; i++)
+                {
+                    free(parts[i]);
+                }
+            }
+        }
+    }
+
+    if (hs->argc > 0 && hs->argv[0])
+    {
+        hs->enabled = 1;
+    }
+    else if (opts->health_enabled)
+    {
+        fprintf(stderr,
+                "oci2bin: --health: image declares no usable HEALTHCHECK and "
+                "no --health-cmd was given; health monitoring disabled\n");
+    }
+}
+
+/*
+ * Run one health probe.  Returns 0 (healthy) when the probe command exits 0,
+ * or 1 (unhealthy) on non-zero exit, exec failure, or timeout.  Probe stdio
+ * is connected to /dev/null so the workload's own output is not polluted.
+ */
+static int run_health_probe(char* const argv[], long timeout_s)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        return 1;
+    }
+    if (pid == 0)
+    {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO)
+            {
+                close(devnull);
+            }
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    long limit_ms  = (timeout_s > 0 ? timeout_s : 30) * 1000L;
+    long waited_ms = 0;
+    for (;;)
+    {
+        int   status = 0;
+        pid_t r      = waitpid(pid, &status, WNOHANG);
+        if (r == pid)
+        {
+            if (WIFEXITED(status))
+            {
+                return WEXITSTATUS(status) == 0 ? 0 : 1;
+            }
+            return 1;
+        }
+        if (r < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return 1;
+        }
+        if (waited_ms >= limit_ms)
+        {
+            kill(pid, SIGKILL);
+            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+            {
+            }
+            return 1;
+        }
+        struct timespec ts = {0, 100L * 1000L * 1000L};
+        nanosleep(&ts, NULL);
+        waited_ms += 100;
+    }
+}
+
+/* Stop requested via SIGTERM/SIGINT — suppresses "always"/"unless-stopped"
+ * relaunches after an explicit stop. */
+static volatile sig_atomic_t g_supervise_stop = 0;
+
+static void supervise_forward_signal(int sig)
+{
+    if (sig == SIGTERM || sig == SIGINT)
+    {
+        g_supervise_stop = 1;
+    }
+    if (g_init_child_pid > 0)
+    {
+        kill(g_init_child_pid, sig);
+    }
+}
+
+/*
+ * Supervising PID-1 loop: (re)launch the workload per the restart policy and,
+ * when health monitoring is enabled, probe it on its interval.  Reaps orphaned
+ * grandchildren like the --init reaper.  Returns the workload's last exit code.
+ */
+static int run_supervised(char** exec_args,
+                          const struct container_opts* opts,
+                          const struct health_state* hs)
+{
+    g_supervise_stop = 0;
+    g_init_child_pid = 0;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = supervise_forward_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGUSR2, &sa, NULL);
+
+    int restart_count = 0;
+    int last_code     = 0;
+
+    for (;;)
+    {
+        pid_t child = fork();
+        if (child < 0)
+        {
+            perror("oci2bin: supervisor fork");
+            return 1;
+        }
+        if (child == 0)
+        {
+            /* Restore default signal disposition for the workload. */
+            signal(SIGTERM, SIG_DFL);
+            signal(SIGINT, SIG_DFL);
+            signal(SIGHUP, SIG_DFL);
+            signal(SIGUSR1, SIG_DFL);
+            signal(SIGUSR2, SIG_DFL);
+            if (opts->has_user)
+            {
+                if (setgroups(0, NULL) < 0
+                        || setgid(opts->run_gid) < 0
+                        || setuid(opts->run_uid) < 0)
+                {
+                    perror("oci2bin: supervisor setuid/setgid");
+                    _exit(1);
+                }
+            }
+            execvp(exec_args[0], exec_args);
+            perror("execvp");
+            _exit(127);
+        }
+
+        g_init_child_pid = child;
+        if (restart_count > 0)
+        {
+            char detail[96];
+            snprintf(detail, sizeof(detail),
+                     "\"attempt\":%d,\"last_exit\":%d",
+                     restart_count, last_code);
+            notify_event(opts, "container_restart", detail);
+        }
+
+        time_t started      = time(NULL);
+        time_t last_probe   = started;
+        int    consec_fail  = 0;
+        int    cur_health   = 0; /* 0 unknown, 1 healthy, 2 unhealthy */
+        int    health_acted = 0;
+        int    status       = 0;
+        int    got_child    = 0;
+
+        while (!got_child)
+        {
+            pid_t r = waitpid(-1, &status, WNOHANG);
+            if (r == child)
+            {
+                got_child = 1;
+                break;
+            }
+            if (r > 0)
+            {
+                continue; /* reaped an orphaned grandchild */
+            }
+            if (r < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                if (errno == ECHILD)
+                {
+                    status    = 0;
+                    got_child = 1;
+                    break;
+                }
+            }
+            /* r == 0: workload still running */
+            if (hs && hs->enabled && !health_acted)
+            {
+                time_t now = time(NULL);
+                if ((now - started) >= hs->start_period_s
+                        && (now - last_probe) >= hs->interval_s)
+                {
+                    last_probe = now;
+                    int probe  = run_health_probe(hs->argv, hs->timeout_s);
+                    if (probe == 0)
+                    {
+                        consec_fail = 0;
+                        if (cur_health != 1)
+                        {
+                            cur_health = 1;
+                            debug_log("health.healthy", "pid=%d", (int)child);
+                        }
+                    }
+                    else
+                    {
+                        consec_fail++;
+                        debug_log("health.fail", "consec=%d/%d",
+                                  consec_fail, hs->retries);
+                        if (consec_fail >= hs->retries && cur_health != 2)
+                        {
+                            cur_health = 2;
+                            fprintf(stderr,
+                                    "oci2bin: container unhealthy (%d "
+                                    "consecutive health-check failures)\n",
+                                    consec_fail);
+                            char d[64];
+                            snprintf(d, sizeof(d), "\"failures\":%d",
+                                     consec_fail);
+                            notify_event(opts, "healthcheck_fail", d);
+                            if (opts->restart_policy != RESTART_NO)
+                            {
+                                kill(child, SIGTERM);
+                                health_acted = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            struct timespec ts = {0, 200L * 1000L * 1000L};
+            nanosleep(&ts, NULL);
+        }
+
+        if (WIFEXITED(status))
+        {
+            last_code = WEXITSTATUS(status);
+        }
+        else if (WIFSIGNALED(status))
+        {
+            last_code = 128 + WTERMSIG(status);
+        }
+        else
+        {
+            last_code = 1;
+        }
+        audit_emit_wait_status("exit", child, status);
+        g_init_child_pid = 0;
+
+        /* Drain any remaining zombies before deciding on a restart. */
+        while (waitpid(-1, NULL, WNOHANG) > 0)
+        {
+        }
+
+        int do_restart = 0;
+        if (!g_supervise_stop)
+        {
+            switch (opts->restart_policy)
+            {
+                case RESTART_ON_FAILURE:
+                    if (last_code != 0
+                            && (opts->restart_max <= 0
+                                || restart_count < opts->restart_max))
+                    {
+                        do_restart = 1;
+                    }
+                    break;
+                case RESTART_ALWAYS:
+                case RESTART_UNLESS_STOPPED:
+                    do_restart = 1;
+                    break;
+                default:
+                    do_restart = 0;
+            }
+        }
+        if (!do_restart)
+        {
+            break;
+        }
+        restart_count++;
+        fprintf(stderr,
+                "oci2bin: restarting container (policy attempt %d, "
+                "last exit %d)\n",
+                restart_count, last_code);
+        /* Brief backoff to avoid a hot crash loop. */
+        struct timespec bo = {1, 0};
+        nanosleep(&bo, NULL);
+    }
+
+    return last_code;
 }
 /* ── Landlock LSM filesystem sandbox ─────────────────────────────────────── */
 
@@ -8836,6 +9527,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
     char* image_user = image_user_buf;
+
+    /* Resolve health-probe config now, while .oci2bin_config is still parsed
+     * — the file itself is unlinked just below, before chroot/exec. */
+    struct health_state supervise_health;
+    health_resolve(opts, oci_cfg.healthcheck_json, &supervise_health);
+
     oci_cfg.env_json = NULL;
     oci_cfg.workdir  = NULL;
     free_oci_config(&oci_cfg);
@@ -9567,6 +10264,13 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* --restart / --health: a supervising PID-1 (re)launches the workload per
+     * the restart policy and probes its health.  Subsumes the --init reaper. */
+    if (opts->restart_policy != RESTART_NO || supervise_health.enabled)
+    {
+        return run_supervised(exec_args, opts, &supervise_health);
+    }
+
     /* --init: run a zombie-reaping init loop; UID drop happens inside */
     if (opts->use_init)
     {
@@ -10002,6 +10706,16 @@ static void usage(const char* prog)
             "  --device /dev/PATH[:CONTAINER_PATH]\n"
             "                      Expose a host device inside the container\n"
             "  --init              Run a zombie-reaping init as PID 1\n"
+            "  --restart POLICY    Supervise + relaunch the workload:"
+            " no|on-failure[:N]|always|unless-stopped\n"
+            "  --health            Run the image HEALTHCHECK on its interval"
+            " (notify + restart on unhealthy)\n"
+            "  --health-cmd CMD    Health probe as a /bin/sh -c command"
+            " (implies --health)\n"
+            "  --health-interval N --health-timeout N --health-retries N"
+            " --health-start-period N\n"
+            "  --no-health         Disable health monitoring even if the image"
+            " declares one\n"
             "  --detach, -d        Run container in background; print PID to stdout\n"
             "  -t, --tty           Allocate a pseudo-terminal for the container\n"
             "  -i, --interactive   Keep stdin open; combine with -t for -it mode\n"
@@ -10955,6 +11669,112 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--require-hint") == 0)
         {
             opts->require_hint = 1;
+        }
+        else if (strcmp(argv[i], "--restart") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --restart requires a policy "
+                                "(no|on-failure[:N]|always|unless-stopped)\n");
+                return -1;
+            }
+            const char* pol = argv[++i];
+            if (strcmp(pol, "no") == 0)
+            {
+                opts->restart_policy = RESTART_NO;
+            }
+            else if (strcmp(pol, "always") == 0)
+            {
+                opts->restart_policy = RESTART_ALWAYS;
+            }
+            else if (strcmp(pol, "unless-stopped") == 0)
+            {
+                opts->restart_policy = RESTART_UNLESS_STOPPED;
+            }
+            else if (strncmp(pol, "on-failure", 10) == 0
+                     && (pol[10] == '\0' || pol[10] == ':'))
+            {
+                opts->restart_policy = RESTART_ON_FAILURE;
+                opts->restart_max    = 0;
+                if (pol[10] == ':')
+                {
+                    char* endp = NULL;
+                    errno = 0;
+                    long n = strtol(pol + 11, &endp, 10);
+                    if (endp == pol + 11 || *endp != '\0' || errno != 0
+                            || n < 0 || n > 1000000)
+                    {
+                        fprintf(stderr, "oci2bin: --restart on-failure:N "
+                                        "needs a non-negative count\n");
+                        return -1;
+                    }
+                    opts->restart_max = (int)n;
+                }
+            }
+            else
+            {
+                fprintf(stderr, "oci2bin: --restart: unknown policy '%s' "
+                                "(use no|on-failure[:N]|always|unless-stopped)\n",
+                        pol);
+                return -1;
+            }
+        }
+        else if (strcmp(argv[i], "--health") == 0)
+        {
+            opts->health_enabled = 1;
+        }
+        else if (strcmp(argv[i], "--no-health") == 0)
+        {
+            opts->health_disabled = 1;
+        }
+        else if (strcmp(argv[i], "--health-cmd") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --health-cmd requires a command\n");
+                return -1;
+            }
+            opts->health_cmd     = argv[++i];
+            opts->health_enabled = 1;
+        }
+        else if (strcmp(argv[i], "--health-interval") == 0
+                 || strcmp(argv[i], "--health-timeout") == 0
+                 || strcmp(argv[i], "--health-start-period") == 0
+                 || strcmp(argv[i], "--health-retries") == 0)
+        {
+            const char* flag = argv[i];
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: %s requires a value\n", flag);
+                return -1;
+            }
+            char* endp = NULL;
+            errno = 0;
+            long v = strtol(argv[++i], &endp, 10);
+            if (endp == argv[i] || *endp != '\0' || errno != 0
+                    || v < 0 || v > 1000000)
+            {
+                fprintf(stderr, "oci2bin: %s needs a non-negative integer\n",
+                        flag);
+                return -1;
+            }
+            if (strcmp(flag, "--health-interval") == 0)
+            {
+                opts->health_interval_s = v;
+            }
+            else if (strcmp(flag, "--health-timeout") == 0)
+            {
+                opts->health_timeout_s = v;
+            }
+            else if (strcmp(flag, "--health-start-period") == 0)
+            {
+                opts->health_start_period_s = v;
+            }
+            else
+            {
+                opts->health_retries = (int)v;
+            }
+            opts->health_enabled = 1;
         }
         else if (strcmp(argv[i], "--metrics-socket") == 0)
         {
@@ -14735,6 +15555,21 @@ static int inspect_image_main(const char* self_path)
         if (dec == 1)
         {
             tar_input = dec_path;
+        }
+    }
+
+    /* Inflate the payload if it is zstd-compressed (--compress-binary). */
+    char unz_path[PATH_MAX];
+    {
+        int unz = maybe_decompress_oci_blob(tar_input, tmpdir,
+                                            unz_path, sizeof(unz_path));
+        if (unz < 0)
+        {
+            goto out;
+        }
+        if (unz == 1)
+        {
+            tar_input = unz_path;
         }
     }
 
