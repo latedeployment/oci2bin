@@ -3679,6 +3679,71 @@ static int run_cmd(char* const argv[])
 }
 
 /*
+ * Run `age` like run_cmd, but forward its stderr through a filter that drops
+ * age's noisy "... report unexpected or unhelpful errors at
+ * https://filippo.io/age/report" footer — oci2bin prints its own clearer
+ * decryption errors. Returns the exit code (127 if age is missing), or -1 on
+ * fork failure. age reads passphrases from /dev/tty, not stderr, so
+ * redirecting stderr here does not interfere with interactive prompts.
+ */
+static int run_age(char* const argv[])
+{
+    int errpipe[2];
+    if (pipe2(errpipe, O_CLOEXEC) < 0)
+    {
+        return run_cmd(argv);    /* fall back to unfiltered on pipe failure */
+    }
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork");
+        close(errpipe[0]);
+        close(errpipe[1]);
+        return -1;
+    }
+    if (pid == 0)
+    {
+        close(errpipe[0]);
+        if (dup2(errpipe[1], STDERR_FILENO) < 0)
+        {
+            _exit(127);
+        }
+        close(errpipe[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(errpipe[1]);
+    FILE* ef = fdopen(errpipe[0], "r");
+    if (ef)
+    {
+        char line[1024];
+        while (fgets(line, sizeof(line), ef))
+        {
+            if (strstr(line, "filippo.io/age/report") != NULL)
+            {
+                continue;
+            }
+            fputs(line, stderr);
+        }
+        fclose(ef);
+    }
+    else
+    {
+        close(errpipe[0]);
+    }
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/*
  * Run a command, capturing its stdout into a malloc'd buffer.
  * *out_len receives the number of bytes read.
  * Caller must free() the returned pointer.
@@ -4124,7 +4189,7 @@ static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
             {
                 "age", "--decrypt", "-o", out_path, (char*)in_path, NULL
             };
-            rc = run_cmd(age_argv);
+            rc = run_age(age_argv);
         }
     }
     else
@@ -4144,7 +4209,7 @@ static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
             "age", "--decrypt", "-i", identity,
             "-o", out_path, (char*)in_path, NULL
         };
-        rc = run_cmd(age_argv);
+        rc = run_age(age_argv);
     }
 
     if (rc == 127)

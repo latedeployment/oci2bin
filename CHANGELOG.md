@@ -6,6 +6,12 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **Quieter age errors** — oci2bin no longer passes through age's noisy
+  "report unexpected or unhelpful errors at https://filippo.io/age/report"
+  footer (e.g. on a wrong passphrase/identity). The real age error line and
+  oci2bin's own message are kept; only the footer is dropped, in both the
+  loader (decrypt) and the builder (encrypt).
+
 - **Rootless subordinate-ID mapping (`newuidmap: ... not allowed`)** — the
   loader unshared `CLONE_NEWUSER` and *then* ran `newuidmap`/`newgidmap` from
   inside the still-unmapped namespace, which the helpers reject on hosts that

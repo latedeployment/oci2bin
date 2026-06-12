@@ -1021,7 +1021,12 @@ def age_encrypt(plaintext, recipients, recipients_files):
               "(https://age-encryption.org)", file=sys.stderr)
         sys.exit(1)
     if proc.returncode != 0:
-        sys.stderr.write(proc.stderr.decode('utf-8', 'replace'))
+        # Forward age's stderr but drop its noisy "report unexpected ...
+        # filippo.io/age/report" footer.
+        for ln in proc.stderr.decode('utf-8', 'replace').splitlines():
+            if 'filippo.io/age/report' in ln:
+                continue
+            print(ln, file=sys.stderr)
         print('error: age encryption failed', file=sys.stderr)
         sys.exit(1)
     return proc.stdout
