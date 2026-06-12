@@ -8,7 +8,10 @@ else
 CC_AARCH64       = aarch64-linux-gnu-gcc
 # Sysroot for the aarch64 cross-compiler — Fedora package: sysroot-aarch64-fc43-glibc
 AARCH64_SYSROOT ?= /usr/aarch64-redhat-linux/sys-root/fc43
-CFLAGS_AARCH64   = --sysroot=$(AARCH64_SYSROOT) -isystem $(AARCH64_SYSROOT)/usr/include
+# The glibc-only sysroot ships no static libatomic.a, but Fedora's gcc spec
+# unconditionally requests -latomic (as-needed) for aarch64 static links, so ld
+# fails just locating the file. Our code uses no atomics; suppress the request.
+CFLAGS_AARCH64   = --sysroot=$(AARCH64_SYSROOT) -isystem $(AARCH64_SYSROOT)/usr/include -fno-link-libatomic
 endif
 CC         = gcc
 CFLAGS     = -static -O2 -s -Wall -Wextra
