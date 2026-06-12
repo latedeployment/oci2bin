@@ -1,6 +1,6 @@
 # oci2bin
 
-**oci2bin** converts any Docker (OCI) image into a single executable file. The output runs as a rootless container on any Linux machine — without Docker, without a daemon, and without any installation on the target.
+**oci2bin** converts any Docker (OCI) image into a single executable file. The output runs as a rootless container on any Linux machine - without Docker, without a daemon, and without any installation on the target.
 
 The output is an [ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): simultaneously a native Linux executable and a valid `docker save` tar archive.
 
