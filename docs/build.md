@@ -12,6 +12,12 @@ oci2bin redis:7-alpine redis_7-alpine
 If the image is not local, `oci2bin` pulls it. The image is saved as an OCI tar
 payload, combined with the loader, and written as one executable file.
 
+`oci2bin` uses `docker` if it is on `PATH`, otherwise it falls back to `podman`
+(its `pull`/`save`/`inspect` subcommands are CLI-compatible). A container engine
+is only needed for this default path — `--oci-dir`, `from-chroot`, and
+`build-dockerfile` build without one. `oci2bin doctor` reports the engine as
+*optional* for the same reason.
+
 ### Pin by digest (validated)
 
 Pass an immutable `name@sha256:...` reference to build from a specific content

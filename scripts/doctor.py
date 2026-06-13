@@ -95,16 +95,25 @@ def _check_static_libc():
 
 
 def _check_docker_or_podman():
+    # The default build path pulls and `save`s the image with a container
+    # engine. podman is CLI-compatible with the docker subcommands oci2bin
+    # uses, so it works as a drop-in fallback. This is NOT a hard requirement:
+    # the loader/runtime never needs it, and an image can be built without any
+    # engine via --oci-dir (an OCI layout from skopeo/crane/buildah), the
+    # `from-chroot` subcommand, or `build-dockerfile`. Hence DEGRADED, not
+    # MISSING, when neither is present.
     for tool in ("docker", "podman"):
         if _which(tool) is not None:
             rc, out, _ = _run([tool, "--version"])
             return _result(
                 f"{tool}", OK,
-                out.strip() or "present")
+                (out.strip() or "present") + " — default build engine")
     return _result(
-        "docker/podman", MISSING,
-        "neither docker nor podman in PATH",
-        "install Docker (https://docs.docker.com/engine/install/) "
+        "docker/podman", DEGRADED,
+        "no container engine in PATH — the default build (pull/save) is "
+        "unavailable; build via --oci-dir (skopeo/crane/buildah), "
+        "from-chroot, or build-dockerfile instead",
+        "optional: install Docker (https://docs.docker.com/engine/install/) "
         "or Podman (apt install podman / dnf install podman)")
 
 

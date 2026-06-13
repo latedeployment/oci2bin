@@ -4,6 +4,17 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **podman now works for the default build, and `doctor` no longer lies about
+  it.** The default `oci2bin IMAGE` build path called `docker` literally, so on
+  a podman-only host it failed even though `doctor` reported the engine as
+  present. The build now picks `docker` if available and otherwise falls back to
+  `podman` (`pull`/`save`/`inspect` are CLI-compatible), and aborts with a clear
+  message — naming the daemonless `--oci-dir`/`from-chroot`/`build-dockerfile`
+  alternatives — when neither is found. `doctor` reports a missing engine as
+  **DEGRADED** rather than **MISSING**, since an image can be built without one.
+
 ### Added
 
 - **`oci2bin doctor`: OS-aware install summary.** After the check table, doctor

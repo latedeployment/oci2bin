@@ -2332,6 +2332,30 @@ else
     fi
 fi
 
+# ── container engine for the default build path ───────────────────────────
+# The default build pulls and `save`s the image via a container engine. podman
+# is CLI-compatible with the docker subcommands used here (image inspect, pull,
+# inspect, save), so it works as a drop-in fallback. The --oci-dir, from-chroot,
+# and build-dockerfile paths need no engine at all.
+if command -v docker >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker
+elif command -v podman >/dev/null 2>&1; then
+    CONTAINER_ENGINE=podman
+else
+    CONTAINER_ENGINE=""
+fi
+
+require_engine() {
+    [[ -n "$CONTAINER_ENGINE" ]] && return 0
+    echo "oci2bin: no container engine found — need 'docker' or 'podman' in PATH" \
+         "to pull/save '$IMAGE'." >&2
+    echo "         To build without a container engine, use one of:" >&2
+    echo "           --oci-dir DIR          (an OCI layout from skopeo/crane/buildah)" >&2
+    echo "           oci2bin from-chroot …  (pack an existing rootfs directory)" >&2
+    echo "           oci2bin build-dockerfile … (daemonless Dockerfile build)" >&2
+    exit 1
+}
+
 # ── OCI image layout: convert to docker-save tar, skip docker entirely ────
 
 if [[ -n "$OCI_DIR" ]]; then
@@ -2354,14 +2378,15 @@ else
 
 # ── pull image if not local ───────────────────────────────────────────────
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+require_engine
+if ! "$CONTAINER_ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
     if [[ "$OFFLINE_ONLY" -eq 1 ]]; then
         echo "oci2bin: --offline-only set but image '$IMAGE' is not in the local store." >&2
-        echo "         Run 'docker pull $IMAGE' before building, or use --oci-dir / --tar." >&2
+        echo "         Run '$CONTAINER_ENGINE pull $IMAGE' before building, or use --oci-dir." >&2
         exit 1
     fi
     echo "oci2bin: pulling $IMAGE..."
-    docker pull "$IMAGE"
+    "$CONTAINER_ENGINE" pull "$IMAGE"
 fi
 
 # ── validate a content-pinned (digest) reference ──────────────────────────
@@ -2375,7 +2400,7 @@ if [[ -n "$PINNED_DIGEST" ]]; then
     _matched=0
     while IFS= read -r _rd; do
         [[ "$_rd" == *"@$PINNED_DIGEST" ]] && { _matched=1; break; }
-    done < <(docker inspect --format \
+    done < <("$CONTAINER_ENGINE" inspect --format \
                  '{{range .RepoDigests}}{{println .}}{{end}}' \
                  "$IMAGE" 2>/dev/null)
     if [[ "$_matched" -ne 1 ]]; then
@@ -2384,7 +2409,7 @@ if [[ -n "$PINNED_DIGEST" ]]; then
         echo "         $PINNED_DIGEST — the daemon/registry may be serving" \
              "different content, or the local image was not pulled by digest." \
              >&2
-        echo "         Refusing to build. Re-pull with: docker pull $IMAGE" >&2
+        echo "         Refusing to build. Re-pull with: $CONTAINER_ENGINE pull $IMAGE" >&2
         exit 1
     fi
     echo "oci2bin: digest pin verified: $PINNED_DIGEST" >&2
@@ -2437,7 +2462,7 @@ export OCI2BIN_COSIGN_RESULT="$COSIGN_RESULT"
 
 DIGEST=""
 DIGEST_SHORT=""
-if DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null)"; then
+if DIGEST="$("$CONTAINER_ENGINE" inspect --format '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null)"; then
     if [[ -n "$DIGEST" ]]; then
         # Extract the sha256 hex part
         sha256_part="${DIGEST##*sha256:}"
@@ -2469,26 +2494,27 @@ if [[ "${#LAYER_IMAGES[@]}" -gt 0 ]]; then
     trap 'rm -rf "$MERGE_TMPDIR"' EXIT
 
     # Save base image
+    require_engine
     BASE_TAR="$MERGE_TMPDIR/base.tar"
     echo "oci2bin: saving base image $IMAGE..."
-    docker save -o "$BASE_TAR" "$IMAGE"
+    "$CONTAINER_ENGINE" save -o "$BASE_TAR" "$IMAGE"
 
     MERGE_ARGS=(--base "$BASE_TAR")
 
     # Save each --layer image
     idx=0
     for layer_img in "${LAYER_IMAGES[@]}"; do
-        if ! docker image inspect "$layer_img" >/dev/null 2>&1; then
+        if ! "$CONTAINER_ENGINE" image inspect "$layer_img" >/dev/null 2>&1; then
             if [[ "$OFFLINE_ONLY" -eq 1 ]]; then
                 echo "oci2bin: --offline-only set but layer image '$layer_img' is not in the local store." >&2
                 exit 1
             fi
             echo "oci2bin: pulling layer image $layer_img..."
-            docker pull "$layer_img"
+            "$CONTAINER_ENGINE" pull "$layer_img"
         fi
         layer_tar="$MERGE_TMPDIR/layer${idx}.tar"
         echo "oci2bin: saving layer image $layer_img..."
-        docker save -o "$layer_tar" "$layer_img"
+        "$CONTAINER_ENGINE" save -o "$layer_tar" "$layer_img"
         MERGE_ARGS+=(--layer "$layer_tar")
         idx=$((idx + 1))
     done
@@ -2512,10 +2538,11 @@ fi
 # squash, and file-injection steps below.
 ensure_base_tar() {
     [[ -n "$BUILD_TAR_ARG" ]] && return 0
+    require_engine
     BASE_TAR_TMPDIR="$(mktemp -d)"
     trap 'rm -rf "$BASE_TAR_TMPDIR"' EXIT
     echo "oci2bin: saving $IMAGE for the build..."
-    docker save -o "$BASE_TAR_TMPDIR/base.tar" "$IMAGE"
+    "$CONTAINER_ENGINE" save -o "$BASE_TAR_TMPDIR/base.tar" "$IMAGE"
     BUILD_TAR_ARG="$BASE_TAR_TMPDIR/base.tar"
 }
 
