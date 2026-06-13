@@ -14507,7 +14507,84 @@ static int vm_init_main(void)
 }
 
 #ifdef USE_LIBKRUN
-#include <libkrun.h>
+#include <dlfcn.h>
+
+/*
+ * libkrun is loaded lazily with dlopen instead of linked with -lkrun, so a
+ * libkrun-capable binary still starts (and runs in namespace mode) on hosts
+ * that do not have libkrun installed. The shared library is only required when
+ * --vm actually takes the libkrun backend — not at process load time.
+ */
+typedef int32_t (*krun_create_ctx_fn)(void);
+typedef int32_t (*krun_set_vm_config_fn)(uint32_t, uint8_t, uint32_t);
+typedef int32_t (*krun_set_root_fn)(uint32_t, const char*);
+typedef int32_t (*krun_set_mapped_volumes_fn)(uint32_t, const char* const[]);
+typedef int32_t (*krun_set_workdir_fn)(uint32_t, const char*);
+typedef int32_t (*krun_set_exec_fn)(uint32_t, const char*,
+                                    const char* const[], const char* const[]);
+typedef int32_t (*krun_start_enter_fn)(uint32_t);
+
+static struct
+{
+    void* handle;
+    krun_create_ctx_fn         create_ctx;
+    krun_set_vm_config_fn      set_vm_config;
+    krun_set_root_fn           set_root;
+    krun_set_mapped_volumes_fn set_mapped_volumes;
+    krun_set_workdir_fn        set_workdir;
+    krun_set_exec_fn           set_exec;
+    krun_start_enter_fn        start_enter;
+} g_krun;
+
+/*
+ * dlopen libkrun and resolve the symbols we call. Returns 0 on success, or -1
+ * (with a clear message) when the library or an expected symbol is missing —
+ * which is the only point where libkrun is actually required.
+ */
+static int libkrun_load(void)
+{
+    if (g_krun.handle)
+    {
+        return 0;
+    }
+    const char* names[] = { "libkrun.so.1", "libkrun.so", NULL };
+    for (int i = 0; names[i] && !g_krun.handle; i++)
+    {
+        g_krun.handle = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!g_krun.handle)
+    {
+        fprintf(stderr,
+                "oci2bin: --vm: libkrun.so.1 not found at runtime. Install "
+                "libkrun, or use --vmm cloud-hypervisor.\n");
+        return -1;
+    }
+    g_krun.create_ctx =
+        (krun_create_ctx_fn)dlsym(g_krun.handle, "krun_create_ctx");
+    g_krun.set_vm_config =
+        (krun_set_vm_config_fn)dlsym(g_krun.handle, "krun_set_vm_config");
+    g_krun.set_root =
+        (krun_set_root_fn)dlsym(g_krun.handle, "krun_set_root");
+    g_krun.set_mapped_volumes =
+        (krun_set_mapped_volumes_fn)dlsym(g_krun.handle,
+                                          "krun_set_mapped_volumes");
+    g_krun.set_workdir =
+        (krun_set_workdir_fn)dlsym(g_krun.handle, "krun_set_workdir");
+    g_krun.set_exec =
+        (krun_set_exec_fn)dlsym(g_krun.handle, "krun_set_exec");
+    g_krun.start_enter =
+        (krun_start_enter_fn)dlsym(g_krun.handle, "krun_start_enter");
+    if (!g_krun.create_ctx || !g_krun.set_vm_config || !g_krun.set_root
+            || !g_krun.set_mapped_volumes || !g_krun.set_workdir
+            || !g_krun.set_exec || !g_krun.start_enter)
+    {
+        fprintf(stderr,
+                "oci2bin: --vm: libkrun is present but is missing expected "
+                "symbols (incompatible version?).\n");
+        return -1;
+    }
+    return 0;
+}
 
 /*
  * run_as_vm_libkrun: launch the container using libkrun in-process VM.
@@ -14518,6 +14595,11 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
 {
     (void)tmpdir; /* unused in libkrun path */
     debug_log("vm.libkrun.begin", "rootfs=%s", rootfs);
+
+    if (libkrun_load() < 0)
+    {
+        return 1;
+    }
 
     /* Read OCI config and build exec argv */
     struct oci_config oci_cfg;
@@ -14555,7 +14637,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     flat_env[flat_env_n] = NULL;
 
     /* Create libkrun context */
-    int32_t ctx = krun_create_ctx();
+    int32_t ctx = g_krun.create_ctx();
     if (ctx < 0)
     {
         fprintf(stderr, "oci2bin: krun_create_ctx failed: %d\n", ctx);
@@ -14573,7 +14655,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
         : DEFAULT_VM_MEM_MB;
     debug_log("vm.libkrun.config", "vcpus=%u mem_mb=%u", (unsigned)vcpus,
               (unsigned)mem_mb);
-    if (krun_set_vm_config((uint32_t)ctx, vcpus, mem_mb) != 0)
+    if (g_krun.set_vm_config((uint32_t)ctx, vcpus, mem_mb) != 0)
     {
         fprintf(stderr, "oci2bin: krun_set_vm_config failed\n");
         goto cleanup;
@@ -14583,7 +14665,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     install_resolv_conf(rootfs);
 
     /* Set rootfs */
-    if (krun_set_root((uint32_t)ctx, rootfs) != 0)
+    if (g_krun.set_root((uint32_t)ctx, rootfs) != 0)
     {
         fprintf(stderr, "oci2bin: krun_set_root failed\n");
         goto cleanup;
@@ -14619,7 +14701,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
             mapped[vi] = vol_bufs[vi];
         }
         mapped[opts->n_vols] = NULL;
-        if (krun_set_mapped_volumes((uint32_t)ctx, mapped) != 0)
+        if (g_krun.set_mapped_volumes((uint32_t)ctx, mapped) != 0)
         {
             fprintf(stderr, "oci2bin: krun_set_mapped_volumes failed\n");
             goto cleanup;
@@ -14638,7 +14720,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
                         "oci2bin: workdir contains ..: %s\n", wdir);
                 goto cleanup;
             }
-            if (krun_set_workdir((uint32_t)ctx, wdir) != 0)
+            if (g_krun.set_workdir((uint32_t)ctx, wdir) != 0)
             {
                 fprintf(stderr,
                         "oci2bin: krun_set_workdir failed\n");
@@ -14648,7 +14730,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     }
 
     /* Set exec */
-    if (krun_set_exec((uint32_t)ctx, exec_args[0],
+    if (g_krun.set_exec((uint32_t)ctx, exec_args[0],
                       (const char* const *)(exec_args + 1),
                       (const char* const *)flat_env) != 0)
     {
@@ -14658,7 +14740,7 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
 
     /* Start VM — does not return on success */
     debug_log("vm.libkrun.start", "entering_guest=1");
-    if (krun_start_enter((uint32_t)ctx) != 0)
+    if (g_krun.start_enter((uint32_t)ctx) != 0)
     {
         fprintf(stderr, "oci2bin: krun_start_enter returned unexpectedly\n");
     }

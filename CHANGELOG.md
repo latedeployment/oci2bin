@@ -4,6 +4,19 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **libkrun is now a lazy (`dlopen`) dependency, not a link-time one.** The
+  libkrun-enabled loader previously linked `-lkrun`, so a libkrun-built binary
+  required `libkrun.so.1` on the target to start *at all* — even for plain
+  namespace runs that never used `--vm`. The loader now links libc only and
+  `dlopen`s `libkrun.so.1` on demand, the first time `--vm` takes the libkrun
+  backend. A libkrun-built binary therefore starts and runs in namespace mode
+  on any glibc host without libkrun installed; the library is needed only for
+  `--vm`, and its absence then fails with a clear message pointing at
+  `--vmm cloud-hypervisor`. `make loader-libkrun` no longer needs libkrun or
+  libkrun-dev at build time (links `-ldl`).
+
 ### Added
 
 - **`--gpus` / `--cdi-device` — Container Device Interface support** — expose

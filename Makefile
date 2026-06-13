@@ -94,17 +94,19 @@ loader-aarch64: build/loader-aarch64
 
 loader-all: build/loader-x86_64 build/loader-aarch64
 
-# libkrun-enabled loader: links -lkrun, NOT static (libkrun is a dynamic lib)
+# libkrun-enabled loader: dynamic (libc), libkrun is dlopen'd at runtime only
+# when --vm uses the libkrun backend, so this links -ldl (not -lkrun) and needs
+# neither libkrun nor libkrun-dev at build time.
 loader-libkrun: build/loader-libkrun-$(ARCH)
 
 build/loader-libkrun-x86_64: src/loader.c
 	@mkdir -p build $(TEST_TMPDIR)
-	$(TEST_ENV) $(CC_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -lkrun
+	$(TEST_ENV) $(CC_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -ldl
 	@echo "Loader/libkrun (x86_64): $$(ls -lh $@ | awk '{print $$5}')"
 
 build/loader-libkrun-aarch64: src/loader.c
 	@mkdir -p build $(TEST_TMPDIR)
-	$(TEST_ENV) $(CC_AARCH64) $(CFLAGS_AARCH64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -lkrun
+	$(TEST_ENV) $(CC_AARCH64) $(CFLAGS_AARCH64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -ldl
 	@echo "Loader/libkrun (aarch64): $$(ls -lh $@ | awk '{print $$5}')"
 
 # Kernel fetch / build (cloud-hypervisor path only)
