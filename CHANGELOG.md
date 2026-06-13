@@ -4,6 +4,39 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Build-time `--entrypoint` / `--cmd` override** — change what the binary runs
+  by default on the plain `oci2bin IMAGE` path, without a Dockerfile. The flags
+  rewrite the embedded image config (`Entrypoint`/`Cmd`); the value is a JSON
+  array (`["a","b"]`) or a shell-split string, and `--entrypoint` without
+  `--cmd` clears the image's default `Cmd` (matching `docker run --entrypoint`).
+  Complements the existing runtime `--entrypoint` (per-launch, no rebuild).
+
+- **Build from a validated image digest** — `oci2bin name@sha256:<64-hex>`
+  builds from an immutable content digest instead of a mutable tag, and the
+  digest is verified before building. `docker pull` rejects a content mismatch,
+  but a digest-pinned image already in the local store is used without a pull
+  (so docker never re-validates it); oci2bin therefore re-checks that the
+  resolved image actually reports the requested digest (`RepoDigests`) and
+  refuses to build on a mismatch — catching a tampered or mis-tagged local
+  image. A malformed digest is rejected up front, and the default output name
+  is `<repo>_<short-digest>` rather than a 70-character sha.
+
+- **Bidirectional cross-compilation** — `--arch` now cross-compiles in both
+  directions: x86_64 host → aarch64 (existing) **and** aarch64 host → x86_64
+  (new), each with its own cross compiler and glibc sysroot
+  (`X86_64_SYSROOT` / `AARCH64_SYSROOT`). The Makefile and the wrapper select
+  the native compiler for the host arch and the cross compiler for the other.
+
+- **`oci2bin doctor` now covers every dependency** — added checks for `age`
+  (image encryption), `nftables` (`--allow-egress`), `rekor-cli`, the
+  cloud-hypervisor/virtiofsd VM backend, the non-native cross-compiler, and the
+  optional runtime helpers (`nsenter`, `sqlite3`, `systemd-creds`, `gdb`,
+  `curl`). The VM-backend row reports `/dev/kvm`, libkrun, cloud-hypervisor, and
+  virtiofsd together. A new `docs/reference/dependencies.md` lists every
+  build-host and target-host dependency per feature.
+
 ### Changed
 
 - **libkrun is now a lazy (`dlopen`) dependency, not a link-time one.** The

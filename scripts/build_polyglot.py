@@ -28,6 +28,7 @@ import io
 import json
 import os
 import pty
+import shlex
 import shutil
 import stat as stat_module
 import struct
@@ -1026,6 +1027,56 @@ def apply_user_labels(oci_data, labels):
     return new_oci
 
 
+def parse_exec_value(s):
+    """Parse a build-time --set-entrypoint/--set-cmd value into an argv list.
+    A value starting with '[' is JSON (an array of strings); otherwise it is
+    shell-split (so `--entrypoint 'redis-server --port 6380'` works)."""
+    s = s.strip()
+    if s.startswith('['):
+        try:
+            v = json.loads(s)
+        except json.JSONDecodeError as e:
+            print(f"error: invalid JSON for exec value '{s}': {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            print("error: exec value JSON must be an array of strings",
+                  file=sys.stderr)
+            sys.exit(1)
+        return v
+    return shlex.split(s)
+
+
+def apply_config_override(oci_data, entrypoint, cmd):
+    """Override the embedded image config's Entrypoint/Cmd at build time.
+
+    `entrypoint` and `cmd` are argv lists, or None to leave that field alone.
+    Setting a new entrypoint without a cmd also clears Cmd, so the new
+    entrypoint is not accidentally paired with the image's old default command
+    (matching `docker run --entrypoint` semantics). Returns updated OCI tar.
+    """
+    if entrypoint is None and cmd is None:
+        return oci_data
+    manifest, old_config_path, config, _ = _parse_oci_manifest_and_config(
+        oci_data)
+    cfg = config.setdefault('config', {})
+    if entrypoint is not None:
+        cfg['Entrypoint'] = entrypoint
+        if cmd is None:
+            cfg['Cmd'] = []
+    if cmd is not None:
+        cfg['Cmd'] = cmd
+    new_oci, _ = _rebuild_oci_with_new_config(
+        oci_data, manifest, old_config_path, config)
+    parts = []
+    if entrypoint is not None:
+        parts.append(f"Entrypoint={entrypoint}")
+    if cmd is not None:
+        parts.append(f"Cmd={cmd}")
+    print(f"  Overrode image config: {', '.join(parts)}", file=sys.stderr)
+    return new_oci
+
+
 def zstd_compress_payload(data, level=19):
     """Compress the embedded OCI payload with the `zstd` CLI.
 
@@ -1220,7 +1271,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    offline_only=False, user_labels=None,
                    encrypt_recipients=None, encrypt_recipients_files=None,
                    encrypt_passphrase=False, password_file=None,
-                   require_signed_pubkey=None, compress_binary=None):
+                   require_signed_pubkey=None, compress_binary=None,
+                   set_entrypoint=None, set_cmd=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -1283,6 +1335,10 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     # 2b. Merge user-supplied --label KEY=VAL pairs into the image config.
     if user_labels:
         oci_data = apply_user_labels(oci_data, user_labels)
+
+    # 2b'. Override the image Entrypoint/Cmd if requested at build time.
+    if set_entrypoint is not None or set_cmd is not None:
+        oci_data = apply_config_override(oci_data, set_entrypoint, set_cmd)
 
     # --reproducible: re-emit the OCI tar with sorted members, mtime=0,
     # zeroed uid/gid/uname/gname, and gzip mtime=0 in each layer header.
@@ -1628,6 +1684,13 @@ def main():
                              'loader refuses to run unless a valid OCI2BIN_SIG '
                              'from this public key is present. Sign afterwards '
                              'with `oci2bin sign --key PRIV.pem`.')
+    parser.add_argument('--set-entrypoint', default=None, metavar='VALUE',
+                        help='Override the embedded image Entrypoint. VALUE is '
+                             'a JSON array (["a","b"]) or a shell-split string. '
+                             'Clears Cmd unless --set-cmd is also given.')
+    parser.add_argument('--set-cmd', default=None, metavar='VALUE',
+                        help='Override the embedded image Cmd (default args). '
+                             'JSON array or shell-split string.')
     parser.add_argument('--compress-binary', nargs='?', const='zstd',
                         choices=['zstd'], default=None,
                         help='Compress the embedded OCI payload with zstd. '
@@ -1765,7 +1828,12 @@ def main():
                    encrypt_passphrase=args.passphrase,
                    password_file=args.password_file,
                    require_signed_pubkey=require_signed_pubkey,
-                   compress_binary=args.compress_binary)
+                   compress_binary=args.compress_binary,
+                   set_entrypoint=(parse_exec_value(args.set_entrypoint)
+                                   if args.set_entrypoint is not None
+                                   else None),
+                   set_cmd=(parse_exec_value(args.set_cmd)
+                            if args.set_cmd is not None else None))
 
 
 if __name__ == '__main__':

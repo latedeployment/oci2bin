@@ -1,10 +1,19 @@
-CC_X86_64  = gcc
 CC_CLANG  ?= clang
-# Use native gcc on aarch64 host; cross-compiler when targeting aarch64 from x86_64
+# The host's own arch builds with plain gcc; the other arch uses a cross
+# compiler + sysroot. Both directions are supported: x86_64 host -> aarch64,
+# and aarch64 host -> x86_64.
 ifeq ($(shell uname -m),aarch64)
+# aarch64 host: native aarch64, cross-compile to x86_64.
 CC_AARCH64       = gcc
 CFLAGS_AARCH64   =
+CC_X86_64        = x86_64-linux-gnu-gcc
+# Sysroot for the x86_64 cross-compiler — Fedora package: sysroot-x86_64-fc43-glibc
+X86_64_SYSROOT  ?= /usr/x86_64-redhat-linux/sys-root/fc43
+CFLAGS_X86_64    = --sysroot=$(X86_64_SYSROOT) -isystem $(X86_64_SYSROOT)/usr/include
 else
+# x86_64 (or other) host: native x86_64, cross-compile to aarch64.
+CC_X86_64        = gcc
+CFLAGS_X86_64    =
 CC_AARCH64       = aarch64-linux-gnu-gcc
 # Sysroot for the aarch64 cross-compiler — Fedora package: sysroot-aarch64-fc43-glibc
 AARCH64_SYSROOT ?= /usr/aarch64-redhat-linux/sys-root/fc43
@@ -101,7 +110,7 @@ loader-libkrun: build/loader-libkrun-$(ARCH)
 
 build/loader-libkrun-x86_64: src/loader.c
 	@mkdir -p build $(TEST_TMPDIR)
-	$(TEST_ENV) $(CC_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -ldl
+	$(TEST_ENV) $(CC_X86_64) $(CFLAGS_X86_64) -O2 -s -Wall -Wextra -DUSE_LIBKRUN $(VM_DEFS) -o $@ $< -ldl
 	@echo "Loader/libkrun (x86_64): $$(ls -lh $@ | awk '{print $$5}')"
 
 build/loader-libkrun-aarch64: src/loader.c
@@ -117,7 +126,7 @@ $(VMLINUX_OUT): kernel/microvm.config scripts/fetch_kernel.sh
 
 build/loader-x86_64: src/loader.c
 	@mkdir -p build $(TEST_TMPDIR)
-	$(TEST_ENV) $(CC_X86_64) $(CFLAGS) $(VM_DEFS) -o $@ $<
+	$(TEST_ENV) $(CC_X86_64) $(CFLAGS_X86_64) $(CFLAGS) $(VM_DEFS) -o $@ $<
 	@echo "Loader (x86_64): $$(ls -lh $@ | awk '{print $$5}')"
 
 build/loader-aarch64: src/loader.c
