@@ -402,15 +402,37 @@ def build_initramfs(rootfs_dir, out_path):
 
 # ── Main polyglot construction ───────────────────────────────────────────────
 
+def _resolve_engine():
+    """Pick the container engine for `save`.
+
+    Honors OCI2BIN_ENGINE (set by the oci2bin wrapper from its own docker →
+    podman detection / --pull-with), otherwise auto-detects docker then podman
+    so the script still works when invoked standalone.
+    """
+    env_engine = os.environ.get('OCI2BIN_ENGINE')
+    if env_engine:
+        return env_engine
+    for candidate in ('docker', 'podman'):
+        if shutil.which(candidate):
+            return candidate
+    return None
+
+
 def get_oci_tar(image_name, output_path):
-    """Run docker save to produce the OCI tar."""
-    print(f"Saving image '{image_name}' via docker save...")
+    """Run `<engine> save` to produce the OCI tar (docker or podman)."""
+    engine = _resolve_engine()
+    if engine is None:
+        print("error: no container engine found — install docker or podman, "
+              "or use oci2bin's --oci-dir / --pull-with skopeo path.",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"Saving image '{image_name}' via {engine} save...")
     result = subprocess.run(
-        ['docker', 'save', '-o', output_path, image_name],
+        [engine, 'save', '-o', output_path, image_name],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        print(f"docker save failed: {result.stderr}", file=sys.stderr)
+        print(f"{engine} save failed: {result.stderr}", file=sys.stderr)
         sys.exit(1)
 
 

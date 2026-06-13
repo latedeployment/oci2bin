@@ -3071,6 +3071,12 @@ static ssize_t read_all_fd(int fd, char* buf, size_t len)
     return (ssize_t)off;
 }
 
+/* Consume the result of a best-effort I/O syscall on a sync/notify pipe.
+ * A plain `(void)write(...)` does NOT silence -Wunused-result under glibc's
+ * fortified declarations (warn_unused_result), so route those calls through
+ * this helper to make the "result intentionally ignored" explicit. */
+static void ignore_io_result(ssize_t r) { (void)r; }
+
 static int write_all_fd(int fd, const char* data, size_t len)
 {
     size_t off = 0;
@@ -6196,7 +6202,7 @@ static int enter_userns_and_map(uid_t real_uid,
                   run_newidmap(plan->newgidmap_path, target,
                                (unsigned long)real_gid,
                                plan->subgid_start) == 0);
-        (void)write(c2p[1], ok ? "1" : "0", 1);
+        ignore_io_result(write(c2p[1], ok ? "1" : "0", 1));
         _exit(ok ? 0 : 1);
     }
 
@@ -14057,7 +14063,7 @@ static pid_t start_metrics_helper(const char* socket_path)
         {
             fprintf(stderr, "oci2bin: --metrics-socket path too long: %s\n",
                     socket_path);
-            (void)write(sync_pipe[1], "0", 1);
+            ignore_io_result(write(sync_pipe[1], "0", 1));
             close(sync_pipe[1]);
             _exit(1);
         }
@@ -14067,7 +14073,7 @@ static pid_t start_metrics_helper(const char* socket_path)
         {
             fprintf(stderr, "oci2bin: --metrics-socket unlink %s: %s\n",
                     socket_path, strerror(errno));
-            (void)write(sync_pipe[1], "0", 1);
+            ignore_io_result(write(sync_pipe[1], "0", 1));
             close(sync_pipe[1]);
             _exit(1);
         }
@@ -14076,7 +14082,7 @@ static pid_t start_metrics_helper(const char* socket_path)
         if (listen_fd < 0)
         {
             perror("oci2bin: metrics socket");
-            (void)write(sync_pipe[1], "0", 1);
+            ignore_io_result(write(sync_pipe[1], "0", 1));
             close(sync_pipe[1]);
             _exit(1);
         }
@@ -14085,7 +14091,7 @@ static pid_t start_metrics_helper(const char* socket_path)
             fprintf(stderr, "oci2bin: --metrics-socket bind %s: %s\n",
                     socket_path, strerror(errno));
             close(listen_fd);
-            (void)write(sync_pipe[1], "0", 1);
+            ignore_io_result(write(sync_pipe[1], "0", 1));
             close(sync_pipe[1]);
             _exit(1);
         }
@@ -14095,7 +14101,7 @@ static pid_t start_metrics_helper(const char* socket_path)
                     socket_path, strerror(errno));
             unlink(socket_path);
             close(listen_fd);
-            (void)write(sync_pipe[1], "0", 1);
+            ignore_io_result(write(sync_pipe[1], "0", 1));
             close(sync_pipe[1]);
             _exit(1);
         }
@@ -14107,7 +14113,7 @@ static pid_t start_metrics_helper(const char* socket_path)
             fprintf(stderr, "oci2bin: metrics initial read failed: %s\n",
                     strerror(errno));
         }
-        (void)write(sync_pipe[1], "1", 1);
+        ignore_io_result(write(sync_pipe[1], "1", 1));
         close(sync_pipe[1]);
 
         char metrics[2048];
@@ -17173,6 +17179,34 @@ int main(int argc, char* argv[])
         if (unshare(ns_flags) < 0)
         {
             perror("unshare(NEWNS|NEWPID|NEWUTS)");
+            /* On Ubuntu 23.10+ the user namespace can be created but is
+             * stripped of capabilities by AppArmor, so this follow-up unshare
+             * fails with EPERM. Detect that knob and tell the user how to fix
+             * it rather than leaving a bare "Operation not permitted". */
+            if (errno == EPERM)
+            {
+                char abuf[8] = {0};
+                int afd = open(
+                    "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+                    O_RDONLY | O_CLOEXEC);
+                if (afd >= 0)
+                {
+                    ssize_t an = read(afd, abuf, sizeof(abuf) - 1);
+                    close(afd);
+                    if (an > 0 && abuf[0] == '1')
+                    {
+                        fprintf(stderr,
+                            "oci2bin: this kernel restricts unprivileged user "
+                            "namespaces via AppArmor\n"
+                            "         (kernel.apparmor_restrict_unprivileged_"
+                            "userns=1). Allow them with:\n"
+                            "           sudo sysctl -w kernel.apparmor_restrict"
+                            "_unprivileged_userns=0\n"
+                            "         (persist via /etc/sysctl.d/), or run "
+                            "inside a microVM with --vm.\n");
+                    }
+                }
+            }
             return 1;
         }
         debug_log("main.unshare", "flags=0x%x", ns_flags);
@@ -17279,7 +17313,7 @@ int main(int argc, char* argv[])
              * slirp4netns/pasta targeting the container's net namespace */
             close(sync_pipe[1]);
             char ready;
-            (void)read(sync_pipe[0], &ready, 1);
+            ignore_io_result(read(sync_pipe[0], &ready, 1));
             close(sync_pipe[0]);
 
             char pid_str[16];

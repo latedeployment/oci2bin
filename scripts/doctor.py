@@ -234,7 +234,29 @@ def _check_cgroup_v2():
         "mount -t cgroup2 cgroup2 /sys/fs/cgroup")
 
 
+def _read_sysctl_file(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
 def _check_userns_unprivileged():
+    # Ubuntu 23.10+ keeps unprivileged userns creation enabled but has AppArmor
+    # strip the new namespace's capabilities unless the binary has a profile.
+    # The follow-up unshare(NEWNS|NEWPID|NEWUTS) then fails with EPERM, so this
+    # knob is the real gate on those distros even when the clone knob is 1.
+    apparmor = _read_sysctl_file(
+        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+    if apparmor == "1":
+        return _result(
+            "unprivileged user namespaces", DEGRADED,
+            "kernel.apparmor_restrict_unprivileged_userns=1 "
+            "(AppArmor strips userns capabilities)",
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 "
+            "(persist via /etc/sysctl.d/), or run with --vm")
+
     path = "/proc/sys/kernel/unprivileged_userns_clone"
     if os.path.isfile(path):
         try:

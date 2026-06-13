@@ -61,6 +61,23 @@ small. Each dependency below is needed **only** for the feature in its row.
 | `libkrun.so.1` | `--vm` on a libkrun-built binary | Lazy — `dlopen`'d only when `--vm` runs; **see the note below** |
 | `qemu-<arch>-static` | running a foreign-arch fat-binary without binfmt | Optional fallback |
 
+### Unprivileged user namespaces (read this if a plain run says "Operation not permitted")
+
+A namespace-mode binary needs the kernel to allow **unprivileged user
+namespaces**. Most distros enable them by default. Two gotchas:
+
+- **Ubuntu 23.10+ / Debian-derived kernels** ship
+  `kernel.apparmor_restrict_unprivileged_userns=1`. The user namespace is still
+  created, but AppArmor strips its capabilities, so the follow-up
+  `unshare(NEWNS|NEWPID|NEWUTS)` fails with `EPERM` ("Operation not permitted").
+  The loader detects this and points you at the fix; relax it with
+  `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via
+  `/etc/sysctl.d/`), or run under a microVM with `--vm`.
+- **Hardened kernels** may set `kernel.unprivileged_userns_clone=0`; enable it
+  with `sudo sysctl -w kernel.unprivileged_userns_clone=1`.
+
+`oci2bin doctor` reports both knobs under **unprivileged user namespaces**.
+
 ### The libkrun note (read this if you build VM binaries)
 
 The **default** loader is fully static and adds no runtime library dependency —

@@ -2545,6 +2545,9 @@ resolve_pull_backend() {
     fi
     [[ "$PULL_BACKEND" == docker || "$PULL_BACKEND" == podman ]] && \
         CONTAINER_ENGINE="$PULL_BACKEND"
+    # Let build_polyglot.py (and other helpers) reuse the same engine instead
+    # of hardcoding `docker` when they need to `save` an image themselves.
+    [[ -n "$CONTAINER_ENGINE" ]] && export OCI2BIN_ENGINE="$CONTAINER_ENGINE"
     return 0
 }
 

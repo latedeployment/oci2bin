@@ -6,6 +6,28 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **Default build no longer hardcodes `docker` on podman-only hosts.**
+  `scripts/build_polyglot.py` and `scripts/reconstruct.py` shelled out to
+  `docker save` unconditionally, so a plain `oci2bin IMAGE` build aborted with
+  `FileNotFoundError: 'docker'` on a host that only has podman (e.g. a stock
+  Ubuntu/aarch64 box). Both now honor the engine the wrapper already resolved
+  via the new internal `OCI2BIN_ENGINE` variable (`--pull-with` aware), falling
+  back to auto-detecting `docker` → `podman` when run standalone.
+
+- **Loader compiles cleanly under glibc fortification (aarch64).** The
+  best-effort sync-pipe `(void)write(...)` / `(void)read(...)` calls tripped
+  `-Wunused-result` (the `(void)` cast does not suppress glibc's
+  `warn_unused_result`), emitting 8 warnings on Ubuntu's GCC. They now route
+  through an explicit `ignore_io_result()` helper — zero warnings on both
+  x86_64 and aarch64.
+
+- **Clear guidance when AppArmor blocks unprivileged user namespaces.** On
+  Ubuntu 23.10+ (`kernel.apparmor_restrict_unprivileged_userns=1`) a plain run
+  failed with a bare `unshare(NEWNS|NEWPID|NEWUTS): Operation not permitted`.
+  The loader now detects that knob and prints how to relax it (or to use
+  `--vm`), and `oci2bin doctor` reports it as DEGRADED instead of falsely
+  showing user namespaces as fully OK.
+
 - **Lifecycle and architecture edge cases in recent build/runtime paths.**
   `--detach --name` now records host-side container state before `chroot()` and
   reports the host PID used by `ps`/`stop`/`logs`; `oci2bin run` forwards the

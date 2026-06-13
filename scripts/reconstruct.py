@@ -26,6 +26,7 @@ import io
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -242,18 +243,28 @@ def main():
         tar_path = args.source
         print(f'oci2bin reconstruct: using {tar_path}', file=sys.stderr)
     else:
-        # Treat as Docker image name
+        # Treat as Docker image name. Honor the engine the oci2bin wrapper
+        # already resolved (OCI2BIN_ENGINE), else auto-detect docker → podman.
+        engine = os.environ.get('OCI2BIN_ENGINE')
+        if not engine:
+            engine = next((e for e in ('docker', 'podman')
+                           if shutil.which(e)), None)
+        if engine is None:
+            print('oci2bin reconstruct: no container engine found — install '
+                  'docker or podman, or pass a saved image tar instead.',
+                  file=sys.stderr)
+            sys.exit(1)
         tmp_tar = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
         tmp_tar.close()
         tar_path = tmp_tar.name
-        print(f'oci2bin reconstruct: running docker save {args.source!r} ...',
+        print(f'oci2bin reconstruct: running {engine} save {args.source!r} ...',
               file=sys.stderr)
         r = subprocess.run(
-            ['docker', 'save', '-o', tar_path, args.source],
+            [engine, 'save', '-o', tar_path, args.source],
             capture_output=True, text=True,
         )
         if r.returncode != 0:
-            print(f'docker save failed:\n{r.stderr}', file=sys.stderr)
+            print(f'{engine} save failed:\n{r.stderr}', file=sys.stderr)
             sys.exit(1)
 
     try:
