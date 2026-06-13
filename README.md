@@ -829,9 +829,15 @@ This is **not** a setuid issue — unprivileged user namespaces exist so that no
 root/setuid is needed. (The setuid `newuidmap`/`newgidmap` helpers only map
 *extra* sub-UID/GID ranges and are optional.) On hardened kernels you may
 instead need `sudo sysctl -w kernel.unprivileged_userns_clone=1`. `oci2bin
-doctor` reports both knobs — but it checks the *build* host, so verify the
-**runtime** host too. See
-[docs: Run Binaries → Rootless Requirements](docs/runtime.md) for details.
+doctor` reports both knobs — but it checks the *build* host. To check the
+**runtime** host where the binary will actually run, ask the binary itself:
+
+```bash
+./app.bin --doctor   # read-only readiness report (userns, seccomp, landlock,
+                     # cgroup v2, tar, /dev/kvm); exits non-zero if blocked
+```
+
+See [docs: Run Binaries → Rootless Requirements](docs/runtime.md) for details.
 
 ### Overriding the entrypoint
 

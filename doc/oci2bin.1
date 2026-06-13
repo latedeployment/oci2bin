@@ -548,6 +548,24 @@ Append newline-delimited JSON lifecycle events to
 .BI \-\-clock\-offset " SECS"
 Shift the container's monotonic/boottime clocks via a time namespace.
 .
+.TP
+.B \-\-doctor
+Report whether the current host can run the binary in namespace mode
+(unprivileged user namespaces and the AppArmor/clone knobs,
+.BR newuidmap / newgidmap " + " /etc/subuid ,
+seccomp, Landlock, cgroup v2,
+.BR tar ,
+and
+.I /dev/kvm
+for
+.BR \-\-vm ),
+then exit.
+Read-only: it never extracts the image or creates namespaces, and exits
+non-zero if a blocking issue is found.
+Unlike
+.B oci2bin doctor
+(which inspects the build host) this reflects the actual runtime host.
+.
 .SS Supervision, health, and devices
 .TP
 .BI \-\-restart " POLICY"

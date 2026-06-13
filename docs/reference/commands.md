@@ -132,6 +132,7 @@ Common runtime options:
 --no-hint
 --require-hint
 --debug
+--doctor              # report this host's runtime readiness, then exit
 ```
 
 ## Subcommands

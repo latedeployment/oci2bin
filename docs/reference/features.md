@@ -221,7 +221,8 @@ This page is a checklist of the feature surface documented by the site.
 | Checkpoint and restore | `oci2bin checkpoint NAME`, `oci2bin restore NAME` |
 | Declarative stack up/down | `oci2bin up`, `oci2bin down` |
 | Stack subcommands | `oci2bin stack up/down/logs/config` |
-| Host capability checks | `oci2bin doctor`, `oci2bin doctor --json` |
+| Host capability checks (build host) | `oci2bin doctor`, `oci2bin doctor --json` |
+| Host capability checks (runtime host) | `./app.bin --doctor` |
 | MCP server | `oci2bin mcp-serve` |
 | Prometheus metrics socket | `--metrics-socket PATH` |
 | Notifications | `--notify ntfy://...`, `gotify://`, `discord://`, `slack://`, `https://` |

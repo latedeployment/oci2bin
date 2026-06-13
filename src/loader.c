@@ -1342,6 +1342,24 @@ static int argv_has_debug_flag(int argc, char* argv[])
     return 0;
 }
 
+static int argv_has_doctor_flag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; i++)
+    {
+        /* Stop at "--" so a container command argument named --doctor is not
+         * intercepted as the loader's own preflight flag. */
+        if (strcmp(argv[i], "--") == 0)
+        {
+            return 0;
+        }
+        if (strcmp(argv[i], "--doctor") == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static const char* opts_net_mode(const struct container_opts* opts)
 {
     if (opts->net_join_pid > 0)
@@ -3075,7 +3093,10 @@ static ssize_t read_all_fd(int fd, char* buf, size_t len)
  * A plain `(void)write(...)` does NOT silence -Wunused-result under glibc's
  * fortified declarations (warn_unused_result), so route those calls through
  * this helper to make the "result intentionally ignored" explicit. */
-static void ignore_io_result(ssize_t r) { (void)r; }
+static void ignore_io_result(ssize_t r)
+{
+    (void)r;
+}
 
 static int write_all_fd(int fd, const char* data, size_t len)
 {
@@ -10946,6 +10967,143 @@ static int load_env_file(const char* path, struct container_opts* opts)
     return 0;
 }
 
+/*
+ * Read a small integer from a /proc/sys file. Returns the parsed value, or -1
+ * when the file is absent or unreadable (i.e. the knob is not present on this
+ * kernel). Read-only; safe to call before any namespace setup.
+ */
+static int read_proc_sys_int(const char* path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    char buf[32] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+    {
+        return -1;
+    }
+    return (int)strtol(buf, NULL, 10);
+}
+
+static void doctor_row(const char* check, const char* status,
+                       const char* detail)
+{
+    printf("  %-32s %-9s %s\n", check, status, detail);
+}
+
+/*
+ * --doctor: report whether THIS host can run the binary in namespace mode,
+ * then exit. Read-only — never extracts the image or creates namespaces, so it
+ * is safe to run anywhere the binary is shipped. Mirrors `oci2bin doctor`, but
+ * reflects the actual runtime host rather than the build host. Returns 0 when
+ * no blocking issue is found, 1 otherwise (handy for scripting).
+ */
+static int run_runtime_doctor(void)
+{
+    int issues = 0;
+    char helper[PATH_MAX];
+
+    printf("oci2bin runtime doctor — can this host run the binary?\n\n");
+    doctor_row("check", "status", "detail");
+    printf("  ----------------------------------------"
+           "----------------------------------\n");
+
+    /* Unprivileged user namespaces — the core requirement for a rootless run. */
+    int apparmor = read_proc_sys_int(
+                       "/proc/sys/kernel/apparmor_restrict_unprivileged_userns");
+    int clone = read_proc_sys_int(
+                    "/proc/sys/kernel/unprivileged_userns_clone");
+    if (apparmor == 1)
+    {
+        doctor_row("unprivileged user namespaces", "BLOCKED",
+                   "AppArmor strips userns caps; sudo sysctl -w kernel."
+                   "apparmor_restrict_unprivileged_userns=0 (or use --vm)");
+        issues++;
+    }
+    else if (clone == 0)
+    {
+        doctor_row("unprivileged user namespaces", "BLOCKED",
+                   "kernel.unprivileged_userns_clone=0; sudo sysctl -w "
+                   "kernel.unprivileged_userns_clone=1");
+        issues++;
+    }
+    else
+    {
+        doctor_row("unprivileged user namespaces", "OK",
+                   "enabled (no restrictive knob set)");
+    }
+
+    /* sub-UID/GID range mapping — optional; single-ID fallback otherwise. */
+    int have_newuid = find_helper_binary("newuidmap", helper,
+                                         sizeof(helper)) == 0;
+    int have_newgid = find_helper_binary("newgidmap", helper,
+                                         sizeof(helper)) == 0;
+    if (have_newuid && have_newgid)
+    {
+        int subuid = access("/etc/subuid", R_OK) == 0;
+        doctor_row("newuidmap / newgidmap", "OK",
+                   subuid ? "present (full sub-UID/GID range)"
+                   : "present, but /etc/subuid missing — single-ID fallback");
+    }
+    else
+    {
+        doctor_row("newuidmap / newgidmap", "DEGRADED",
+                   "missing — single-ID userns fallback (install uidmap)");
+    }
+
+    /* seccomp — PR_GET_SECCOMP returns the current mode, or -1 if unsupported. */
+    int seccomp_mode = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+    doctor_row("seccomp", seccomp_mode >= 0 ? "OK" : "DEGRADED",
+               seccomp_mode >= 0 ? "available (syscall filter applied by default)"
+               : "unavailable — runs without a seccomp filter");
+
+    /* landlock — filesystem sandbox. */
+    int have_landlock = kernel_supports_landlock();
+    doctor_row("landlock", have_landlock ? "OK" : "DEGRADED",
+               have_landlock ? "available (filesystem sandbox)"
+               : "unavailable — fs sandbox skipped");
+
+    /* cgroup v2 — resource limits. */
+    int cg2 = access("/sys/fs/cgroup/cgroup.controllers", F_OK) == 0;
+    doctor_row("cgroup v2", cg2 ? "OK" : "DEGRADED",
+               cg2 ? "present (--memory/--cpus limits available)"
+               : "absent — resource limits unavailable");
+
+    /* tar — the only universal runtime dependency. */
+    int have_tar = find_helper_binary("tar", helper, sizeof(helper)) == 0;
+    doctor_row("tar", have_tar ? "OK" : "MISSING",
+               have_tar ? "present (rootfs extraction)"
+               : "required for rootfs extraction — install tar");
+    if (!have_tar)
+    {
+        issues++;
+    }
+
+    /* /dev/kvm — only needed for --vm; namespace mode works without it. */
+    int have_kvm = access("/dev/kvm", R_OK | W_OK) == 0;
+    doctor_row("/dev/kvm (--vm only)", have_kvm ? "OK" : "DEGRADED",
+               have_kvm ? "accessible (microVM isolation available)"
+               : "absent/inaccessible — --vm unavailable");
+
+    printf("\n");
+    if (issues == 0)
+    {
+        printf("oci2bin: this host can run the binary in namespace mode.\n");
+    }
+    else
+    {
+        printf("oci2bin: %d blocking issue(s) — see BLOCKED/MISSING above.\n",
+               issues);
+    }
+    printf("oci2bin: note — encrypted (age) or compressed (zstd) payloads also "
+           "need those tools present at runtime.\n");
+    return issues == 0 ? 0 : 1;
+}
+
 static void usage(const char* prog)
 {
     fprintf(stderr,
@@ -11091,6 +11249,9 @@ static void usage(const char* prog)
             "  --ulimit TYPE=N     Set resource limit (nofile,nproc,cpu,as,fsize)\n"
             "  --config PATH       Load options from a key=value config file\n"
             "  --debug             Emit verbose runtime debug diagnostics\n"
+            "  --doctor            Report whether this host can run the binary\n"
+            "                      (unprivileged userns, seccomp, landlock, tar,\n"
+            "                      cgroup v2, /dev/kvm) and exit; no image is run\n"
             "  --vm               run container inside a microVM (requires KVM or HVF)\n"
             "  --vmm VMM          VMM backend: cloud-hypervisor, or path to binary\n"
             "                     (default: cloud-hypervisor; libkrun if compiled with LIBKRUN=1)\n"
@@ -16745,6 +16906,14 @@ int main(int argc, char* argv[])
         return mcp_serve_main(self_path, allow_net);
     }
 
+    /* 1c. --doctor: report this host's runtime readiness and exit (read-only;
+     * no image extraction, no namespace setup). Reflects the actual runtime
+     * host, unlike the build-host `oci2bin doctor`. */
+    if (argv_has_doctor_flag(argc, argv))
+    {
+        return run_runtime_doctor();
+    }
+
     /* 1b. oci2vm mode: if invoked as "oci2vm", prepend --vm to argv so VM
      * mode is the default without requiring an explicit flag. */
     char** vm_argv = NULL;
@@ -17187,8 +17356,8 @@ int main(int argc, char* argv[])
             {
                 char abuf[8] = {0};
                 int afd = open(
-                    "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
-                    O_RDONLY | O_CLOEXEC);
+                              "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+                              O_RDONLY | O_CLOEXEC);
                 if (afd >= 0)
                 {
                     ssize_t an = read(afd, abuf, sizeof(abuf) - 1);
@@ -17196,14 +17365,14 @@ int main(int argc, char* argv[])
                     if (an > 0 && abuf[0] == '1')
                     {
                         fprintf(stderr,
-                            "oci2bin: this kernel restricts unprivileged user "
-                            "namespaces via AppArmor\n"
-                            "         (kernel.apparmor_restrict_unprivileged_"
-                            "userns=1). Allow them with:\n"
-                            "           sudo sysctl -w kernel.apparmor_restrict"
-                            "_unprivileged_userns=0\n"
-                            "         (persist via /etc/sysctl.d/), or run "
-                            "inside a microVM with --vm.\n");
+                                "oci2bin: this kernel restricts unprivileged user "
+                                "namespaces via AppArmor\n"
+                                "         (kernel.apparmor_restrict_unprivileged_"
+                                "userns=1). Allow them with:\n"
+                                "           sudo sysctl -w kernel.apparmor_restrict"
+                                "_unprivileged_userns=0\n"
+                                "         (persist via /etc/sysctl.d/), or run "
+                                "inside a microVM with --vm.\n");
                     }
                 }
             }

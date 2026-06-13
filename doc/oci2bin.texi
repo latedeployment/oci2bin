@@ -198,6 +198,11 @@ Supervise and relaunch the workload.
 Run the image HEALTHCHECK; restart on unhealthy when paired with --restart.
 @item --metrics-socket P / --notify URL [--notify-name N] / --audit-log F / --clock-offset S
 Prometheus metrics socket, lifecycle notifications, JSON audit log, time-namespace clock offset.
+@item --doctor
+Report whether the current (runtime) host can run the binary in namespace mode
+(unprivileged user namespaces and the AppArmor/clone knobs, newuidmap/newgidmap,
+seccomp, Landlock, cgroup v2, tar, /dev/kvm) and exit; read-only, exits non-zero
+if blocked. Complements the build-host @command{oci2bin doctor}.
 @item --vm [--vmm VMM] [--memory/--cpus]
 Run inside a hardware-isolated microVM (libkrun or cloud-hypervisor).
 @end table

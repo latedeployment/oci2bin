@@ -2444,6 +2444,47 @@ static void test_read_write_file(void)
     unlink(path);
 }
 
+/* ── test_runtime_doctor_helpers ──────────────────────────────────────────── */
+
+static void test_runtime_doctor_helpers(void)
+{
+    /* read_proc_sys_int: parses the leading integer; -1 when absent. */
+    char path[] = "/tmp/oci2bin-procsys-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT(fd >= 0, "doctor: mkstemp succeeds");
+    if (fd >= 0)
+    {
+        ASSERT_INT_EQ(write_all_fd(fd, "1\n", 2), 0, "doctor: write '1'");
+        close(fd);
+        ASSERT_INT_EQ(read_proc_sys_int(path), 1,
+                      "doctor: read_proc_sys_int parses 1");
+
+        fd = open(path, O_WRONLY | O_TRUNC);
+        ASSERT(fd >= 0, "doctor: reopen temp for '0'");
+        if (fd >= 0)
+        {
+            ASSERT_INT_EQ(write_all_fd(fd, "0\n", 2), 0, "doctor: write '0'");
+            close(fd);
+            ASSERT_INT_EQ(read_proc_sys_int(path), 0,
+                          "doctor: read_proc_sys_int parses 0");
+        }
+        unlink(path);
+    }
+    ASSERT_INT_EQ(read_proc_sys_int("/tmp/oci2bin-no-such-sysctl-xyz"), -1,
+                  "doctor: read_proc_sys_int missing path returns -1");
+
+    /* argv_has_doctor_flag: detects --doctor, but stops at "--". */
+    char* a1[] = { "app", "--doctor", NULL };
+    ASSERT_INT_EQ(argv_has_doctor_flag(2, a1), 1,
+                  "doctor: --doctor detected");
+    char* a2[] = { "app", "run", NULL };
+    ASSERT_INT_EQ(argv_has_doctor_flag(2, a2), 0,
+                  "doctor: absent returns 0");
+    char* a3[] = { "app", "--", "--doctor", NULL };
+    ASSERT_INT_EQ(argv_has_doctor_flag(3, a3), 0,
+                  "doctor: --doctor after -- is not intercepted");
+}
+
 /* ── test_copy_n_bytes ────────────────────────────────────────────────────── */
 
 static void test_copy_n_bytes(void)
@@ -5449,6 +5490,7 @@ int main(void)
     test_parent_dir_path();
     test_read_write_all_fd();
     test_read_write_file();
+    test_runtime_doctor_helpers();
     test_copy_n_bytes();
     test_blob_is_age_encrypted();
     test_blob_age_is_passphrase();

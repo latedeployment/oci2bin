@@ -57,12 +57,21 @@ sudo sysctl -w kernel.unprivileged_userns_clone=1
 
 `oci2bin doctor` reports both knobs (under **unprivileged user namespaces**),
 but it only inspects the **build** host. When you ship the binary to a different
-machine, check that host directly:
+machine, ask the binary itself to check that host:
+
+```bash
+./app.bin --doctor      # report this host's runtime readiness, then exit
+```
+
+`--doctor` is read-only — it never extracts the image or creates namespaces. It
+reports unprivileged user namespaces (including the AppArmor / `clone` knobs
+above), `newuidmap`/`newgidmap` + `/etc/subuid`, seccomp, landlock, cgroup v2,
+`tar`, and `/dev/kvm` (for `--vm`), then exits non-zero if a blocking issue is
+found. You can also probe the kernel knobs by hand:
 
 ```bash
 sysctl kernel.apparmor_restrict_unprivileged_userns   # want 0 (or absent)
 sysctl kernel.unprivileged_userns_clone               # want 1 (or absent)
-unshare --user --map-root-user --pid --mount-proc true && echo "userns OK"
 ```
 
 ## Commands And Entrypoints

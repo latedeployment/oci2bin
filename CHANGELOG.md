@@ -64,6 +64,17 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`--doctor`: runner-side readiness check on the generated binary.** Run
+  `./app.bin --doctor` on the **target** host to report whether it can run the
+  container in namespace mode — unprivileged user namespaces (including the
+  AppArmor / `unprivileged_userns_clone` knobs), `newuidmap`/`newgidmap` +
+  `/etc/subuid`, seccomp, Landlock, cgroup v2, `tar`, and `/dev/kvm` (for
+  `--vm`) — then exit non-zero if a blocking issue is found. It is read-only:
+  it never extracts the image or creates namespaces. Complements the build-host
+  `oci2bin doctor`, which cannot see the host a shipped binary lands on. Parsing
+  stops at `--`, so a container command argument named `--doctor` is passed
+  through untouched.
+
 - **`--pull-with docker|podman|skopeo` and a native skopeo pull backend.** The
   default `oci2bin IMAGE` build now resolves a pull backend (auto-detect order
   docker → podman → skopeo, or forced with `--pull-with`). The skopeo backend
