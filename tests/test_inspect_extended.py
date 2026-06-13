@@ -3,9 +3,13 @@ Smoke tests for the extended human + JSON output of inspect_image.py.
 """
 
 import json
+import io
 import pathlib
 import subprocess
+import struct
 import sys
+import tarfile
+import tempfile
 import unittest
 
 
@@ -63,6 +67,53 @@ class RedactEnvTest(unittest.TestCase):
         self.assertIn("API_KEY=<redacted>", out)
         self.assertIn("MY_TOKEN=<redacted>", out)
         self.assertIn("DB_PASSWORD=<redacted>", out)
+
+
+class ReadOciDataTest(unittest.TestCase):
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "inspect_image", _SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _tar_bytes(self):
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w") as tf:
+            data = b"{}"
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        return out.getvalue()
+
+    def _binary_with_markers(self, order):
+        blob = self._tar_bytes()
+        oci_offset = 4096
+        loader = bytearray(512)
+        if order == "offset-size":
+            loader[128:136] = struct.pack("<Q", oci_offset)
+            loader[136:144] = struct.pack("<Q", len(blob))
+        else:
+            loader[128:136] = struct.pack("<Q", len(blob))
+            loader[136:144] = struct.pack("<Q", oci_offset)
+        return bytes(loader) + b"\0" * (oci_offset - len(loader)) + blob, blob
+
+    def test_read_oci_data_accepts_offset_size_marker_order(self):
+        mod = self._mod()
+        data, blob = self._binary_with_markers("offset-size")
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(data)
+            f.flush()
+            self.assertEqual(mod.read_oci_data(f.name), blob)
+
+    def test_read_oci_data_accepts_size_offset_marker_order(self):
+        mod = self._mod()
+        data, blob = self._binary_with_markers("size-offset")
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(data)
+            f.flush()
+            self.assertEqual(mod.read_oci_data(f.name), blob)
 
 
 class RenderFormatTest(unittest.TestCase):

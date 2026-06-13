@@ -145,29 +145,40 @@ def read_oci_data(binary_path):
     oci_offset = None
     oci_size = None
 
-    # Scan uint64 values in the loader region looking for a plausible offset
-    for pos in range(0, len(loader_region) - 16, 8):
-        candidate_offset = struct.unpack_from('<Q', loader_region, pos)[0]
-        candidate_size   = struct.unpack_from('<Q', loader_region, pos + 8)[0]
+    sentinels = (0xDEADBEEFCAFEBABE, 0xCAFEBABEDEADBEEF,
+                 0xAAAAAAAAAAAAAAAA, 0)
 
-        # Skip sentinel / unpatched values
-        if candidate_offset in (0xDEADBEEFCAFEBABE, 0xCAFEBABEDEADBEEF,
-                                 0xAAAAAAAAAAAAAAAA, 0):
-            continue
-
-        # Sanity checks
+    def valid_span(candidate_offset, candidate_size):
+        if candidate_offset in sentinels:
+            return False
         if candidate_offset >= file_size:
-            continue
+            return False
         if candidate_size == 0 or candidate_size > file_size:
-            continue
+            return False
         if candidate_offset + candidate_size > file_size:
-            continue
-
-        # Check for tar magic at the candidate offset
+            return False
         tar_region = data[candidate_offset:candidate_offset + 512]
-        if len(tar_region) >= 262 and tar_region[257:262] == b'ustar':
-            oci_offset = candidate_offset
-            oci_size   = candidate_size
+        return len(tar_region) >= 262 and tar_region[257:262] == b'ustar'
+
+    # Scan uint64 values in the loader region looking for a plausible offset.
+    # Older loader layouts may place offset,size next to each other; current
+    # compiler output stores size,offset. Accept either adjacent order.
+    for pos in range(0, len(loader_region) - 8, 8):
+        candidate_offset = struct.unpack_from('<Q', loader_region, pos)[0]
+        size_positions = []
+        if pos + 8 <= len(loader_region) - 8:
+            size_positions.append(pos + 8)
+        if pos >= 8:
+            size_positions.append(pos - 8)
+
+        for size_pos in size_positions:
+            candidate_size = struct.unpack_from('<Q', loader_region,
+                                                size_pos)[0]
+            if valid_span(candidate_offset, candidate_size):
+                oci_offset = candidate_offset
+                oci_size   = candidate_size
+                break
+        if oci_offset is not None:
             break
 
     if oci_offset is None:

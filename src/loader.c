@@ -4632,6 +4632,112 @@ static int maybe_decompress_oci_blob(const char* in_path, const char* tmpdir,
 }
 
 /*
+ * extract_embedded_oci_layout: copy the embedded OCI tar out of `self_path`,
+ * decrypt it (--encrypt) and inflate it (--compress-binary) as needed, prescan
+ * for unsafe tar entry names, and extract it into `<tmpdir>/oci`. On success
+ * writes that directory into `oci_dir_out` (size `oci_dir_sz`) and returns 0;
+ * returns -1 on any failure (diagnostic already printed). `tmpdir` must already
+ * exist. Shared by extract_oci_rootfs() and inspect_image_main() so the
+ * copy/decrypt/inflate/prescan/extract sequence lives in exactly one place.
+ */
+static int extract_embedded_oci_layout(const char* self_path,
+                                       const char* tmpdir,
+                                       char* oci_dir_out, size_t oci_dir_sz)
+{
+    char oci_tar_path[PATH_MAX];
+    if (path_join_suffix(oci_tar_path, sizeof(oci_tar_path), tmpdir,
+                         "/image.tar") < 0)
+    {
+        fprintf(stderr, "oci2bin: oci tar path too long\n");
+        return -1;
+    }
+
+    int self_fd = open(self_path, O_RDONLY);
+    if (self_fd < 0)
+    {
+        perror("open self");
+        return -1;
+    }
+    if (lseek(self_fd, (off_t)OCI_DATA_OFFSET, SEEK_SET) < 0)
+    {
+        perror("lseek");
+        close(self_fd);
+        return -1;
+    }
+    int out_fd = open(oci_tar_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (out_fd < 0)
+    {
+        perror("open oci tar");
+        close(self_fd);
+        return -1;
+    }
+    if (copy_n_bytes(self_fd, out_fd, OCI_DATA_SIZE) < 0)
+    {
+        fprintf(stderr, "oci2bin: error extracting embedded OCI data\n");
+        close(self_fd);
+        close(out_fd);
+        return -1;
+    }
+    close(self_fd);
+    close(out_fd);
+
+    /* Decrypt (--encrypt) then inflate (--compress-binary); tar_input tracks
+     * whichever plaintext tar we should actually read. */
+    const char* tar_input = oci_tar_path;
+    char decrypted_path[PATH_MAX];
+    int dec = maybe_decrypt_oci_blob(oci_tar_path, tmpdir,
+                                     decrypted_path, sizeof(decrypted_path));
+    if (dec < 0)
+    {
+        return -1;
+    }
+    if (dec == 1)
+    {
+        tar_input = decrypted_path;
+    }
+
+    char decompressed_path[PATH_MAX];
+    int unz = maybe_decompress_oci_blob(tar_input, tmpdir,
+                                        decompressed_path,
+                                        sizeof(decompressed_path));
+    if (unz < 0)
+    {
+        return -1;
+    }
+    if (unz == 1)
+    {
+        tar_input = decompressed_path;
+    }
+
+    if (path_join_suffix(oci_dir_out, oci_dir_sz, tmpdir, "/oci") < 0)
+    {
+        fprintf(stderr, "oci2bin: oci dir path too long\n");
+        return -1;
+    }
+    if (mkdir(oci_dir_out, 0700) < 0)
+    {
+        perror("mkdir oci_dir");
+        return -1;
+    }
+
+    if (tar_layer_prescan(tar_input) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: OCI tar contains unsafe entry names; refusing\n");
+        return -1;
+    }
+    char* tar_argv[] = {"tar", "xf", (char*)tar_input, "-C", oci_dir_out,
+                        "--no-same-permissions", "--no-same-owner", NULL
+                       };
+    if (run_cmd(tar_argv) != 0)
+    {
+        fprintf(stderr, "oci2bin: failed to extract OCI tar\n");
+        return -1;
+    }
+    return 0;
+}
+
+/*
  * Extract the OCI tar data from ourselves into a temp directory,
  * then parse manifest.json and extract layers into a rootfs.
  *
@@ -4651,105 +4757,13 @@ static char* extract_oci_rootfs(const char* self_path)
         return NULL;
     }
 
-    /* 1. Extract the embedded OCI tar from ourselves */
-    char oci_tar_path[PATH_MAX];
-    if (path_join_suffix(oci_tar_path, sizeof(oci_tar_path), tmpdir,
-                         "/image.tar") < 0)
-    {
-        fprintf(stderr, "oci2bin: oci tar path too long\n");
-        return NULL;
-    }
-
-    int self_fd = open(self_path, O_RDONLY);
-    if (self_fd < 0)
-    {
-        perror("open self");
-        return NULL;
-    }
-
-    if (lseek(self_fd, OCI_DATA_OFFSET, SEEK_SET) < 0)
-    {
-        perror("lseek");
-        close(self_fd);
-        return NULL;
-    }
-
-    int out_fd = open(oci_tar_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out_fd < 0)
-    {
-        perror("open oci tar");
-        close(self_fd);
-        return NULL;
-    }
-
-    if (copy_n_bytes(self_fd, out_fd, OCI_DATA_SIZE) < 0)
-    {
-        fprintf(stderr,
-                "oci2bin: error extracting embedded OCI data\n");
-        close(self_fd);
-        close(out_fd);
-        return NULL;
-    }
-    close(self_fd);
-    close(out_fd);
-
-    /* 1a. If the embedded payload is age-encrypted (--encrypt), decrypt it
-     * to a plaintext tar before any tar parsing. tar_input then points at
-     * whichever tar we should actually read. */
-    char decrypted_path[PATH_MAX];
-    const char* tar_input = oci_tar_path;
-    int dec = maybe_decrypt_oci_blob(oci_tar_path, tmpdir,
-                                     decrypted_path, sizeof(decrypted_path));
-    if (dec < 0)
-    {
-        return NULL;    /* error already reported */
-    }
-    if (dec == 1)
-    {
-        tar_input = decrypted_path;
-    }
-
-    /* 1b. If the payload is zstd-compressed (--compress-binary), inflate it
-     * after any decryption. tar_input then points at the plain tar. */
-    char decompressed_path[PATH_MAX];
-    int unz = maybe_decompress_oci_blob(tar_input, tmpdir,
-                                        decompressed_path,
-                                        sizeof(decompressed_path));
-    if (unz < 0)
-    {
-        return NULL;    /* error already reported */
-    }
-    if (unz == 1)
-    {
-        tar_input = decompressed_path;
-    }
-
-    /* 2. Extract the OCI tar into tmpdir/oci/ */
+    /* 1-2. Copy the embedded OCI tar out of ourselves, decrypt/inflate it as
+     * needed, prescan it, and extract it into tmpdir/oci/. */
     char oci_dir[PATH_MAX];
-    if (path_join_suffix(oci_dir, sizeof(oci_dir), tmpdir, "/oci") < 0)
+    if (extract_embedded_oci_layout(self_path, tmpdir,
+                                    oci_dir, sizeof(oci_dir)) < 0)
     {
-        fprintf(stderr, "oci2bin: oci dir path too long\n");
-        return NULL;
-    }
-    if (mkdir(oci_dir, 0755) < 0)
-    {
-        perror("mkdir oci_dir");
-        return NULL;
-    }
-
-    if (tar_layer_prescan(tar_input) < 0)
-    {
-        fprintf(stderr,
-                "oci2bin: OCI tar contains unsafe entry names; refusing\n");
-        return NULL;
-    }
-    char* tar_argv[] = {"tar", "xf", (char*)tar_input, "-C", oci_dir,
-                        "--no-same-permissions", "--no-same-owner", NULL
-                       };
-    if (run_cmd(tar_argv) != 0)
-    {
-        fprintf(stderr, "oci2bin: failed to extract OCI tar\n");
-        return NULL;
+        return NULL;    /* diagnostic already printed */
     }
 
     /* 3. Read manifest.json */
@@ -16218,92 +16232,13 @@ static int inspect_image_main(const char* self_path)
         return 1;
     }
 
-    char tar_path[PATH_MAX];
-    if (snprintf(tar_path, sizeof(tar_path), "%s/image.tar", tmpdir)
-            >= (int)sizeof(tar_path))
-    {
-        goto out;
-    }
-
-    {
-        int self_fd = open(self_path, O_RDONLY);
-        if (self_fd < 0)
-        {
-            goto out;
-        }
-        if (lseek(self_fd, (off_t)OCI_DATA_OFFSET, SEEK_SET) < 0)
-        {
-            close(self_fd);
-            goto out;
-        }
-        int out_fd = open(tar_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (out_fd < 0)
-        {
-            close(self_fd);
-            goto out;
-        }
-        if (copy_n_bytes(self_fd, out_fd, OCI_DATA_SIZE) < 0)
-        {
-            close(self_fd);
-            close(out_fd);
-            goto out;
-        }
-        close(self_fd);
-        close(out_fd);
-    }
-
-    /* Decrypt the payload first if it is age-encrypted (--encrypt). */
-    char dec_path[PATH_MAX];
-    const char* tar_input = tar_path;
-    {
-        int dec = maybe_decrypt_oci_blob(tar_path, tmpdir,
-                                         dec_path, sizeof(dec_path));
-        if (dec < 0)
-        {
-            goto out;
-        }
-        if (dec == 1)
-        {
-            tar_input = dec_path;
-        }
-    }
-
-    /* Inflate the payload if it is zstd-compressed (--compress-binary). */
-    char unz_path[PATH_MAX];
-    {
-        int unz = maybe_decompress_oci_blob(tar_input, tmpdir,
-                                            unz_path, sizeof(unz_path));
-        if (unz < 0)
-        {
-            goto out;
-        }
-        if (unz == 1)
-        {
-            tar_input = unz_path;
-        }
-    }
-
-    /* Extract OCI tar */
+    /* Copy + decrypt/inflate + prescan + extract the embedded OCI layout into
+     * tmpdir/oci/ (shared with extract_oci_rootfs). */
     char oci_dir[PATH_MAX];
-    if (snprintf(oci_dir, sizeof(oci_dir), "%s/oci", tmpdir)
-            >= (int)sizeof(oci_dir))
+    if (extract_embedded_oci_layout(self_path, tmpdir,
+                                    oci_dir, sizeof(oci_dir)) < 0)
     {
         goto out;
-    }
-    if (mkdir(oci_dir, 0700) < 0)
-    {
-        goto out;
-    }
-    {
-        char* tar_argv[] =
-        {
-            "tar", "xf", (char*)tar_input, "-C", oci_dir,
-            "--no-same-permissions", "--no-same-owner", NULL
-        };
-        if (run_cmd(tar_argv) != 0)
-        {
-            goto out;
-        }
     }
 
     /* Read manifest.json */
@@ -16330,12 +16265,13 @@ static int inspect_image_main(const char* self_path)
             goto out;
         }
 
-        /* Sanitize config digest: only alnum, ':', '-', '_' — no '/' to prevent
-         * path traversal when the digest is appended to oci_dir. */
+        /* Sanitize config filename: docker-save manifests commonly reference
+         * "<config-digest>.json".  Keep dots, but reject slash-like traversal
+         * by mapping anything outside this small filename alphabet to '_'. */
         for (char* p = config_digest; *p; p++)
         {
             if (!isalnum((unsigned char)*p) && *p != ':' &&
-                    *p != '-' && *p != '_')
+                    *p != '-' && *p != '_' && *p != '.')
             {
                 *p = '_';
             }

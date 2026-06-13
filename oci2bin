@@ -51,6 +51,9 @@
 #                         Inject a host directory recursively (repeatable)
 #   --oci-dir DIR         Use an OCI image layout directory instead of docker save
 #                         (skips docker pull/save; IMAGE arg used only for naming)
+#   --pull-with BACKEND   Force image pull backend: docker, podman, or skopeo
+#                         (default auto-detect: docker → podman → skopeo).
+#                         skopeo pulls daemonlessly via OCI layout conversion.
 #   --kernel PATH         Embed a vmlinux kernel blob (enables --vm mode)
 #   --initramfs PATH      Embed a pre-built initramfs cpio.gz blob
 #   --libkrun             Force libkrun loader (default: auto-detected)

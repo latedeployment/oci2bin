@@ -106,8 +106,8 @@ exhaustive reference.
 @item IMAGE / IMAGE@@sha256:DIGEST
 Build from a tag or a validated content digest (the digest is verified;
 mismatch aborts).
-@item --oci-dir DIR / --tar FILE
-Build from an OCI layout dir or a saved tar instead of pulling.
+@item --oci-dir DIR
+Build from an OCI layout directory instead of pulling.
 @item --pull-with docker|podman|skopeo
 Force the pull backend for the default @code{IMAGE} build (auto-detect order:
 docker, podman, skopeo). @code{skopeo} pulls daemonlessly, so no container

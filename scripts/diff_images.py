@@ -57,23 +57,34 @@ def read_oci_data(binary_path):
     loader_region = data[:8 * 1024 * 1024]
     file_size = len(data)
 
-    for pos in range(0, len(loader_region) - 16, 8):
-        candidate_offset = struct.unpack_from('<Q', loader_region, pos)[0]
-        candidate_size   = struct.unpack_from('<Q', loader_region, pos + 8)[0]
+    sentinels = (0xDEADBEEFCAFEBABE, 0xCAFEBABEDEADBEEF,
+                 0xAAAAAAAAAAAAAAAA, 0)
 
-        if candidate_offset in (0xDEADBEEFCAFEBABE, 0xCAFEBABEDEADBEEF,
-                                 0xAAAAAAAAAAAAAAAA, 0):
-            continue
+    def valid_span(candidate_offset, candidate_size):
+        if candidate_offset in sentinels:
+            return False
         if candidate_offset >= file_size:
-            continue
+            return False
         if candidate_size == 0 or candidate_size > file_size:
-            continue
+            return False
         if candidate_offset + candidate_size > file_size:
-            continue
-
+            return False
         tar_region = data[candidate_offset:candidate_offset + 512]
-        if len(tar_region) >= 262 and tar_region[257:262] == b'ustar':
-            return data[candidate_offset:candidate_offset + candidate_size]
+        return len(tar_region) >= 262 and tar_region[257:262] == b'ustar'
+
+    for pos in range(0, len(loader_region) - 8, 8):
+        candidate_offset = struct.unpack_from('<Q', loader_region, pos)[0]
+        size_positions = []
+        if pos + 8 <= len(loader_region) - 8:
+            size_positions.append(pos + 8)
+        if pos >= 8:
+            size_positions.append(pos - 8)
+
+        for size_pos in size_positions:
+            candidate_size = struct.unpack_from('<Q', loader_region,
+                                                size_pos)[0]
+            if valid_span(candidate_offset, candidate_size):
+                return data[candidate_offset:candidate_offset + candidate_size]
 
     print(f"diff: could not find embedded OCI tar in {binary_path}", file=sys.stderr)
     sys.exit(1)
