@@ -24,6 +24,20 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`--pull-with docker|podman|skopeo` and a native skopeo pull backend.** The
+  default `oci2bin IMAGE` build now resolves a pull backend (auto-detect order
+  docker → podman → skopeo, or forced with `--pull-with`). The skopeo backend
+  fetches with `skopeo copy docker://IMAGE oci:…` and reuses the `--oci-dir`
+  conversion, so `oci2bin IMAGE` builds with **no container engine at all** —
+  one command instead of a manual `skopeo copy` + `--oci-dir`. skopeo verifies
+  a digest-pinned reference natively, and selects the right image from a
+  multi-arch manifest for a non-host `--arch`. `--pull-with skopeo` is rejected
+  (not silently downgraded) with `--layer`, `--offline-only`, or cosign. The
+  unconditional `need docker` precondition was removed so podman-only and
+  daemonless builds are no longer blocked. `build-dockerfile`'s `FROM <image>`
+  uses the same docker → podman → skopeo precedence, and `doctor` now reports
+  skopeo as a valid (daemonless) pull backend.
+
 - **`oci2bin doctor`: OS-aware install summary.** After the check table, doctor
   detects the distro from `/etc/os-release` and prints a single
   `apt`/`dnf`/`pacman`/`zypper` command listing the correct packages for

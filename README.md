@@ -19,6 +19,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Run anywhere — no Docker, no daemon | `scp ./redis_7-alpine user@remote:/opt/redis/ && ssh user@remote /opt/redis/redis_7-alpine` |
 | Build from a chroot directory | `oci2bin from-chroot ./rootfs -o myapp.bin` |
 | Build from a Dockerfile | `oci2bin build-dockerfile -o myapp.bin` |
+| Daemonless pull (no Docker) | `oci2bin --pull-with skopeo redis:7-alpine` |
 | Inject secrets at runtime | `./myapp --secret /etc/ssl/key.pem:/run/secrets/key` |
 | TPM2-sealed secrets | `./myapp --secret tpm2:mykey` |
 | Kernel-protected secrets (no page cache, no swap) | automatic on Linux ≥ 5.14 via `memfd_secret` |
@@ -608,6 +609,25 @@ oci2bin --oci-dir ./redis-oci redis:7-alpine redis_7-alpine
 ```
 
 The `IMAGE` argument is optional and used only for the output filename default and embedded metadata. Compatible with `--add-file`, `--add-dir`, and `--strip`.
+
+### Choosing a pull backend (`--pull-with`)
+
+The default `oci2bin IMAGE` path auto-detects a pull backend in the order
+**docker → podman → skopeo**. `skopeo` makes the build fully daemonless without
+the manual `skopeo copy` + `--oci-dir` two-step — one command:
+
+```bash
+oci2bin --pull-with skopeo redis:7-alpine    # no docker/podman needed
+oci2bin --pull-with podman alpine:latest
+```
+
+A backend is only required for this default path; `--oci-dir`, `from-chroot`,
+and `build-dockerfile` need none. `--pull-with skopeo` does not support
+`--layer`, `--offline-only`, or cosign verification (which require the
+docker/podman CLI) and aborts rather than skipping them. For a non-host
+`--arch`, the skopeo backend selects the matching image from a multi-arch
+manifest. `build-dockerfile`'s `FROM <image>` uses the same docker → podman →
+skopeo precedence.
 
 ### Caching builds
 

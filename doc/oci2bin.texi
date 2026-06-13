@@ -108,6 +108,11 @@ Build from a tag or a validated content digest (the digest is verified;
 mismatch aborts).
 @item --oci-dir DIR / --tar FILE
 Build from an OCI layout dir or a saved tar instead of pulling.
+@item --pull-with docker|podman|skopeo
+Force the pull backend for the default @code{IMAGE} build (auto-detect order:
+docker, podman, skopeo). @code{skopeo} pulls daemonlessly, so no container
+engine is required; it does not support @option{--layer}, @option{--offline-only},
+or cosign verification.
 @item --arch x86_64|aarch64|all
 Cross-compile (both directions) or emit a multi-arch wrapper.
 @item --add-file H:C / --add-dir H:C

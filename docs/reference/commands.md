@@ -23,6 +23,7 @@ Common build options:
 --add-file HOST:CONTAINER
 --add-dir HOST:CONTAINER
 --oci-dir DIR
+--pull-with docker|podman|skopeo
 --label KEY=VAL
 --entrypoint JSON_OR_STRING
 --cmd JSON_OR_STRING

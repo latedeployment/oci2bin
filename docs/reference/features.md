@@ -7,6 +7,7 @@ This page is a checklist of the feature surface documented by the site.
 | Feature | Command |
 | --- | --- |
 | Build from Docker or Podman image | `oci2bin alpine:latest` |
+| Build daemonless with skopeo | `oci2bin --pull-with skopeo alpine:latest` |
 | Build (and validate) by image digest | `oci2bin alpine@sha256:<64-hex>` |
 | Build from OCI layout directory | `oci2bin --oci-dir ./layout alpine:latest` |
 | Build from chroot | `oci2bin from-chroot ./rootfs -o app.bin` |

@@ -747,18 +747,34 @@ def _do_from(state: _State, args: str, tmpdir: str) -> None:
         _inherit_config(state, cfg)
         return
 
-    if shutil.which("docker"):
-        print(f"oci2bin: FROM {image} (docker pull)", file=sys.stderr)
-        subprocess.run(["docker", "pull", image], check=True)
-        docker_tar = os.path.join(tmpdir, "base.tar")
-        subprocess.run(["docker", "save", "-o", docker_tar, image], check=True)
-        cfg = _extract_docker_save_to_rootfs(docker_tar, state.rootfs)
-        os.unlink(docker_tar)
+    # Remote image: prefer docker, then podman (CLI-compatible save/pull),
+    # then skopeo (daemonless copy into an OCI layout). Same precedence as the
+    # top-level `oci2bin` wrapper.
+    engine = "docker" if shutil.which("docker") else (
+        "podman" if shutil.which("podman") else None)
+    if engine:
+        print(f"oci2bin: FROM {image} ({engine} pull)", file=sys.stderr)
+        subprocess.run([engine, "pull", image], check=True)
+        save_tar = os.path.join(tmpdir, "base.tar")
+        subprocess.run([engine, "save", "-o", save_tar, image], check=True)
+        cfg = _extract_docker_save_to_rootfs(save_tar, state.rootfs)
+        os.unlink(save_tar)
         _inherit_config(state, cfg)
         return
 
-    print(f"error: FROM {image!r}: not a local OCI dir and docker not found",
-          file=sys.stderr)
+    if shutil.which("skopeo"):
+        print(f"oci2bin: FROM {image} (skopeo copy, no daemon)",
+              file=sys.stderr)
+        oci_dir = tempfile.mkdtemp(dir=tmpdir, prefix="from_oci_")
+        subprocess.run(["skopeo", "copy", f"docker://{image}",
+                        f"oci:{oci_dir}:latest"], check=True)
+        cfg = _extract_oci_to_rootfs(oci_dir, state.rootfs)
+        shutil.rmtree(oci_dir, ignore_errors=True)
+        _inherit_config(state, cfg)
+        return
+
+    print(f"error: FROM {image!r}: not a local OCI dir and no "
+          f"docker/podman/skopeo found", file=sys.stderr)
     sys.exit(1)
 
 

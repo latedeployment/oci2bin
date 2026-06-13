@@ -83,7 +83,7 @@ cloud-hypervisor backend. See
 | --- | --- | --- |
 | `gcc` + static libc (`glibc-static` or `musl-gcc`) | Compiling the loader (first build only; then cached) | Hard |
 | `python3` (stdlib only) | The builder itself | Hard |
-| `docker` or `podman` | Pulling/saving images | Optional - not needed with `--oci-dir`, `from-chroot`, or `build-dockerfile FROM scratch`/OCI dir |
+| `docker`, `podman`, or `skopeo` | Pull backend for `oci2bin IMAGE` (auto-detected docker → podman → skopeo; force with `--pull-with`) | Optional - not needed with `--oci-dir`, `from-chroot`, or `build-dockerfile FROM scratch`/OCI dir |
 | `zstd` | `--compress`, `--compress-binary` | Required for those flags |
 | `age` | `--encrypt`, `--passphrase` | Required for those flags |
 | `cosign` | `--verify-cosign`, `--require-cosign` | Required for those flags |
@@ -91,7 +91,7 @@ cloud-hypervisor backend. See
 | `openssl` | `sign`, `verify`, `--require-signed` | Required for signing |
 | aarch64 cross-toolchain + sysroot | `--arch aarch64` / `--arch all` | Required for cross builds |
 | `pkg-config` + `libkrun`/`libkrun-dev` | Building the libkrun VM loader | Required for that loader |
-| `skopeo` / `crane` / `buildah` | Producing OCI layouts for `--oci-dir` | Optional, your choice of tool |
+| `skopeo` / `crane` / `buildah` | Producing OCI layouts for `--oci-dir`; `skopeo` also works as a direct daemonless pull backend (`--pull-with skopeo`) | Optional, your choice of tool |
 
 ## Check a host
 

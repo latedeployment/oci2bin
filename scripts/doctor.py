@@ -108,13 +108,22 @@ def _check_docker_or_podman():
             return _result(
                 f"{tool}", OK,
                 (out.strip() or "present") + " — default build engine")
+    # skopeo is a fully daemonless pull backend: `oci2bin IMAGE` works through
+    # it (skopeo copy docker://… → OCI layout) with no docker/podman at all.
+    if _which("skopeo") is not None:
+        rc, out, _ = _run(["skopeo", "--version"])
+        return _result(
+            "skopeo", OK,
+            (out.strip() or "present")
+            + " — daemonless pull backend (no engine needed)")
     return _result(
         "docker/podman", DEGRADED,
-        "no container engine in PATH — the default build (pull/save) is "
-        "unavailable; build via --oci-dir (skopeo/crane/buildah), "
-        "from-chroot, or build-dockerfile instead",
-        "optional: install Docker (https://docs.docker.com/engine/install/) "
-        "or Podman (apt install podman / dnf install podman)")
+        "no pull backend in PATH — the default build is unavailable; install "
+        "skopeo for a daemonless pull, or build via --oci-dir, from-chroot, "
+        "or build-dockerfile instead",
+        "optional: install skopeo (apt/dnf install skopeo), Docker "
+        "(https://docs.docker.com/engine/install/), or Podman "
+        "(apt/dnf install podman)")
 
 
 def _check_newuidmap():
@@ -496,8 +505,8 @@ _PKGS = {
                                     "curl"],
                          "zypper": ["util-linux", "sqlite3", "systemd", "gdb",
                                     "curl"]},
-    "docker/podman":    {"apt": ["podman"], "dnf": ["podman"],
-                         "pacman": ["podman"], "zypper": ["podman"]},
+    "docker/podman":    {"apt": ["skopeo"], "dnf": ["skopeo"],
+                         "pacman": ["skopeo"], "zypper": ["skopeo"]},
 }
 
 # Cross-compiler package names differ per distro AND per target arch. Note the

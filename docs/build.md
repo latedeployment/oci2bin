@@ -2,7 +2,7 @@
 
 This page covers features that affect the generated file.
 
-## Build From Docker Or Podman
+## Build From Docker, Podman, Or Skopeo
 
 ```bash
 oci2bin alpine:latest
@@ -12,11 +12,36 @@ oci2bin redis:7-alpine redis_7-alpine
 If the image is not local, `oci2bin` pulls it. The image is saved as an OCI tar
 payload, combined with the loader, and written as one executable file.
 
-`oci2bin` uses `docker` if it is on `PATH`, otherwise it falls back to `podman`
-(its `pull`/`save`/`inspect` subcommands are CLI-compatible). A container engine
-is only needed for this default path — `--oci-dir`, `from-chroot`, and
-`build-dockerfile` build without one. `oci2bin doctor` reports the engine as
-*optional* for the same reason.
+### Pull backend (`--pull-with`)
+
+The default `oci2bin IMAGE` path fetches the image with one of three backends,
+auto-detected in the order **docker → podman → skopeo**:
+
+| Backend  | How it fetches                                  | Daemon? |
+|----------|-------------------------------------------------|---------|
+| `docker` | `docker pull` + `docker save`                   | yes     |
+| `podman` | `podman pull` + `podman save` (CLI-compatible)  | no      |
+| `skopeo` | `skopeo copy docker://IMAGE oci:…` → OCI layout | no      |
+
+`skopeo` makes `oci2bin IMAGE` work with **no container engine at all** — one
+command, no manual `skopeo copy` + `--oci-dir` two-step. Force a specific
+backend with `--pull-with`:
+
+```bash
+oci2bin --pull-with skopeo alpine:latest        # daemonless pull
+oci2bin --pull-with podman redis:7-alpine
+```
+
+Notes:
+
+- A pull backend is only needed for this default path — `--oci-dir`,
+  `from-chroot`, and `build-dockerfile` build without one. `oci2bin doctor`
+  reports the backend as *optional* and accepts any of the three.
+- `--pull-with skopeo` does not support `--layer`, `--offline-only`, or cosign
+  verification (which need the docker/podman CLI); oci2bin aborts with a clear
+  message rather than silently skipping them.
+- For a non-host `--arch`, the skopeo backend selects the matching image from a
+  multi-arch manifest (`--override-arch`).
 
 ### Pin by digest (validated)
 
@@ -32,9 +57,11 @@ oci2bin verifies the digest before building: a digest-pinned image already in
 the local store is used without a pull (so `docker` never re-validates it), so
 oci2bin re-checks that the resolved image actually reports the requested digest
 and **refuses to build on a mismatch** — defending against a tampered or
-mis-tagged local image. A malformed digest is rejected up front. This pins the
-build *input*; [`--pin-digest`](#reproducible-builds-and-digest-pinning) pins
-what the *loader* re-checks at run time.
+mis-tagged local image. A malformed digest is rejected up front. With
+`--pull-with skopeo`, skopeo fetches the digest-pinned reference directly
+(`docker://name@sha256:…`) and verifies it on copy. This pins the build
+*input*; [`--pin-digest`](#reproducible-builds-and-digest-pinning) pins what the
+*loader* re-checks at run time.
 
 ## Build From An OCI Layout
 

@@ -1913,6 +1913,7 @@ STRIP_AUTO=0
 ADD_FILE_ARGS=()
 ADD_DIR_ARGS=()
 OCI_DIR=""
+PULL_WITH=""          # docker|podman|skopeo; empty = auto-detect
 KERNEL_PATH=""
 INITRAMFS_PATH=""
 EMBED_LOADER_LAYER=0
@@ -2007,6 +2008,14 @@ while [[ $# -gt 0 ]]; do
         --oci-dir)
             [[ $# -lt 2 ]] && { echo "oci2bin: --oci-dir requires a DIR argument" >&2; exit 1; }
             OCI_DIR="$2"
+            shift 2
+            ;;
+        --pull-with)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --pull-with requires docker|podman|skopeo" >&2; exit 1; }
+            case "$2" in
+                docker|podman|skopeo) PULL_WITH="$2" ;;
+                *) echo "oci2bin: --pull-with: unknown backend '$2' (use docker|podman|skopeo)" >&2; exit 1 ;;
+            esac
             shift 2
             ;;
         --kernel)
@@ -2311,7 +2320,10 @@ fi
 
 need "$CC_CROSS"
 need python3
-need docker
+# NB: no unconditional `need docker` here — the image pull backend (docker /
+# podman / skopeo) is resolved and required only on the path that actually
+# pulls (resolve_pull_backend); --oci-dir / from-chroot / build-dockerfile
+# need none.
 
 # ── build loader if needed ────────────────────────────────────────────────
 
@@ -2332,29 +2344,108 @@ else
     fi
 fi
 
-# ── container engine for the default build path ───────────────────────────
-# The default build pulls and `save`s the image via a container engine. podman
-# is CLI-compatible with the docker subcommands used here (image inspect, pull,
-# inspect, save), so it works as a drop-in fallback. The --oci-dir, from-chroot,
-# and build-dockerfile paths need no engine at all.
-if command -v docker >/dev/null 2>&1; then
-    CONTAINER_ENGINE=docker
-elif command -v podman >/dev/null 2>&1; then
-    CONTAINER_ENGINE=podman
-else
-    CONTAINER_ENGINE=""
-fi
+# ── pull backend for the default build path ───────────────────────────────
+# The default `oci2bin IMAGE` build needs a way to fetch and export the image.
+# Three backends are supported, selected by --pull-with or auto-detected in the
+# order docker → podman → skopeo:
+#   docker / podman  — `image inspect` + `pull` + `save` (podman is CLI-compatible)
+#   skopeo           — `skopeo copy docker://IMAGE oci:DIR` (no daemon at all),
+#                      converted with the same OCI-layout path as --oci-dir
+# None of this runs for --oci-dir / from-chroot / build-dockerfile, which need
+# no backend.
+CONTAINER_ENGINE=""        # docker|podman when the daemon/CLI path is used
+PULL_BACKEND=""            # resolved backend for the default path
 
+# Map oci2bin's target arch onto skopeo/OCI platform arch names.
+skopeo_arch_name() {
+    case "$1" in
+        x86_64)  echo amd64 ;;
+        aarch64) echo arm64 ;;
+        *)       echo "$1" ;;
+    esac
+}
+
+resolve_pull_backend() {
+    # Not needed when an OCI layout is supplied directly, or already resolved.
+    [[ -n "$OCI_DIR" || -n "$PULL_BACKEND" ]] && return 0
+    if [[ -n "$PULL_WITH" ]]; then
+        if ! command -v "$PULL_WITH" >/dev/null 2>&1; then
+            echo "oci2bin: --pull-with $PULL_WITH: '$PULL_WITH' not found in PATH" >&2
+            exit 1
+        fi
+        PULL_BACKEND="$PULL_WITH"
+    elif command -v docker >/dev/null 2>&1; then
+        PULL_BACKEND=docker
+    elif command -v podman >/dev/null 2>&1; then
+        PULL_BACKEND=podman
+    elif command -v skopeo >/dev/null 2>&1; then
+        PULL_BACKEND=skopeo
+    else
+        echo "oci2bin: no image pull backend found — install docker, podman, or skopeo," >&2
+        echo "         or build without one via --oci-dir, from-chroot, or build-dockerfile." >&2
+        exit 1
+    fi
+    [[ "$PULL_BACKEND" == docker || "$PULL_BACKEND" == podman ]] && \
+        CONTAINER_ENGINE="$PULL_BACKEND"
+    return 0
+}
+
+# Assert a docker/podman CLI for steps that genuinely need it (image saves for
+# --layer, ensure_base_tar). skopeo is not a substitute there.
 require_engine() {
+    resolve_pull_backend
     [[ -n "$CONTAINER_ENGINE" ]] && return 0
-    echo "oci2bin: no container engine found — need 'docker' or 'podman' in PATH" \
-         "to pull/save '$IMAGE'." >&2
-    echo "         To build without a container engine, use one of:" >&2
-    echo "           --oci-dir DIR          (an OCI layout from skopeo/crane/buildah)" >&2
-    echo "           oci2bin from-chroot …  (pack an existing rootfs directory)" >&2
-    echo "           oci2bin build-dockerfile … (daemonless Dockerfile build)" >&2
+    echo "oci2bin: this step needs 'docker' or 'podman' in PATH${PULL_WITH:+ (got --pull-with $PULL_WITH)}." >&2
     exit 1
 }
+
+# Cumulative temp-dir cleanup: a single EXIT trap that removes every path
+# registered below. (A plain `trap '...' EXIT` per branch would overwrite the
+# previous one, so e.g. the skopeo layout + the converted-tar dir could not
+# both be cleaned.)
+_CLEANUP_PATHS=()
+_cleanup_build_tmp() {
+    local p
+    for p in "${_CLEANUP_PATHS[@]}"; do
+        [[ -n "$p" ]] && rm -rf "$p"
+    done
+}
+trap _cleanup_build_tmp EXIT
+
+# ── skopeo pull: fetch into an OCI layout, then reuse the --oci-dir path ──
+# This makes `oci2bin IMAGE` work with no daemon — one command instead of a
+# manual `skopeo copy` + `--oci-dir`. skopeo verifies a digest-pinned
+# reference natively on copy, so PINNED_DIGEST needs no extra check here.
+resolve_pull_backend
+if [[ -z "$OCI_DIR" && "$PULL_BACKEND" == "skopeo" ]]; then
+    # Fail loud rather than silently skip docker-only features / security checks.
+    if [[ "$VERIFY_COSIGN" -eq 1 ]]; then
+        echo "oci2bin: cosign verification is not supported with the skopeo backend yet;" >&2
+        echo "         use --pull-with docker|podman." >&2
+        exit 1
+    fi
+    if [[ "${#LAYER_IMAGES[@]}" -gt 0 ]]; then
+        echo "oci2bin: --layer requires the docker/podman backend." >&2
+        exit 1
+    fi
+    if [[ "$OFFLINE_ONLY" -eq 1 ]]; then
+        echo "oci2bin: --offline-only requires the docker/podman backend (local image store)." >&2
+        exit 1
+    fi
+    SKOPEO_OCI_TMPDIR="$(mktemp -d)"
+    _CLEANUP_PATHS+=("$SKOPEO_OCI_TMPDIR")
+    SK_COPY=(skopeo copy)
+    # Single-arch select for a cross/explicit target; skopeo otherwise copies
+    # the image matching the host platform out of a manifest list.
+    if [[ "$TARGET_ARCH" != "$HOST_ARCH" ]]; then
+        SK_COPY+=(--override-os linux --override-arch "$(skopeo_arch_name "$TARGET_ARCH")")
+    fi
+    echo "oci2bin: pulling $IMAGE with skopeo (no daemon)..."
+    "${SK_COPY[@]}" "docker://$IMAGE" "oci:$SKOPEO_OCI_TMPDIR:latest"
+    [[ -n "$PINNED_DIGEST" ]] && \
+        echo "oci2bin: digest pin verified by skopeo: $PINNED_DIGEST" >&2
+    OCI_DIR="$SKOPEO_OCI_TMPDIR"
+fi
 
 # ── OCI image layout: convert to docker-save tar, skip docker entirely ────
 
@@ -2364,7 +2455,7 @@ if [[ -n "$OCI_DIR" ]]; then
         exit 1
     fi
     OCI_TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "$OCI_TMPDIR"' EXIT
+    _CLEANUP_PATHS+=("$OCI_TMPDIR")
     OCI_TAR="$OCI_TMPDIR/oci_image.tar"
     echo "oci2bin: converting OCI image layout from $OCI_DIR..."
     python3 "$OCI2BIN_HOME/scripts/oci_layout_to_tar.py" \
@@ -2491,7 +2582,7 @@ fi  # close: if [[ -n "$OCI_DIR" ]]; then ... else ... fi
 
 if [[ "${#LAYER_IMAGES[@]}" -gt 0 ]]; then
     MERGE_TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "$MERGE_TMPDIR"' EXIT
+    _CLEANUP_PATHS+=("$MERGE_TMPDIR")
 
     # Save base image
     require_engine
@@ -2540,7 +2631,7 @@ ensure_base_tar() {
     [[ -n "$BUILD_TAR_ARG" ]] && return 0
     require_engine
     BASE_TAR_TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "$BASE_TAR_TMPDIR"' EXIT
+    _CLEANUP_PATHS+=("$BASE_TAR_TMPDIR")
     echo "oci2bin: saving $IMAGE for the build..."
     "$CONTAINER_ENGINE" save -o "$BASE_TAR_TMPDIR/base.tar" "$IMAGE"
     BUILD_TAR_ARG="$BASE_TAR_TMPDIR/base.tar"

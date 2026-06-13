@@ -16,6 +16,7 @@ oci2bin \- convert Docker/OCI images into self-contained rootless container exec
 .OP \-\-add\-file HOST:CONTAINER
 .OP \-\-add\-dir HOST:CONTAINER
 .OP \-\-oci\-dir DIR
+.OP \-\-pull\-with docker|podman|skopeo
 .I IMAGE\c
 .RI [: TAG ]
 .RI [ OUTPUT ]
@@ -155,6 +156,20 @@ Compatible with images produced by
 .BR crane (1),
 and
 .BR buildah (1).
+.
+.TP
+.BI \-\-pull\-with " docker|podman|skopeo"
+Force the pull backend used by the default
+.I IMAGE
+build instead of auto-detecting (order: docker, podman, skopeo).
+.B skopeo
+pulls daemonlessly
+.RB ( "skopeo copy docker://IMAGE oci:\&\&..." ),
+so no container engine is required.
+.B \-\-pull\-with skopeo
+does not support
+.BR \-\-layer ", " \-\-offline\-only ,
+or cosign verification, and aborts rather than skipping them.
 .
 .TP
 .B \-\-squash
@@ -868,6 +883,9 @@ oci2bin \-\-layer debugtools:latest myapp:latest myapp\-debug
 # Build without Docker, from an OCI layout directory
 skopeo copy docker://redis:7\-alpine oci:\&./redis\-oci:latest
 oci2bin \-\-oci\-dir \&./redis\-oci redis:7\-alpine
+
+# Build without a daemon in one step (skopeo pull backend)
+oci2bin \-\-pull\-with skopeo redis:7\-alpine
 .EE
 .
 .SS Runtime examples
