@@ -16,7 +16,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Feature | Example |
 |---------|---------|
 | Pack any image into a single binary | `oci2bin redis:7-alpine` |
-| Run anywhere — no Docker, no daemon | `scp redis_7-alpine remote && ssh remote ./redis_7-alpine` |
+| Run anywhere — no Docker, no daemon | `scp ./redis_7-alpine user@remote:/opt/redis/ && ssh user@remote /opt/redis/redis_7-alpine` |
 | Build from a chroot directory | `oci2bin from-chroot ./rootfs -o myapp.bin` |
 | Build from a Dockerfile | `oci2bin build-dockerfile -o myapp.bin` |
 | Inject secrets at runtime | `./myapp --secret /etc/ssl/key.pem:/run/secrets/key` |
@@ -24,6 +24,12 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Kernel-protected secrets (no page cache, no swap) | automatic on Linux ≥ 5.14 via `memfd_secret` |
 | SSH agent forwarding in builds | `RUN --mount=type=ssh git clone git@github.com:org/repo` |
 | Persistent build cache across runs | `RUN --mount=type=cache,target=/var/cache/apt apt-get install ...` |
+| GPUs / CDI devices | `./myapp --gpus all` |
+| Declarative multi-binary stacks | `oci2bin up -f stack.yaml` |
+| Restart policy (supervise + relaunch) | `./myapp --restart on-failure:5` |
+| Run the image HEALTHCHECK at runtime | `./myapp --health --restart always` |
+| Shrink the binary with zstd | `oci2bin --compress-binary zstd redis:7-alpine` |
+| Publish a Rekor transparency-log entry | `oci2bin sign --key priv.pem --rekor --in myapp.bin` |
 | Run as a lightweight VM | `oci2vm alpine:latest` |
 | Cross-architecture builds | `oci2bin --arch aarch64 alpine:latest` |
 | Fat binaries (x86 + arm in one file) | `oci2bin --arch all alpine:latest` |
@@ -53,6 +59,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
   - [Merging image layers](#merging-image-layers)
   - [Stripping images](#stripping-images)
   - [Squashing layers](#squashing-layers)
+  - [Compressing the binary](#compressing-the-binary---compress-binary)
   - [Verifying image signatures (cosign)](#verifying-image-signatures-cosign)
   - [Using OCI image layout](#using-oci-image-layout-no-docker-daemon)
   - [Caching builds](#caching-builds)
@@ -89,6 +96,8 @@ oci2bin alpine:latest    # produces ./alpine_latest
 - [Process management](#process-management)
   - [Init process and zombie reaping](#init-process-and-zombie-reaping)
   - [Running in background](#running-in-background)
+  - [Restart policy](#restart-policy)
+  - [Health checks](#health-checks)
   - [Named containers and lifecycle management](#named-containers-and-lifecycle-management)
   - [Interactive and TTY mode](#interactive-and-tty-mode)
 - [Subcommands](#subcommands)
@@ -164,7 +173,58 @@ oci2bin nginx:1.25 my-nginx  # explicit output name
 
 ## Building binaries
 
+### Pinning the source image by digest
+
+Build from an immutable content digest instead of a mutable tag by passing a
+`name@sha256:...` reference — the supply-chain-safe way to pin exactly what goes
+into the binary:
+
+```bash
+oci2bin alpine@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+# → builds ./alpine_25109184c71b   (output name = repo + short digest)
+```
+
+oci2bin **verifies the digest** before building. `docker pull` already rejects a
+content mismatch, but a digest-pinned image that is *already in the local store*
+is used without a pull — so oci2bin re-checks that the resolved image actually
+reports the requested digest (via its `RepoDigests`) and **refuses to build on a
+mismatch**. This catches a tampered or mis-tagged local image, not just a bad
+registry response. A malformed digest (not `sha256:` + 64 hex chars) is rejected
+up front.
+
+This is independent of [`--pin-digest`](#reproducible-builds-and-digest-pinning),
+which embeds a digest the *loader* re-checks at run time; digest pulls pin the
+*build input*. The two compose well.
+
+### Baking a different entrypoint/command at build time
+
+By default the binary runs the image's own `Entrypoint`/`Cmd`. Override what it
+runs *by default* — without a Dockerfile — with the build-time `--entrypoint`
+and `--cmd` flags:
+
+```bash
+# Shell-split string form
+oci2bin --entrypoint '/usr/bin/myserver --config /etc/app.conf' myapp:latest
+
+# JSON-array (exec) form, with a separate default command
+oci2bin --entrypoint '["redis-server"]' --cmd '["--port","6380"]' redis:7-alpine myredis
+```
+
+The value is parsed as a JSON array (`["a","b"]`) when it starts with `[`,
+otherwise it is shell-split. Setting `--entrypoint` without `--cmd` clears the
+image's default `Cmd` so the new entrypoint runs alone (matching
+`docker run --entrypoint`). These rewrite the embedded image config, so the
+change is baked into the artifact and shows up in `oci2bin inspect`.
+
+This is the build-time counterpart to the runtime
+[`--entrypoint`](#overriding-the-entrypoint) flag (which overrides per launch
+without rebuilding).
+
 ### Cross-architecture builds
+
+Cross-compilation works in **both directions** — the host's native architecture
+builds with plain `gcc`, and the other architecture uses a cross-compiler plus a
+matching glibc sysroot.
 
 Build an aarch64 binary on an x86_64 host with `--arch aarch64`:
 
@@ -175,13 +235,27 @@ sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
 oci2bin --arch aarch64 alpine:latest
 ```
 
-The sysroot defaults to `/usr/aarch64-redhat-linux/sys-root/fc43`. Override with:
+Build an x86_64 binary on an aarch64 host with `--arch x86_64`:
+
+```bash
+# Fedora
+sudo dnf install gcc-x86_64-linux-gnu sysroot-x86_64-fc43-glibc
+
+oci2bin --arch x86_64 alpine:latest
+```
+
+The sysroot defaults to `/usr/aarch64-redhat-linux/sys-root/fc43` (aarch64) or
+`/usr/x86_64-redhat-linux/sys-root/fc43` (x86_64). Override with the matching
+environment variable:
 
 ```bash
 AARCH64_SYSROOT=/path/to/sysroot oci2bin --arch aarch64 alpine:latest
+X86_64_SYSROOT=/path/to/sysroot  oci2bin --arch x86_64  alpine:latest
 ```
 
-The output runs only on aarch64 Linux (or under qemu-aarch64).
+The output runs only on the target architecture (or under the matching
+`qemu-<arch>-static`). `oci2bin doctor` reports whether the cross-compiler for
+the non-native architecture is installed.
 
 #### Multi-arch fat binaries
 
@@ -309,6 +383,36 @@ oci2bin --squash --compress zstd ubuntu:22.04 ubuntu-squashed
 ```
 
 `--compress zstd` requires the `zstd` binary to be installed. Whiteout entries are processed correctly so the squashed layer faithfully represents the final filesystem state.
+
+### Compressing the binary (--compress-binary)
+
+`--compress` above re-compresses *individual layers*. `--compress-binary zstd`
+instead inflates the per-layer gzip and recompresses the **entire embedded OCI
+payload** as one zstd-19 frame, which compresses the whole rootfs together far
+better than independent gzip streams:
+
+```bash
+oci2bin --compress-binary zstd redis:7-alpine myredis
+```
+
+How much it saves depends on the image: already-gzipped base images shrink
+modestly (Alpine ≈ 4.2 → 3.4 MB), while images with bulky, related, or poorly
+gzip-compressed content shrink substantially more. The win grows with image
+size, which is exactly when a smaller artifact matters.
+
+At run time the loader detects the zstd frame magic and inflates the payload
+(after any decryption) before extracting the rootfs — so the only added runtime
+dependency is the `zstd` binary, much like `age` for `--encrypt`. If `zstd` is
+not on `PATH` at run time the binary refuses to run with a clear message.
+
+Because the compressed payload is no longer a valid tar, a `--compress-binary`
+binary is **opaque** to `docker load`, `oci2bin reconstruct`, and `sbom` — the
+same trade-off as [`--encrypt`](#encrypting-the-embedded-image---encrypt).
+`oci2bin inspect` still reads it (the loader inflates internally). zstd frames
+carry no timestamp, so `--compress-binary` combines cleanly with
+[`--reproducible`](#reproducible-builds-and-digest-pinning), and it composes
+with `--encrypt` (compressed first, then encrypted; the loader decrypts then
+inflates).
 
 ### Image labels (for fleet management)
 
@@ -1112,6 +1216,70 @@ oci2bin pod run \
     ./myapp
 ```
 
+### Declarative stacks (oci2bin up)
+
+`oci2bin up` is a daemon-free, compose-lite runner: describe a set of oci2bin
+binaries in a stack file and bring them up as a unit, with startup ordering,
+per-service restart/health, ports, env, volumes, and service-name DNS.
+
+```yaml
+# stack.yaml
+name: blog
+net: host                 # host (default) | shared | none
+services:
+  db:
+    binary: ./postgres
+    env: { POSTGRES_PASSWORD: secret }
+    volumes: ["./pgdata:/var/lib/postgresql/data"]
+    restart: unless-stopped
+  app:
+    binary: ./ghost
+    depends_on: [db]        # started after db
+    env: { DB_HOST: db }    # 'db' resolves to the db service
+    ports: ["2368:2368"]
+    health: true            # run the image HEALTHCHECK; restart on unhealthy
+    restart: on-failure:5
+  proxy:
+    binary: ./caddy
+    depends_on: [app]
+    ports: ["80:80", "443:443"]
+    restart: always
+```
+
+```bash
+oci2bin up                       # foreground; uses ./stack.yaml
+oci2bin up -f blog.yaml -d        # start detached, return immediately
+oci2bin down blog                 # stop the detached stack (graceful, then kill)
+oci2bin stack logs blog app       # tail one service's logs (add -f to follow)
+oci2bin stack config -f blog.yaml # validate + print the resolved launch plan
+```
+
+Per-service keys: `binary` (required), `command` (argv override), `ports`
+(`-p`), `env` (mapping or `KEY=VALUE` list), `volumes` (`-v`), `depends_on`,
+`restart` (`no|on-failure[:N]|always|unless-stopped`), `health` /
+`health_cmd`, `aliases`, and `net` (per-service override). Each service name —
+and any `aliases` — resolves to `127.0.0.1` inside every service via injected
+`/etc/hosts` entries, so services reach each other by name.
+
+How it works and what to know:
+
+- **Ordering, not readiness.** `depends_on` controls *startup order* (a service
+  starts after its dependencies); it does not wait for them to become healthy.
+  Use `--start-delay SECONDS` to space out starts.
+- **Networking.** `net: host` (default) runs every service on the host network
+  — ports are bound directly and detached mode is supported. `net: shared`
+  uses a private shared namespace (a `pause` process, like `pod run`) so
+  services talk over loopback; it requires unprivileged user namespaces.
+- **Detached supervision is self-contained.** `up -d` forks a backgrounded
+  supervisor that tracks the real host PIDs of the services it starts and
+  redirects each service's output to a per-service log under
+  `$XDG_DATA_HOME/oci2bin/stacks/<name>/`. `down` signals each service's whole
+  process group (`SIGTERM`, then `SIGKILL` after a grace period, since a
+  container's PID 1 ignores `SIGTERM`). Restart/health are handled *inside*
+  each binary by its own supervisor.
+- **Format.** The stack file is a small YAML subset (block mappings, block and
+  flow scalar lists, `# comments`) — or plain JSON, which is always accepted.
+
 ### Read-only containers
 
 `--read-only` mounts the rootfs read-only via overlayfs. Writes go to a temporary upper layer discarded on exit. The on-disk rootfs is never modified.
@@ -1152,6 +1320,28 @@ Use cases:
 
 `DIR/upper` and `DIR/work` must be on the same filesystem. The immutable base
 (extracted OCI rootfs) is never modified.
+
+### Runtime profiles (--profile)
+
+`--profile NAME` applies a bundle of runtime **defaults** in one flag. Profiles
+only set defaults — any explicit flag on the same command line overrides the
+field it touches, so `--profile prod --cap-add net_raw` keeps the prod baseline
+but adds one capability.
+
+| Profile | Effect |
+|---------|--------|
+| `dev` | No-op marker: host network, read-write, full caps, default seccomp. Recorded in `oci2bin explain` and the audit log so a run is self-describing. |
+| `prod` | `--net none`, `--read-only`, drop all capabilities then re-add a safe baseline (`chown`, `dac_override`, `fowner`, `setgid`, `setuid`, `net_bind_service`, `kill`). |
+| `locked-down` | Everything `prod` does, plus Landlock **required** (not best-effort), `--strict` (fail closed on any security degradation), and default `--pids-limit 512` / `--memory 1g` if not set. |
+
+```bash
+./my-app --profile prod
+./my-app --profile locked-down
+./my-app --profile prod --cap-add net_raw --memory 2g   # override profile defaults
+```
+
+The selected profile is recorded in the binary's audit log and surfaced by
+`oci2bin explain`. The accepted names are `dev`, `prod`, and `locked-down`.
 
 ### Capabilities
 
@@ -1491,6 +1681,48 @@ Only numeric UIDs/GIDs are accepted. Values must be ≤ 65534. If any of `setgro
 
 The host path must start with `/dev/`. The container path defaults to the same path if omitted. oci2bin first attempts `mknod` with the host device's `st_rdev`; if that fails it falls back to a bind mount. Failure is non-fatal. May be repeated.
 
+By default the container is given the standard host `/dev` nodes (`null`, `zero`, `random`, `urandom`, `tty`, `full`). Pass `--no-host-dev` to skip bind-mounting them — useful for the most locked-down sandboxes where the workload needs no device access:
+
+```bash
+./my-app --no-host-dev
+```
+
+#### GPUs and CDI devices (--gpus / --cdi-device)
+
+For GPUs (and any other vendor device) the raw `--device` flag is rarely
+enough — a working GPU also needs driver libraries mounted and environment
+variables set. oci2bin reads [Container Device Interface
+(CDI)](https://github.com/cncf-tags/container-device-interface) specs and
+applies their full set of edits:
+
+```bash
+./my-app --gpus all                       # all NVIDIA GPUs
+./my-app --gpus 0                         # GPU index 0
+./my-app --cdi-device nvidia.com/gpu=all  # explicit CDI name (any vendor)
+./my-app --cdi-device intel.com/gpu=card0
+```
+
+`--gpus all` / `--gpus N` is sugar for `nvidia.com/gpu=all` / `nvidia.com/gpu=N`;
+a value containing `/` or `=` is treated as a full CDI device name, so `--gpus`
+works for non-NVIDIA vendors too. `--cdi-device KIND=DEVICE` is the general form
+and may be repeated.
+
+At startup (before any namespace setup) oci2bin scans `*.json` CDI specs in
+`/etc/cdi` and `/run/cdi` (and `/var/run/cdi`), finds the one whose `kind`
+matches, and applies that spec's **global** `containerEdits` plus the named
+device's edits:
+
+- `deviceNodes` → exposed like `--device` (validated to be under `/dev/`),
+- `mounts` → bind-mounted like `-v` (driver libraries, etc.),
+- `env` → set inside the container.
+
+Generate NVIDIA specs in JSON form with
+`nvidia-ctk cdi generate --format=json --output=/etc/cdi/nvidia.json`. Point at
+a non-standard location with `OCI2BIN_CDI_DIR=/path` (searched first). If the
+requested kind or device is not found, the run aborts with a clear message.
+Only JSON CDI specs are read (not YAML), and a single device's edits are capped
+at the runtime device/mount/env limits.
+
 ### Config file (--config)
 
 All runtime options can be loaded from a simple `key=value` text file with
@@ -1542,6 +1774,71 @@ kill "$PID"
 ```
 
 The child calls `setsid()` to detach from the terminal and redirects stdin from `/dev/null`. Combine with `--init` for a fully-managed background service.
+
+### Restart policy
+
+`--restart POLICY` makes the binary supervise its own workload and relaunch it
+on exit — a daemon-free alternative to a systemd `Restart=` unit (see
+[systemd](#systemd) if you do want a unit file). A supervising PID 1 inside the
+container forks the workload, reaps zombies (so this also subsumes `--init`),
+and decides whether to restart it each time it exits:
+
+| Policy | Restarts when… |
+|--------|----------------|
+| `no` (default) | never |
+| `on-failure[:N]` | the workload exits non-zero; at most `N` times when `N` is given (unlimited otherwise) |
+| `always` | the workload exits for any reason |
+| `unless-stopped` | like `always`, but an explicit `SIGTERM`/`SIGINT` stop suppresses the relaunch |
+
+```bash
+./myapp --restart on-failure:5            # retry up to 5 times on crash
+./myapp --restart always --detach --name myapp
+./myapp --restart unless-stopped
+```
+
+A one-second backoff separates attempts to avoid a hot crash loop. Each restart
+fires a `container_restart` [notification](#notifications-on-container-events)
+carrying the attempt number and the last exit code. When the supervisor finally
+returns, its exit code is the workload's last exit code. An explicit stop
+(`SIGTERM`/`SIGINT`, e.g. from `oci2bin stop`) always wins over `always` /
+`unless-stopped`.
+
+### Health checks
+
+`--health` runs the image's `HEALTHCHECK` on its declared interval (the same
+`Test`/`Interval`/`Timeout`/`Retries`/`StartPeriod` shown by
+[`inspect`](#inspect)) and acts on the result. After the configured number of
+consecutive failures the container is marked **unhealthy**: oci2bin logs the
+transition, fires the `healthcheck_fail`
+[notification](#notifications-on-container-events), and — when a
+[`--restart`](#restart-policy) policy is active — restarts the workload.
+
+```bash
+# Use the image's own HEALTHCHECK and restart it if it goes unhealthy
+./myapp --health --restart always
+
+# Define a probe when the image declares none (run via /bin/sh -c)
+./myapp --health-cmd 'curl -fsS http://localhost:8080/healthz || exit 1' \
+        --health-interval 10 --health-retries 3 --restart on-failure
+```
+
+| Flag | Description |
+|------|-------------|
+| `--health` | Run the image `HEALTHCHECK` (no-op if the image declares none and no `--health-cmd` is given) |
+| `--health-cmd CMD` | Probe command run as `/bin/sh -c CMD`; implies `--health` |
+| `--health-interval N` | Seconds between probes (default: image value or 30) |
+| `--health-timeout N` | Per-probe timeout in seconds; a timed-out probe counts as a failure (default: image value or 30) |
+| `--health-retries N` | Consecutive failures before "unhealthy" (default: image value or 3) |
+| `--health-start-period N` | Grace seconds after start before failures are counted (default: image value or 0) |
+| `--no-health` | Disable health monitoring even if the image declares a `HEALTHCHECK` |
+
+A `HEALTHCHECK` of `["NONE"]` (the image opting out) disables monitoring even
+with `--health`. Probe output is sent to `/dev/null`. Because the supervisor
+runs inside the container, the `healthcheck_fail` notification is best-effort
+in the same way other in-container notifications are (it needs `curl` and
+outbound networking — both available with the default `--net host`); the
+healthy↔unhealthy transitions are always written to the container log, visible
+via [`oci2bin logs`](#logs) for named/detached containers.
 
 ### Named containers and lifecycle management
 
@@ -1617,6 +1914,40 @@ oci2bin verify-file --key signing.pub --in ./update.json --sig ./update.json.sig
 `--verify-key` checks the signature at startup, before any rootfs extraction.
 If verification fails the process exits immediately without writing a single byte
 to disk.
+
+#### Rekor transparency log
+
+`oci2bin sign --rekor` additionally publishes a [Rekor](https://docs.sigstore.dev/rekor/overview/)
+`hashedrekord` transparency-log entry for the signed binary, so a tamper-evident
+public record exists that this key signed this artifact at this time:
+
+```bash
+oci2bin sign --key signing.key --rekor --in ./redis_7-alpine
+# Signed: ./redis_7-alpine (keyid: ...)
+# Rekor: logged to https://rekor.sigstore.dev (index 123456789); receipt
+#        written to ./redis_7-alpine.rekor.json
+```
+
+The receipt (`<binary>.rekor.json`) records the Rekor server, log index, entry
+UUID, and the sha256 of the signed content. Point at a private/self-hosted log
+with `--rekor-url URL` (default `https://rekor.sigstore.dev`). The embedded
+binary signature may use sha512, but Rekor's `hashedrekord` is sha256-based, so
+oci2bin uploads an **independent** sha256 ECDSA signature over the same signed
+content — the embedded trailer is unchanged.
+
+Confirm a binary's entry is in the log later with:
+
+```bash
+oci2bin verify --key signing.pub --rekor --in ./redis_7-alpine
+# Verified OK: ./redis_7-alpine (keyid: ..., hash: sha512)
+# Rekor: entry <uuid> confirmed in https://rekor.sigstore.dev
+```
+
+Both require the [`rekor-cli`](https://docs.sigstore.dev/rekor/installation/)
+binary. **`--rekor` is an explicit, opt-in network publish**: the artifact hash,
+signature, and public key become publicly visible in the transparency log and
+may be cached or indexed even if you later try to remove them. It pairs
+naturally with `--attest`.
 
 #### SLSA / in-toto provenance
 
@@ -1809,8 +2140,8 @@ Once built, the binary is fully self-contained:
 oci2bin build-dockerfile -o myapp
 
 # Distribute and run anywhere
-scp myapp remote-host:
-ssh remote-host ./myapp
+scp ./myapp deploy@remote-host.example.com:/opt/app/myapp
+ssh deploy@remote-host.example.com /opt/app/myapp
 ```
 
 ---
@@ -1833,6 +2164,42 @@ oci2bin: secret /run/secrets/mykey -> /run/secrets/mykey (read-only)
 
 TPM2-sealed secrets (decrypted via `systemd-creds`) also use `memfd_secret` when
 available, so the decrypted plaintext never enters the page cache.
+
+---
+
+## Environment variables
+
+oci2bin is tuned by a handful of environment variables — some read **at run
+time** by a produced binary, some **at build time** by the `oci2bin` CLI.
+
+### Run time (read by the produced binary)
+
+| Variable | Effect |
+|----------|--------|
+| `OCI2BIN_DEBUG` | Any value → verbose runtime diagnostics (same as `--debug`). |
+| `OCI2BIN_TMPDIR` | Extraction tmpdir, tried before `TMPDIR`; point at a tmpfs for speed and to keep the rootfs off disk. |
+| `TMPDIR` | Fallback extraction dir (then `/tmp`, then `/var/tmp`). |
+| `OCI2BIN_IDENTITY` | age identity (or SSH private key) to decrypt an `--encrypt` recipient image. |
+| `OCI2BIN_PASSWORD` / `OCI2BIN_PASSWORD_FILE` | Passphrase (or first line of a file) for a `--passphrase` image. |
+| `OCI2BIN_CDI_DIR` | Extra directory searched first for CDI specs (`--gpus`/`--cdi-device`). |
+| `SSH_AUTH_SOCK` | Host SSH-agent socket forwarded by `--ssh-agent`. |
+| `HOME` | Base for the named-container state dir (`~/.cache/oci2bin/containers/`). |
+
+### Build time (read by the `oci2bin` CLI)
+
+| Variable | Effect |
+|----------|--------|
+| `OCI2BIN_HOME` | Where shared resources (builder, prebuilt loaders) live; set by `make install`. |
+| `AARCH64_SYSROOT` / `X86_64_SYSROOT` | Cross-compiler sysroots for `--arch`. |
+| `SOURCE_DATE_EPOCH` | Fixed timestamp for `--reproducible` / `--offline-only`. |
+| `VM_CPUS` / `VM_MEM_MB` | Default vCPUs / memory baked into VM binaries. |
+| `XDG_CACHE_HOME` / `XDG_DATA_HOME` | Override `~/.cache` (build/layer caches) and `~/.local/share` (stack manifests, freeze tokens). |
+| `PREFIX` | Install prefix for `make install` (default `/usr/local`). |
+
+`OCI2BIN_INSPECT`, `OCI2BIN_VM_INIT`, `OCI2BIN_GOSU_DEPTH`, `OCI2BIN_META`,
+`OCI2BIN_SELF`, and `OCI2BIN_COSIGN_*` are set internally by oci2bin (mode
+switches, the gosu recursion guard, and passing the build-time cosign result
+into `sign --attest auto`); you do not set these yourself.
 
 ---
 
@@ -1874,11 +2241,14 @@ detail. On `MISSING` the row includes a `fix:` command. The exit
 code is non-zero only when at least one check is `MISSING`;
 `DEGRADED` (e.g. `cosign` not installed) is informational.
 
-Checks: `gcc`, static libc (`musl-gcc` or `gcc -static`),
-Docker/Podman, `newuidmap`/`newgidmap` and `/etc/subuid`/`subgid`,
-seccomp, Landlock ABI, cgroup v2 controllers, unprivileged user
-namespaces, `slirp4netns`/`pasta`, `/dev/kvm`/`libkrun`,
-`openssl`/`cosign`, `tar`/`gzip`/`zstd`.
+Checks: `gcc`, static libc (`musl-gcc` or `gcc -static`), the cross-compiler
+for the non-native architecture, Docker/Podman, `newuidmap`/`newgidmap` and
+`/etc/subuid`/`subgid`, seccomp, Landlock ABI, cgroup v2 controllers,
+unprivileged user namespaces, `slirp4netns`/`pasta`, `nftables`
+(`--allow-egress`), the VM backend (`/dev/kvm`, `libkrun`,
+`cloud-hypervisor`/`virtiofsd`), `openssl`/`cosign`, `rekor-cli`,
+`tar`/`gzip`/`zstd`, `age` (image encryption), and the optional runtime
+helpers (`nsenter`, `sqlite3`, `systemd-creds`, `gdb`, `curl`).
 
 ### explain
 

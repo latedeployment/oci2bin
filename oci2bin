@@ -11,6 +11,9 @@
 #   oci2bin sign-file --key KEY.pem --in FILE --out SIG
 #   oci2bin verify-file --key PUB.pem --in FILE --sig SIG
 #   oci2bin pod run [--net shared] [--ipc shared] BINARY [BINARY ...]
+#   oci2bin up [-f stack.yaml] [-d] [--start-delay SEC]   (declarative stack)
+#   oci2bin down [STACK_NAME | -f stack.yaml]
+#   oci2bin stack {up|down|logs|config} ...
 #   oci2bin run [BUILD_OPTS...] IMAGE [-- RUNTIME_ARGS...]
 #   oci2bin systemd BINARY [--user] [--restart always|on-failure|no]
 #   oci2bin healthcheck BINARY [--pid PID]
@@ -73,6 +76,9 @@
 #                         instead of recipients. Runtime: set OCI2BIN_PASSWORD
 #                         or OCI2BIN_PASSWORD_FILE, else prompts on the terminal
 #   --password-file F     Read the --passphrase from the first line of F
+#   --compress-binary zstd
+#                         Compress the embedded OCI payload with zstd (shrinks
+#                         the binary; opaque to docker load). Runtime needs zstd.
 #   --require-signed PUB  Embed a self-enforcing signature policy: refuse to run
 #                         unless a valid signature from PUB is present (then run
 #                         'oci2bin sign --key PRIV --in BINARY')
@@ -382,6 +388,25 @@ if [[ "${1:-}" == "explain" ]]; then
         exit 1
     fi
     exec python3 "$OCI2BIN_HOME/scripts/explain.py" "$@"
+fi
+
+# ── pod-stack subcommands (up / down / stack) ─────────────────────────────
+# Declarative compose-lite over oci2bin binaries. `down`/`logs` reuse the
+# existing named-container lifecycle, so pass our own path for callbacks.
+
+if [[ "${1:-}" == "up" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/pod_stack.py" --oci2bin "$0" up "$@"
+fi
+
+if [[ "${1:-}" == "down" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/pod_stack.py" --oci2bin "$0" down "$@"
+fi
+
+if [[ "${1:-}" == "stack" ]]; then
+    shift
+    exec python3 "$OCI2BIN_HOME/scripts/pod_stack.py" --oci2bin "$0" "$@"
 fi
 
 # ── sign subcommand ───────────────────────────────────────────────────────
@@ -1185,7 +1210,7 @@ if [[ "${1:-}" == "run" ]]; then
     RUN_IMAGE=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--self-update-url|--pin-digest|--recipient|--recipients-file|--password-file|--require-signed)
+            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--compress-binary|--entrypoint|--cmd|--self-update-url|--pin-digest|--recipient|--recipients-file|--password-file|--require-signed)
                 [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
                 BUILD_ARGS+=("$1" "$2")
                 shift 2
@@ -1902,6 +1927,9 @@ ENCRYPT_RECIPIENTS_FILES=()
 ENCRYPT_PASSPHRASE=0
 ENCRYPT_PASSWORD_FILE=""
 REQUIRE_SIGNED_KEY=""
+COMPRESS_BINARY=""
+SET_ENTRYPOINT=""
+SET_CMD=""
 SELF_UPDATE_URL=""
 PIN_DIGEST=""
 VERIFY_COSIGN=0
@@ -2059,6 +2087,26 @@ while [[ $# -gt 0 ]]; do
             ENCRYPT_PASSWORD_FILE="$2"
             shift 2
             ;;
+        --compress-binary)
+            # Optional value (defaults to zstd). Only consume the next token
+            # as the codec when it is a known codec, so positional IMAGE args
+            # are never swallowed.
+            if [[ "${2:-}" == "zstd" ]]; then
+                COMPRESS_BINARY="$2"; shift 2
+            else
+                COMPRESS_BINARY="zstd"; shift
+            fi
+            ;;
+        --entrypoint)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --entrypoint requires a value" >&2; exit 1; }
+            SET_ENTRYPOINT="$2"
+            shift 2
+            ;;
+        --cmd)
+            [[ $# -lt 2 ]] && { echo "oci2bin: --cmd requires a value" >&2; exit 1; }
+            SET_CMD="$2"
+            shift 2
+            ;;
         --require-signed)
             [[ $# -lt 2 ]] && { echo "oci2bin: --require-signed requires PUBKEY.pem" >&2; exit 1; }
             REQUIRE_SIGNED_KEY="$2"
@@ -2112,12 +2160,30 @@ if [[ $# -lt 1 ]]; then
 fi
 
 IMAGE="$1"
-# Derive output name from image: "nginx:1.25" -> "nginx_1.25"
+# Detect a content-pinned (digest) reference: "name@sha256:<64-hex>".
+# Validated after the pull below; used here to derive a clean output name.
+PINNED_DIGEST=""
+if [[ "$IMAGE" == *@sha256:* ]]; then
+    PINNED_DIGEST="${IMAGE##*@}"   # e.g. sha256:2510...
+    _dhex="${PINNED_DIGEST#sha256:}"
+    if [[ ! "$_dhex" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "oci2bin: invalid image digest '$PINNED_DIGEST'" \
+             "(expected sha256:<64 hex chars>)" >&2
+        exit 1
+    fi
+fi
+# Derive output name from image: "nginx:1.25" -> "nginx_1.25". For a digest
+# reference use "<repo>_<short-digest>" so the filename is not a 70-char sha.
 # In oci2vm mode prefix with "oci2vm_" so the loader's basename check fires.
-if [[ "$OCI2VM_MODE" -eq 1 ]]; then
-    OUTPUT="${2:-oci2vm_${IMAGE//[:\/]/_}}"
+if [[ -n "$PINNED_DIGEST" ]]; then
+    _name_src="${IMAGE%@*}_${_dhex:0:12}"
 else
-    OUTPUT="${2:-${IMAGE//[:\/]/_}}"
+    _name_src="$IMAGE"
+fi
+if [[ "$OCI2VM_MODE" -eq 1 ]]; then
+    OUTPUT="${2:-oci2vm_${_name_src//[:\/@]/_}}"
+else
+    OUTPUT="${2:-${_name_src//[:\/@]/_}}"
 fi
 shift 2 2>/dev/null || shift 1
 
@@ -2229,7 +2295,13 @@ if [[ "$TARGET_ARCH" == "$HOST_ARCH" ]]; then
 elif [[ "$TARGET_ARCH" == "aarch64" && "$HOST_ARCH" == "x86_64" ]]; then
     CC_CROSS="aarch64-linux-gnu-gcc"
     AARCH64_SYSROOT="${AARCH64_SYSROOT:-/usr/aarch64-redhat-linux/sys-root/fc43}"
-    CFLAGS_CROSS="--sysroot=$AARCH64_SYSROOT -isystem $AARCH64_SYSROOT/usr/include"
+    # The glibc-only sysroot ships no static libatomic.a but Fedora's gcc spec
+    # requests -latomic for aarch64 static links; our code uses no atomics.
+    CFLAGS_CROSS="--sysroot=$AARCH64_SYSROOT -isystem $AARCH64_SYSROOT/usr/include -fno-link-libatomic"
+elif [[ "$TARGET_ARCH" == "x86_64" && "$HOST_ARCH" == "aarch64" ]]; then
+    CC_CROSS="x86_64-linux-gnu-gcc"
+    X86_64_SYSROOT="${X86_64_SYSROOT:-/usr/x86_64-redhat-linux/sys-root/fc43}"
+    CFLAGS_CROSS="--sysroot=$X86_64_SYSROOT -isystem $X86_64_SYSROOT/usr/include"
 else
     echo "oci2bin: cross-compilation from $HOST_ARCH to $TARGET_ARCH is not supported" >&2
     exit 1
@@ -2249,7 +2321,7 @@ if [[ "$USE_LIBKRUN" -eq 1 ]]; then
     if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
         echo "oci2bin: building loader with libkrun for $TARGET_ARCH..."
         mkdir -p "$OCI2BIN_HOME/build"
-        $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC" -lkrun
+        $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC" -ldl
     fi
 else
     LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
@@ -2290,6 +2362,32 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     fi
     echo "oci2bin: pulling $IMAGE..."
     docker pull "$IMAGE"
+fi
+
+# ── validate a content-pinned (digest) reference ──────────────────────────
+# "name@sha256:HASH" is content-addressed. `docker pull` rejects a mismatch,
+# but a digest-pinned image that is ALREADY in the local store is used without
+# any pull (the inspect above succeeds), so docker never re-validates it. We
+# therefore verify the resolved image actually carries the requested digest —
+# defense against a tampered local image or a daemon/registry serving other
+# content. A mismatch aborts the build.
+if [[ -n "$PINNED_DIGEST" ]]; then
+    _matched=0
+    while IFS= read -r _rd; do
+        [[ "$_rd" == *"@$PINNED_DIGEST" ]] && { _matched=1; break; }
+    done < <(docker inspect --format \
+                 '{{range .RepoDigests}}{{println .}}{{end}}' \
+                 "$IMAGE" 2>/dev/null)
+    if [[ "$_matched" -ne 1 ]]; then
+        echo "oci2bin: SECURITY: image '$IMAGE' does not report the requested" \
+             "digest" >&2
+        echo "         $PINNED_DIGEST — the daemon/registry may be serving" \
+             "different content, or the local image was not pulled by digest." \
+             >&2
+        echo "         Refusing to build. Re-pull with: docker pull $IMAGE" >&2
+        exit 1
+    fi
+    echo "oci2bin: digest pin verified: $PINNED_DIGEST" >&2
 fi
 
 # ── cosign image signature verification ──────────────────────────────────
@@ -2507,6 +2605,9 @@ for _rf in "${ENCRYPT_RECIPIENTS_FILES[@]}"; do EMBED_LOADER_ARG+=(--recipients-
 [[ "$ENCRYPT_PASSPHRASE" -eq 1 ]] && EMBED_LOADER_ARG+=(--passphrase)
 [[ -n "$ENCRYPT_PASSWORD_FILE" ]] && EMBED_LOADER_ARG+=(--password-file "$ENCRYPT_PASSWORD_FILE")
 [[ -n "$REQUIRE_SIGNED_KEY" ]] && EMBED_LOADER_ARG+=(--require-signed "$REQUIRE_SIGNED_KEY")
+[[ -n "$COMPRESS_BINARY" ]] && EMBED_LOADER_ARG+=(--compress-binary "$COMPRESS_BINARY")
+[[ -n "$SET_ENTRYPOINT" ]] && EMBED_LOADER_ARG+=(--set-entrypoint "$SET_ENTRYPOINT")
+[[ -n "$SET_CMD" ]] && EMBED_LOADER_ARG+=(--set-cmd "$SET_CMD")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \

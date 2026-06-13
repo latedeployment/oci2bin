@@ -272,16 +272,22 @@ def _check_kvm_libkrun():
         if os.path.isfile(cand):
             libkrun = cand
             break
-    if libkrun:
-        notes.append(f"libkrun: {libkrun}")
-    if "/dev/kvm absent" in notes and not libkrun:
+    notes.append("libkrun: " + (libkrun if libkrun else "absent"))
+    # cloud-hypervisor backend: needs the VMM binary; virtiofsd for -v.
+    notes.append("cloud-hypervisor: "
+                 + ("present" if _which("cloud-hypervisor") else "absent"))
+    notes.append("virtiofsd: "
+                 + ("present" if _which("virtiofsd") else "absent"))
+    have_backend = bool(libkrun) or _which("cloud-hypervisor")
+    if "/dev/kvm absent" in notes or not have_backend:
         return _result(
-            "VM backend (KVM / libkrun)", DEGRADED,
+            "VM backend (KVM / libkrun / cloud-hypervisor)", DEGRADED,
             "; ".join(notes),
-            "install KVM (apt install qemu-kvm) and add user to "
-            "kvm group, or `make LIBKRUN=1` with libkrun-devel")
+            "install KVM (apt install qemu-kvm) and add user to the kvm "
+            "group; install libkrun, or cloud-hypervisor + virtiofsd")
     return _result(
-        "VM backend (KVM / libkrun)", OK, "; ".join(notes))
+        "VM backend (KVM / libkrun / cloud-hypervisor)", OK,
+        "; ".join(notes))
 
 
 def _check_openssl_cosign():
@@ -300,6 +306,82 @@ def _check_openssl_cosign():
         parts.append("cosign")
     return _result("signing tooling", status,
                    ", ".join(parts), fix)
+
+
+def _check_age():
+    if _which("age") is None:
+        return _result(
+            "age (image encryption)", DEGRADED,
+            "missing — --encrypt/--passphrase builds and encrypted binaries "
+            "cannot run",
+            "apt install age / dnf install age / pacman -S age")
+    return _result("age (image encryption)", OK, "present")
+
+
+def _check_nftables():
+    if _which("nft") is None:
+        return _result(
+            "nftables (--allow-egress)", DEGRADED,
+            "missing — default-deny egress allowlist unavailable",
+            "apt install nftables / dnf install nftables")
+    return _result("nftables (--allow-egress)", OK, "present")
+
+
+def _check_rekor():
+    if _which("rekor-cli") is None:
+        return _result(
+            "rekor-cli (transparency log)", DEGRADED,
+            "missing — sign/verify --rekor unavailable",
+            "see https://docs.sigstore.dev/rekor/installation/")
+    return _result("rekor-cli (transparency log)", OK, "present")
+
+
+def _check_runtime_helpers():
+    # Per-feature optional runtime helpers the loader/subcommands exec.
+    tools = [
+        ("nsenter", "oci2bin exec / freeze / thaw"),
+        ("sqlite3", "freeze / thaw snapshots"),
+        ("systemd-creds", "--secret tpm2:"),
+        ("gdb", "--gdb"),
+        ("curl", "--notify"),
+    ]
+    present = [t for t, _ in tools if _which(t)]
+    absent = [t for t, _ in tools if not _which(t)]
+    if not absent:
+        return _result("runtime helpers", OK, ", ".join(present))
+    return _result(
+        "runtime helpers", DEGRADED,
+        "present: " + (", ".join(present) or "none")
+        + "; missing (optional): " + ", ".join(absent),
+        "install as needed: util-linux (nsenter), sqlite3, "
+        "systemd (systemd-creds), gdb, curl")
+
+
+def _check_cross_toolchain():
+    # The native arch builds with plain gcc; the "other" arch needs a cross
+    # compiler. Pick the target opposite the host so `--arch` (the non-native
+    # direction) is what we probe — x86_64 host -> aarch64, aarch64 -> x86_64.
+    machine = os.uname().machine
+    if machine in ("aarch64", "arm64"):
+        target = "x86_64"
+        cands = ("x86_64-linux-gnu-gcc", "x86_64-redhat-linux-gcc")
+        pkg = "gcc-x86_64-linux-gnu / dnf install gcc-x86_64-linux-gnu"
+    else:
+        target = "aarch64"
+        cands = ("aarch64-linux-gnu-gcc", "aarch64-redhat-linux-gcc")
+        pkg = "gcc-aarch64-linux-gnu / dnf install gcc-aarch64-linux-gnu"
+    name = f"cross-compiler (-> {target})"
+    cc = None
+    for c in cands:
+        if _which(c):
+            cc = _which(c)
+            break
+    if cc is None:
+        return _result(
+            name, DEGRADED,
+            f"missing — cross-building for {target} (--arch) unavailable",
+            f"apt install {pkg}")
+    return _result(name, OK, cc)
 
 
 def _check_tar_gzip_zstd():
@@ -326,6 +408,7 @@ def _check_tar_gzip_zstd():
 CHECKS = [
     _check_gcc,
     _check_static_libc,
+    _check_cross_toolchain,
     _check_docker_or_podman,
     _check_newuidmap,
     _check_subid,
@@ -334,9 +417,13 @@ CHECKS = [
     _check_cgroup_v2,
     _check_userns_unprivileged,
     _check_slirp_or_pasta,
+    _check_nftables,
     _check_kvm_libkrun,
     _check_openssl_cosign,
+    _check_rekor,
     _check_tar_gzip_zstd,
+    _check_age,
+    _check_runtime_helpers,
 ]
 
 

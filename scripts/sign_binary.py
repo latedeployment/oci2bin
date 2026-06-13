@@ -472,6 +472,122 @@ def _attestation_bytes(att_json: dict) -> bytes:
         "utf-8")
 
 
+DEFAULT_REKOR_URL = "https://rekor.sigstore.dev"
+
+
+def _rekor_upload(out_path: str, signed_content: bytes, key_path: str,
+                  rekor_url: str) -> int:
+    """Submit a Rekor `hashedrekord` transparency-log entry for the signed
+    binary and record the result next to it as `<out>.rekor.json`.
+
+    The embedded binary signature may use sha512, but Rekor's hashedrekord is
+    sha256-based, so we upload an independent sha256 ECDSA signature over the
+    same signed content (the binary without its trailing OCI2BIN_SIG block).
+    This is an explicit, user-requested network publish (the --rekor flag);
+    the artifact hash, signature, and public key become publicly visible.
+
+    Returns 0 on success, 1 on failure. Requires `rekor-cli` and `openssl`.
+    """
+    if shutil_which("rekor-cli") is None:
+        print("sign_binary: --rekor requires the 'rekor-cli' binary on PATH "
+              "(https://docs.sigstore.dev/rekor/installation/)",
+              file=sys.stderr)
+        return 1
+
+    tmp_artifact = tmp_sig = tmp_pub = None
+    try:
+        # Independent sha256 signature over the signed content.
+        rekor_hash = _hash_bytes(signed_content, "sha256")
+        rekor_sig = _sign_hash_with_key(key_path, rekor_hash, "sha256")
+
+        with tempfile.NamedTemporaryFile(delete=False,
+                                         suffix=".bin") as af:
+            af.write(signed_content)
+            tmp_artifact = af.name
+        with tempfile.NamedTemporaryFile(delete=False,
+                                         suffix=".sig") as sf:
+            sf.write(rekor_sig)
+            tmp_sig = sf.name
+
+        # Derive the PEM public key from the private key for the entry.
+        with tempfile.NamedTemporaryFile(delete=False,
+                                         suffix=".pub") as pf:
+            tmp_pub = pf.name
+        pub = subprocess.run(
+            ["openssl", "pkey", "-in", key_path, "-pubout", "-out", tmp_pub],
+            capture_output=True)
+        if pub.returncode != 0:
+            print("sign_binary: --rekor: could not derive public key: "
+                  + pub.stderr.decode(errors="replace"), file=sys.stderr)
+            return 1
+
+        proc = subprocess.run(
+            ["rekor-cli", "upload",
+             "--rekor_server", rekor_url,
+             "--type", "hashedrekord",
+             "--artifact", tmp_artifact,
+             "--signature", tmp_sig,
+             "--public-key", tmp_pub,
+             "--pki-format", "x509",
+             "--format", "json"],
+            capture_output=True)
+        out_text = (proc.stdout or b"").decode(errors="replace")
+        err_text = (proc.stderr or b"").decode(errors="replace")
+        if proc.returncode != 0:
+            print("sign_binary: --rekor: upload failed: "
+                  + (err_text or out_text).strip(), file=sys.stderr)
+            return 1
+
+        # rekor-cli --format json prints a JSON object; fall back to scraping
+        # the human "Created entry at .../<uuid>" / "Index: N" lines.
+        location = ""
+        log_index = None
+        uuid = ""
+        try:
+            j = json.loads(out_text)
+            location = j.get("Location", "") or j.get("location", "")
+            if "Index" in j:
+                log_index = j["Index"]
+            uuid = j.get("UUID", "") or j.get("uuid", "")
+        except (json.JSONDecodeError, AttributeError):
+            for line in (out_text + "\n" + err_text).splitlines():
+                line = line.strip()
+                low = line.lower()
+                if low.startswith("created entry at") or "available at" in low:
+                    location = line.split()[-1]
+                    uuid = location.rstrip("/").rsplit("/", 1)[-1]
+                elif low.startswith("index:"):
+                    try:
+                        log_index = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+        if not uuid and location:
+            uuid = location.rstrip("/").rsplit("/", 1)[-1]
+
+        record = {
+            "rekorServer": rekor_url,
+            "logIndex": log_index,
+            "uuid": uuid,
+            "location": location,
+            "artifactSha256": rekor_hash.hex(),
+        }
+        sidecar = out_path + ".rekor.json"
+        with open(sidecar, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, sort_keys=True)
+            f.write("\n")
+        idx = log_index if log_index is not None else "?"
+        print(f"Rekor: logged to {rekor_url} (index {idx}); "
+              f"receipt written to {sidecar}")
+        return 0
+    finally:
+        for p in (tmp_artifact, tmp_sig, tmp_pub):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
 def cmd_sign(args):
     in_path = args.input
     out_path = args.output if args.output else in_path
@@ -576,6 +692,15 @@ def cmd_sign(args):
 
     suffix = " +attestation" if att_bytes else ""
     print(f"Signed: {out_path} (keyid: {keyid.hex()[:16]}...{suffix})")
+
+    # Optionally publish a Rekor transparency-log entry for the signed binary.
+    if getattr(args, "rekor", False):
+        rekor_url = getattr(args, "rekor_url", None) or DEFAULT_REKOR_URL
+        # `data` here is the signed content (binary without the sig block),
+        # which is exactly what the Rekor hashedrekord entry attests to.
+        rc = _rekor_upload(out_path, data, args.key, rekor_url)
+        if rc != 0:
+            return rc
     return 0
 
 
@@ -637,6 +762,48 @@ def cmd_verify(args):
         f"Verified OK: {args.input} "
         f"(keyid: {keyid.hex()[:16]}..., hash: {algorithm}{suffix})"
     )
+
+    if getattr(args, "rekor", False):
+        return _rekor_verify_inclusion(args.input)
+    return 0
+
+
+def _rekor_verify_inclusion(binary_path: str) -> int:
+    """Confirm a Rekor entry recorded in <binary>.rekor.json is in the log.
+
+    Returns 0 if the entry is found (or no receipt exists — nothing to check),
+    2 if a receipt exists but the entry cannot be confirmed. Requires
+    'rekor-cli' only when a receipt is present.
+    """
+    sidecar = binary_path + ".rekor.json"
+    if not os.path.exists(sidecar):
+        print(f"Rekor: no receipt ({sidecar}); nothing to verify")
+        return 0
+    try:
+        with open(sidecar, "r", encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"sign_binary: --rekor: cannot read {sidecar}: {e}",
+              file=sys.stderr)
+        return 2
+    uuid = record.get("uuid") or ""
+    rekor_url = record.get("rekorServer") or DEFAULT_REKOR_URL
+    if not uuid:
+        print(f"sign_binary: --rekor: {sidecar} has no uuid", file=sys.stderr)
+        return 2
+    if shutil_which("rekor-cli") is None:
+        print("sign_binary: --rekor: 'rekor-cli' not on PATH; cannot confirm "
+              "inclusion", file=sys.stderr)
+        return 2
+    proc = subprocess.run(
+        ["rekor-cli", "get", "--rekor_server", rekor_url, "--uuid", uuid],
+        capture_output=True)
+    if proc.returncode != 0:
+        print("Rekor: entry NOT found in log: "
+              + (proc.stderr or proc.stdout).decode(errors="replace").strip(),
+              file=sys.stderr)
+        return 2
+    print(f"Rekor: entry {uuid} confirmed in {rekor_url}")
     return 0
 
 
@@ -868,12 +1035,24 @@ def main():
                         choices=sorted(COSIGN_RESULTS),
                         help="Outcome of the build-time cosign verification "
                         "(verified|failed|skipped|unavailable).")
+    p_sign.add_argument("--rekor", action="store_true", default=False,
+                        help="After signing, publish a Rekor transparency-log "
+                        "entry (hashedrekord) for the binary and write the "
+                        "receipt to <out>.rekor.json. Requires 'rekor-cli'. "
+                        "This is a public network publish of the artifact "
+                        "hash, signature, and public key.")
+    p_sign.add_argument("--rekor-url", default=DEFAULT_REKOR_URL,
+                        help="Rekor server URL (default: %(default)s).")
 
     p_verify = sub.add_parser("verify", help="Verify a binary signature")
     p_verify.add_argument("--key", required=True, help="PEM public key")
     p_verify.add_argument("--in", dest="input", required=True, help="Binary to verify")
     p_verify.add_argument("--require-attestation", action="store_true",
                           help="Fail if no in-toto attestation is embedded")
+    p_verify.add_argument("--rekor", action="store_true", default=False,
+                          help="Also confirm the Rekor entry recorded in "
+                          "<in>.rekor.json is present in the transparency log "
+                          "(requires 'rekor-cli').")
 
     p_attest = sub.add_parser("attest-show",
                               help="Print the embedded in-toto attestation")

@@ -6,6 +6,121 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **Build-time `--entrypoint` / `--cmd` override** — change what the binary runs
+  by default on the plain `oci2bin IMAGE` path, without a Dockerfile. The flags
+  rewrite the embedded image config (`Entrypoint`/`Cmd`); the value is a JSON
+  array (`["a","b"]`) or a shell-split string, and `--entrypoint` without
+  `--cmd` clears the image's default `Cmd` (matching `docker run --entrypoint`).
+  Complements the existing runtime `--entrypoint` (per-launch, no rebuild).
+
+- **Build from a validated image digest** — `oci2bin name@sha256:<64-hex>`
+  builds from an immutable content digest instead of a mutable tag, and the
+  digest is verified before building. `docker pull` rejects a content mismatch,
+  but a digest-pinned image already in the local store is used without a pull
+  (so docker never re-validates it); oci2bin therefore re-checks that the
+  resolved image actually reports the requested digest (`RepoDigests`) and
+  refuses to build on a mismatch — catching a tampered or mis-tagged local
+  image. A malformed digest is rejected up front, and the default output name
+  is `<repo>_<short-digest>` rather than a 70-character sha.
+
+- **Bidirectional cross-compilation** — `--arch` now cross-compiles in both
+  directions: x86_64 host → aarch64 (existing) **and** aarch64 host → x86_64
+  (new), each with its own cross compiler and glibc sysroot
+  (`X86_64_SYSROOT` / `AARCH64_SYSROOT`). The Makefile and the wrapper select
+  the native compiler for the host arch and the cross compiler for the other.
+
+- **`oci2bin doctor` now covers every dependency** — added checks for `age`
+  (image encryption), `nftables` (`--allow-egress`), `rekor-cli`, the
+  cloud-hypervisor/virtiofsd VM backend, the non-native cross-compiler, and the
+  optional runtime helpers (`nsenter`, `sqlite3`, `systemd-creds`, `gdb`,
+  `curl`). The VM-backend row reports `/dev/kvm`, libkrun, cloud-hypervisor, and
+  virtiofsd together. A new `docs/reference/dependencies.md` lists every
+  build-host and target-host dependency per feature.
+
+### Changed
+
+- **libkrun is now a lazy (`dlopen`) dependency, not a link-time one.** The
+  libkrun-enabled loader previously linked `-lkrun`, so a libkrun-built binary
+  required `libkrun.so.1` on the target to start *at all* — even for plain
+  namespace runs that never used `--vm`. The loader now links libc only and
+  `dlopen`s `libkrun.so.1` on demand, the first time `--vm` takes the libkrun
+  backend. A libkrun-built binary therefore starts and runs in namespace mode
+  on any glibc host without libkrun installed; the library is needed only for
+  `--vm`, and its absence then fails with a clear message pointing at
+  `--vmm cloud-hypervisor`. `make loader-libkrun` no longer needs libkrun or
+  libkrun-dev at build time (links `-ldl`).
+
+### Added
+
+- **`--gpus` / `--cdi-device` — Container Device Interface support** — expose
+  GPUs and other vendor devices with their full set of edits, not just a raw
+  device node. At startup the loader scans JSON CDI specs in `/etc/cdi` and
+  `/run/cdi` (override with `$OCI2BIN_CDI_DIR`), matches the requested
+  `KIND=DEVICE`, and applies the spec's global plus device `containerEdits`:
+  `deviceNodes` (exposed like `--device`, validated under `/dev/`), `mounts`
+  (bind-mounted like `-v`, for driver libraries), and `env`. `--gpus all|N` is
+  sugar for `nvidia.com/gpu=all|N`; a value with `/` or `=` is a full CDI name,
+  so `--gpus` works for any vendor. New JSON helpers (`json_get_toplevel_object`
+  to read a top-level key without a nested same-named key shadowing it,
+  `json_split_object_array`) and C unit tests for the helpers, flag parsing, and
+  end-to-end CDI resolution.
+
+- **`oci2bin up` / `down` / `stack` — declarative pod stacks** — a daemon-free,
+  compose-lite runner over oci2bin binaries (`scripts/pod_stack.py`, stdlib
+  only). A stack file (a small YAML subset, or JSON) lists services with
+  `binary`, `command`, `ports`, `env`, `volumes`, `depends_on`, `restart`,
+  `health`/`health_cmd`, `aliases`, and `net`; `up` starts them in dependency
+  order (topologically sorted, cycle-detected), injects each service name as a
+  `127.0.0.1` `/etc/hosts` alias so services reach each other by name, and
+  monitors them (a non-zero exit tears the rest down). `up -d` forks a
+  self-contained backgrounded supervisor that records the real host PIDs of the
+  services and redirects per-service logs under
+  `$XDG_DATA_HOME/oci2bin/stacks/<name>/`; `down` signals each service's whole
+  process group (`SIGTERM`→`SIGKILL`, since a container PID 1 ignores
+  `SIGTERM`); `stack logs` tails them and `stack config` prints the resolved
+  plan. `net: shared` reuses the `pod run` pause-process model. 18 new unit
+  tests for the parser, topo-sort, argv construction, and validation.
+
+- **`--restart no|on-failure[:N]|always|unless-stopped`** — a supervising
+  PID-1 inside the container now relaunches the workload on exit per a Docker-
+  style restart policy, without needing systemd. `on-failure[:N]` restarts only
+  on a non-zero exit (capped at N attempts when given); `always` and
+  `unless-stopped` restart on any exit, while an explicit SIGTERM/SIGINT stop
+  suppresses the relaunch. The supervisor also reaps orphaned grandchildren
+  (subsuming `--init`) and emits a `container_restart` `--notify` event with the
+  attempt number and last exit code. New C unit tests for the policy parser.
+
+- **`--health` / runtime HEALTHCHECK execution** — the image `HEALTHCHECK`
+  (previously only displayed by `inspect`) now actually runs. `--health`
+  probes the workload on the image's interval; `--health-cmd CMD` defines a
+  probe (`/bin/sh -c CMD`) when the image declares none, and
+  `--health-interval`, `--health-timeout`, `--health-retries`,
+  `--health-start-period` override the image durations (`--no-health` forces it
+  off). After the configured number of consecutive failures the container is
+  marked unhealthy: oci2bin logs the transition, fires the `healthcheck_fail`
+  `--notify` event, and — when a `--restart` policy is active — restarts the
+  workload. The image `Healthcheck` object is now carried in `.oci2bin_config`
+  and parsed at runtime. New C unit tests for `json_get_object`,
+  `json_get_longlong`, and `health_resolve`.
+
+- **`--compress-binary zstd`** — inflate the per-layer gzip and recompress the
+  entire embedded OCI payload as one zstd-19 frame at build time; the loader
+  sniffs the zstd frame magic and inflates it (after any decryption) before
+  extraction (layers extract via `tar`'s auto-detection). Compressing the whole
+  rootfs together beats independent gzip streams (e.g. Alpine ≈ 4.2 → 3.4 MB,
+  more on larger images). Requires `zstd` at run time. Like `--encrypt`, the
+  payload is no longer a plain tar, so a compressed binary is opaque to
+  `docker load` / `oci2bin reconstruct`. Compatible with `--reproducible` (zstd
+  frames embed no timestamp). New C unit test for the magic sniffer.
+
+- **`oci2bin sign --rekor [--rekor-url URL]`** — after signing, publish a Rekor
+  `hashedrekord` transparency-log entry for the binary (an independent sha256
+  ECDSA signature over the signed content, so it works regardless of the
+  embedded signature's hash algorithm) and write the receipt to
+  `<out>.rekor.json`. `oci2bin verify --rekor` confirms the recorded entry is
+  present in the log. Requires `rekor-cli`; this is an explicit, user-requested
+  public network publish of the artifact hash, signature, and public key.
+
 - **`make test-integration-live`** — a live build-and-run matrix that builds
   real Alpine and Redis images with oci2bin and runs them on the **full**
   runtime path (no `--no-userns-remap`, no `--no-seccomp`): rootless UID
