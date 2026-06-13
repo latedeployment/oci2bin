@@ -2523,6 +2523,30 @@ skopeo_arch_name() {
     esac
 }
 
+# Normalize a Docker/OCI short name to a fully-qualified docker.io reference,
+# the way `docker` does implicitly. podman and skopeo do NOT assume docker.io
+# for bare names unless the host configures unqualified-search-registries, so a
+# plain `redis:7-alpine` fails to resolve out of the box on those backends.
+# Already-qualified references are returned unchanged:
+#   - a first path component that looks like a registry host (has '.' or ':')
+#     or is exactly "localhost"  ->  left alone (registry[:port]/...)
+#   - otherwise "user/repo[:tag]"  ->  "docker.io/user/repo[:tag]"
+#   - otherwise "name[:tag]"       ->  "docker.io/library/name[:tag]"
+# Digest pins (`name@sha256:...`) ride along on the name part unchanged.
+qualify_image_ref() {
+    local ref="$1"
+    if [[ "$ref" == *"/"* ]]; then
+        local first="${ref%%/*}"
+        if [[ "$first" == *.* || "$first" == *:* || "$first" == "localhost" ]]; then
+            printf '%s' "$ref"
+        else
+            printf 'docker.io/%s' "$ref"
+        fi
+    else
+        printf 'docker.io/library/%s' "$ref"
+    fi
+}
+
 resolve_pull_backend() {
     # Not needed when an OCI layout is supplied directly, or already resolved.
     [[ -n "$OCI_DIR" || -n "$PULL_BACKEND" ]] && return 0
@@ -2593,6 +2617,13 @@ if [[ -z "$OCI_DIR" && "$PULL_BACKEND" == "skopeo" ]]; then
         echo "oci2bin: --offline-only requires the docker/podman backend (local image store)." >&2
         exit 1
     fi
+    # skopeo (like podman) won't assume docker.io for bare names; qualify so a
+    # short reference resolves out of the box.
+    _qualified="$(qualify_image_ref "$IMAGE")"
+    if [[ "$_qualified" != "$IMAGE" ]]; then
+        echo "oci2bin: qualifying short name '$IMAGE' → '$_qualified' for skopeo" >&2
+        IMAGE="$_qualified"
+    fi
     SKOPEO_OCI_TMPDIR="$(mktemp -d)"
     _CLEANUP_PATHS+=("$SKOPEO_OCI_TMPDIR")
     SK_COPY=(skopeo copy)
@@ -2636,6 +2667,17 @@ if ! "$CONTAINER_ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
         echo "oci2bin: --offline-only set but image '$IMAGE' is not in the local store." >&2
         echo "         Run '$CONTAINER_ENGINE pull $IMAGE' before building, or use --oci-dir." >&2
         exit 1
+    fi
+    # podman won't assume docker.io for a bare name the way docker does, so a
+    # not-yet-local short name like "redis:7-alpine" fails to resolve. Qualify
+    # it to docker.io so the common case works out of the box. (Local images
+    # already resolved via the inspect above, so localhost/ refs are untouched.)
+    if [[ "$CONTAINER_ENGINE" == podman ]]; then
+        _qualified="$(qualify_image_ref "$IMAGE")"
+        if [[ "$_qualified" != "$IMAGE" ]]; then
+            echo "oci2bin: qualifying short name '$IMAGE' → '$_qualified' for podman" >&2
+            IMAGE="$_qualified"
+        fi
     fi
     echo "oci2bin: pulling $IMAGE..."
     "$CONTAINER_ENGINE" pull "$IMAGE"

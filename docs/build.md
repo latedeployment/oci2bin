@@ -34,6 +34,15 @@ oci2bin --pull-with podman redis:7-alpine
 
 Notes:
 
+- **Short image names work out of the box.** `docker` implicitly resolves a
+  bare name like `redis:7-alpine` against `docker.io`, but `podman` and
+  `skopeo` do not unless the host configures `unqualified-search-registries`.
+  So when those backends pull a *not-yet-local* short name, oci2bin qualifies it
+  to `docker.io/...` the way docker does (`redis:7-alpine` →
+  `docker.io/library/redis:7-alpine`, `user/app` → `docker.io/user/app`) and
+  prints the rewrite. References that already name a registry
+  (`quay.io/…`, `localhost/…`, `registry:5000/…`) and locally-built images are
+  left untouched. Pass a fully-qualified name to target a different registry.
 - A pull backend is only needed for this default path — `--oci-dir`,
   `from-chroot`, and `build-dockerfile` build without one. `oci2bin doctor`
   reports the backend as *optional* and accepts any of the three.

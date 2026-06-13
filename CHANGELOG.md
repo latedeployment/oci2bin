@@ -6,6 +6,15 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **Short image names resolve out of the box with podman/skopeo.** `docker`
+  implicitly assumes `docker.io` for a bare name, but `podman`/`skopeo` reject
+  one ("short-name … did not resolve … no unqualified-search registries") unless
+  the host is configured. When those backends pull a not-yet-local short name,
+  oci2bin now qualifies it to `docker.io/...` the way docker does
+  (`redis:7-alpine` → `docker.io/library/redis:7-alpine`) and prints the
+  rewrite. References that already name a registry (`quay.io/…`, `localhost/…`,
+  `registry:PORT/…`), digest pins, and locally-built images are left untouched.
+
 - **Default build no longer hardcodes `docker` on podman-only hosts.**
   `scripts/build_polyglot.py` and `scripts/reconstruct.py` shelled out to
   `docker save` unconditionally, so a plain `oci2bin IMAGE` build aborted with
