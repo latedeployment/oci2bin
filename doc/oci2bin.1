@@ -157,6 +157,13 @@ and
 .BR buildah (1).
 .
 .TP
+.B \-\-squash
+Merge all image layers into a single squashed layer before packaging
+(combine with
+.B \-\-compress
+to pick the layer codec).
+.
+.TP
 .BI \-\-entrypoint " VALUE" \fR, \fB\-\-cmd " VALUE"
 Override the embedded image Entrypoint/Cmd at build time.
 .I VALUE
@@ -365,6 +372,31 @@ Share the host network stack (default).
 Create an isolated network namespace with only a loopback interface.
 .
 .TP
+.B \-\-net slirp \fR/\fB \-\-net pasta
+Userspace outbound networking in a private namespace via
+.BR slirp4netns (1)
+or
+.BR pasta (1).
+.
+.TP
+.BI \-p " HOST:CTR"
+Publish a port (implies
+.BR "\-\-net slirp" ).
+May be repeated.
+.
+.TP
+.BI \-\-dns " IP" \fR, \fB\-\-dns\-search " DOMAIN" \fR, \fB\-\-add\-host " HOST:IP"
+Write a custom resolver and add
+.I /etc/hosts
+entries inside the container.
+.
+.TP
+.BI \-\-allow\-egress " HOST:PORT|CIDR:PORT"
+Default-deny egress allowlist (requires
+.BR \-\-net " slirp/pasta " "and " nft );
+fails closed. May be repeated.
+.
+.TP
 .BI \-\-net " container:" PID
 Join the network namespace of the process with PID
 .IR PID .
@@ -424,6 +456,82 @@ add_key, request_key, keyctl, userfaultfd, pivot_root, ptrace,
 process_vm_readv, process_vm_writev, init_module, finit_module.
 .B PR_SET_NO_NEW_PRIVS
 is always set regardless of this flag.
+.
+.TP
+.BI \-\-seccomp\-profile " FILE"
+Load a Docker-compatible JSON seccomp profile instead of the default filter.
+.
+.TP
+.BI \-\-gen\-seccomp " FILE"
+Trace the workload's syscalls and write a least-privilege profile to
+.IR FILE .
+.
+.TP
+.BI \-\-seccomp\-deny\-write " PATH"
+Bind-mount
+.I PATH
+read-only inside the container. May be repeated.
+.
+.TP
+.B \-\-landlock \fR/\fB \-\-no\-landlock
+Force or disable the Landlock filesystem sandbox (default: auto when the kernel
+supports it).
+.
+.TP
+.BI \-\-security\-opt " apparmor=" PROFILE \fR| \fBlabel=\fITYPE:VAL\fR
+Apply an AppArmor profile or SELinux exec label (compile-time support required).
+.
+.SS Resources and state
+.TP
+.BI \-\-memory " SIZE" \fR, \fB\-\-cpus " N" \fR, \fB\-\-pids\-limit " N"
+cgroup v2 hard limits on memory, CPU, and PID count for the whole container
+tree.
+.
+.TP
+.BI \-\-size " NAME"
+Apply a resource preset
+.RB ( pi\-zero ", " pi4 ", " vps\-small ", " vps\-medium ", " beefy ", " auto )
+that fills unset
+.BR \-\-memory / \-\-cpus / \-\-pids\-limit .
+.
+.TP
+.BI \-\-ulimit " TYPE=N"
+Set a
+.BR setrlimit (2)
+limit
+.RB ( nofile ", " nproc ", " cpu ", " as ", " fsize ).
+May be repeated.
+.
+.TP
+.BI \-\-overlay\-persist " DIR"
+Keep the overlay upper layer in
+.I DIR
+so writes survive between runs.
+.
+.SS Observability
+.TP
+.BI \-\-metrics\-socket " PATH"
+Export Prometheus cgroup metrics over a Unix socket at
+.IR PATH .
+.
+.TP
+.BI \-\-notify " URL" \fR, \fB\-\-notify\-name " NAME"
+Fire lifecycle notifications to an
+.BR ntfy / gotify / discord / slack
+or generic
+.B https
+sink.
+.I NAME
+labels the payloads. May be repeated.
+.
+.TP
+.BI \-\-audit\-log " FILE"
+Append newline-delimited JSON lifecycle events to
+.IR FILE " (" \- " = stderr)."
+.
+.TP
+.BI \-\-clock\-offset " SECS"
+Shift the container's monotonic/boottime clocks via a time namespace.
 .
 .SS Supervision, health, and devices
 .TP
@@ -580,6 +688,17 @@ the stack-file format).
 .TP
 .B oci2bin mcp\-serve \fR[\fB\-\-allow\-net\fR]
 Serve the Model Context Protocol interface for AI-agent integration.
+.
+.TP
+.B oci2bin from\-chroot \fIDIR\fR \fR[\fB\-o \fIOUT\fR] [\fB\-\-entrypoint \fICMD\fR] ...
+Build a binary directly from a chroot directory — no Docker. Packs
+.I DIR
+into a single OCI layer.
+.
+.TP
+.B oci2bin build\-dockerfile \fR[\fB\-f \fIFILE\fR] [\fB\-\-context \fIDIR\fR] ...
+Build from a Dockerfile (BuildKit-compatible subset, incl.\&
+.BR "RUN \-\-mount" ) without a Docker daemon.
 .
 .SH NAMESPACE SHARING
 Two containers can share network or IPC namespaces using the

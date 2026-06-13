@@ -41,6 +41,7 @@ under the terms of the MIT License.
 
 @menu
 * Overview::                    What oci2bin does
+* Feature Reference::           Every build and runtime flag, by category
 * Getting Started::             Installation and first steps
 * Building Binaries::           Build options and image customisation
 * Running Containers::          Runtime options reference
@@ -90,6 +91,111 @@ reference is the project @file{README} and the documentation site under
 the @command{oci2bin up}/@command{down}/@command{stack} declarative-stack
 commands).
 @end quotation
+
+@c ─────────────────────────────────────────────────────────────────────────────
+@node Feature Reference
+@chapter Feature Reference
+
+A categorized list of every option and capability. Later chapters cover the
+common ones in depth; the @file{README} and @file{docs/} site are the
+exhaustive reference.
+
+@section Build inputs and transformations
+
+@table @code
+@item IMAGE / IMAGE@@sha256:DIGEST
+Build from a tag or a validated content digest (the digest is verified;
+mismatch aborts).
+@item --oci-dir DIR / --tar FILE
+Build from an OCI layout dir or a saved tar instead of pulling.
+@item --arch x86_64|aarch64|all
+Cross-compile (both directions) or emit a multi-arch wrapper.
+@item --add-file H:C / --add-dir H:C
+Inject files/directories as a build-time layer.
+@item --layer IMAGE
+Overlay additional image layers (last image's config wins).
+@item --strip / --strip-prefix P / --strip-auto
+Remove docs/locales/caches; auto-detect package-manager caches.
+@item --squash
+Merge all layers into one squashed layer.
+@item --compress none|gzip|zstd
+Per-layer compression codec.
+@item --compress-binary zstd
+Recompress the whole payload as one zstd frame (opaque to docker load).
+@item --entrypoint VALUE / --cmd VALUE
+Override the embedded Entrypoint/Cmd (JSON array or shell-split).
+@item --label K=V
+Add image-config labels (matchable by ps/list --filter).
+@item --cache / --no-cache
+Output-binary cache; per-layer cache toggle.
+@item --reproducible / --offline-only
+Byte-identical output; air-gap seal (no registry fetch, hermetic marker).
+@item --pin-digest auto|ALGO:auto|ALGO:HEX
+Embed a digest the loader re-checks at run time.
+@item --self-update-url URL
+Embed a signed-update-manifest URL.
+@item --embed-loader-layer / --embed-loader-labels
+Persist the loader in the image so @code{reconstruct} can rebuild it.
+@end table
+
+@section Signing, attestation, and encryption
+
+@table @code
+@item --verify-cosign / --require-cosign / --cosign-key K
+Verify the source image's cosign signature before building.
+@item --require-signed PUB
+Embed a self-enforcing signature policy (refuse to run unsigned).
+@item --encrypt --recipient PUB / --recipients-file F
+Encrypt the payload to age recipients (opaque at rest).
+@item --passphrase [--password-file F]
+Symmetric (scrypt) encryption.
+@end table
+
+(See also the @code{sign}, @code{verify}, and @code{attest} subcommands, with
+@option{--rekor} for a transparency-log entry and @option{--attest} for SLSA/
+in-toto provenance.)
+
+@section Runtime: command, filesystem, networking
+
+@table @code
+@item --entrypoint / --workdir / -e K=V / --env-file F
+Override entrypoint, workdir, environment.
+@item -v H:C / --tmpfs P / --read-only / --overlay-persist DIR
+Bind mounts, tmpfs, read-only rootfs, persistent overlay upper layer.
+@item --secret H[:C] / --secret tpm2:NAME / --ssh-agent
+File secrets (memfd_secret-backed), TPM2-sealed secrets, SSH-agent forwarding.
+@item --device /dev/H[:C] / --gpus all|N|CDI / --cdi-device KIND=DEV / --no-host-dev
+Expose device nodes, GPUs/CDI devices, or skip the host /dev nodes.
+@item --net host|none|slirp|pasta|container:PID / -p H:C / --allow-egress H:P
+Network modes, published ports, default-deny egress allowlist.
+@item --dns IP / --dns-search D / --add-host H:IP / --ipc container:PID
+Custom DNS, /etc/hosts entries, shared IPC namespace.
+@item --hostname N / --user UID[:GID]
+UTS hostname; run as a numeric user.
+@end table
+
+@section Runtime: isolation, limits, supervision, observability
+
+@table @code
+@item --cap-drop / --cap-add / --no-seccomp / --seccomp-profile F / --gen-seccomp F / --seccomp-deny-write P
+Capability and seccomp controls; generate a least-privilege profile.
+@item --landlock / --no-landlock / --security-opt apparmor=|label=
+Landlock sandbox (auto by default); AppArmor/SELinux confinement.
+@item --memory / --cpus / --pids-limit / --ulimit T=N / --size NAME
+cgroup v2 limits, setrlimit, and resource presets.
+@item --profile dev|prod|locked-down
+Apply a bundle of runtime defaults.
+@item --init / --detach / --name N / -it
+Init reaper, background detach, naming, interactive TTY.
+@item --restart no|on-failure[:N]|always|unless-stopped
+Supervise and relaunch the workload.
+@item --health [--health-cmd C] [--health-interval/-timeout/-retries/-start-period] / --no-health
+Run the image HEALTHCHECK; restart on unhealthy when paired with --restart.
+@item --metrics-socket P / --notify URL [--notify-name N] / --audit-log F / --clock-offset S
+Prometheus metrics socket, lifecycle notifications, JSON audit log, time-namespace clock offset.
+@item --vm [--vmm VMM] [--memory/--cpus]
+Run inside a hardware-isolated microVM (libkrun or cloud-hypervisor).
+@end table
 
 @c ─────────────────────────────────────────────────────────────────────────────
 @node Getting Started
@@ -292,7 +398,7 @@ binary name replace the default command:
 @menu
 * Volume Mounts::
 * Secrets::
-* Environment Variables::         (runtime)
+* Container Environment::         (-e, --env-file)
 * Entrypoint and WorkingDir::
 * User and Hostname::
 * Resource Limits::
@@ -333,8 +439,8 @@ the file lands at @file{/run/secrets/@var{basename}}.  Enforced with
 ./my-app --secret /etc/ssl/cert.pem:/certs/ca.pem
 @end example
 
-@node Environment Variables
-@section Environment Variables
+@node Container Environment
+@section Container Environment
 
 @opindex -e
 @opindex --env-file
@@ -696,56 +802,61 @@ kill "$PID"
 @node Subcommands
 @chapter Subcommands
 
-@menu
-* inspect::
-* list::
-* prune::
-* diff::
-@end menu
+Besides building, the @command{oci2bin} CLI provides these subcommands.
 
-@node inspect
-@section inspect
-
-@example
-oci2bin inspect @var{BINARY}
-@end example
-
-Display OCI metadata embedded in @var{BINARY}: image name,
-architecture, layer count, entrypoint, command, environment, working
-directory, build digest, and build timestamp.
-
-@node list
-@section list
-
-@example
-oci2bin list [--json]
-@end example
-
-List all cached binaries with image name, digest, size, and build date.
-@option{--json} emits machine-readable JSON.
-
-@node prune
-@section prune
-
-@example
-oci2bin prune [--dry-run]
-@end example
-
-Remove outdated cache entries, keeping only the most recently built
-binary for each image name.  @option{--dry-run} shows what would be
-deleted without deleting.
-
-@node diff
-@section diff
-
-@example
-oci2bin diff @var{OLD} @var{NEW}
-@end example
-
-Compare the filesystem contents of two oci2bin binaries.  Output lines
-are prefixed with @code{+} (added), @code{-} (removed), or @code{M}
-(modified).  Exits with status@tie{}0 if identical, or 1 if there are
-differences.
+@table @code
+@item oci2bin inspect BINARY [--json | --format TMPL]
+Show embedded image metadata (name, arch, layers, entrypoint, cmd, env,
+workdir, digest, build time); secret-shaped env values are redacted.
+@item oci2bin explain BINARY [--json]
+Inspect plus a host-capability check of what the binary needs to run.
+@item oci2bin doctor [--json]
+Probe the host for oci2bin's toolchain/kernel features and print a fix command
+for each missing piece.
+@item oci2bin list [--json]
+List cached binaries.
+@item oci2bin prune [--dry-run]
+Remove stale cache entries.
+@item oci2bin diff OLD NEW
+Compare two binaries' filesystems (@code{+}/@code{-}/@code{M}).
+@item oci2bin diff-fs OVERLAY_PATH
+Classify an overlayfs upperdir (after @option{--overlay-persist}).
+@item oci2bin sbom BINARY
+Generate a Software Bill of Materials for the embedded image.
+@item oci2bin reconstruct SRC [--output PATH]
+Rebuild a polyglot from an image/tar carrying an embedded loader.
+@item oci2bin push BINARY REF
+Push the embedded image payload to an OCI registry.
+@item oci2bin exec PID [--] CMD ...
+Run a command inside a running container's namespaces (needs @command{nsenter}).
+@item oci2bin ps / stop NAME / logs [-f] NAME
+List, stop, and tail named detached containers.
+@item oci2bin top [--once] [--interval SEC]
+Live per-container resource stats.
+@item oci2bin systemd BINARY [--user] [--restart POLICY]
+Print a systemd unit for the binary.
+@item oci2bin healthcheck BINARY [--pid PID]
+Run the image's HEALTHCHECK once and report the result.
+@item oci2bin freeze NAME [-- CMD] / thaw NAME
+Quiesce SQLite-backed volumes for a consistent snapshot, and release it.
+@item oci2bin checkpoint NAME / restore NAME
+Dump and restore a running container with CRIU.
+@item oci2bin sign --key KEY --in BIN [--rekor] [--attest A] / verify --key PUB --in BIN
+Sign a binary (optionally publishing a Rekor entry / embedding an attestation)
+and verify it.
+@item oci2bin sign-file / verify-file
+Sign or verify an arbitrary detached file.
+@item oci2bin pod run [--net shared] [--ipc shared] BIN ...
+Run several binaries sharing namespaces.
+@item oci2bin up [-f stack.yaml] [-d] / down / stack @{up|down|logs|config@}
+Bring a declarative stack of binaries up and down.
+@item oci2bin run [BUILD_OPTS] IMAGE [-- ARGS]
+Build to a temp file and run it in one step.
+@item oci2bin from-chroot DIR [-o OUT] / build-dockerfile [-f FILE]
+Build without Docker — from a chroot directory or a Dockerfile.
+@item oci2bin mcp-serve [--allow-net]
+Serve the Model Context Protocol interface for AI-agent integration.
+@end table
 
 @c ─────────────────────────────────────────────────────────────────────────────
 @node How It Works
