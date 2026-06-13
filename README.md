@@ -1256,6 +1256,28 @@ Use cases:
 `DIR/upper` and `DIR/work` must be on the same filesystem. The immutable base
 (extracted OCI rootfs) is never modified.
 
+### Runtime profiles (--profile)
+
+`--profile NAME` applies a bundle of runtime **defaults** in one flag. Profiles
+only set defaults — any explicit flag on the same command line overrides the
+field it touches, so `--profile prod --cap-add net_raw` keeps the prod baseline
+but adds one capability.
+
+| Profile | Effect |
+|---------|--------|
+| `dev` | No-op marker: host network, read-write, full caps, default seccomp. Recorded in `oci2bin explain` and the audit log so a run is self-describing. |
+| `prod` | `--net none`, `--read-only`, drop all capabilities then re-add a safe baseline (`chown`, `dac_override`, `fowner`, `setgid`, `setuid`, `net_bind_service`, `kill`). |
+| `locked-down` | Everything `prod` does, plus Landlock **required** (not best-effort), `--strict` (fail closed on any security degradation), and default `--pids-limit 512` / `--memory 1g` if not set. |
+
+```bash
+./my-app --profile prod
+./my-app --profile locked-down
+./my-app --profile prod --cap-add net_raw --memory 2g   # override profile defaults
+```
+
+The selected profile is recorded in the binary's audit log and surfaced by
+`oci2bin explain`. The accepted names are `dev`, `prod`, and `locked-down`.
+
 ### Capabilities
 
 Use `--cap-drop` and `--cap-add` to manage Linux capabilities:
@@ -1593,6 +1615,12 @@ Only numeric UIDs/GIDs are accepted. Values must be ≤ 65534. If any of `setgro
 ```
 
 The host path must start with `/dev/`. The container path defaults to the same path if omitted. oci2bin first attempts `mknod` with the host device's `st_rdev`; if that fails it falls back to a bind mount. Failure is non-fatal. May be repeated.
+
+By default the container is given the standard host `/dev` nodes (`null`, `zero`, `random`, `urandom`, `tty`, `full`). Pass `--no-host-dev` to skip bind-mounting them — useful for the most locked-down sandboxes where the workload needs no device access:
+
+```bash
+./my-app --no-host-dev
+```
 
 #### GPUs and CDI devices (--gpus / --cdi-device)
 

@@ -25,6 +25,11 @@ classifiers = [
 # Runtime system requirements: gcc, docker (documented in README).
 dependencies = []
 
+[dependency-groups]
+docs = [
+    "mkdocs-material>=9.5",
+]
+
 [project.urls]
 Homepage = "https://github.com/latedeployment/oci2bin"
 Changelog = "https://github.com/latedeployment/oci2bin/blob/main/CHANGELOG.md"

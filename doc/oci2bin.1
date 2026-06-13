@@ -66,6 +66,13 @@ It runs the container rootlessly using Linux user namespaces.
 .PP
 The container process appears as UID\~0 inside the container; on the host it runs
 as the invoking user with no elevated privileges.
+.PP
+This man page summarizes the most common options and subcommands. The complete
+and authoritative reference is the project
+.B README
+and the documentation site under
+.IR docs/ ,
+which always track the current feature set.
 .
 .SH BUILD OPTIONS
 These options are passed to the
@@ -148,6 +155,35 @@ Compatible with images produced by
 .BR crane (1),
 and
 .BR buildah (1).
+.
+.TP
+.B \-\-compress\-binary zstd
+Recompress the embedded payload as one zstd frame to shrink the output.
+Requires
+.BR zstd (1)
+at run time; the payload is then opaque to
+.BR "docker load" .
+.
+.TP
+.B \-\-encrypt \fR[\fB\-\-recipient \fIPUB\fR]\fR, \fB\-\-passphrase
+Encrypt the embedded image with
+.BR age .
+At run time supply the identity via
+.B OCI2BIN_IDENTITY
+or the passphrase via
+.BR OCI2BIN_PASSWORD [ _FILE ].
+.
+.TP
+.B \-\-reproducible \fR/\fB \-\-offline\-only
+Produce byte-identical output across builds;
+.B \-\-offline\-only
+additionally refuses any registry fetch and records a hermetic marker.
+.
+.TP
+.B \-\-verify\-cosign \fR/\fB \-\-require\-cosign
+Verify the source image's cosign signature before building (abort on failure
+with
+.BR \-\-require\-cosign ).
 .
 .SH RUNTIME OPTIONS
 These options are passed to the generated binary at run time.
@@ -377,6 +413,51 @@ process_vm_readv, process_vm_writev, init_module, finit_module.
 .B PR_SET_NO_NEW_PRIVS
 is always set regardless of this flag.
 .
+.SS Supervision, health, and devices
+.TP
+.BI \-\-restart " POLICY"
+Supervise and relaunch the workload.
+.I POLICY
+is
+.BR no ", " on\-failure [: \fIN\fR],
+.BR always ", or " unless\-stopped .
+.
+.TP
+.B \-\-health
+Run the image HEALTHCHECK on its interval; mark the container unhealthy after
+repeated failures and (with
+.BR \-\-restart )
+restart it. Override with
+.BR \-\-health\-cmd ", " \-\-health\-interval ", " \-\-health\-timeout ", " \-\-health\-retries ", " \-\-health\-start\-period ;
+disable with
+.BR \-\-no\-health .
+.
+.TP
+.BI \-\-gpus " all|N|CDI" \fR, \fB\-\-cdi\-device " KIND=DEVICE"
+Expose GPUs or other Container Device Interface devices, applying the matching
+CDI spec's device nodes, mounts, and environment.
+.
+.TP
+.B \-\-no\-host\-dev
+Skip bind-mounting the standard host
+.I /dev
+nodes into the container.
+.
+.TP
+.BI \-\-profile " NAME"
+Apply a runtime defaults preset:
+.BR dev ", " prod ", or " locked\-down .
+Later flags override the profile.
+.
+.TP
+.B \-\-vm \fR[\fB\-\-vmm \fIVMM\fR]
+Run the container in a hardware-isolated microVM (libkrun, or
+.B cloud\-hypervisor
+via
+.BR \-\-vmm ).
+Requires
+.IR /dev/kvm .
+.
 .SH SUBCOMMANDS
 .TP
 .B oci2bin inspect \fIBINARY\fR
@@ -404,6 +485,89 @@ Compare the filesystem contents of two oci2bin binaries.
 Output lines are prefixed with
 .BR + " (added), " \- " (removed), or " M " (modified)."
 Exits 0 if identical, 1 if there are differences.
+.
+.TP
+.B oci2bin diff\-fs \fIOVERLAY_PATH\fR
+Classify an overlayfs upperdir (from a
+.B \-\-overlay\-persist
+run) as docker-diff-style A/D entries.
+.
+.TP
+.B oci2bin explain \fIBINARY\fR \fR[\fB\-\-json\fR]
+Combined report: embedded metadata (secrets redacted) plus a host-capability
+check for what the binary needs to run.
+.
+.TP
+.B oci2bin doctor \fR[\fB\-\-json\fR]
+Probe the host for the toolchain and kernel features oci2bin uses and print a
+fix command for each missing piece.
+.
+.TP
+.B oci2bin sbom \fIBINARY\fR
+Generate a Software Bill of Materials for the embedded image.
+.
+.TP
+.B oci2bin reconstruct \fISRC\fR \fR[\fB\-\-output \fIPATH\fR]
+Rebuild a polyglot from a Docker image or saved tar that carries an embedded
+loader.
+.
+.TP
+.B oci2bin push \fIBINARY\fR \fIREF\fR
+Push the embedded image payload to an OCI registry reference.
+.
+.TP
+.B oci2bin exec \fIPID\fR \fR[\fB\-\-\fR] \fICMD\fR ...
+Run a command inside a running container's namespaces (needs
+.BR nsenter ).
+.
+.TP
+.B oci2bin ps
+List running named containers.
+.B oci2bin stop \fINAME\fR
+and
+.B oci2bin logs \fR[\fB\-f\fR] \fINAME\fR
+stop and tail them.
+.
+.TP
+.B oci2bin top \fR[\fB\-\-once\fR] [\fB\-\-interval \fISEC\fR]
+Live per-container resource stats.
+.
+.TP
+.B oci2bin systemd \fIBINARY\fR \fR[\fB\-\-user\fR] [\fB\-\-restart \fIPOLICY\fR]
+Print a systemd unit file for the binary.
+.
+.TP
+.B oci2bin healthcheck \fIBINARY\fR \fR[\fB\-\-pid \fIPID\fR]
+Run the image's declared HEALTHCHECK once and report the result.
+.
+.TP
+.B oci2bin freeze \fINAME\fR \fR[\fB\-\- \fICMD\fR]\fR, \fBoci2bin thaw \fINAME\fR
+Quiesce SQLite-backed volumes for an application-consistent snapshot, and
+release it.
+.
+.TP
+.B oci2bin checkpoint \fINAME\fR\fR, \fBoci2bin restore \fINAME\fR
+Dump and restore a running named container with CRIU.
+.
+.TP
+.B oci2bin sign \fR[\fB\-\-rekor\fR] [\fB\-\-attest \fIA\fR] \fB\-\-key \fIKEY\fR \fB\-\-in \fIBINARY\fR
+Sign a binary (optionally publishing a Rekor transparency-log entry and/or an
+in-toto attestation).
+.B oci2bin verify \fB\-\-key \fIPUB\fR \fB\-\-in \fIBINARY\fR
+checks it.
+.
+.TP
+.B oci2bin pod run \fR[\fB\-\-net shared\fR] [\fB\-\-ipc shared\fR] \fIBINARY\fR ...
+Run several binaries sharing namespaces.
+.
+.TP
+.B oci2bin up \fR[\fB\-f \fIstack.yaml\fR] [\fB\-d\fR]\fR, \fBdown\fR, \fBstack \fR{\fBup\fR|\fBdown\fR|\fBlogs\fR|\fBconfig\fR}
+Bring a declarative stack of binaries up and down (see the documentation for
+the stack-file format).
+.
+.TP
+.B oci2bin mcp\-serve \fR[\fB\-\-allow\-net\fR]
+Serve the Model Context Protocol interface for AI-agent integration.
 .
 .SH NAMESPACE SHARING
 Two containers can share network or IPC namespaces using the

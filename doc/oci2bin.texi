@@ -81,6 +81,16 @@ Containers run rootlessly using Linux user namespaces.  The process
 appears as UID@tie{}0 inside the container; on the host it runs as the
 invoking user with no elevated privileges.
 
+@quotation Note
+This manual covers the core workflow.  The complete and authoritative
+reference is the project @file{README} and the documentation site under
+@file{docs/}, which always track the current feature set (including the
+@option{--restart}, @option{--health}, @option{--gpus}/@option{--cdi-device},
+@option{--profile}, and @option{--compress-binary} options, Rekor signing, and
+the @command{oci2bin up}/@command{down}/@command{stack} declarative-stack
+commands).
+@end quotation
+
 @c ─────────────────────────────────────────────────────────────────────────────
 @node Getting Started
 @chapter Getting Started

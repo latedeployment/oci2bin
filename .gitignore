@@ -25,6 +25,9 @@ main.c
 src/loader
 # Python packaging metadata
 oci2bin.egg-info/
+.venv/
+# Generated documentation site
+site/
 # Built oci2bin binaries kept in the repo root for local testing
 /alpine
 /redis

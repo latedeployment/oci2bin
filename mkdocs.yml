@@ -1,0 +1,38 @@
+site_name: oci2bin
+site_description: Convert OCI and Docker images into self-contained Linux executables.
+site_url: https://latedeployment.github.io/oci2bin/
+repo_url: https://github.com/latedeployment/oci2bin
+repo_name: latedeployment/oci2bin
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Use Cases: use-cases.md
+  - Concepts: concepts.md
+  - Build Binaries: build.md
+  - Run Binaries: runtime.md
+  - Security: security.md
+  - Operations: operations.md
+  - Feature Inventory: reference/features.md
+  - Command Reference: reference/commands.md
+  - How It Works: internals/how-it-works.md
+  - Local Preview: local-preview.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
