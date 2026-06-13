@@ -2911,7 +2911,7 @@ static void test_misc_helpers(void)
     int saved = g_debug;
     g_debug = 1;
     debug_log("test.event", "val=%d", 7);
-    debug_log("test.empty", "");
+    debug_log("test.empty", "%s", "");
     debug_log("test.null", NULL);
     g_debug = saved;
 }
@@ -3069,7 +3069,7 @@ static void test_safe_merge_layer_blocks_escape(void)
 
     /* Stage layer 1: an absolute symlink pointing outside rootfs */
     char layer1_link[256];
-    snprintf(layer1_link, sizeof(layer1_link), "%s/escape", stage);
+    snprintf(layer1_link, sizeof(layer1_link), "%s/stage/escape", tdir);
     int sl_rc = symlink(victim, layer1_link);
     ASSERT_INT_EQ(sl_rc, 0, "merge test: stage symlink created");
 
@@ -3081,7 +3081,7 @@ static void test_safe_merge_layer_blocks_escape(void)
     /* The rootfs should now have the symlink — but as a symlink, not
      * as a path that resolves outside. Verify it's a symlink. */
     char rootfs_escape[256];
-    snprintf(rootfs_escape, sizeof(rootfs_escape), "%s/escape", rootfs);
+    snprintf(rootfs_escape, sizeof(rootfs_escape), "%s/rootfs/escape", tdir);
     struct stat st;
     int lst = lstat(rootfs_escape, &st);
     ASSERT_INT_EQ(lst, 0, "merge test: rootfs/escape exists");
@@ -3098,8 +3098,8 @@ static void test_safe_merge_layer_blocks_escape(void)
     snprintf(stage2, sizeof(stage2), "%s/stage2", tdir);
     mkdir(stage2, 0755);
     char layer2_dir[256], layer2_file[256];
-    snprintf(layer2_dir,  sizeof(layer2_dir),  "%s/escape", stage2);
-    snprintf(layer2_file, sizeof(layer2_file), "%s/escape/poison", stage2);
+    snprintf(layer2_dir,  sizeof(layer2_dir),  "%s/stage2/escape", tdir);
+    snprintf(layer2_file, sizeof(layer2_file), "%s/stage2/escape/poison", tdir);
     mkdir(layer2_dir, 0755);
     int pfd = creat(layer2_file, 0644);
     ASSERT(pfd >= 0, "merge test: layer2 poison created in stage");
@@ -3115,7 +3115,7 @@ static void test_safe_merge_layer_blocks_escape(void)
     safe_merge_layer(rfd, stage2);
 
     char victim_poison[256];
-    snprintf(victim_poison, sizeof(victim_poison), "%s/poison", victim);
+    snprintf(victim_poison, sizeof(victim_poison), "%s/victim/poison", tdir);
     struct stat vst;
     int vrc = lstat(victim_poison, &vst);
     ASSERT(vrc < 0,
