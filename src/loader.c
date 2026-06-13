@@ -5394,6 +5394,57 @@ static int egress_resolve_and_pin(const char* host, const char* port,
 }
 
 /*
+ * tool_is_available: return 1 if an executable named `prog` is reachable via
+ * $PATH or in the two fixed fallback directories the net-helper exec chain
+ * tries (/usr/bin, /usr/local/bin), else 0. `prog` must be a bare name (no
+ * '/'). Used to fail closed before forking a network helper (slirp4netns /
+ * pasta): a missing binary then aborts the run with a clear message instead
+ * of leaving the container in an unconfigured, network-less namespace.
+ */
+static int tool_is_available(const char* prog)
+{
+    if (!prog || !*prog || strchr(prog, '/'))
+    {
+        return 0;
+    }
+    static const char* const fixed_dirs[] = { "/usr/bin", "/usr/local/bin" };
+    char cand[PATH_MAX];
+    for (size_t i = 0; i < sizeof(fixed_dirs) / sizeof(fixed_dirs[0]); i++)
+    {
+        int n = snprintf(cand, sizeof(cand), "%s/%s", fixed_dirs[i], prog);
+        if (n > 0 && n < (int)sizeof(cand) && access(cand, X_OK) == 0)
+        {
+            return 1;
+        }
+    }
+    const char* path = getenv("PATH");
+    if (!path || !*path)
+    {
+        return 0;
+    }
+    for (const char* p = path; *p;)
+    {
+        const char* colon = strchr(p, ':');
+        size_t dirlen = colon ? (size_t)(colon - p) : strlen(p);
+        if (dirlen > 0 && dirlen < sizeof(cand))
+        {
+            int n = snprintf(cand, sizeof(cand), "%.*s/%s",
+                             (int)dirlen, p, prog);
+            if (n > 0 && n < (int)sizeof(cand) && access(cand, X_OK) == 0)
+            {
+                return 1;
+            }
+        }
+        if (!colon)
+        {
+            break;
+        }
+        p = colon + 1;
+    }
+    return 0;
+}
+
+/*
  * Install a default-deny outbound allowlist in the current network namespace
  * via nftables. Each --allow-egress entry is HOST:PORT or CIDR:PORT; literal
  * IPs/CIDRs are used directly, hostnames are resolved once and pinned (both
@@ -14731,8 +14782,8 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
 
     /* Set exec */
     if (g_krun.set_exec((uint32_t)ctx, exec_args[0],
-                      (const char* const *)(exec_args + 1),
-                      (const char* const *)flat_env) != 0)
+                        (const char* const *)(exec_args + 1),
+                        (const char* const *)flat_env) != 0)
     {
         fprintf(stderr, "oci2bin: krun_set_exec failed\n");
         goto cleanup_ctx;
@@ -17025,6 +17076,23 @@ int main(int argc, char* argv[])
     if (opts.net &&
             (strcmp(opts.net, "slirp") == 0 || strcmp(opts.net, "pasta") == 0))
     {
+        /* Fail closed: if the userspace net helper is not installed, the
+         * forked child would exec-fail and _exit(127) while the container
+         * kept running with an unconfigured, network-less namespace. Verify
+         * the binary is reachable up front and abort with a clear message. */
+        int is_slirp = (strcmp(opts.net, "slirp") == 0);
+        const char* net_tool = is_slirp ? "slirp4netns" : "pasta";
+        if (!tool_is_available(net_tool))
+        {
+            fprintf(stderr,
+                    "oci2bin: --net %s requires '%s', but it was not found in"
+                    " $PATH, /usr/bin, or /usr/local/bin.\n"
+                    "         Install it (%s) or use --net host|none.\n",
+                    opts.net, net_tool,
+                    is_slirp ? "dnf/apt install slirp4netns"
+                    : "dnf install passt / apt install passt");
+            return 1;
+        }
         int sync_pipe[2];
         if (pipe(sync_pipe) < 0)
         {

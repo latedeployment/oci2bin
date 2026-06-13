@@ -6,6 +6,13 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **`--net slirp` / `--net pasta` now fail closed when the helper is missing.**
+  Previously the forked net helper would exec-fail and exit while the container
+  kept running with an unconfigured, network-less namespace — no error surfaced.
+  oci2bin now verifies `slirp4netns` / `pasta` is reachable (PATH, `/usr/bin`,
+  `/usr/local/bin`) before starting the container and aborts with an install
+  hint otherwise.
+
 - **podman now works for the default build, and `doctor` no longer lies about
   it.** The default `oci2bin IMAGE` build path called `docker` literally, so on
   a podman-only host it failed even though `doctor` reported the engine as
