@@ -4,6 +4,8 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-13
+
 ### Added
 
 - **Build-time `--entrypoint` / `--cmd` override** — change what the binary runs
