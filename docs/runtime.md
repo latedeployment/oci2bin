@@ -6,6 +6,65 @@ Runtime options are passed to the generated binary, not to `oci2bin`.
 ./app.bin [OPTIONS] [-- CMD [ARGS...]]
 ```
 
+## Rootless Requirements (unprivileged user namespaces)
+
+The binary runs **as your normal user** — no root, no setuid, no daemon. To do
+that it creates an unprivileged **user namespace** and then mount/PID/UTS
+namespaces inside it. The host kernel must allow this. Most distros do by
+default; two gotchas commonly bite:
+
+### Ubuntu 23.10+ / Debian-derived: AppArmor restriction
+
+These ship `kernel.apparmor_restrict_unprivileged_userns=1`. The user namespace
+is still created, but AppArmor strips its capabilities, so the follow-up
+`unshare(NEWNS|NEWPID|NEWUTS)` fails and you see:
+
+```
+unshare(NEWNS|NEWPID|NEWUTS): Operation not permitted
+```
+
+The binary detects this and prints the fix. You have three options:
+
+```bash
+# 1. Relax the knob globally (simplest; needs root once):
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | \
+    sudo tee /etc/sysctl.d/60-oci2bin-userns.conf      # persist across reboots
+
+# 2. Or author an AppArmor profile that grants `userns,` to the binary
+#    (Ubuntu's intended per-application mechanism — see `man apparmor.d`).
+#    Practical when the binary lives at a stable path.
+
+# 3. Or sidestep host namespaces entirely with a microVM (needs KVM):
+./app.bin --vm
+```
+
+> This is **not** a setuid problem. Unprivileged user namespaces exist precisely
+> so no setuid/root is needed. The setuid `newuidmap`/`newgidmap` helpers are a
+> separate thing — they only map *multiple* sub-UIDs/GIDs and are optional
+> (oci2bin falls back to a single-ID mapping without them). Making the binary
+> setuid would defeat the rootless design and is not the fix.
+
+### Hardened kernels: userns clone disabled
+
+Some hardened kernels set `kernel.unprivileged_userns_clone=0`. Enable it with:
+
+```bash
+sudo sysctl -w kernel.unprivileged_userns_clone=1
+```
+
+### Checking a host
+
+`oci2bin doctor` reports both knobs (under **unprivileged user namespaces**),
+but it only inspects the **build** host. When you ship the binary to a different
+machine, check that host directly:
+
+```bash
+sysctl kernel.apparmor_restrict_unprivileged_userns   # want 0 (or absent)
+sysctl kernel.unprivileged_userns_clone               # want 1 (or absent)
+unshare --user --map-root-user --pid --mount-proc true && echo "userns OK"
+```
+
 ## Commands And Entrypoints
 
 Run the image default command:

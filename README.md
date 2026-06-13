@@ -800,6 +800,39 @@ Use `--` to terminate option parsing when a command argument starts with `-`:
 ./alpine_latest -- -v
 ```
 
+### Running rootless: unprivileged user namespaces
+
+The binary runs **as your normal user** — no root, no setuid, no daemon — by
+creating an unprivileged user namespace. The host kernel must allow that. Most
+distros do by default, but on **Ubuntu 23.10+ and Debian-derived kernels** a
+plain run can fail with:
+
+```
+unshare(NEWNS|NEWPID|NEWUTS): Operation not permitted
+```
+
+That is `kernel.apparmor_restrict_unprivileged_userns=1`: the user namespace is
+created but AppArmor strips its capabilities. The binary detects this and prints
+the fix. Pick one:
+
+```bash
+# 1. Relax the knob (simplest; root once, then persist):
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | \
+    sudo tee /etc/sysctl.d/60-oci2bin-userns.conf
+
+# 2. Or ship an AppArmor profile granting `userns,` to the binary.
+# 3. Or run inside a microVM (needs KVM): ./app.bin --vm
+```
+
+This is **not** a setuid issue — unprivileged user namespaces exist so that no
+root/setuid is needed. (The setuid `newuidmap`/`newgidmap` helpers only map
+*extra* sub-UID/GID ranges and are optional.) On hardened kernels you may
+instead need `sudo sysctl -w kernel.unprivileged_userns_clone=1`. `oci2bin
+doctor` reports both knobs — but it checks the *build* host, so verify the
+**runtime** host too. See
+[docs: Run Binaries → Rootless Requirements](docs/runtime.md) for details.
+
 ### Overriding the entrypoint
 
 `--entrypoint PATH` replaces the image entrypoint:
