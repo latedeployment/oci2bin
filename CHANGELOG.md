@@ -4,6 +4,17 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`oci2bin doctor`: OS-aware install summary.** After the check table, doctor
+  detects the distro from `/etc/os-release` and prints a single
+  `apt`/`dnf`/`pacman`/`zypper` command listing the correct packages for
+  everything missing, plus a manual-install note for tools
+  that aren't packaged (cosign, rekor-cli, libkrun/cloud-hypervisor). Package
+  names are distro-correct — notably the x86_64 cross-compiler is
+  `gcc-x86-64-linux-gnu` on Debian/Ubuntu vs `gcc-x86_64-linux-gnu` on Fedora.
+  Docs updated with both apt and dnf cross-compiler commands.
+
 ## [0.16.0] - 2026-06-13
 
 ### Added

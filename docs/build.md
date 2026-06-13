@@ -167,12 +167,15 @@ toolchain for the non-native target:
 
 ```bash
 # x86_64 host -> aarch64
-sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
+sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc   # Fedora
+sudo apt install gcc-aarch64-linux-gnu                              # Debian/Ubuntu
 # aarch64 host -> x86_64
-sudo dnf install gcc-x86_64-linux-gnu sysroot-x86_64-fc43-glibc
+sudo dnf install gcc-x86_64-linux-gnu sysroot-x86_64-fc43-glibc     # Fedora
+sudo apt install gcc-x86-64-linux-gnu                               # Debian/Ubuntu (note: x86-64 hyphen)
 ```
 
-Override the sysroot with the matching variable:
+`oci2bin doctor` prints the right command for your distro. Override the sysroot
+with the matching variable:
 
 ```bash
 AARCH64_SYSROOT=/path/to/sysroot oci2bin --arch aarch64 alpine:latest

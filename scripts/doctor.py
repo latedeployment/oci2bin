@@ -427,6 +427,135 @@ CHECKS = [
 ]
 
 
+# ── distro detection + per-distro package summary ─────────────────────────────
+
+def _detect_pkgmgr():
+    """Return (pkgmgr, install_cmd, pretty_name) from /etc/os-release, or
+    (None, None, name). pkgmgr is one of apt/dnf/pacman/zypper."""
+    osr = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    osr[k] = v.strip().strip('"')
+    except OSError:
+        pass
+    ident = (osr.get("ID", "") + " " + osr.get("ID_LIKE", "")).lower()
+    pretty = osr.get("PRETTY_NAME") or osr.get("NAME") or "this system"
+    if any(d in ident for d in ("debian", "ubuntu")):
+        return "apt", "sudo apt install", pretty
+    if any(d in ident for d in ("fedora", "rhel", "centos")):
+        return "dnf", "sudo dnf install", pretty
+    if any(d in ident for d in ("arch", "manjaro")):
+        return "pacman", "sudo pacman -S", pretty
+    if any(d in ident for d in ("suse", "opensuse")):
+        return "zypper", "sudo zypper install", pretty
+    return None, None, pretty
+
+
+# Per-check packages by package manager. The native arch never needs a cross
+# compiler; the cross-compiler entry is resolved dynamically (see _packages).
+# Items absent from a manager's list are not cleanly packaged there and are
+# reported under "install manually".
+_PKGS = {
+    "gcc":              {"apt": ["build-essential"], "dnf": ["gcc"],
+                         "pacman": ["base-devel"], "zypper": ["gcc"]},
+    "static libc":      {"apt": ["musl-tools"], "dnf": ["glibc-static"],
+                         "pacman": ["musl"], "zypper": ["glibc-devel-static"]},
+    "newuidmap/newgidmap": {"apt": ["uidmap"], "dnf": ["shadow-utils"],
+                            "pacman": [], "zypper": ["shadow"]},
+    "slirp4netns / pasta": {"apt": ["slirp4netns", "passt"],
+                            "dnf": ["slirp4netns", "passt"],
+                            "pacman": ["slirp4netns", "passt"],
+                            "zypper": ["slirp4netns", "passt"]},
+    "nftables (--allow-egress)": {"apt": ["nftables"], "dnf": ["nftables"],
+                                  "pacman": ["nftables"], "zypper": ["nftables"]},
+    "age (image encryption)": {"apt": ["age"], "dnf": ["age"],
+                               "pacman": ["age"], "zypper": ["age"]},
+    "tar/gzip/zstd":    {"apt": ["tar", "gzip", "zstd"],
+                         "dnf": ["tar", "gzip", "zstd"],
+                         "pacman": ["tar", "gzip", "zstd"],
+                         "zypper": ["tar", "gzip", "zstd"]},
+    "signing tooling":  {"apt": ["openssl"], "dnf": ["openssl"],
+                         "pacman": ["openssl"], "zypper": ["openssl"]},
+    "runtime helpers":  {"apt": ["util-linux", "sqlite3", "systemd", "gdb",
+                                 "curl"],
+                         "dnf": ["util-linux", "sqlite", "systemd", "gdb",
+                                 "curl"],
+                         "pacman": ["util-linux", "sqlite", "systemd", "gdb",
+                                    "curl"],
+                         "zypper": ["util-linux", "sqlite3", "systemd", "gdb",
+                                    "curl"]},
+    "docker/podman":    {"apt": ["podman"], "dnf": ["podman"],
+                         "pacman": ["podman"], "zypper": ["podman"]},
+}
+
+# Cross-compiler package names differ per distro AND per target arch. Note the
+# Debian/Ubuntu x86_64 package uses a hyphen ("x86-64"), unlike Fedora.
+_CROSS_PKGS = {
+    "aarch64": {"apt": ["gcc-aarch64-linux-gnu"],
+                "dnf": ["gcc-aarch64-linux-gnu",
+                        "sysroot-aarch64-fc-glibc"],
+                "pacman": ["aarch64-linux-gnu-gcc"], "zypper": []},
+    "x86_64":  {"apt": ["gcc-x86-64-linux-gnu"],
+                "dnf": ["gcc-x86_64-linux-gnu", "sysroot-x86_64-fc-glibc"],
+                "pacman": [], "zypper": []},
+}
+
+# Deps that are not cleanly packaged on most distros — point at upstream.
+_MANUAL = {
+    "signing tooling": "cosign (https://docs.sigstore.dev/cosign/installation/)",
+    "rekor-cli (transparency log)":
+        "rekor-cli (https://docs.sigstore.dev/rekor/installation/)",
+    "VM backend (KVM / libkrun / cloud-hypervisor)":
+        "libkrun or cloud-hypervisor + virtiofsd (see your distro / upstream)",
+}
+
+
+def _packages(result, pkgmgr):
+    """Packages to install for one non-OK check on this pkgmgr. Returns
+    (apt_packages_list, manual_note_or_None)."""
+    name = result["name"]
+    if name.startswith("cross-compiler"):
+        arch = "x86_64" if "x86_64" in name else "aarch64"
+        return _CROSS_PKGS.get(arch, {}).get(pkgmgr, []), None
+    pkgs = _PKGS.get(name, {}).get(pkgmgr, [])
+    return pkgs, _MANUAL.get(name)
+
+
+def _install_summary(results, pkgmgr, install_cmd, pretty):
+    """Build the OS-aware install summary lines for non-OK checks."""
+    if pkgmgr is None:
+        return ["Install summary: unrecognized distro — see the per-check "
+                "fix: lines above."]
+    pkgs = []
+    manual = []
+    for r in results:
+        if r["status"] == OK:
+            continue
+        p, m = _packages(r, pkgmgr)
+        pkgs.extend(p)
+        if m:
+            manual.append(m)
+    # De-dup, preserve order.
+    seen = set()
+    pkgs = [x for x in pkgs if not (x in seen or seen.add(x))]
+    manual = sorted(set(manual))
+    lines = [f"Install summary for {pretty}:"]
+    if pkgs:
+        lines.append(f"  {install_cmd} {' '.join(pkgs)}")
+    if manual:
+        lines.append("  install manually: " + "; ".join(manual))
+    if not pkgs and not manual:
+        lines.append("  nothing to install — all checks OK or kernel-only.")
+    # Fedora sysroot packages embed the release (fcNN); flag the substitution.
+    if pkgmgr == "dnf" and any("sysroot-" in x for x in pkgs):
+        lines.append("  (replace 'fc' in sysroot-* with your Fedora release, "
+                     "e.g. sysroot-aarch64-fc43-glibc)")
+    return lines
+
+
 def _print_table(results):
     name_w = max(len(r["name"]) for r in results) + 2
     status_w = max(len(r["status"]) for r in results) + 2
@@ -448,11 +577,16 @@ def main():
                    help="machine-readable JSON output")
     args = p.parse_args()
     results = [c() for c in CHECKS]
+    pkgmgr, install_cmd, pretty = _detect_pkgmgr()
     if args.json:
+        # Stable shape: a list of check results (consumers depend on this).
         json.dump(results, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         _print_table(results)
+        print()
+        for line in _install_summary(results, pkgmgr, install_cmd, pretty):
+            print(line)
     # Exit non-zero only on hard MISSING; DEGRADED is informational.
     if any(r["status"] == MISSING for r in results):
         sys.exit(1)

@@ -231,6 +231,8 @@ Build an aarch64 binary on an x86_64 host with `--arch aarch64`:
 ```bash
 # Fedora
 sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
+# Debian / Ubuntu
+sudo apt install gcc-aarch64-linux-gnu
 
 oci2bin --arch aarch64 alpine:latest
 ```
@@ -240,9 +242,15 @@ Build an x86_64 binary on an aarch64 host with `--arch x86_64`:
 ```bash
 # Fedora
 sudo dnf install gcc-x86_64-linux-gnu sysroot-x86_64-fc43-glibc
+# Debian / Ubuntu — the package name uses 'x86-64' (hyphen) even though the
+# compiler binary is x86_64-linux-gnu-gcc (underscore).
+sudo apt install gcc-x86-64-linux-gnu
 
 oci2bin --arch x86_64 alpine:latest
 ```
+
+`oci2bin doctor` detects your distro and prints the exact install command for
+whichever cross-compiler (and other dependencies) you are missing.
 
 The sysroot defaults to `/usr/aarch64-redhat-linux/sys-root/fc43` (aarch64) or
 `/usr/x86_64-redhat-linux/sys-root/fc43` (x86_64). Override with the matching
@@ -2247,6 +2255,13 @@ Each row reports `OK`, `DEGRADED`, or `MISSING` plus a one-line
 detail. On `MISSING` the row includes a `fix:` command. The exit
 code is non-zero only when at least one check is `MISSING`;
 `DEGRADED` (e.g. `cosign` not installed) is informational.
+
+It then prints an **install summary** for your detected distro
+(`/etc/os-release`): a single `apt`/`dnf`/`pacman`/`zypper` command with the
+correct package names for everything missing, plus a short "install manually"
+note for tools that aren't packaged (cosign, rekor-cli, libkrun/cloud-hypervisor).
+Package names are distro-correct — e.g. the x86_64 cross-compiler is
+`gcc-x86-64-linux-gnu` on Debian/Ubuntu but `gcc-x86_64-linux-gnu` on Fedora.
 
 Checks: `gcc`, static libc (`musl-gcc` or `gcc -static`), the cross-compiler
 for the non-native architecture, Docker/Podman, `newuidmap`/`newgidmap` and
