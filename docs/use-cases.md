@@ -206,13 +206,22 @@ oci2bin down -f stack.yaml
 
 ## Build A VM-Mode Binary
 
+`oci2vm` is the same CLI as `oci2bin`, just invoked under a different name. It
+ships as a symlink to `oci2bin` in the repo (and `make install` / `pip install`
+provide it too), so it is available as soon as you clone:
+
 ```bash
-oci2vm redis:7-alpine
-./oci2vm_redis_7-alpine
+oci2vm redis:7-alpine          # builds ./oci2vm_redis_7-alpine
+./oci2vm_redis_7-alpine        # runs as a microVM — no --vm flag needed
+
+# From a clone without installing, run it via the repo symlink:
+./oci2vm redis:7-alpine
 ```
 
-`oci2vm` builds a binary that defaults to VM isolation. You can also build with
-`oci2bin` and run with `--vm` when VM assets are embedded.
+A binary whose name starts with `oci2vm` auto-enables `--vm` at run time — which
+is why the output is named `oci2vm_<image>`. Equivalently, build with plain
+`oci2bin` and pass `--vm` at run time. Either way needs `/dev/kvm` and a VM
+backend (libkrun, or cloud-hypervisor with an embedded kernel).
 
 ## Reconstruct A Binary From A Registry Round Trip
 

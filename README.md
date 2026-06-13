@@ -675,15 +675,22 @@ oci2bin --offline-only --oci-dir ./image-layout/ alpine:3.20
 
 ### VM-mode binaries (oci2vm)
 
-`oci2vm` is a symlink to `oci2bin` that builds binaries which run in VM mode by default — no `--vm` flag needed at runtime. The output is named `oci2vm_<image>` so that the embedded loader detects the invocation name and enables VM mode automatically.
+`oci2vm` is the same CLI as `oci2bin`, just invoked under a different name: it builds binaries that run in VM mode by default — no `--vm` flag needed at runtime. The output is named `oci2vm_<image>` so that the embedded loader detects the invocation name and enables VM mode automatically.
+
+It ships as a symlink to `oci2bin` in the repository (and `make install` and `pip install` both provide it), so it is available immediately:
 
 ```bash
+# Installed on PATH (make install / pip install):
 oci2vm redis:7-alpine          # -> oci2vm_redis_7-alpine (runs as VM by default)
+
+# Or straight from a clone, via the repo symlink:
+./oci2vm redis:7-alpine
+
 ./oci2vm_redis_7-alpine        # starts a VM, no --vm required
 ./oci2vm_redis_7-alpine --net host redis-server --port 6380
 ```
 
-This is equivalent to building with `oci2bin` and always running with `--vm`, but removes the need to remember the flag. You can also rename or symlink any oci2bin binary to a name starting with `oci2vm` to get the same effect.
+This is equivalent to building with `oci2bin` and always running with `--vm`, but removes the need to remember the flag. The mechanism is purely the invocation name, so renaming or symlinking any oci2bin binary to a name starting with `oci2vm` gets the same effect.
 
 ### Embedding the loader for reconstruction
 
