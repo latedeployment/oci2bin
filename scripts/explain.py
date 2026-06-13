@@ -163,8 +163,8 @@ def main():
         print(f"User:         {user}")
         if env:
             print("Env:")
-            for e in _redact_env(env):
-                print(f"              {e}")
+            for entry in _redact_env(env):
+                print(f"              {entry}")
         if ports:
             print(f"ExposedPorts: {' '.join(ports)}")
         if healthcheck:

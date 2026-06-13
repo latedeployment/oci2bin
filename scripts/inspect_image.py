@@ -479,8 +479,8 @@ def main():
 
     if env:
         print("Env:")
-        for e in redact_env(env):
-            print(f"              {e}")
+        for entry in redact_env(env):
+            print(f"              {entry}")
 
     if ports:
         print(f"ExposedPorts: {' '.join(ports.keys())}")
@@ -522,8 +522,8 @@ def main():
         if 'version' in meta:
             print(f"  oci2bin:   {meta['version']}")
         if meta.get('hermetic') == 'yes':
-            print(f"  Hermetic:  yes (built with --offline-only,"
-                  f" no network used)")
+            print("  Hermetic:  yes (built with --offline-only,"
+                  " no network used)")
 
 
 if __name__ == '__main__':

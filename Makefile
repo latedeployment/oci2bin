@@ -259,7 +259,21 @@ lint: lint-clang lint-scan-build lint-shellcheck lint-semgrep
 #   -Wcomma               comma operator (often a typo for ';')
 #   -Wundef               macro used in #if but never defined
 #   -Wduplicate-enum      duplicate enum constant values
-CLANG_LINT_FLAGS = -static -O2 -Wall -Wextra -Werror \
+#   -Wpointer-arith       arithmetic on void*/function pointers
+#   -Wredundant-decls     duplicate declarations
+#   -Wvla                 variable-length arrays (unbounded stack growth)
+#   -Winit-self           self-initialising variables
+#   -Wdouble-promotion    silent float->double promotion
+#   -Wshift-sign-overflow shifting into/over the sign bit
+#   -Wconditional-uninitialized  used-uninitialised on some path
+#   -Wfloat-equal         exact float == comparison
+#   -Wbad-function-cast   casting a function-call result to the wrong type
+#   -Wmissing-variable-declarations  non-static global without a declaration
+# Intentionally NOT enabled (conflict with idiomatic POSIX C here, would only
+# add noise): -Wwrite-strings (string-literal argv arrays), -Wcast-qual /
+# -Wsign-conversion / -Wconversion (const-stripping for execvp, size_t math),
+# -Wswitch-enum, -Wpedantic (dlsym void*->fn-ptr cast).
+CLANG_WARN = -Wall -Wextra -Werror \
                    -Wno-unused-parameter \
                    -Wcast-align \
                    -Wshadow \
@@ -273,11 +287,25 @@ CLANG_LINT_FLAGS = -static -O2 -Wall -Wextra -Werror \
                    -Wunreachable-code \
                    -Wcomma \
                    -Wundef \
-                   -Wduplicate-enum
+                   -Wduplicate-enum \
+                   -Wpointer-arith \
+                   -Wredundant-decls \
+                   -Wvla \
+                   -Winit-self \
+                   -Wdouble-promotion \
+                   -Wshift-sign-overflow \
+                   -Wconditional-uninitialized \
+                   -Wfloat-equal \
+                   -Wbad-function-cast \
+                   -Wmissing-variable-declarations
 
 lint-clang:
 	@echo "=== clang lint ($(CC_CLANG)) ==="
-	$(CC_CLANG) $(CLANG_LINT_FLAGS) $(VM_DEFS) -o /dev/null src/loader.c
+	# Default static build.
+	$(CC_CLANG) -static -O2 $(CLANG_WARN) $(VM_DEFS) -o /dev/null src/loader.c
+	# libkrun/dlopen path (#ifdef'd out of the default build, so lint it too).
+	$(CC_CLANG) -O2 -DUSE_LIBKRUN $(CLANG_WARN) $(VM_DEFS) -o /dev/null \
+		src/loader.c -ldl
 	@echo "clang lint: OK"
 
 # clang static analyzer: interprocedural analysis for null-deref, memory leaks,

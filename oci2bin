@@ -2507,18 +2507,23 @@ else
     BUILD_TAR_ARG="${BUILD_TAR_ARG:-}"
 fi
 
+# Ensure BUILD_TAR_ARG points at a saved image tar, saving $IMAGE once if no
+# earlier step (--layer / --oci-dir) already produced one. Shared by the strip,
+# squash, and file-injection steps below.
+ensure_base_tar() {
+    [[ -n "$BUILD_TAR_ARG" ]] && return 0
+    BASE_TAR_TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$BASE_TAR_TMPDIR"' EXIT
+    echo "oci2bin: saving $IMAGE for the build..."
+    docker save -o "$BASE_TAR_TMPDIR/base.tar" "$IMAGE"
+    BUILD_TAR_ARG="$BASE_TAR_TMPDIR/base.tar"
+}
+
 # ── strip if requested ────────────────────────────────────────────────────
 
 if [[ "$DO_STRIP" -eq 1 ]]; then
     # Need a tar to strip — save now if not already saved by --layer logic
-    if [[ -z "$BUILD_TAR_ARG" ]]; then
-        STRIP_TMPDIR="$(mktemp -d)"
-        trap 'rm -rf "$STRIP_TMPDIR"' EXIT
-        BASE_TAR_FOR_STRIP="$STRIP_TMPDIR/base.tar"
-        echo "oci2bin: saving $IMAGE for stripping..."
-        docker save -o "$BASE_TAR_FOR_STRIP" "$IMAGE"
-        BUILD_TAR_ARG="$BASE_TAR_FOR_STRIP"
-    fi
+    ensure_base_tar
     STRIPPED_TAR="${BUILD_TAR_ARG%.tar}_stripped.tar"
     echo "oci2bin: stripping docs/man/locale from image..."
     STRIP_AUTO_ARG=()
@@ -2534,14 +2539,7 @@ fi
 # ── squash layers if requested ────────────────────────────────────────────
 
 if [[ "$DO_SQUASH" -eq 1 ]]; then
-    if [[ -z "$BUILD_TAR_ARG" ]]; then
-        SQUASH_TMPDIR="$(mktemp -d)"
-        trap 'rm -rf "$SQUASH_TMPDIR"' EXIT
-        BASE_TAR_FOR_SQUASH="$SQUASH_TMPDIR/base.tar"
-        echo "oci2bin: saving $IMAGE for squashing..."
-        docker save -o "$BASE_TAR_FOR_SQUASH" "$IMAGE"
-        BUILD_TAR_ARG="$BASE_TAR_FOR_SQUASH"
-    fi
+    ensure_base_tar
     SQUASHED_TAR="${BUILD_TAR_ARG%.tar}_squashed.tar"
     echo "oci2bin: squashing layers..."
     SQUASH_ARGS=(python3 "$OCI2BIN_HOME/scripts/squash_layers.py"
@@ -2556,14 +2554,7 @@ fi
 
 if [[ "${#ADD_FILE_ARGS[@]}" -gt 0 || "${#ADD_DIR_ARGS[@]}" -gt 0 ]]; then
     # Need a tar to inject into — save now if not already saved
-    if [[ -z "$BUILD_TAR_ARG" ]]; then
-        INJECT_TMPDIR="$(mktemp -d)"
-        trap 'rm -rf "$INJECT_TMPDIR"' EXIT
-        BASE_TAR_FOR_INJECT="$INJECT_TMPDIR/base.tar"
-        echo "oci2bin: saving $IMAGE for file injection..."
-        docker save -o "$BASE_TAR_FOR_INJECT" "$IMAGE"
-        BUILD_TAR_ARG="$BASE_TAR_FOR_INJECT"
-    fi
+    ensure_base_tar
     INJECTED_TAR="${BUILD_TAR_ARG%.tar}_injected.tar"
 
     INJECT_ARGS=()

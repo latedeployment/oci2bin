@@ -1595,7 +1595,7 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
 
     print(f"\n  Byte 0-3:     {polyglot[0:4].hex()} (ELF magic)")
     print(f"  Byte 257-262: {polyglot[257:263]} (tar magic)")
-    print(f"\nVerification passed: file is both ELF and TAR!")
+    print("\nVerification passed: file is both ELF and TAR!")
 
 
 def main():
