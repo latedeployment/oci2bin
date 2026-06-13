@@ -13,8 +13,8 @@ oci2bin --strip --compress-binary zstd nginx:1.25 my-nginx
 Copy and run:
 
 ```bash
-scp my-nginx server:
-ssh server './my-nginx -p 8080:80 --net slirp'
+scp ./my-nginx deploy@server.example.com:/opt/nginx/my-nginx
+ssh deploy@server.example.com '/opt/nginx/my-nginx -p 8080:80 --net slirp'
 ```
 
 Make a systemd unit:
@@ -199,8 +199,8 @@ oci2bin pod run --net shared --ipc shared ./api ./worker ./sidecar
 Use declarative stacks when you want a repeatable service group:
 
 ```bash
-oci2bin up -f stack.yaml -d           # the file's name: field names the stack
-oci2bin stack logs mystack api -f      # by stack name + service; -f follows
+oci2bin up -f stack.yaml -d # the file's name: field names the stack
+oci2bin stack logs mystack api -f # by stack name + service; -f follows
 oci2bin down -f stack.yaml
 ```
 

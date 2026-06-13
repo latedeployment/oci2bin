@@ -24,8 +24,9 @@ nav:
   - Operations: operations.md
   - Feature Inventory: reference/features.md
   - Command Reference: reference/commands.md
+  - Dependencies: reference/dependencies.md
+  - Environment Variables: reference/environment.md
   - How It Works: internals/how-it-works.md
-  - Local Preview: local-preview.md
 
 markdown_extensions:
   - admonition

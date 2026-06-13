@@ -830,18 +830,52 @@ Temporary directories are created with @code{mkdtemp} (mode
 @node Environment Variables
 @chapter Environment Variables
 
+@section Run time (read by the produced binary)
+
 @table @env
+@item OCI2BIN_DEBUG
+Any value enables verbose runtime diagnostics (same as @option{--debug}).
+@item OCI2BIN_TMPDIR
+Directory for the runtime extraction tmpdir; tried before @env{TMPDIR}.
+Point at a tmpfs for speed and to keep the rootfs off disk.
+@item TMPDIR
+Fallback extraction directory (then @file{/tmp}, then @file{/var/tmp}).
+@item OCI2BIN_IDENTITY
+Path to the age identity (or SSH private key) used to decrypt an
+@option{--encrypt} recipient image.
+@item OCI2BIN_PASSWORD / OCI2BIN_PASSWORD_FILE
+Passphrase (or a file whose first line is the passphrase) for a
+@option{--passphrase} image.
+@item OCI2BIN_CDI_DIR
+Extra directory searched first for CDI specs, ahead of @file{/etc/cdi}
+and @file{/run/cdi} (@option{--gpus} / @option{--cdi-device}).
 @item SSH_AUTH_SOCK
 Path to the SSH agent socket forwarded when @option{--ssh-agent} is
 given.
-@item AARCH64_SYSROOT
-Override the sysroot used by the aarch64 cross-compiler.  Default:
-@file{/usr/aarch64-redhat-linux/sys-root/fc43}.
+@item HOME
+Base for the named-container state directory
+(@file{~/.cache/oci2bin/containers/}).
+@end table
+
+@section Build time (read by the oci2bin CLI)
+
+@table @env
 @item OCI2BIN_HOME
 Override the directory where shared resources are found
 (@file{build_polyglot.py}, pre-built loader binaries).  Set
 automatically by @command{make install} to
 @file{@var{PREFIX}/share/oci2bin}.
+@item AARCH64_SYSROOT / X86_64_SYSROOT
+Override the sysroot used by the aarch64 / x86_64 cross-compiler.
+aarch64 default: @file{/usr/aarch64-redhat-linux/sys-root/fc43}.
+@item SOURCE_DATE_EPOCH
+Fixed timestamp for @option{--reproducible} / @option{--offline-only}
+builds.
+@item VM_CPUS / VM_MEM_MB
+Default vCPU count and memory (MiB) baked into a VM-mode binary.
+@item XDG_CACHE_HOME / XDG_DATA_HOME
+Override @file{~/.cache} (build/layer caches) and @file{~/.local/share}
+(detached-stack manifests, freeze tokens).
 @end table
 
 @c ─────────────────────────────────────────────────────────────────────────────

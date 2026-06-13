@@ -8,9 +8,9 @@ The output file is both:
 - a valid tar archive that can be loaded back into Docker with `docker load`
 
 ```bash
-oci2bin redis:7-alpine
-scp redis_7-alpine server:
-ssh server ./redis_7-alpine
+oci2bin redis:7-alpine # builds ./redis_7-alpine
+scp ./redis_7-alpine deploy@server.example.com:/opt/redis/redis_7-alpine
+ssh deploy@server.example.com /opt/redis/redis_7-alpine
 ```
 
 There is no daemon on the target machine. There is no install step on the
@@ -42,8 +42,8 @@ oci2bin alpine:latest
 Send it to another Linux host:
 
 ```bash
-scp alpine_latest host:
-ssh host ./alpine_latest /bin/uname -a
+scp ./alpine_latest deploy@host.example.com:/usr/local/bin/alpine_latest
+ssh deploy@host.example.com /usr/local/bin/alpine_latest /bin/uname -a
 ```
 
 Load it back into Docker:
@@ -97,5 +97,7 @@ oci2bin doctor
 - [Feature Inventory](reference/features.md): the complete feature checklist
 - [Dependencies](reference/dependencies.md): build-host and target-host
   requirements per feature (and the libkrun caveat)
+- [Environment Variables](reference/environment.md): every `OCI2BIN_*` and
+  related variable, for run time and build time
 - [How It Works](internals/how-it-works.md): loader flow and polyglot layout
 

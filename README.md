@@ -16,7 +16,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Feature | Example |
 |---------|---------|
 | Pack any image into a single binary | `oci2bin redis:7-alpine` |
-| Run anywhere — no Docker, no daemon | `scp redis_7-alpine remote && ssh remote ./redis_7-alpine` |
+| Run anywhere — no Docker, no daemon | `scp ./redis_7-alpine user@remote:/opt/redis/ && ssh user@remote /opt/redis/redis_7-alpine` |
 | Build from a chroot directory | `oci2bin from-chroot ./rootfs -o myapp.bin` |
 | Build from a Dockerfile | `oci2bin build-dockerfile -o myapp.bin` |
 | Inject secrets at runtime | `./myapp --secret /etc/ssl/key.pem:/run/secrets/key` |
@@ -173,7 +173,58 @@ oci2bin nginx:1.25 my-nginx  # explicit output name
 
 ## Building binaries
 
+### Pinning the source image by digest
+
+Build from an immutable content digest instead of a mutable tag by passing a
+`name@sha256:...` reference — the supply-chain-safe way to pin exactly what goes
+into the binary:
+
+```bash
+oci2bin alpine@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+# → builds ./alpine_25109184c71b   (output name = repo + short digest)
+```
+
+oci2bin **verifies the digest** before building. `docker pull` already rejects a
+content mismatch, but a digest-pinned image that is *already in the local store*
+is used without a pull — so oci2bin re-checks that the resolved image actually
+reports the requested digest (via its `RepoDigests`) and **refuses to build on a
+mismatch**. This catches a tampered or mis-tagged local image, not just a bad
+registry response. A malformed digest (not `sha256:` + 64 hex chars) is rejected
+up front.
+
+This is independent of [`--pin-digest`](#reproducible-builds-and-digest-pinning),
+which embeds a digest the *loader* re-checks at run time; digest pulls pin the
+*build input*. The two compose well.
+
+### Baking a different entrypoint/command at build time
+
+By default the binary runs the image's own `Entrypoint`/`Cmd`. Override what it
+runs *by default* — without a Dockerfile — with the build-time `--entrypoint`
+and `--cmd` flags:
+
+```bash
+# Shell-split string form
+oci2bin --entrypoint '/usr/bin/myserver --config /etc/app.conf' myapp:latest
+
+# JSON-array (exec) form, with a separate default command
+oci2bin --entrypoint '["redis-server"]' --cmd '["--port","6380"]' redis:7-alpine myredis
+```
+
+The value is parsed as a JSON array (`["a","b"]`) when it starts with `[`,
+otherwise it is shell-split. Setting `--entrypoint` without `--cmd` clears the
+image's default `Cmd` so the new entrypoint runs alone (matching
+`docker run --entrypoint`). These rewrite the embedded image config, so the
+change is baked into the artifact and shows up in `oci2bin inspect`.
+
+This is the build-time counterpart to the runtime
+[`--entrypoint`](#overriding-the-entrypoint) flag (which overrides per launch
+without rebuilding).
+
 ### Cross-architecture builds
+
+Cross-compilation works in **both directions** — the host's native architecture
+builds with plain `gcc`, and the other architecture uses a cross-compiler plus a
+matching glibc sysroot.
 
 Build an aarch64 binary on an x86_64 host with `--arch aarch64`:
 
@@ -184,13 +235,27 @@ sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
 oci2bin --arch aarch64 alpine:latest
 ```
 
-The sysroot defaults to `/usr/aarch64-redhat-linux/sys-root/fc43`. Override with:
+Build an x86_64 binary on an aarch64 host with `--arch x86_64`:
+
+```bash
+# Fedora
+sudo dnf install gcc-x86_64-linux-gnu sysroot-x86_64-fc43-glibc
+
+oci2bin --arch x86_64 alpine:latest
+```
+
+The sysroot defaults to `/usr/aarch64-redhat-linux/sys-root/fc43` (aarch64) or
+`/usr/x86_64-redhat-linux/sys-root/fc43` (x86_64). Override with the matching
+environment variable:
 
 ```bash
 AARCH64_SYSROOT=/path/to/sysroot oci2bin --arch aarch64 alpine:latest
+X86_64_SYSROOT=/path/to/sysroot  oci2bin --arch x86_64  alpine:latest
 ```
 
-The output runs only on aarch64 Linux (or under qemu-aarch64).
+The output runs only on the target architecture (or under the matching
+`qemu-<arch>-static`). `oci2bin doctor` reports whether the cross-compiler for
+the non-native architecture is installed.
 
 #### Multi-arch fat binaries
 
@@ -2075,8 +2140,8 @@ Once built, the binary is fully self-contained:
 oci2bin build-dockerfile -o myapp
 
 # Distribute and run anywhere
-scp myapp remote-host:
-ssh remote-host ./myapp
+scp ./myapp deploy@remote-host.example.com:/opt/app/myapp
+ssh deploy@remote-host.example.com /opt/app/myapp
 ```
 
 ---
@@ -2099,6 +2164,42 @@ oci2bin: secret /run/secrets/mykey -> /run/secrets/mykey (read-only)
 
 TPM2-sealed secrets (decrypted via `systemd-creds`) also use `memfd_secret` when
 available, so the decrypted plaintext never enters the page cache.
+
+---
+
+## Environment variables
+
+oci2bin is tuned by a handful of environment variables — some read **at run
+time** by a produced binary, some **at build time** by the `oci2bin` CLI.
+
+### Run time (read by the produced binary)
+
+| Variable | Effect |
+|----------|--------|
+| `OCI2BIN_DEBUG` | Any value → verbose runtime diagnostics (same as `--debug`). |
+| `OCI2BIN_TMPDIR` | Extraction tmpdir, tried before `TMPDIR`; point at a tmpfs for speed and to keep the rootfs off disk. |
+| `TMPDIR` | Fallback extraction dir (then `/tmp`, then `/var/tmp`). |
+| `OCI2BIN_IDENTITY` | age identity (or SSH private key) to decrypt an `--encrypt` recipient image. |
+| `OCI2BIN_PASSWORD` / `OCI2BIN_PASSWORD_FILE` | Passphrase (or first line of a file) for a `--passphrase` image. |
+| `OCI2BIN_CDI_DIR` | Extra directory searched first for CDI specs (`--gpus`/`--cdi-device`). |
+| `SSH_AUTH_SOCK` | Host SSH-agent socket forwarded by `--ssh-agent`. |
+| `HOME` | Base for the named-container state dir (`~/.cache/oci2bin/containers/`). |
+
+### Build time (read by the `oci2bin` CLI)
+
+| Variable | Effect |
+|----------|--------|
+| `OCI2BIN_HOME` | Where shared resources (builder, prebuilt loaders) live; set by `make install`. |
+| `AARCH64_SYSROOT` / `X86_64_SYSROOT` | Cross-compiler sysroots for `--arch`. |
+| `SOURCE_DATE_EPOCH` | Fixed timestamp for `--reproducible` / `--offline-only`. |
+| `VM_CPUS` / `VM_MEM_MB` | Default vCPUs / memory baked into VM binaries. |
+| `XDG_CACHE_HOME` / `XDG_DATA_HOME` | Override `~/.cache` (build/layer caches) and `~/.local/share` (stack manifests, freeze tokens). |
+| `PREFIX` | Install prefix for `make install` (default `/usr/local`). |
+
+`OCI2BIN_INSPECT`, `OCI2BIN_VM_INIT`, `OCI2BIN_GOSU_DEPTH`, `OCI2BIN_META`,
+`OCI2BIN_SELF`, and `OCI2BIN_COSIGN_*` are set internally by oci2bin (mode
+switches, the gosu recursion guard, and passing the build-time cosign result
+into `sign --attest auto`); you do not set these yourself.
 
 ---
 
@@ -2140,11 +2241,14 @@ detail. On `MISSING` the row includes a `fix:` command. The exit
 code is non-zero only when at least one check is `MISSING`;
 `DEGRADED` (e.g. `cosign` not installed) is informational.
 
-Checks: `gcc`, static libc (`musl-gcc` or `gcc -static`),
-Docker/Podman, `newuidmap`/`newgidmap` and `/etc/subuid`/`subgid`,
-seccomp, Landlock ABI, cgroup v2 controllers, unprivileged user
-namespaces, `slirp4netns`/`pasta`, `/dev/kvm`/`libkrun`,
-`openssl`/`cosign`, `tar`/`gzip`/`zstd`.
+Checks: `gcc`, static libc (`musl-gcc` or `gcc -static`), the cross-compiler
+for the non-native architecture, Docker/Podman, `newuidmap`/`newgidmap` and
+`/etc/subuid`/`subgid`, seccomp, Landlock ABI, cgroup v2 controllers,
+unprivileged user namespaces, `slirp4netns`/`pasta`, `nftables`
+(`--allow-egress`), the VM backend (`/dev/kvm`, `libkrun`,
+`cloud-hypervisor`/`virtiofsd`), `openssl`/`cosign`, `rekor-cli`,
+`tar`/`gzip`/`zstd`, `age` (image encryption), and the optional runtime
+helpers (`nsenter`, `sqlite3`, `systemd-creds`, `gdb`, `curl`).
 
 ### explain
 

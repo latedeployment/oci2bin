@@ -10,6 +10,30 @@ There are two separate environments:
 - **Build host** — the machine that runs `oci2bin` to *produce* a binary.
 - **Target host** — the machine that *runs* the produced `./mybinary`.
 
+## Graceful degradation
+
+A missing dependency never blocks an unrelated run. The rule is:
+
+- **Always-applied hardening degrades silently.** The default seccomp filter,
+  Landlock sandbox, cgroup v2 limits, the full rootless UID/GID range
+  (`newuidmap`/`newgidmap`), `memfd_secret`-backed secrets, and `--notify`
+  delivery all *warn and continue* (or fall back) when the kernel feature or
+  helper is absent. A plain `./mybinary` needs only `tar` plus unprivileged
+  user namespaces. (`--strict` is the opt-in that turns these degradations into
+  hard failures.)
+- **A dependency is required only when its feature is in play.** `age` only when
+  the payload is encrypted; `zstd` only when it is compressed; `slirp4netns`/
+  `pasta` only for `--net slirp`/`pasta`; `nft` only for `--allow-egress`;
+  `systemd-creds` only for `--secret tpm2:`; `rekor-cli` only for `--rekor`; and
+  so on. If you do not use the feature, the tool is never looked for.
+- **Explicitly requested things fail loudly rather than silently wrong.** When
+  you *do* ask for a feature whose dependency is missing, oci2bin aborts with a
+  clear message instead of running degraded — `--vm` without a VM backend,
+  `--gpus`/`--cdi-device` without a CDI spec, `--allow-egress` without `nft`
+  (fail-closed), a `--seccomp-profile` that won't load, or an encrypted/
+  compressed payload without `age`/`zstd`. These are the only "strict"
+  requirements, and each is tied to something you opted into.
+
 ## Target host (runtime)
 
 The produced binary is statically linked by default, so the runtime surface is

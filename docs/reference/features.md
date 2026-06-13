@@ -7,6 +7,7 @@ This page is a checklist of the feature surface documented by the site.
 | Feature | Command |
 | --- | --- |
 | Build from Docker or Podman image | `oci2bin alpine:latest` |
+| Build (and validate) by image digest | `oci2bin alpine@sha256:<64-hex>` |
 | Build from OCI layout directory | `oci2bin --oci-dir ./layout alpine:latest` |
 | Build from saved image tar | `oci2bin --tar image.tar image:tag output` |
 | Build from chroot | `oci2bin from-chroot ./rootfs -o app.bin` |
@@ -17,7 +18,7 @@ This page is a checklist of the feature surface documented by the site.
 
 | Feature | Command |
 | --- | --- |
-| Cross-architecture output | `oci2bin --arch aarch64 alpine:latest` |
+| Cross-architecture output (both directions) | `oci2bin --arch aarch64 ...` / `--arch x86_64 ...` |
 | Multi-arch wrapper | `oci2bin --arch all alpine:latest` |
 | qemu-user-static fallback | automatic through wrapper when available |
 | Add file | `--add-file HOST:CONTAINER` |
@@ -27,6 +28,8 @@ This page is a checklist of the feature surface documented by the site.
 | Custom strip prefix | `--strip-prefix PREFIX` |
 | Package-manager cache detection | `--strip-auto` |
 | Squash layers | `--squash` |
+| Override entrypoint at build | `--entrypoint '["redis-server"]'` |
+| Override default command at build | `--cmd '["--port","6380"]'` |
 | zstd-compress payload | `--compress-binary zstd` |
 | Add labels | `--label KEY=VAL` |
 | Cache output binary | `--cache` |

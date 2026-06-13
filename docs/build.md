@@ -12,6 +12,24 @@ oci2bin redis:7-alpine redis_7-alpine
 If the image is not local, `oci2bin` pulls it. The image is saved as an OCI tar
 payload, combined with the loader, and written as one executable file.
 
+### Pin by digest (validated)
+
+Pass an immutable `name@sha256:...` reference to build from a specific content
+digest instead of a mutable tag:
+
+```bash
+oci2bin alpine@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+# → builds ./alpine_25109184c71b
+```
+
+oci2bin verifies the digest before building: a digest-pinned image already in
+the local store is used without a pull (so `docker` never re-validates it), so
+oci2bin re-checks that the resolved image actually reports the requested digest
+and **refuses to build on a mismatch** — defending against a tampered or
+mis-tagged local image. A malformed digest is rejected up front. This pins the
+build *input*; [`--pin-digest`](#reproducible-builds-and-digest-pinning) pins
+what the *loader* re-checks at run time.
+
 ## Build From An OCI Layout
 
 ```bash
@@ -111,12 +129,31 @@ Snap-like distribution after the build:
 
 ```bash
 oci2bin build-dockerfile -o myapp
-scp myapp remote-host:
-ssh remote-host ./myapp
+scp ./myapp deploy@remote-host.example.com:/opt/app/myapp
+ssh deploy@remote-host.example.com /opt/app/myapp
 ```
 
 The result is a self-contained executable artifact. The target host does not
 need the Dockerfile builder or Docker.
+
+## Override Entrypoint Or Command
+
+Change what the binary runs by default — without writing a Dockerfile — by
+rewriting the embedded image config at build time:
+
+```bash
+# Shell-split string form
+oci2bin --entrypoint '/usr/bin/myserver --config /etc/app.conf' myapp:latest
+
+# JSON-array (exec) form, with a separate default command
+oci2bin --entrypoint '["redis-server"]' --cmd '["--port","6380"]' redis:7-alpine myredis
+```
+
+A value starting with `[` is parsed as a JSON array; otherwise it is
+shell-split. `--entrypoint` without `--cmd` clears the image's default `Cmd`
+(like `docker run --entrypoint`). The change is baked into the artifact and
+appears in `oci2bin inspect`. To override per launch instead (no rebuild), use
+the runtime `--entrypoint` flag on the produced binary.
 
 ## Cross-Architecture Builds
 
@@ -127,18 +164,26 @@ oci2bin --arch x86_64 alpine:latest
 oci2bin --arch aarch64 alpine:latest
 ```
 
-For aarch64 from an x86_64 host, install the matching cross compiler and
-sysroot:
+Cross-compilation works in **both directions**: the host's native architecture
+uses plain `gcc`, the other uses a cross compiler + sysroot. Install the matching
+toolchain for the non-native target:
 
 ```bash
+# x86_64 host -> aarch64
 sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
+# aarch64 host -> x86_64
+sudo dnf install gcc-x86_64-linux-gnu sysroot-x86_64-fc43-glibc
 ```
 
-Override the sysroot:
+Override the sysroot with the matching variable:
 
 ```bash
 AARCH64_SYSROOT=/path/to/sysroot oci2bin --arch aarch64 alpine:latest
+X86_64_SYSROOT=/path/to/sysroot  oci2bin --arch x86_64  alpine:latest
 ```
+
+`oci2bin doctor` reports whether the cross-compiler for the non-native
+architecture is installed.
 
 Build a wrapper plus both supported architectures:
 

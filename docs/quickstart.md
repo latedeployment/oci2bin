@@ -77,9 +77,9 @@ oci2bin nginx:1.25 my-nginx
 ## Copy To Another Machine
 
 ```bash
-oci2bin redis:7-alpine
-scp redis_7-alpine server:
-ssh server ./redis_7-alpine redis-server --port 6379
+oci2bin redis:7-alpine                                    # builds ./redis_7-alpine
+scp ./redis_7-alpine deploy@server.example.com:/opt/redis/redis_7-alpine
+ssh deploy@server.example.com /opt/redis/redis_7-alpine redis-server --port 6379
 ```
 
 The target host does not need Docker installed.

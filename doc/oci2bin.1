@@ -157,6 +157,18 @@ and
 .BR buildah (1).
 .
 .TP
+.BI \-\-entrypoint " VALUE" \fR, \fB\-\-cmd " VALUE"
+Override the embedded image Entrypoint/Cmd at build time.
+.I VALUE
+is a JSON array
+.RB ( [\fB"a","b"\fR] )
+or a shell-split string.
+.B \-\-entrypoint
+without
+.B \-\-cmd
+clears the image's default Cmd.
+.
+.TP
 .B \-\-compress\-binary zstd
 Recompress the embedded payload as one zstd frame to shrink the output.
 Requires
@@ -607,16 +619,64 @@ If
 fails, a descriptive error is printed and the container exits.
 .
 .SH ENVIRONMENT
+.SS Run time (read by the produced binary)
+.TP
+.B OCI2BIN_DEBUG
+Set to any value to print verbose runtime diagnostics (same as
+.BR \-\-debug ).
+.TP
+.B OCI2BIN_TMPDIR
+Directory for the runtime extraction tmpdir; tried before
+.BR TMPDIR .
+Point at a tmpfs for speed and to keep the rootfs off disk.
+.TP
+.B TMPDIR
+Fallback extraction directory (then
+.IR /tmp ", then " /var/tmp ).
+.TP
+.B OCI2BIN_IDENTITY
+Path to the age identity (or SSH private key) used to decrypt an
+.B \-\-encrypt
+recipient image.
+.TP
+.B OCI2BIN_PASSWORD \fR/\fB OCI2BIN_PASSWORD_FILE
+Passphrase (or a file whose first line is the passphrase) for a
+.B \-\-passphrase
+image.
+.TP
+.B OCI2BIN_CDI_DIR
+Extra directory searched first for CDI specs, ahead of
+.I /etc/cdi
+and
+.IR /run/cdi .
 .TP
 .B SSH_AUTH_SOCK
 Path to the SSH agent socket forwarded when
 .B \-\-ssh\-agent
 is given.
+.SS Build time (read by the oci2bin CLI)
 .TP
-.B AARCH64_SYSROOT
-Override the sysroot used by the aarch64 cross-compiler.
-Default:
+.B AARCH64_SYSROOT \fR/\fB X86_64_SYSROOT
+Override the sysroot used by the aarch64 / x86_64 cross-compiler.
+aarch64 default:
 .IR /usr/aarch64\-redhat\-linux/sys\-root/fc43 .
+.TP
+.B SOURCE_DATE_EPOCH
+Fixed timestamp for
+.B \-\-reproducible
+/
+.B \-\-offline\-only
+builds.
+.TP
+.B VM_CPUS \fR/\fB VM_MEM_MB
+Default vCPU count and memory (MiB) baked into a VM-mode binary.
+.TP
+.B XDG_CACHE_HOME \fR/\fB XDG_DATA_HOME
+Override
+.I ~/.cache
+(build/layer caches) and
+.I ~/.local/share
+(detached-stack manifests, freeze tokens).
 .TP
 .B OCI2BIN_HOME
 Override the directory where shared resources
