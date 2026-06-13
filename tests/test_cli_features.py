@@ -59,6 +59,13 @@ def _minimal_oci_tar(labels=None, healthcheck=None):
     return buf.getvalue()
 
 
+def _proc_start_ticks(pid):
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").strip()
+    rparen = raw.rfind(")")
+    fields = raw[rparen + 2:].split()
+    return int(fields[19])
+
+
 class TestCliFeatures(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -216,6 +223,22 @@ class TestCliFeatures(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("state path contains symlink component", result.stderr)
 
+    def test_run_forwards_new_build_options(self):
+        missing_oci = self.tmpdir / "missing-oci-layout"
+        result = subprocess.run(
+            [str(OCI2BIN), "run",
+             "--pull-with", "skopeo",
+             "--reproducible",
+             "--oci-dir", str(missing_oci),
+             "alpine:latest", "--", "/bin/true"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("unknown build option before IMAGE", result.stderr)
+        self.assertIn("--oci-dir: directory not found", result.stderr)
+
     def test_stop_refuses_mismatched_process_identity(self):
         home = self.tmpdir / "home-stop"
         ctr_dir = home / ".cache" / "oci2bin" / "containers"
@@ -250,6 +273,46 @@ class TestCliFeatures(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+
+    def test_stop_uses_supervisor_identity_and_stops_container_pid(self):
+        home = self.tmpdir / "home-stop-supervisor"
+        ctr_dir = home / ".cache" / "oci2bin" / "containers"
+        ctr_dir.mkdir(parents=True, exist_ok=True)
+        supervisor = subprocess.Popen(["sleep", "60"])
+        container = subprocess.Popen(["sleep", "60"])
+        try:
+            state = ctr_dir / "demo.json"
+            state.write_text(json.dumps({
+                "name": "demo",
+                "pid": container.pid,
+                "binary": os.readlink(f"/proc/{supervisor.pid}/exe"),
+                "started_at": "2026-04-17T12:00:00Z",
+                "start_ticks": _proc_start_ticks(container.pid),
+                "supervisor_pid": supervisor.pid,
+                "supervisor_start_ticks": _proc_start_ticks(supervisor.pid),
+            }), encoding="utf-8")
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            result = subprocess.run(
+                [str(OCI2BIN), "stop", "demo"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            supervisor.wait(timeout=5)
+            container.wait(timeout=5)
+            self.assertFalse(state.exists())
+        finally:
+            for proc in (supervisor, container):
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
 
     def test_check_update_uses_signed_manifest(self):
         key = self.tmpdir / "update.key"

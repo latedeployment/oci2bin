@@ -754,7 +754,8 @@ def _do_from(state: _State, args: str, tmpdir: str) -> None:
         "podman" if shutil.which("podman") else None)
     if engine:
         print(f"oci2bin: FROM {image} ({engine} pull)", file=sys.stderr)
-        subprocess.run([engine, "pull", image], check=True)
+        subprocess.run([engine, "pull", "--platform", f"linux/{state.arch}",
+                        image], check=True)
         save_tar = os.path.join(tmpdir, "base.tar")
         subprocess.run([engine, "save", "-o", save_tar, image], check=True)
         cfg = _extract_docker_save_to_rootfs(save_tar, state.rootfs)
@@ -766,7 +767,10 @@ def _do_from(state: _State, args: str, tmpdir: str) -> None:
         print(f"oci2bin: FROM {image} (skopeo copy, no daemon)",
               file=sys.stderr)
         oci_dir = tempfile.mkdtemp(dir=tmpdir, prefix="from_oci_")
-        subprocess.run(["skopeo", "copy", f"docker://{image}",
+        subprocess.run(["skopeo", "copy",
+                        "--override-os", "linux",
+                        "--override-arch", state.arch,
+                        f"docker://{image}",
                         f"oci:{oci_dir}:latest"], check=True)
         cfg = _extract_oci_to_rootfs(oci_dir, state.rootfs)
         shutil.rmtree(oci_dir, ignore_errors=True)

@@ -6,6 +6,15 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **Lifecycle and architecture edge cases in recent build/runtime paths.**
+  `--detach --name` now records host-side container state before `chroot()` and
+  reports the host PID used by `ps`/`stop`/`logs`; `oci2bin run` forwards the
+  full build option set including `--pull-with`, `--reproducible`, and
+  `--offline-only`; `--arch all` preserves parsed build/security options when
+  recursively building each architecture; and `build-dockerfile --arch` now
+  selects the matching platform for remote `FROM` images with docker, podman,
+  or skopeo.
+
 - **`--net slirp` / `--net pasta` now fail closed when the helper is missing.**
   Previously the forked net helper would exec-fail and exit while the container
   kept running with an unconfigured, network-less namespace — no error surfaced.

@@ -1530,13 +1530,12 @@ static int open_path_nofollow(const char* path, int flags, mode_t mode)
  * $HOME/.cache/oci2bin/containers/<name>.json.
  * When redirect_output is 1, redirect stdout/stderr to the log file.
  */
-static void write_container_state(const char* name, pid_t pid,
-                                  int redirect_output)
+static int container_state_dir(char* dir, size_t dirsz)
 {
     const char* home = getenv("HOME");
-    if (!home || !name || !*name)
+    if (!home || !dir || dirsz == 0)
     {
-        return;
+        return -1;
     }
 
     /* Reject HOME values that contain JSON-breaking characters or path
@@ -1545,12 +1544,85 @@ static void write_container_state(const char* name, pid_t pid,
     {
         if (*hp == '"' || *hp == '\\' || *hp == '\n')
         {
-            return;
+            return -1;
         }
     }
     if (home[0] != '/' || path_has_dotdot_component(home))
     {
-        return;
+        return -1;
+    }
+
+    int n = snprintf(dir, dirsz, "%s/.cache/oci2bin/containers", home);
+    if (n < 0 || n >= (int)dirsz)
+    {
+        return -1;
+    }
+    if (mkdir_p_secure(dir, 0700, "container state") < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static int container_log_path(const char* name, char* log_path,
+                              size_t log_path_sz)
+{
+    if (!name || !*name || !log_path || log_path_sz == 0)
+    {
+        return -1;
+    }
+
+    char dir[PATH_MAX];
+    if (container_state_dir(dir, sizeof(dir)) < 0)
+    {
+        return -1;
+    }
+
+    int n = snprintf(log_path, log_path_sz, "%s/%s.log", dir, name);
+    return (n < 0 || n >= (int)log_path_sz) ? -1 : 0;
+}
+
+static int redirect_container_log(const char* name)
+{
+    char log_path[PATH_MAX];
+    if (container_log_path(name, log_path, sizeof(log_path)) < 0)
+    {
+        return -1;
+    }
+
+    int log_fd = open_path_nofollow(log_path,
+                                    O_WRONLY | O_CREAT | O_APPEND,
+                                    0600);
+    if (log_fd < 0)
+    {
+        return -1;
+    }
+    if (dup2(log_fd, STDOUT_FILENO) < 0)
+    {
+        close(log_fd);
+        return -1;
+    }
+    if (dup2(log_fd, STDERR_FILENO) < 0)
+    {
+        close(log_fd);
+        return -1;
+    }
+    close(log_fd);
+    return 0;
+}
+
+/*
+ * Write host-side lifecycle state for `oci2bin ps/stop/logs`:
+ * $HOME/.cache/oci2bin/containers/<name>.json.
+ * When redirect_output is 1, redirect stdout/stderr to the log file.
+ */
+static int write_container_state(const char* name, pid_t pid,
+                                 pid_t supervisor_pid,
+                                 int redirect_output)
+{
+    if (!name || !*name)
+    {
+        return -1;
     }
 
     /* Resolve our own path for the state file */
@@ -1563,46 +1635,33 @@ static void write_container_state(const char* name, pid_t pid,
     }
 
     char dir[PATH_MAX];
-    int n = snprintf(dir, sizeof(dir),
-                     "%s/.cache/oci2bin/containers", home);
-    if (n < 0 || n >= (int)sizeof(dir))
+    if (container_state_dir(dir, sizeof(dir)) < 0)
     {
-        return;
-    }
-    if (mkdir_p_secure(dir, 0700, "container state") < 0)
-    {
-        return;
+        return -1;
     }
 
     unsigned long long start_ticks = 0;
     (void)read_proc_start_ticks(pid, &start_ticks);
+    unsigned long long supervisor_start_ticks = 0;
+    if (supervisor_pid > 0)
+    {
+        (void)read_proc_start_ticks(supervisor_pid,
+                                    &supervisor_start_ticks);
+    }
 
     char log_path[PATH_MAX];
-    n = snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, name);
+    int n = snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, name);
     if (n < 0 || n >= (int)sizeof(log_path))
     {
-        return;
+        return -1;
     }
 
     /* Redirect stdout/stderr to log file (detached child) */
     if (redirect_output)
     {
-        int log_fd = open_path_nofollow(log_path,
-                                        O_WRONLY | O_CREAT | O_APPEND,
-                                        0600);
-        if (log_fd >= 0)
+        if (redirect_container_log(name) < 0)
         {
-            if (dup2(log_fd, STDOUT_FILENO) < 0)
-            {
-                close(log_fd);
-                return;
-            }
-            if (dup2(log_fd, STDERR_FILENO) < 0)
-            {
-                close(log_fd);
-                return;
-            }
-            close(log_fd);
+            return -1;
         }
     }
 
@@ -1610,7 +1669,7 @@ static void write_container_state(const char* name, pid_t pid,
     n = snprintf(state_path, sizeof(state_path), "%s/%s.json", dir, name);
     if (n < 0 || n >= (int)sizeof(state_path))
     {
-        return;
+        return -1;
     }
 
     /* Build ISO-8601 timestamp */
@@ -1637,13 +1696,26 @@ static void write_container_state(const char* name, pid_t pid,
      * breaks the getenv→write taint chain that triggers CodeQL
      * cpp/system-data-exposure. */
     char json[2048];
-    n = snprintf(json, sizeof(json),
-                 "{\"name\":\"%s\",\"pid\":%d,\"binary\":\"%s\","
-                 "\"started_at\":\"%s\",\"start_ticks\":%llu}\n",
-                 name, (int)pid, self_path, ts, start_ticks);
+    if (supervisor_pid > 0)
+    {
+        n = snprintf(json, sizeof(json),
+                     "{\"name\":\"%s\",\"pid\":%d,\"binary\":\"%s\","
+                     "\"started_at\":\"%s\",\"start_ticks\":%llu,"
+                     "\"supervisor_pid\":%d,"
+                     "\"supervisor_start_ticks\":%llu}\n",
+                     name, (int)pid, self_path, ts, start_ticks,
+                     (int)supervisor_pid, supervisor_start_ticks);
+    }
+    else
+    {
+        n = snprintf(json, sizeof(json),
+                     "{\"name\":\"%s\",\"pid\":%d,\"binary\":\"%s\","
+                     "\"started_at\":\"%s\",\"start_ticks\":%llu}\n",
+                     name, (int)pid, self_path, ts, start_ticks);
+    }
     if (n < 0 || n >= (int)sizeof(json))
     {
-        return;
+        return -1;
     }
 
     int fd = open_path_nofollow(state_path,
@@ -1651,10 +1723,11 @@ static void write_container_state(const char* name, pid_t pid,
                                 0600);
     if (fd < 0)
     {
-        return;
+        return -1;
     }
     size_t total = 0;
     size_t len   = strlen(json);
+    int write_ok = 1;
     while (total < len)
     {
         ssize_t w = write(fd, json + total, len - total);
@@ -1664,11 +1737,57 @@ static void write_container_state(const char* name, pid_t pid,
             {
                 continue;
             }
+            write_ok = 0;
+            break;
+        }
+        if (w == 0)
+        {
+            write_ok = 0;
             break;
         }
         total += (size_t)w;
     }
-    close(fd);
+    if (close(fd) < 0)
+    {
+        write_ok = 0;
+    }
+    if (!write_ok)
+    {
+        unlink(state_path);
+        return -1;
+    }
+    return 0;
+}
+
+static int notify_detached_pid(int fd, pid_t pid)
+{
+    char pid_msg[32];
+    int  pid_len = snprintf(pid_msg, sizeof(pid_msg), "%d\n", (int)pid);
+    if (pid_len <= 0 || pid_len >= (int)sizeof(pid_msg))
+    {
+        return -1;
+    }
+
+    int written = 0;
+    while (written < pid_len)
+    {
+        ssize_t w = write(fd, pid_msg + written,
+                          (size_t)(pid_len - written));
+        if (w < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return -1;
+        }
+        if (w == 0)
+        {
+            return -1;
+        }
+        written += (int)w;
+    }
+    return 0;
 }
 
 /* ── tiny JSON helpers (just enough to parse manifest.json and config) ─── */
@@ -10488,43 +10607,6 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* --detach: fork to background, print child PID, parent exits */
-    if (opts->detach)
-    {
-        pid_t bg = fork();
-        if (bg < 0)
-        {
-            perror("oci2bin: --detach fork");
-            return 1;
-        }
-        if (bg > 0)
-        {
-            /* Parent: write state file then print child PID and exit */
-            if (opts->name)
-            {
-                write_container_state(opts->name, bg, 0);
-            }
-            printf("%d\n", (int)bg);
-            fflush(stdout);
-            _exit(0);
-        }
-        /* Child: detach from terminal, redirect output to log */
-        setsid();
-        if (opts->name)
-        {
-            write_container_state(opts->name, getpid(), 1);
-        }
-        if (!opts->interactive)
-        {
-            int null_fd = open("/dev/null", O_RDONLY);
-            if (null_fd >= 0)
-            {
-                dup2(null_fd, STDIN_FILENO);
-                close(null_fd);
-            }
-        }
-    }
-
     /* --restart / --health: a supervising PID-1 (re)launches the workload per
      * the restart policy and probes its health.  Subsumes the --init reaper. */
     if (opts->restart_policy != RESTART_NO || supervise_health.enabled)
@@ -16841,6 +16923,133 @@ int main(int argc, char* argv[])
     atexit(cleanup_oci_rootfs);
     debug_log("main.rootfs", "path=%s", rootfs);
 
+    int detach_notify_fd = -1;
+    if (opts.detach)
+    {
+        int notify_pipe[2];
+        if (pipe2(notify_pipe, O_CLOEXEC) < 0)
+        {
+            perror("oci2bin: --detach pipe");
+            return 1;
+        }
+
+        pid_t supervisor = fork();
+        if (supervisor < 0)
+        {
+            perror("oci2bin: --detach fork");
+            close(notify_pipe[0]);
+            close(notify_pipe[1]);
+            return 1;
+        }
+        if (supervisor > 0)
+        {
+            close(notify_pipe[1]);
+            char    buf[64];
+            size_t  off = 0;
+            while (off + 1 < sizeof(buf))
+            {
+                ssize_t r = read(notify_pipe[0], buf + off,
+                                 sizeof(buf) - off - 1);
+                if (r < 0)
+                {
+                    if (errno == EINTR)
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                if (r == 0)
+                {
+                    break;
+                }
+                off += (size_t)r;
+                if (memchr(buf, '\n', off))
+                {
+                    break;
+                }
+            }
+            close(notify_pipe[0]);
+            buf[off] = '\0';
+            if (off == 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: detached container failed to start\n");
+                _exit(1);
+            }
+            fputs(buf, stdout);
+            fflush(stdout);
+            _exit(0);
+        }
+
+        close(notify_pipe[0]);
+        detach_notify_fd = notify_pipe[1];
+        if (setsid() < 0)
+        {
+            perror("oci2bin: --detach setsid");
+            close(detach_notify_fd);
+            detach_notify_fd = -1;
+            return 1;
+        }
+        if (opts.name)
+        {
+            if (redirect_container_log(opts.name) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --detach: cannot open lifecycle log\n");
+                close(detach_notify_fd);
+                detach_notify_fd = -1;
+                return 1;
+            }
+        }
+        else
+        {
+            int null_out = open("/dev/null", O_WRONLY);
+            if (null_out >= 0)
+            {
+                if (dup2(null_out, STDOUT_FILENO) < 0 ||
+                        dup2(null_out, STDERR_FILENO) < 0)
+                {
+                    perror("oci2bin: --detach redirect stdout/stderr");
+                    close(null_out);
+                    close(detach_notify_fd);
+                    detach_notify_fd = -1;
+                    return 1;
+                }
+                close(null_out);
+            }
+            else
+            {
+                perror("oci2bin: --detach open /dev/null");
+                close(detach_notify_fd);
+                detach_notify_fd = -1;
+                return 1;
+            }
+        }
+        if (!opts.interactive)
+        {
+            int null_in = open("/dev/null", O_RDONLY);
+            if (null_in >= 0)
+            {
+                if (dup2(null_in, STDIN_FILENO) < 0)
+                {
+                    perror("oci2bin: --detach redirect stdin");
+                    close(null_in);
+                    close(detach_notify_fd);
+                    detach_notify_fd = -1;
+                    return 1;
+                }
+                close(null_in);
+            }
+            else
+            {
+                perror("oci2bin: --detach open /dev/null");
+                close(detach_notify_fd);
+                detach_notify_fd = -1;
+                return 1;
+            }
+        }
+    }
+
     if (opts.use_vm && opts.n_egress > 0)
     {
         fprintf(stderr,
@@ -16864,6 +17073,26 @@ int main(int argc, char* argv[])
         }
         debug_log("main.vm_dispatch", "tmpdir=%s vmm=%s", vm_tmpdir,
                   opts.vmm ? opts.vmm : "(default)");
+        if (opts.detach && detach_notify_fd >= 0)
+        {
+            if (opts.name)
+            {
+                if (write_container_state(opts.name, getpid(), 0, 0) < 0)
+                {
+                    close(detach_notify_fd);
+                    detach_notify_fd = -1;
+                    return 1;
+                }
+            }
+            if (notify_detached_pid(detach_notify_fd, getpid()) < 0)
+            {
+                close(detach_notify_fd);
+                detach_notify_fd = -1;
+                return 1;
+            }
+            close(detach_notify_fd);
+            detach_notify_fd = -1;
+        }
 #ifdef USE_LIBKRUN
         if (!opts.vmm || strcmp(opts.vmm, "libkrun") == 0)
         {
@@ -17239,6 +17468,11 @@ int main(int argc, char* argv[])
 
     if (child == 0)
     {
+        if (detach_notify_fd >= 0)
+        {
+            close(detach_notify_fd);
+            detach_notify_fd = -1;
+        }
         /* Redirect stderr to the PTY slave immediately so all child
          * diagnostic output goes through the PTY line discipline
          * (LF→CRLF) and the parent relay, instead of writing directly
@@ -17265,6 +17499,32 @@ int main(int argc, char* argv[])
             }
             return 1;
         }
+    }
+
+    if (opts.detach && detach_notify_fd >= 0)
+    {
+        if (opts.name)
+        {
+            if (write_container_state(opts.name, child, getpid(), 0) < 0)
+            {
+                kill(child, SIGKILL);
+                waitpid(child, NULL, 0);
+                close(detach_notify_fd);
+                detach_notify_fd = -1;
+                return 1;
+            }
+        }
+
+        if (notify_detached_pid(detach_notify_fd, child) < 0)
+        {
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+            close(detach_notify_fd);
+            detach_notify_fd = -1;
+            return 1;
+        }
+        close(detach_notify_fd);
+        detach_notify_fd = -1;
     }
 
     /* Parent: close slave end — only the child needs it */

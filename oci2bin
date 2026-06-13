@@ -325,6 +325,52 @@ PYEOF
     [[ "$proc_ticks" == "$start_ticks" ]]
 }
 
+process_start_ticks_match() {
+    local pid="$1" start_ticks="$2" proc_ticks
+    proc_ticks="$(python3 - "$pid" <<'PYEOF'
+import sys
+try:
+    with open(f"/proc/{sys.argv[1]}/stat", encoding="utf-8") as f:
+        raw = f.read().strip()
+except OSError:
+    sys.exit(1)
+rparen = raw.rfind(")")
+if rparen < 0:
+    sys.exit(1)
+fields = raw[rparen + 2:].split()
+if len(fields) <= 19:
+    sys.exit(1)
+print(fields[19])
+PYEOF
+)" || return 1
+    [[ "$proc_ticks" == "$start_ticks" ]]
+}
+
+process_is_zombie() {
+    local pid="$1" state
+    state="$(python3 - "$pid" <<'PYEOF'
+import sys
+try:
+    with open(f"/proc/{sys.argv[1]}/stat", encoding="utf-8") as f:
+        raw = f.read().strip()
+except OSError:
+    sys.exit(1)
+rparen = raw.rfind(")")
+if rparen < 0:
+    sys.exit(1)
+fields = raw[rparen + 2:].split()
+if not fields:
+    sys.exit(1)
+print(fields[0])
+PYEOF
+)" || return 1
+    [[ "$state" == "Z" ]]
+}
+
+process_signalable() {
+    kill -0 "$1" 2>/dev/null && ! process_is_zombie "$1"
+}
+
 # ── exec subcommand ──────────────────────────────────────────────────────
 # Usage: oci2bin exec <PID> [--] <CMD> [ARGS...]
 # Joins the namespaces of a running container by PID and executes CMD inside.
@@ -1115,16 +1161,30 @@ if [[ "${1:-}" == "stop" ]]; then
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as f:
     data = json.load(f)
-print(data.get("pid", 0))
+print(data.get("supervisor_pid", data.get("pid", 0)))
 print(data.get("binary", ""))
+print(data.get("supervisor_start_ticks", data.get("start_ticks", 0)))
+print(data.get("pid", 0))
 print(data.get("start_ticks", 0))
 PYEOF
 )
     STOP_PID="${STOP_INFO[0]:-0}"
     STOP_BINARY="${STOP_INFO[1]:-}"
     STOP_START_TICKS="${STOP_INFO[2]:-0}"
+    STOP_CONTAINER_PID="${STOP_INFO[3]:-0}"
+    STOP_CONTAINER_START_TICKS="${STOP_INFO[4]:-0}"
     if ! [[ "$STOP_PID" =~ ^[0-9]+$ ]]; then
         echo "oci2bin stop: invalid PID in state file" >&2
+        rm -f "$STATE_FILE"
+        exit 1
+    fi
+    if ! [[ "$STOP_CONTAINER_PID" =~ ^[0-9]+$ ]]; then
+        echo "oci2bin stop: invalid container PID in state file" >&2
+        rm -f "$STATE_FILE"
+        exit 1
+    fi
+    if ! [[ "$STOP_CONTAINER_START_TICKS" =~ ^[0-9]+$ ]]; then
+        echo "oci2bin stop: invalid container identity in state file" >&2
         rm -f "$STATE_FILE"
         exit 1
     fi
@@ -1132,31 +1192,59 @@ PYEOF
         echo "oci2bin stop: state file is missing process identity fields" >&2
         exit 1
     fi
-    if ! kill -0 "$STOP_PID" 2>/dev/null; then
+    if ! process_signalable "$STOP_PID" &&
+       { [[ "$STOP_CONTAINER_PID" == "$STOP_PID" ]] ||
+         ! process_signalable "$STOP_CONTAINER_PID"; }; then
         rm -f "$STATE_FILE"
         echo "oci2bin stop: '$1' is not running; stale state removed" >&2
         exit 0
     fi
-    if ! state_matches_process_identity "$STOP_PID" "$STOP_BINARY" "$STOP_START_TICKS"; then
+    if process_signalable "$STOP_PID" &&
+       ! state_matches_process_identity "$STOP_PID" "$STOP_BINARY" "$STOP_START_TICKS"; then
         echo "oci2bin stop: state file no longer matches PID $STOP_PID; refusing to signal" >&2
         rm -f "$STATE_FILE"
         exit 1
     fi
-    if kill -0 "$STOP_PID" 2>/dev/null; then
-        echo "oci2bin stop: sending SIGTERM to PID $STOP_PID..." >&2
-        kill -TERM "$STOP_PID" 2>/dev/null || true
+    if process_signalable "$STOP_PID" ||
+       { [[ "$STOP_CONTAINER_PID" != "$STOP_PID" ]] &&
+         process_signalable "$STOP_CONTAINER_PID"; }; then
+        if process_signalable "$STOP_PID"; then
+            echo "oci2bin stop: sending SIGTERM to PID $STOP_PID..." >&2
+            kill -TERM "$STOP_PID" 2>/dev/null || true
+        fi
+        if [[ "$STOP_CONTAINER_PID" != "$STOP_PID" ]] &&
+           process_signalable "$STOP_CONTAINER_PID" &&
+           process_start_ticks_match "$STOP_CONTAINER_PID" "$STOP_CONTAINER_START_TICKS"; then
+            kill -TERM "$STOP_CONTAINER_PID" 2>/dev/null || true
+        fi
         for _ in $(seq 1 10); do
-            kill -0 "$STOP_PID" 2>/dev/null || break
+            if ! process_signalable "$STOP_PID" &&
+               { [[ "$STOP_CONTAINER_PID" == "$STOP_PID" ]] ||
+                 ! process_signalable "$STOP_CONTAINER_PID"; }; then
+                break
+            fi
             sleep 1
         done
-        if kill -0 "$STOP_PID" 2>/dev/null; then
-            if ! state_matches_process_identity "$STOP_PID" "$STOP_BINARY" "$STOP_START_TICKS"; then
+        if process_signalable "$STOP_PID" ||
+           { [[ "$STOP_CONTAINER_PID" != "$STOP_PID" ]] &&
+             process_signalable "$STOP_CONTAINER_PID"; }; then
+            if process_signalable "$STOP_PID" &&
+               [[ -e "/proc/$STOP_PID/exe" ]] &&
+               ! state_matches_process_identity "$STOP_PID" "$STOP_BINARY" "$STOP_START_TICKS"; then
                 echo "oci2bin stop: PID $STOP_PID changed identity before SIGKILL; aborting hard kill" >&2
                 rm -f "$STATE_FILE"
                 exit 1
             fi
-            echo "oci2bin stop: sending SIGKILL to PID $STOP_PID..." >&2
-            kill -KILL "$STOP_PID" 2>/dev/null || true
+            if process_signalable "$STOP_PID" &&
+               [[ -e "/proc/$STOP_PID/exe" ]]; then
+                echo "oci2bin stop: sending SIGKILL to PID $STOP_PID..." >&2
+                kill -KILL "$STOP_PID" 2>/dev/null || true
+            fi
+            if [[ "$STOP_CONTAINER_PID" != "$STOP_PID" ]] &&
+               process_signalable "$STOP_CONTAINER_PID" &&
+               process_start_ticks_match "$STOP_CONTAINER_PID" "$STOP_CONTAINER_START_TICKS"; then
+                kill -KILL "$STOP_CONTAINER_PID" 2>/dev/null || true
+            fi
         fi
     fi
     rm -f "$STATE_FILE"
@@ -1213,12 +1301,21 @@ if [[ "${1:-}" == "run" ]]; then
     RUN_IMAGE=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--compress-binary|--entrypoint|--cmd|--self-update-url|--pin-digest|--recipient|--recipients-file|--password-file|--require-signed)
+            --compress-binary)
+                if [[ "${2:-}" == "zstd" ]]; then
+                    BUILD_ARGS+=("$1" "$2")
+                    shift 2
+                else
+                    BUILD_ARGS+=("$1")
+                    shift
+                fi
+                ;;
+            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--pull-with|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--entrypoint|--cmd|--self-update-url|--pin-digest|--recipient|--recipients-file|--password-file|--require-signed)
                 [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
                 BUILD_ARGS+=("$1" "$2")
                 shift 2
                 ;;
-            --cache|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash|--encrypt|--passphrase)
+            --cache|--no-cache|--reproducible|--offline-only|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash|--encrypt|--passphrase)
                 BUILD_ARGS+=("$1")
                 shift
                 ;;
@@ -1849,6 +1946,7 @@ if [[ "${1:-}" == "build-dockerfile" ]]; then
     BDF_OUTPUT=""
     BDF_PY_ARGS=()
     BDF_BUILD_ARGS=()
+    BDF_ARCH_BUILD_ARG=(--arch x86_64)
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1863,6 +1961,11 @@ if [[ "${1:-}" == "build-dockerfile" ]]; then
                 BDF_PY_ARGS+=(--build-secret "$2"); shift 2 ;;
             --arch)
                 [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: --arch requires amd64|arm64" >&2; exit 1; }
+                case "$2" in
+                    amd64) BDF_ARCH_BUILD_ARG=(--arch x86_64) ;;
+                    arm64) BDF_ARCH_BUILD_ARG=(--arch aarch64) ;;
+                    *) echo "oci2bin build-dockerfile: --arch requires amd64|arm64" >&2; exit 1 ;;
+                esac
                 BDF_PY_ARGS+=(--arch "$2"); shift 2 ;;
             -o|--output)
                 [[ $# -lt 2 ]] && { echo "oci2bin build-dockerfile: -o requires PATH" >&2; exit 1; }
@@ -1897,8 +2000,8 @@ if [[ "${1:-}" == "build-dockerfile" ]]; then
         "$BDF_DOCKERFILE" "$BDF_TMPDIR/oci" \
         "${BDF_PY_ARGS[@]}"
 
-    "$0" --oci-dir "$BDF_TMPDIR/oci" "local/dockerfile:latest" \
-        "$BDF_OUTPUT" "${BDF_BUILD_ARGS[@]}"
+    "$0" "${BDF_ARCH_BUILD_ARG[@]}" "${BDF_BUILD_ARGS[@]}" \
+        --oci-dir "$BDF_TMPDIR/oci" "local/dockerfile:latest" "$BDF_OUTPUT"
     exit $?
 fi
 
@@ -2213,12 +2316,70 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+build_forward_args_for_arch_all() {
+    ARCH_ALL_FORWARD_ARGS=()
+    [[ "$USE_CACHE" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--cache)
+    [[ "$NO_LAYER_CACHE" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--no-cache)
+    [[ "$REPRODUCIBLE_BUILD" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--reproducible)
+    for _layer in "${LAYER_IMAGES[@]}"; do
+        ARCH_ALL_FORWARD_ARGS+=(--layer "$_layer")
+    done
+    [[ "$DO_STRIP" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--strip)
+    ARCH_ALL_FORWARD_ARGS+=("${STRIP_PREFIX_ARGS[@]}")
+    [[ "$STRIP_AUTO" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--strip-auto)
+    for _add_file in "${ADD_FILE_ARGS[@]}"; do
+        ARCH_ALL_FORWARD_ARGS+=(--add-file "$_add_file")
+    done
+    for _add_dir in "${ADD_DIR_ARGS[@]}"; do
+        ARCH_ALL_FORWARD_ARGS+=(--add-dir "$_add_dir")
+    done
+    [[ -n "$OCI_DIR" ]] && ARCH_ALL_FORWARD_ARGS+=(--oci-dir "$OCI_DIR")
+    [[ -n "$PULL_WITH" ]] && ARCH_ALL_FORWARD_ARGS+=(--pull-with "$PULL_WITH")
+    [[ -n "$KERNEL_PATH" ]] && ARCH_ALL_FORWARD_ARGS+=(--kernel "$KERNEL_PATH")
+    [[ -n "$INITRAMFS_PATH" ]] && ARCH_ALL_FORWARD_ARGS+=(--initramfs "$INITRAMFS_PATH")
+    if [[ "$USE_LIBKRUN" -eq 1 ]]; then
+        ARCH_ALL_FORWARD_ARGS+=(--libkrun)
+    else
+        ARCH_ALL_FORWARD_ARGS+=(--no-libkrun)
+    fi
+    [[ "$EMBED_LOADER_LAYER" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--embed-loader-layer)
+    [[ "$EMBED_LOADER_LABELS" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--embed-loader-labels)
+    [[ -n "$LABEL_CHUNK_SIZE" ]] && ARCH_ALL_FORWARD_ARGS+=(--label-chunk-size "$LABEL_CHUNK_SIZE")
+    [[ -n "$LOADER_DIR" ]] && ARCH_ALL_FORWARD_ARGS+=(--loader-dir "$LOADER_DIR")
+    [[ -n "$LABEL_PREFIX" ]] && ARCH_ALL_FORWARD_ARGS+=(--label-prefix "$LABEL_PREFIX")
+    for _label in "${USER_LABELS[@]}"; do
+        ARCH_ALL_FORWARD_ARGS+=(--label "$_label")
+    done
+    [[ "$ENCRYPT" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--encrypt)
+    for _recipient in "${ENCRYPT_RECIPIENTS[@]}"; do
+        ARCH_ALL_FORWARD_ARGS+=(--recipient "$_recipient")
+    done
+    for _recipients_file in "${ENCRYPT_RECIPIENTS_FILES[@]}"; do
+        ARCH_ALL_FORWARD_ARGS+=(--recipients-file "$_recipients_file")
+    done
+    [[ "$ENCRYPT_PASSPHRASE" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--passphrase)
+    [[ -n "$ENCRYPT_PASSWORD_FILE" ]] && ARCH_ALL_FORWARD_ARGS+=(--password-file "$ENCRYPT_PASSWORD_FILE")
+    [[ -n "$COMPRESS_BINARY" ]] && ARCH_ALL_FORWARD_ARGS+=(--compress-binary "$COMPRESS_BINARY")
+    [[ -n "$SET_ENTRYPOINT" ]] && ARCH_ALL_FORWARD_ARGS+=(--entrypoint "$SET_ENTRYPOINT")
+    [[ -n "$SET_CMD" ]] && ARCH_ALL_FORWARD_ARGS+=(--cmd "$SET_CMD")
+    [[ -n "$REQUIRE_SIGNED_KEY" ]] && ARCH_ALL_FORWARD_ARGS+=(--require-signed "$REQUIRE_SIGNED_KEY")
+    [[ -n "$SELF_UPDATE_URL" ]] && ARCH_ALL_FORWARD_ARGS+=(--self-update-url "$SELF_UPDATE_URL")
+    [[ -n "$PIN_DIGEST" ]] && ARCH_ALL_FORWARD_ARGS+=(--pin-digest "$PIN_DIGEST")
+    [[ "$VERIFY_COSIGN" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--verify-cosign)
+    [[ "$REQUIRE_COSIGN" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--require-cosign)
+    [[ -n "$COSIGN_KEY" ]] && ARCH_ALL_FORWARD_ARGS+=(--cosign-key "$COSIGN_KEY")
+    [[ "$DO_SQUASH" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--squash)
+    [[ "$OFFLINE_ONLY" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--offline-only)
+    [[ -n "$COMPRESS_FORMAT" ]] && ARCH_ALL_FORWARD_ARGS+=(--compress "$COMPRESS_FORMAT")
+}
+
 # ── architecture / compiler selection ─────────────────────────────────────
 
 # Handle --arch all: build for all supported architectures and produce a
 # wrapper script that detects the running arch and delegates to the right
 # binary.  Both arch-specific binaries are placed next to the output.
 if [[ "$TARGET_ARCH" == "all" ]]; then
+    build_forward_args_for_arch_all
     # Recursively invoke oci2bin for each target arch
     MULTI_ARCH_ARCHS=("x86_64" "aarch64")
     MULTI_ARCH_OUTPUTS=()
@@ -2227,14 +2388,8 @@ if [[ "$TARGET_ARCH" == "all" ]]; then
         echo "oci2bin: building for $a → $out_a" >&2
         env_args=()
         [[ -n "${OCI2BIN_HOME:-}" ]] && env_args=(env "OCI2BIN_HOME=$OCI2BIN_HOME")
-        # Rebuild arg list without --arch all
-        _rebuild_args=()
-        _skip_next=0
-        for arg in "$@"; do
-            if [[ "$_skip_next" -eq 1 ]]; then _skip_next=0; continue; fi
-            _rebuild_args+=("$arg")
-        done
-        "${env_args[@]}" "$0" --arch "$a" "${_rebuild_args[@]}" "$IMAGE" "$out_a"
+        "${env_args[@]}" "$0" --arch "$a" \
+            "${ARCH_ALL_FORWARD_ARGS[@]}" "$IMAGE" "$out_a"
         MULTI_ARCH_OUTPUTS+=("$out_a")
     done
 
