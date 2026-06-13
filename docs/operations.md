@@ -176,9 +176,13 @@ Stack subcommands:
 ```bash
 oci2bin stack up -f stack.yaml
 oci2bin stack down -f stack.yaml
-oci2bin stack logs -f stack.yaml
+oci2bin stack logs blog
+oci2bin stack logs blog app -f
 oci2bin stack config -f stack.yaml
 ```
+
+`stack logs` is addressed by stack name, not by file path. Add a service name
+to show one service and `-f` to follow.
 
 ## Pod Mode
 
@@ -331,4 +335,3 @@ oci2bin mcp-serve
 
 The MCP server exposes `oci2bin` functionality to AI agents through structured
 tool calls.
-

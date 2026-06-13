@@ -1898,8 +1898,17 @@ static void test_userns_subid_helpers(void)
     unsigned long start = 0;
     unsigned long count = 0;
 
-    ASSERT_INT_EQ(parse_subid_line("omer:524288:65536\n", "omer", "1000",
-                                   &start, &count),
+    /* Use the invoking user's name from $USER so no real username is baked in;
+     * fall back to a generic name when USER is unset (minimal/CI env). */
+    const char* user = getenv("USER");
+    if (!user || !*user)
+    {
+        user = "testuser";
+    }
+    char line[160];
+
+    snprintf(line, sizeof(line), "%s:524288:65536\n", user);
+    ASSERT_INT_EQ(parse_subid_line(line, user, "1000", &start, &count),
                   0,
                   "userns subid: parse_subid_line accepts matching name");
     ASSERT(start == 524288UL,
@@ -1907,7 +1916,7 @@ static void test_userns_subid_helpers(void)
     ASSERT(count == 65536UL,
            "userns subid: parse_subid_line stores count");
 
-    ASSERT_INT_EQ(parse_subid_line("1000:600000:70000\n", "omer", "1000",
+    ASSERT_INT_EQ(parse_subid_line("1000:600000:70000\n", user, "1000",
                                    &start, &count),
                   0,
                   "userns subid: parse_subid_line accepts numeric owner");
@@ -1916,16 +1925,17 @@ static void test_userns_subid_helpers(void)
     ASSERT(count == 70000UL,
            "userns subid: parse_subid_line numeric owner count");
 
-    ASSERT_INT_EQ(parse_subid_line("other:1:2\n", "omer", "1000",
-                                   &start, &count),
+    /* Owner prefixed so it can never equal $USER. */
+    snprintf(line, sizeof(line), "x-%s:1:2\n", user);
+    ASSERT_INT_EQ(parse_subid_line(line, user, "1000", &start, &count),
                   -1,
                   "userns subid: parse_subid_line rejects other owners");
-    ASSERT_INT_EQ(parse_subid_line("omer:bad:65536\n", "omer", "1000",
-                                   &start, &count),
+    snprintf(line, sizeof(line), "%s:bad:65536\n", user);
+    ASSERT_INT_EQ(parse_subid_line(line, user, "1000", &start, &count),
                   -1,
                   "userns subid: parse_subid_line rejects bad start");
-    ASSERT_INT_EQ(parse_subid_line("omer:1:2:3\n", "omer", "1000",
-                                   &start, &count),
+    snprintf(line, sizeof(line), "%s:1:2:3\n", user);
+    ASSERT_INT_EQ(parse_subid_line(line, user, "1000", &start, &count),
                   -1,
                   "userns subid: parse_subid_line rejects extra fields");
 
@@ -1937,17 +1947,19 @@ static void test_userns_subid_helpers(void)
         return;
     }
 
-    const char* file_data =
-        "ignored\n"
-        "omer:700000:65536\n"
-        "1001:800000:70000\n"
-        "tiny:900000:16\n";
+    char file_data[256];
+    snprintf(file_data, sizeof(file_data),
+             "ignored\n"
+             "%s:700000:65536\n"
+             "1001:800000:70000\n"
+             "tiny:900000:16\n",
+             user);
     ASSERT_INT_EQ(write_all_fd(fd, file_data, strlen(file_data)),
                   0,
                   "userns subid: write temp file succeeds");
     close(fd);
 
-    ASSERT_INT_EQ(lookup_subid_range_in_file(path, "omer", 1000,
+    ASSERT_INT_EQ(lookup_subid_range_in_file(path, user, 1000,
                   USERNS_REMAP_CONTAINER_IDS,
                   &start, &count),
                   0,

@@ -73,7 +73,6 @@ compatibility.
 - an image in Docker or Podman
 - an OCI image layout directory from tools such as `skopeo`, `crane`, or
   `buildah`
-- an existing saved tar
 - a chroot directory
 - a Dockerfile interpreted by `oci2bin` without a Docker daemon
 
@@ -126,4 +125,3 @@ Some features intentionally change that:
 
 Use those features when the smaller or encrypted executable matters more than
 direct `docker load` compatibility.
-

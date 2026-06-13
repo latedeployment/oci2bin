@@ -632,8 +632,8 @@ When `--cache` is active, the cache key includes the digest so that `redis:lates
 
 ```bash
 # Build twice, get identical bytes — verifiable by sha256.
-oci2bin --reproducible --tar fixed-image.tar repro:test repro_v1
-oci2bin --reproducible --tar fixed-image.tar repro:test repro_v2
+oci2bin --reproducible --oci-dir ./fixed-layout repro:test repro_v1
+oci2bin --reproducible --oci-dir ./fixed-layout repro:test repro_v2
 sha256sum repro_v1 repro_v2   # identical hashes
 ```
 
@@ -643,7 +643,7 @@ sha256sum repro_v1 repro_v2   # identical hashes
 - The embedded OCI tar is re-emitted with members sorted by name; `mtime`, `uid`, `gid`, `uname`, `gname` are zeroed.
 - Each gzipped layer is re-compressed with `mtime=0` in its gzip header (Python `gzip.GzipFile` defaults to `time.time()` otherwise).
 
-`--reproducible` does **not** rewrite content-addressed blob filenames — if your upstream `docker save` produces a different layer SHA on each run (e.g. because the source image's gzip layer mtime differs), the input is non-equivalent regardless of the flag. Combine `--reproducible` with `--tar fixed.tar` (or use [`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/docs/source-date-epoch/) when invoking `docker buildx`) to give the builder content-stable input.
+`--reproducible` does **not** rewrite content-addressed blob filenames — if your upstream image build produces a different layer SHA on each run (e.g. because the source image's gzip layer mtime differs), the input is non-equivalent regardless of the flag. Combine `--reproducible` with a content-stable OCI layout via `--oci-dir` (or use [`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/docs/source-date-epoch/) when invoking `docker buildx`) to give the builder content-stable input.
 
 #### Air-gap seal — `--offline-only`
 
@@ -651,7 +651,7 @@ For air-gapped homelab and industrial / regulated builds, `--offline-only`
 adds three guarantees on top of `--reproducible`:
 
 - **No registry fetch.** The image must already be in the local Docker
-  store, or supplied via `--oci-dir DIR` / `--tar FILE`. Any path that
+  store, or supplied via `--oci-dir DIR`. Any path that
   would call `docker pull` (including the `--layer` per-image pulls)
   refuses to run and prints what to do instead.
 - **Reproducible by default.** `--offline-only` implies `--reproducible`

@@ -158,7 +158,7 @@ Add hosts entries:
 Default-deny egress allowlist:
 
 ```bash
-./app.bin --allow-egress 10.0.0.0/24 --allow-egress 198.51.100.10:443
+./app.bin --allow-egress 10.0.0.0/24:443 --allow-egress api.example.com:443
 ```
 
 ## Namespace Sharing

@@ -83,7 +83,7 @@ cloud-hypervisor backend. See
 | --- | --- | --- |
 | `gcc` + static libc (`glibc-static` or `musl-gcc`) | Compiling the loader (first build only; then cached) | Hard |
 | `python3` (stdlib only) | The builder itself | Hard |
-| `docker` or `podman` | Pulling/saving images | Optional — not needed with `--oci-dir`, `--tar`, `from-chroot`, or `build-dockerfile FROM scratch`/OCI dir |
+| `docker` or `podman` | Pulling/saving images | Optional - not needed with `--oci-dir`, `from-chroot`, or `build-dockerfile FROM scratch`/OCI dir |
 | `zstd` | `--compress`, `--compress-binary` | Required for those flags |
 | `age` | `--encrypt`, `--passphrase` | Required for those flags |
 | `cosign` | `--verify-cosign`, `--require-cosign` | Required for those flags |

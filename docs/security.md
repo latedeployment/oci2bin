@@ -54,7 +54,7 @@ Use userspace networking instead of host networking:
 Restrict egress:
 
 ```bash
-./app.bin --allow-egress 10.10.0.0/16 --allow-egress 198.51.100.10:443
+./app.bin --allow-egress 10.10.0.0/16:443 --allow-egress 198.51.100.10:443
 ```
 
 ## Read-Only Rootfs
@@ -295,4 +295,3 @@ oci2bin sign --key priv.pem --in app.bin
   --memory 512m \
   --seccomp-profile ./seccomp.json
 ```
-

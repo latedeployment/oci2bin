@@ -9,7 +9,6 @@ This page is a checklist of the feature surface documented by the site.
 | Build from Docker or Podman image | `oci2bin alpine:latest` |
 | Build (and validate) by image digest | `oci2bin alpine@sha256:<64-hex>` |
 | Build from OCI layout directory | `oci2bin --oci-dir ./layout alpine:latest` |
-| Build from saved image tar | `oci2bin --tar image.tar image:tag output` |
 | Build from chroot | `oci2bin from-chroot ./rootfs -o app.bin` |
 | Build from Dockerfile without Docker | `oci2bin build-dockerfile -f Dockerfile -o app.bin` |
 | One-shot build and run | `oci2bin run IMAGE -- ARGS` |
@@ -166,6 +165,8 @@ This page is a checklist of the feature surface documented by the site.
 | Runtime password | `OCI2BIN_PASSWORD=... ./app.bin` |
 | Runtime password file | `OCI2BIN_PASSWORD_FILE=FILE ./app.bin` |
 | Kernel-protected secret memory | automatic with `memfd_secret` where available |
+| Show embedded attestation | `oci2bin attest-show --in app.bin` |
+| Verify recorded source-image attestation | `oci2bin attest verify --in app.bin [--recheck]` |
 
 ## VM Mode
 
@@ -212,6 +213,7 @@ This page is a checklist of the feature surface documented by the site.
 | Generate systemd unit | `oci2bin systemd app.bin` |
 | Generate SBOM | `oci2bin sbom app.bin` |
 | Push image payload | `oci2bin push app.bin REF` |
+| Update a binary from its signed manifest | `oci2bin update [--check] [--verify-key PATH] app.bin` |
 | Self-update check | `./app.bin --check-update` |
 | Self-update apply | `./app.bin --self-update` |
 | Freeze and thaw | `oci2bin freeze NAME`, `oci2bin thaw NAME` |

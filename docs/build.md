@@ -40,14 +40,6 @@ oci2bin --oci-dir ./redis-oci redis:7-alpine redis_7-alpine
 The image argument is used for naming and embedded metadata. The content comes
 from the OCI layout directory.
 
-## Build From A Saved Tar
-
-```bash
-oci2bin --tar image.tar myimage:latest myimage.bin
-```
-
-Use this when another tool already produced a saved image tar.
-
 ## Build From A Chroot
 
 ```bash
@@ -122,8 +114,13 @@ oci2bin build-dockerfile \
 Build with SSH agent access:
 
 ```bash
-oci2bin build-dockerfile -o app.bin --context . --ssh
+oci2bin build-dockerfile -o app.bin --context .
 ```
+
+Use `RUN --mount=type=ssh ...` in the Dockerfile and run the builder with
+`SSH_AUTH_SOCK` set in the host environment. The builder forwards that socket
+for the `RUN` step and does not include the socket or SSH credentials in the
+image layer.
 
 Snap-like distribution after the build:
 

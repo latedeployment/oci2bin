@@ -23,8 +23,9 @@ Common build options:
 --add-file HOST:CONTAINER
 --add-dir HOST:CONTAINER
 --oci-dir DIR
---tar FILE
 --label KEY=VAL
+--entrypoint JSON_OR_STRING
+--cmd JSON_OR_STRING
 --encrypt
 --recipient AGE_PUB
 --recipients-file FILE
@@ -36,6 +37,9 @@ Common build options:
 --pin-digest DIGEST
 --reproducible
 --offline-only
+--verify-cosign
+--require-cosign
+--cosign-key PUB
 --embed-loader-layer
 --embed-loader-labels
 --label-chunk-size N
@@ -68,13 +72,16 @@ Common runtime options:
 --add-host HOST:IP
 --dns IP
 --dns-search DOMAIN
---allow-egress CIDR_OR_HOST
+--allow-egress HOST:PORT
+--allow-egress CIDR:PORT
 --read-only
 --overlay-persist DIR
 --tmpfs PATH
+--lazy
 --no-auto-tmpfs
 --ssh-agent
 --device /dev/HOST[:CONTAINER]
+--no-host-dev
 --gpus all
 --cdi-device NAME
 --cap-drop CAP
@@ -89,22 +96,40 @@ Common runtime options:
 --no-seccomp
 --seccomp-profile FILE
 --gen-seccomp FILE
+--landlock
+--no-landlock
+--seccomp-deny-write PATH
 --gdb
 --security-opt apparmor=PROFILE
 --security-opt label=TYPE:VAL
+--no-userns-remap
+--strict
 --init
 --detach
 --name NAME
 --restart POLICY
 --health
+--health-cmd CMD
+--health-interval N
+--health-timeout N
+--health-retries N
+--health-start-period N
+--no-health
+-i | --interactive
+-t | --tty
 --vm
 --vmm PATH
 --verify-key PATH
+--check-update
+--self-update
 --config PATH
 --metrics-socket PATH
 --notify URL
+--notify-name NAME
 --audit-log PATH
 --clock-offset OFFSET
+--no-hint
+--require-hint
 --debug
 ```
 
@@ -114,7 +139,7 @@ Common runtime options:
 oci2bin exec PID -- CMD
 oci2bin inspect BINARY [--json | -o json | --format TEMPLATE]
 oci2bin explain BINARY
-oci2bin list [--json]
+oci2bin list [--json] [--filter label=KEY[=VAL]]
 oci2bin prune [--dry-run]
 oci2bin diff BINARY1 BINARY2
 oci2bin diff-fs OVERLAY_PATH
@@ -123,24 +148,27 @@ oci2bin thaw NAME
 oci2bin reconstruct SRC [--output PATH] [--no-strip] [--label-prefix PREFIX]
 oci2bin push BINARY REF
 oci2bin sbom BINARY
+oci2bin update [--check] [--verify-key PATH] BINARY
 oci2bin run [BUILD_OPTIONS] IMAGE [-- RUNTIME_ARGS...]
 oci2bin systemd BINARY [--user] [--restart POLICY]
 oci2bin healthcheck BINARY [--pid PID]
-oci2bin ps
+oci2bin ps [--filter label=KEY[=VAL]]
 oci2bin stop NAME
-oci2bin logs NAME
+oci2bin logs [-f | --follow] NAME
 oci2bin checkpoint NAME
 oci2bin restore NAME
 oci2bin top [--once] [--interval SEC]
 oci2bin doctor [--json]
-oci2bin mcp-serve
+oci2bin mcp-serve [--allow-net]
 ```
 
 ## Signing Commands
 
 ```bash
 oci2bin sign --key KEY.pem --in BINARY [--out BINARY] [--rekor] [--attest FILE]
-oci2bin verify --key PUB.pem --in BINARY
+oci2bin verify --key PUB.pem --in BINARY [--require-attestation] [--rekor]
+oci2bin attest-show --in BINARY
+oci2bin attest verify --in BINARY [--recheck] [--key COSIGN_PUB]
 oci2bin sign-file --key KEY.pem --in FILE --out SIG
 oci2bin verify-file --key PUB.pem --in FILE --sig SIG
 ```
@@ -148,7 +176,7 @@ oci2bin verify-file --key PUB.pem --in FILE --sig SIG
 ## Pod And Stack Commands
 
 ```bash
-oci2bin pod run [--net shared] [--ipc shared] BINARY [BINARY ...]
+oci2bin pod run [--net shared] [--ipc shared] [--network-alias NAME] BINARY [BINARY ...]
 oci2bin up [-f stack.yaml] [-d] [--start-delay SEC]
 oci2bin down [STACK_NAME | -f stack.yaml]
 oci2bin stack up [-f stack.yaml] [-d] [--start-delay SEC]
@@ -161,6 +189,10 @@ oci2bin stack config [-f stack.yaml]
 `down` also accepts the stack name. `logs` is addressed by stack name (the
 file's `name:`, default `stack`) with an optional service, and `-f` there means
 *follow* (like `tail -f`), not a file.
+
+`mcp-serve` starts a stdio JSON-RPC MCP server. It keeps networking disabled by
+default; `--allow-net` only permits host networking when the MCP caller also
+requests it.
 
 ## Build Without Docker
 
