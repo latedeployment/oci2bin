@@ -49,7 +49,6 @@ import posixpath
 import re
 import shlex
 import shutil
-import stat
 import subprocess
 import sys
 import tarfile
@@ -676,7 +675,7 @@ def _mount_tmpfs(m: dict, state: _State) -> tuple:
     if "size" in m:
         # Validate: must be a plain integer (bytes)
         if not re.fullmatch(r"[0-9]+", str(m["size"])):
-            print(f"error: --mount=type=tmpfs,size= must be an integer",
+            print("error: --mount=type=tmpfs,size= must be an integer",
                   file=sys.stderr)
             sys.exit(1)
         opts = f",size={m['size']}"

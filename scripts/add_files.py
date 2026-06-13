@@ -205,8 +205,6 @@ def add_files(input_tar, output_tar, files, dirs):
             info.mtime = int(time.time())
             out_tf.addfile(info, io.BytesIO(layer_bytes))
 
-    n = sum(1 + (len(list(os.walk(h))) > 0) for h, _, is_dir in entries
-            if is_dir) + sum(1 for _, _, is_dir in entries if not is_dir)
     print(f"add_files: injected {len(entries)} item(s) as new layer {layer_dir[:12]}")
 
 
