@@ -4,6 +4,8 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-14
+
 ### Fixed
 
 - **Short image names resolve out of the box with podman/skopeo.** `docker`
