@@ -7067,6 +7067,49 @@ static void init_forward_signal(int sig)
 }
 
 /*
+ * spawn_workload: fork the container workload. In the child, restore default
+ * signal dispositions, drop to the --user UID/GID if requested, and exec
+ * exec_args (never returns there). In the parent, return the child PID, or -1
+ * on fork failure (message printed). Shared by run_as_init() and
+ * run_supervised() so the fork + privilege-drop + exec sequence is defined
+ * once. Must be called AFTER seccomp/capability setup.
+ */
+static pid_t spawn_workload(char** exec_args,
+                            const struct container_opts* opts)
+{
+    pid_t child = fork();
+    if (child < 0)
+    {
+        perror("oci2bin: workload fork");
+        return -1;
+    }
+    if (child == 0)
+    {
+        /* Default signal disposition for the workload (the parent installs
+         * forwarders that must not leak into the child). */
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGUSR1, SIG_DFL);
+        signal(SIGUSR2, SIG_DFL);
+        if (opts->has_user)
+        {
+            if (setgroups(0, NULL) < 0
+                    || setgid(opts->run_gid) < 0
+                    || setuid(opts->run_uid) < 0)
+            {
+                perror("oci2bin: workload setuid/setgid");
+                _exit(1);
+            }
+        }
+        execvp(exec_args[0], exec_args);
+        perror("execvp");
+        _exit(127);
+    }
+    return child;
+}
+
+/*
  * run_as_init: fork the entrypoint as a child, then loop reaping all zombies.
  * Returns the child's exit code, or 1 on fork failure.
  * Must be called AFTER seccomp/capability setup (both apply to parent+child).
@@ -7075,29 +7118,10 @@ static void init_forward_signal(int sig)
 static int run_as_init(char** exec_args,
                        const struct container_opts* opts)
 {
-    pid_t child = fork();
+    pid_t child = spawn_workload(exec_args, opts);
     if (child < 0)
     {
-        perror("oci2bin: --init fork");
         return 1;
-    }
-
-    if (child == 0)
-    {
-        /* Child: apply UID/GID drop if requested, then exec */
-        if (opts->has_user)
-        {
-            if (setgroups(0, NULL) < 0
-                    || setgid(opts->run_gid) < 0
-                    || setuid(opts->run_uid) < 0)
-            {
-                perror("oci2bin: --init setuid/setgid");
-                _exit(1);
-            }
-        }
-        execvp(exec_args[0], exec_args);
-        perror("execvp");
-        _exit(127);
     }
 
     /* Parent: install signal forwarders then reap zombies */
@@ -7449,33 +7473,10 @@ static int run_supervised(char** exec_args,
 
     for (;;)
     {
-        pid_t child = fork();
+        pid_t child = spawn_workload(exec_args, opts);
         if (child < 0)
         {
-            perror("oci2bin: supervisor fork");
             return 1;
-        }
-        if (child == 0)
-        {
-            /* Restore default signal disposition for the workload. */
-            signal(SIGTERM, SIG_DFL);
-            signal(SIGINT, SIG_DFL);
-            signal(SIGHUP, SIG_DFL);
-            signal(SIGUSR1, SIG_DFL);
-            signal(SIGUSR2, SIG_DFL);
-            if (opts->has_user)
-            {
-                if (setgroups(0, NULL) < 0
-                        || setgid(opts->run_gid) < 0
-                        || setuid(opts->run_uid) < 0)
-                {
-                    perror("oci2bin: supervisor setuid/setgid");
-                    _exit(1);
-                }
-            }
-            execvp(exec_args[0], exec_args);
-            perror("execvp");
-            _exit(127);
         }
 
         g_init_child_pid = child;
