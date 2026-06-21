@@ -3007,6 +3007,26 @@ static void test_openat_beneath(void)
     fd = openat_beneath(root_fd, "no-such-file", O_RDONLY, 0);
     ASSERT_INT_EQ(fd, -1, "openat_beneath: missing file returns -1");
 
+    char outside[PATH_MAX];
+    snprintf(outside, sizeof(outside), "%s.outside", base);
+    ASSERT_INT_EQ(mkdir(outside, 0755), 0,
+                  "openat_beneath: create outside dir");
+    char etclink[PATH_MAX];
+    snprintf(etclink, sizeof(etclink), "%s/etc", base);
+    ASSERT_INT_EQ(symlink(outside, etclink), 0,
+                  "openat_beneath: create symlink parent");
+    fd = openat_beneath(root_fd, "etc/hosts",
+                        O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    ASSERT_INT_EQ(fd, -1,
+                  "openat_beneath: O_CREAT rejects symlink parent");
+    char escaped[PATH_MAX];
+    snprintf(escaped, sizeof(escaped), "%s/hosts", outside);
+    struct stat st;
+    ASSERT(lstat(escaped, &st) < 0 && errno == ENOENT,
+           "openat_beneath: did not create escaped file");
+    unlink(etclink);
+    rmdir(outside);
+
     /* unlinkat_beneath: remove nested file */
     ASSERT_INT_EQ(unlinkat_beneath(root_fd, "sub/file.txt", 0), 0,
                   "unlinkat_beneath: removes nested file");
@@ -3050,6 +3070,9 @@ static void test_mcp_helpers(void)
     ASSERT_INT_EQ(mcp_parse_request_id(
                       "{\"params\":{\"id\":99},\"method\":\"x\"}"), -1,
                   "mcp_helpers: nested JSON-RPC id ignored");
+    ASSERT_INT_EQ(mcp_parse_request_id(
+                      "{\"id\":\"4\\\\2\",\"method\":\"x\"}"), -1,
+                  "mcp_helpers: escaped string JSON-RPC id rejected");
     ASSERT_INT_EQ(mcp_parse_request_id("{\"method\":\"x\"}"), -1,
                   "mcp_helpers: missing JSON-RPC id -> -1");
 
@@ -3059,6 +3082,10 @@ static void test_mcp_helpers(void)
                   "mcp_helpers: detached PID parsed after warning");
     ASSERT_INT_EQ((int)mcp_parse_detached_pid("warning pid=12\n"), -1,
                   "mcp_helpers: detached PID rejects embedded number");
+    ASSERT_INT_EQ((int)mcp_parse_detached_pid("1234 still starting\n"), -1,
+                  "mcp_helpers: detached PID rejects trailing text");
+    ASSERT_INT_EQ((int)mcp_parse_detached_pid("0\n"), -1,
+                  "mcp_helpers: detached PID rejects zero");
 
     /* mcp container tracking */
     g_mcp_n_ctrs = 0;

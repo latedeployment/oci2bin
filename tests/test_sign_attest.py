@@ -386,6 +386,22 @@ class TestRekorVerification(unittest.TestCase):
             rc = sb._rekor_verify_inclusion(str(self.binary), self.content)
         self.assertEqual(rc, 0)
 
+    def test_rekor_verify_falls_back_to_human_output(self):
+        expected_hash = hashlib.sha256(self.content).hexdigest()
+        self._write_receipt(expected_hash)
+        json_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=b"", stderr=b"unknown flag")
+        text_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=f"Artifact Hash: sha256:{expected_hash}\n".encode("utf-8"),
+            stderr=b"")
+        with mock.patch.object(sb, "shutil_which", return_value="/bin/rekor-cli"), \
+                mock.patch.object(sb.subprocess, "run",
+                                  side_effect=[json_result, text_result]) as run:
+            rc = sb._rekor_verify_inclusion(str(self.binary), self.content)
+        self.assertEqual(rc, 0)
+        self.assertEqual(run.call_count, 2)
+
     def test_rekor_verify_rejects_entry_for_other_hash(self):
         expected_hash = hashlib.sha256(self.content).hexdigest()
         self._write_receipt(expected_hash)

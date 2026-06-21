@@ -143,6 +143,23 @@ class SafeResolveTest(unittest.TestCase):
         with open(target) as f:
             self.assertEqual(f.read(), "new")
 
+    def test_copy_directory_rejects_symlinked_existing_subdir_escape(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        src = os.path.join(ctx, "src")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(os.path.join(src, "sub"))
+        os.makedirs(outside)
+        with open(os.path.join(src, "sub", "payload"), "w") as f:
+            f.write("new")
+        os.makedirs(os.path.join(self.rootfs, "dst"))
+        os.symlink(outside, os.path.join(self.rootfs, "dst", "sub"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._do_copy(state, "src /dst")
+        self.assertFalse(os.path.exists(os.path.join(outside, "payload")))
+
     def test_run_bind_source_symlink_escape_rejected(self):
         ctx = os.path.join(self.tmp, "ctx")
         outside = os.path.join(self.tmp, "outside")
