@@ -30,7 +30,11 @@ oci2bin.egg-info/
 site/
 # Built oci2bin binaries kept in the repo root for local testing
 /alpine
+/alpine_latest
 /redis
+/myredis
+/hw
+/hw2
 # Local design / planning notes (not part of the project history)
 linux-embedd.md
 macwin-os-support.md

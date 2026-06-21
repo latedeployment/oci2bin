@@ -1,12 +1,15 @@
 """Tests for sign_binary.py: v3 signature block with optional in-toto
 attestation.  Uses real openssl via the script; skipped if not available."""
 import importlib.util
+import base64
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -328,6 +331,72 @@ class TestSigBlockParser(unittest.TestCase):
         block = body + sb.TRAILER + struct.pack(">I", total)
         result = sb._find_sig_block(b"junk-binary-content" + block)
         self.assertEqual(result, (None, None, None, None, None, None))
+
+
+class TestRekorVerification(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="oci2bin-rekor-test-"))
+        self.binary = self.tmpdir / "demo.bin"
+        self.content = b"signed-content"
+        self.binary.write_bytes(self.content)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_receipt(self, artifact_hash):
+        receipt = {
+            "artifactSha256": artifact_hash,
+            "rekorServer": "https://rekor.example",
+            "uuid": "abc123",
+        }
+        (self.tmpdir / "demo.bin.rekor.json").write_text(
+            json.dumps(receipt), encoding="utf-8")
+
+    def test_rekor_verify_requires_receipt_when_requested(self):
+        rc = sb._rekor_verify_inclusion(str(self.binary), self.content)
+        self.assertEqual(rc, 2)
+
+    def test_rekor_verify_rejects_sidecar_hash_mismatch(self):
+        self._write_receipt("0" * 64)
+        with mock.patch.object(sb, "shutil_which", return_value="/bin/rekor-cli"), \
+                mock.patch.object(sb.subprocess, "run") as run:
+            rc = sb._rekor_verify_inclusion(str(self.binary), self.content)
+        self.assertEqual(rc, 2)
+        run.assert_not_called()
+
+    def test_rekor_verify_matches_hash_inside_encoded_entry_body(self):
+        expected_hash = hashlib.sha256(self.content).hexdigest()
+        self._write_receipt(expected_hash)
+        body = base64.b64encode(json.dumps({
+            "spec": {
+                "data": {
+                    "hash": {
+                        "algorithm": "sha256",
+                        "value": expected_hash,
+                    }
+                }
+            }
+        }).encode("utf-8")).decode("ascii")
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"Body": body}).encode("utf-8"),
+            stderr=b"")
+        with mock.patch.object(sb, "shutil_which", return_value="/bin/rekor-cli"), \
+                mock.patch.object(sb.subprocess, "run", return_value=result):
+            rc = sb._rekor_verify_inclusion(str(self.binary), self.content)
+        self.assertEqual(rc, 0)
+
+    def test_rekor_verify_rejects_entry_for_other_hash(self):
+        expected_hash = hashlib.sha256(self.content).hexdigest()
+        self._write_receipt(expected_hash)
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=json.dumps({"Body": "not this artifact"}).encode("utf-8"),
+            stderr=b"")
+        with mock.patch.object(sb, "shutil_which", return_value="/bin/rekor-cli"), \
+                mock.patch.object(sb.subprocess, "run", return_value=result):
+            rc = sb._rekor_verify_inclusion(str(self.binary), self.content)
+        self.assertEqual(rc, 2)
 
 
 if __name__ == "__main__":

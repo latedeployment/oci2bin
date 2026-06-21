@@ -105,6 +105,60 @@ class SafeResolveTest(unittest.TestCase):
                          os.path.join(os.path.realpath(self.rootfs),
                                       "target.txt"))
 
+    def test_copy_trailing_slash_rejects_leaf_symlink_escape(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(ctx)
+        os.makedirs(outside)
+        with open(os.path.join(ctx, "payload"), "w") as f:
+            f.write("owned")
+        os.symlink(outside, os.path.join(self.rootfs, "dst"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._do_copy(state, "payload /dst/")
+        self.assertFalse(os.path.exists(os.path.join(outside, "payload")))
+
+    def test_copy_file_replaces_leaf_symlink_without_following(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(ctx)
+        os.makedirs(outside)
+        with open(os.path.join(ctx, "payload"), "w") as f:
+            f.write("new")
+        outside_target = os.path.join(outside, "target")
+        with open(outside_target, "w") as f:
+            f.write("old")
+        os.symlink(outside_target, os.path.join(self.rootfs, "target"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        _MOD._do_copy(state, "payload /target")
+
+        with open(outside_target) as f:
+            self.assertEqual(f.read(), "old")
+        target = os.path.join(self.rootfs, "target")
+        self.assertFalse(os.path.islink(target))
+        with open(target) as f:
+            self.assertEqual(f.read(), "new")
+
+    def test_run_bind_source_symlink_escape_rejected(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(ctx)
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(ctx, "outside-link"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._mount_bind(
+                {"type": "bind", "source": "outside-link",
+                 "target": "/mnt"},
+                state,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3043,6 +3043,23 @@ static void test_mcp_helpers(void)
     ASSERT_INT_EQ(mcp_name_valid("bad name"), 0,
                   "mcp_helpers: space in name rejected");
 
+    ASSERT_INT_EQ(mcp_parse_request_id("{\"id\":42,\"method\":\"x\"}"), 42,
+                  "mcp_helpers: numeric JSON-RPC id accepted");
+    ASSERT_INT_EQ(mcp_parse_request_id("{\"id\":\"43\",\"method\":\"x\"}"), 43,
+                  "mcp_helpers: string JSON-RPC id accepted");
+    ASSERT_INT_EQ(mcp_parse_request_id(
+                      "{\"params\":{\"id\":99},\"method\":\"x\"}"), -1,
+                  "mcp_helpers: nested JSON-RPC id ignored");
+    ASSERT_INT_EQ(mcp_parse_request_id("{\"method\":\"x\"}"), -1,
+                  "mcp_helpers: missing JSON-RPC id -> -1");
+
+    ASSERT_INT_EQ((int)mcp_parse_detached_pid("1234\n"), 1234,
+                  "mcp_helpers: detached PID parsed");
+    ASSERT_INT_EQ((int)mcp_parse_detached_pid("warning\n 5678 \n"), 5678,
+                  "mcp_helpers: detached PID parsed after warning");
+    ASSERT_INT_EQ((int)mcp_parse_detached_pid("warning pid=12\n"), -1,
+                  "mcp_helpers: detached PID rejects embedded number");
+
     /* mcp container tracking */
     g_mcp_n_ctrs = 0;
     memset(g_mcp_ctrs, 0, sizeof(g_mcp_ctrs));
@@ -4860,6 +4877,57 @@ static void test_ensure_bind_mount_target(void)
     rm_rf_dir(tdir);
 }
 
+/* ── test_ensure_regular_file_target ─────────────────────────────────────── */
+
+static void test_ensure_regular_file_target(void)
+{
+    char tmpl[] = "/tmp/oci2bin-erft-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "ensure_regular_file_target: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+    struct stat st;
+
+    char dst[320];
+    snprintf(dst, sizeof(dst), "%s/root/secrets/key", tdir);
+    ASSERT_INT_EQ(ensure_regular_file_target(dst, "test", 0400), 0,
+                  "ensure_regular_file_target: creates missing file");
+    ASSERT(lstat(dst, &st) == 0 && S_ISREG(st.st_mode),
+           "ensure_regular_file_target: dst is a file");
+
+    ASSERT_INT_EQ(ensure_regular_file_target(dst, "test", 0400), 0,
+                  "ensure_regular_file_target: existing file accepted");
+
+    char leaflink[320];
+    snprintf(leaflink, sizeof(leaflink), "%s/root/leaflink", tdir);
+    ASSERT_INT_EQ(symlink("/tmp/oci2bin-erft-outside", leaflink), 0,
+                  "ensure_regular_file_target: create leaf symlink");
+    ASSERT_INT_EQ(ensure_regular_file_target(leaflink, "test", 0400), -1,
+                  "ensure_regular_file_target: rejects symlink leaf");
+
+    char outside[320];
+    snprintf(outside, sizeof(outside), "%s/outside", tdir);
+    ASSERT_INT_EQ(mkdir(outside, 0755), 0,
+                  "ensure_regular_file_target: create outside dir");
+    char parent_link[320];
+    snprintf(parent_link, sizeof(parent_link), "%s/root/link-parent", tdir);
+    ASSERT_INT_EQ(symlink(outside, parent_link), 0,
+                  "ensure_regular_file_target: create parent symlink");
+    char via_parent[380];
+    snprintf(via_parent, sizeof(via_parent), "%s/root/link-parent/secret",
+             tdir);
+    ASSERT_INT_EQ(ensure_regular_file_target(via_parent, "test", 0400), -1,
+                  "ensure_regular_file_target: rejects symlink parent");
+    char escaped[380];
+    snprintf(escaped, sizeof(escaped), "%s/secret", outside);
+    ASSERT(lstat(escaped, &st) < 0 && errno == ENOENT,
+           "ensure_regular_file_target: did not create escaped file");
+
+    rm_rf_dir(tdir);
+}
+
 /* Build a tar archive at `path` holding a single zero-length regular file
  * whose stored name is `entry`. Used to exercise the prescan reject path
  * with names (../, /abs) that GNU tar would sanitize away on create. */
@@ -5526,6 +5594,7 @@ int main(void)
     test_open_path_nofollow();
     test_mkdir_p_secure();
     test_ensure_bind_mount_target();
+    test_ensure_regular_file_target();
     test_tar_layer_prescan_and_extract();
     test_mkdir_in_root();
     test_json_get_object();

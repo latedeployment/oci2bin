@@ -310,6 +310,31 @@ def _safe_resolve(rootfs: str, container_path: str) -> str:
     return os.path.join(real_parent, leaf) if leaf else real_parent
 
 
+def _safe_resolve_follow(rootfs: str, container_path: str) -> str:
+    """Resolve the full container path under *rootfs*, including the leaf.
+
+    Use this only when the caller intends to use an existing path as a
+    directory.  Callers that are going to replace the leaf should keep using
+    _safe_resolve(), which deliberately leaves the leaf unresolved.
+    """
+    if not container_path:
+        raise ValueError("empty container path")
+    if not container_path.startswith("/"):
+        raise ValueError(
+            f"container path must be absolute: {container_path!r}")
+    norm = posixpath.normpath(container_path)
+    rel = norm.lstrip("/")
+    real_root = os.path.realpath(rootfs)
+    host_path = os.path.join(rootfs, rel) if rel else rootfs
+    real_path = os.path.realpath(host_path)
+    if real_path != real_root and \
+            not real_path.startswith(real_root + os.sep):
+        raise ValueError(
+            f"symlink escape: {container_path!r} resolves outside "
+            f"the rootfs ({real_path!r})")
+    return real_path
+
+
 def _safe_unlink_if_present(path: str) -> None:
     """Remove an existing file or symlink at *path* (no-op if absent).
     Used before writing through a destination so we replace a symlink
@@ -320,6 +345,84 @@ def _safe_unlink_if_present(path: str) -> None:
         pass
     except IsADirectoryError:
         pass
+
+
+def _container_join(base: str, rel: str) -> str:
+    rel_posix = rel.replace(os.sep, "/")
+    if rel_posix in ("", "."):
+        return posixpath.normpath(base)
+    return posixpath.normpath(posixpath.join(base, rel_posix))
+
+
+def _copy_leaf(src_path: str, dest_host: str) -> None:
+    """Copy one file/symlink to a destination whose parent is already safe."""
+    os.makedirs(os.path.dirname(dest_host), exist_ok=True)
+    _safe_unlink_if_present(dest_host)
+    if os.path.islink(src_path):
+        os.symlink(os.readlink(src_path), dest_host)
+    else:
+        shutil.copy2(src_path, dest_host)
+
+
+def _copy_dir_contents(state: "_State", src_path: str,
+                       dst_container: str) -> None:
+    """Copy a source directory into a container destination safely.
+
+    This avoids shutil.copytree() because copytree follows existing
+    destination symlinks while merging, which lets a malicious base image
+    redirect writes outside the rootfs.
+    """
+    for dirpath, dirnames, filenames in os.walk(src_path, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, src_path)
+        dst_dir_container = _container_join(dst_container, rel_dir)
+        try:
+            dst_dir_host = _safe_resolve_follow(state.rootfs,
+                                                dst_dir_container)
+        except ValueError as exc:
+            print(f"error: COPY destination escapes rootfs: {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+        os.makedirs(dst_dir_host, exist_ok=True)
+
+        kept_dirnames = []
+        for dname in sorted(dirnames):
+            src_child = os.path.join(dirpath, dname)
+            rel_ctx = os.path.relpath(src_child, state.context_dir)
+            if state.dockerignore.patterns and \
+                    state.dockerignore.matches(rel_ctx):
+                continue
+            if os.path.islink(src_child):
+                rel_child = os.path.relpath(src_child, src_path)
+                dst_child_container = _container_join(dst_container,
+                                                      rel_child)
+                try:
+                    dst_child_host = _safe_resolve(state.rootfs,
+                                                   dst_child_container)
+                except ValueError as exc:
+                    print(f"error: COPY destination escapes rootfs: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _copy_leaf(src_child, dst_child_host)
+            else:
+                kept_dirnames.append(dname)
+        dirnames[:] = kept_dirnames
+
+        for fname in sorted(filenames):
+            src_child = os.path.join(dirpath, fname)
+            rel_ctx = os.path.relpath(src_child, state.context_dir)
+            if state.dockerignore.patterns and \
+                    state.dockerignore.matches(rel_ctx):
+                continue
+            rel_child = os.path.relpath(src_child, src_path)
+            dst_child_container = _container_join(dst_container, rel_child)
+            try:
+                dst_child_host = _safe_resolve(state.rootfs,
+                                               dst_child_container)
+            except ValueError as exc:
+                print(f"error: COPY destination escapes rootfs: {exc}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _copy_leaf(src_child, dst_child_host)
 
 
 def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
@@ -512,12 +615,15 @@ def _mount_bind(m: dict, state: _State) -> tuple:
         print("error: --mount=type=bind requires target=", file=sys.stderr)
         sys.exit(1)
 
+    real_context = os.path.realpath(state.context_dir)
     src = os.path.normpath(os.path.join(state.context_dir, src_rel))
-    if src != state.context_dir and \
-            not src.startswith(state.context_dir + os.sep):
+    src_real = os.path.realpath(src)
+    if src_real != real_context and \
+            not src_real.startswith(real_context + os.sep):
         print(f"error: --mount=type=bind source escapes build context: {src_rel}",
               file=sys.stderr)
         sys.exit(1)
+    src = src_real
 
     dst_in_rootfs = _safe_resolve(state.rootfs, "/" + dst.lstrip("/"))
     is_dir = os.path.isdir(src)
@@ -809,14 +915,34 @@ def _do_copy(state: _State, args: str) -> None:
     srcs, dst_rel = parts[:-1], parts[-1]
     dst_container = dst_rel if os.path.isabs(dst_rel) else \
         os.path.join(state.workdir, dst_rel)
+    dst_container = posixpath.normpath(dst_container.replace(os.sep, "/"))
     try:
         dst_host = _safe_resolve(state.rootfs, dst_container)
     except ValueError as exc:
         print(f"error: COPY destination escapes rootfs: {exc}",
               file=sys.stderr)
         sys.exit(1)
-    dst_is_dir = dst_rel.endswith("/") or (
-        os.path.isdir(dst_host) and not os.path.islink(dst_host))
+    if dst_rel.endswith("/"):
+        try:
+            dst_host_followed = _safe_resolve_follow(state.rootfs,
+                                                     dst_container)
+        except ValueError as exc:
+            print(f"error: COPY destination escapes rootfs: {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+        dst_is_dir = True
+    else:
+        try:
+            dst_host_followed = _safe_resolve_follow(state.rootfs,
+                                                     dst_container)
+            dst_is_dir = os.path.isdir(dst_host_followed)
+        except ValueError as exc:
+            if os.path.islink(dst_host):
+                dst_is_dir = False
+            else:
+                print(f"error: COPY destination escapes rootfs: {exc}",
+                      file=sys.stderr)
+                sys.exit(1)
 
     resolved: list = []
     for src in srcs:
@@ -843,17 +969,6 @@ def _do_copy(state: _State, args: str) -> None:
         print(f"error: COPY: no files matched: {srcs}", file=sys.stderr)
         sys.exit(1)
 
-    def _ignore_for_copytree(dirpath: str, names: list) -> list:
-        if not state.dockerignore.patterns:
-            return []
-        out = []
-        for n in names:
-            full = os.path.join(dirpath, n)
-            rel = os.path.relpath(full, state.context_dir)
-            if state.dockerignore.matches(rel):
-                out.append(n)
-        return out
-
     for src_path in resolved:
         src_path = os.path.normpath(src_path)
         if not src_path.startswith(state.context_dir + os.sep) and \
@@ -865,23 +980,28 @@ def _do_copy(state: _State, args: str) -> None:
             print(f"error: COPY source not found: {src_path}", file=sys.stderr)
             sys.exit(1)
         if os.path.isdir(src_path) and not os.path.islink(src_path):
-            os.makedirs(dst_host, exist_ok=True)
-            shutil.copytree(src_path, dst_host, symlinks=True,
-                            dirs_exist_ok=True,
-                            ignore=_ignore_for_copytree)
+            _copy_dir_contents(state, src_path, dst_container)
         else:
             if dst_is_dir or len(resolved) > 1:
-                os.makedirs(dst_host, exist_ok=True)
-                dest = os.path.join(dst_host, os.path.basename(src_path))
+                try:
+                    dst_dir = _safe_resolve_follow(state.rootfs,
+                                                   dst_container)
+                except ValueError as exc:
+                    print(f"error: COPY destination escapes rootfs: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                os.makedirs(dst_dir, exist_ok=True)
+                dest_container = posixpath.join(
+                    dst_container, os.path.basename(src_path))
+                try:
+                    dest = _safe_resolve(state.rootfs, dest_container)
+                except ValueError as exc:
+                    print(f"error: COPY destination escapes rootfs: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
             else:
-                os.makedirs(os.path.dirname(dst_host), exist_ok=True)
                 dest = dst_host
-            if os.path.islink(src_path):
-                if os.path.lexists(dest):
-                    os.unlink(dest)
-                os.symlink(os.readlink(src_path), dest)
-            else:
-                shutil.copy2(src_path, dest)
+            _copy_leaf(src_path, dest)
 
 
 def _do_run(state: _State, args: str) -> None:

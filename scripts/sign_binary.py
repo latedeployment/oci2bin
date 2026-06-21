@@ -59,6 +59,7 @@ Usage:
 """
 
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -764,21 +765,62 @@ def cmd_verify(args):
     )
 
     if getattr(args, "rekor", False):
-        return _rekor_verify_inclusion(args.input)
+        return _rekor_verify_inclusion(args.input, content)
     return 0
 
 
-def _rekor_verify_inclusion(binary_path: str) -> int:
+def _rekor_value_contains_hash(value, expected_hash: str) -> bool:
+    if isinstance(value, dict):
+        return any(_rekor_value_contains_hash(v, expected_hash)
+                   for v in value.values())
+    if isinstance(value, list):
+        return any(_rekor_value_contains_hash(v, expected_hash)
+                   for v in value)
+    if not isinstance(value, str):
+        return False
+
+    text = value.lower()
+    if expected_hash in text:
+        return True
+
+    if len(value) < 16 or len(value) % 4 != 0:
+        return False
+    try:
+        decoded = base64.b64decode(value, validate=True)
+        decoded_text = decoded.decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    if expected_hash in decoded_text.lower():
+        return True
+    try:
+        return _rekor_value_contains_hash(json.loads(decoded_text),
+                                          expected_hash)
+    except json.JSONDecodeError:
+        return False
+
+
+def _rekor_output_contains_hash(output: str, expected_hash: str) -> bool:
+    expected_hash = expected_hash.lower()
+    if expected_hash in output.lower():
+        return True
+    try:
+        return _rekor_value_contains_hash(json.loads(output), expected_hash)
+    except json.JSONDecodeError:
+        return False
+
+
+def _rekor_verify_inclusion(binary_path: str, signed_content: bytes) -> int:
     """Confirm a Rekor entry recorded in <binary>.rekor.json is in the log.
 
-    Returns 0 if the entry is found (or no receipt exists — nothing to check),
-    2 if a receipt exists but the entry cannot be confirmed. Requires
-    'rekor-cli' only when a receipt is present.
+    Returns 0 if the entry is found and matches the current signed content,
+    or 2 if the receipt is missing, malformed, absent from the log, or points
+    at a different artifact.
     """
     sidecar = binary_path + ".rekor.json"
     if not os.path.exists(sidecar):
-        print(f"Rekor: no receipt ({sidecar}); nothing to verify")
-        return 0
+        print(f"sign_binary: --rekor: missing receipt {sidecar}",
+              file=sys.stderr)
+        return 2
     try:
         with open(sidecar, "r", encoding="utf-8") as f:
             record = json.load(f)
@@ -791,17 +833,34 @@ def _rekor_verify_inclusion(binary_path: str) -> int:
     if not uuid:
         print(f"sign_binary: --rekor: {sidecar} has no uuid", file=sys.stderr)
         return 2
+    expected_hash = hashlib.sha256(signed_content).hexdigest()
+    sidecar_hash = str(record.get("artifactSha256") or "").lower()
+    if sidecar_hash != expected_hash:
+        print(f"sign_binary: --rekor: {sidecar} artifact hash does not match "
+              "the verified binary", file=sys.stderr)
+        return 2
     if shutil_which("rekor-cli") is None:
         print("sign_binary: --rekor: 'rekor-cli' not on PATH; cannot confirm "
               "inclusion", file=sys.stderr)
         return 2
+    cmd = ["rekor-cli", "get", "--rekor_server", rekor_url, "--uuid", uuid]
     proc = subprocess.run(
-        ["rekor-cli", "get", "--rekor_server", rekor_url, "--uuid", uuid],
-        capture_output=True)
+        cmd + ["--format", "json"], capture_output=True)
+    if proc.returncode != 0:
+        proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
         print("Rekor: entry NOT found in log: "
               + (proc.stderr or proc.stdout).decode(errors="replace").strip(),
               file=sys.stderr)
+        return 2
+    output = (
+        (proc.stdout or b"").decode(errors="replace")
+        + "\n"
+        + (proc.stderr or b"").decode(errors="replace")
+    )
+    if not _rekor_output_contains_hash(output, expected_hash):
+        print("Rekor: entry found but does not match this binary's "
+              "SHA-256 artifact hash", file=sys.stderr)
         return 2
     print(f"Rekor: entry {uuid} confirmed in {rekor_url}")
     return 0

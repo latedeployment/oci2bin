@@ -71,16 +71,9 @@ class McpParamsShapeTest(unittest.TestCase):
             },
         }
         reply = _send_one(req)
-        # Tolerate the existing id-echo issue (production replies with
-        # id=-1) but assert we got a real result, not the "params
-        # missing" error.
-        if "error" in reply:
-            err = reply["error"]
-            self.assertNotIn(
-                "params missing", str(err.get("message", "")),
-                f"object-form params rejected: {reply}")
-        else:
-            self.assertIn("result", reply, msg=str(reply))
+        self.assertEqual(reply.get("id"), req["id"], msg=str(reply))
+        self.assertNotIn("error", reply, msg=str(reply))
+        self.assertIn("result", reply, msg=str(reply))
 
 
 if __name__ == "__main__":

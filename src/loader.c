@@ -2357,6 +2357,8 @@ static int mkdir_p_secure(const char* path, mode_t leaf_mode, const char* what);
 static int ensure_path_not_symlink(const char* path, const char* what);
 static int ensure_bind_mount_target(const char* src, const char* dst,
                                     const char* what);
+static int ensure_regular_file_target(const char* dst, const char* what,
+                                      mode_t mode);
 static int parse_id_value(const char* text, long max_value, long* out);
 static int lookup_passwd_user(const char* passwd_path, const char* name,
                               uid_t* out_uid, gid_t* out_gid);
@@ -3389,6 +3391,56 @@ static int ensure_bind_mount_target(const char* src, const char* dst,
 
     int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
                   src_st.st_mode & 0777 ? (src_st.st_mode & 0777) : 0600);
+    if (fd < 0)
+    {
+        fprintf(stderr, "oci2bin: create %s: %s\n", dst, strerror(errno));
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int ensure_regular_file_target(const char* dst, const char* what,
+                                      mode_t mode)
+{
+    char parent[PATH_MAX];
+    if (parent_dir_path(dst, parent, sizeof(parent)) < 0)
+    {
+        fprintf(stderr, "oci2bin: %s destination path too long: %s\n",
+                what, dst);
+        return -1;
+    }
+    if (mkdir_p_secure(parent, 0755, what) < 0)
+    {
+        return -1;
+    }
+
+    struct stat dst_st;
+    if (lstat(dst, &dst_st) == 0)
+    {
+        if (S_ISLNK(dst_st.st_mode))
+        {
+            fprintf(stderr,
+                    "oci2bin: %s destination must not be a symlink: %s\n",
+                    what, dst);
+            return -1;
+        }
+        if (!S_ISREG(dst_st.st_mode))
+        {
+            fprintf(stderr,
+                    "oci2bin: %s destination must be a regular file: %s\n",
+                    what, dst);
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT)
+    {
+        fprintf(stderr, "oci2bin: lstat %s: %s\n", dst, strerror(errno));
+        return -1;
+    }
+
+    int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode);
     if (fd < 0)
     {
         fprintf(stderr, "oci2bin: create %s: %s\n", dst, strerror(errno));
@@ -4950,6 +5002,9 @@ static char* extract_oci_rootfs(const char* self_path)
     if (mkdir(rootfs, 0755) < 0)
     {
         perror("mkdir rootfs");
+        free(config_path_rel);
+        free(layers_json);
+        free(manifest);
         return NULL;
     }
 
@@ -5689,12 +5744,44 @@ static int apply_egress_allowlist(struct container_opts* opts,
             }
             char* slash = strchr(netonly, '/');
             *slash = '\0';
+            /* Validate the prefix-length suffix BEFORE emitting the raw token
+             * into the nft ruleset. inet_pton below validates the network part
+             * (and rejects any embedded whitespace), but the bytes after '/'
+             * are otherwise unchecked — without this an entry like
+             * "10.0.0.0/0 accept; <more nft rules> :443" would split a numeric
+             * port off the end, pass the network check on "10.0.0.0", and
+             * inject arbitrary nftables directives via the unvalidated suffix. */
+            const char* prefix_len = slash + 1;
+            if (*prefix_len == '\0')
+            {
+                fprintf(stderr,
+                        "oci2bin: --allow-egress: invalid CIDR '%s'\n", host);
+                return -1;
+            }
+            for (const char* pp = prefix_len; *pp; pp++)
+            {
+                if (!isdigit((unsigned char)*pp))
+                {
+                    fprintf(stderr,
+                            "oci2bin: --allow-egress: invalid CIDR '%s'\n",
+                            host);
+                    return -1;
+                }
+            }
             int v6 = strchr(netonly, ':') != NULL;
             if ((v6 && inet_pton(AF_INET6, netonly, &a6) != 1) ||
                     (!v6 && inet_pton(AF_INET, netonly, &a4) != 1))
             {
                 fprintf(stderr,
                         "oci2bin: --allow-egress: invalid CIDR '%s'\n", host);
+                return -1;
+            }
+            long bits = strtol(prefix_len, NULL, 10);
+            if (bits < 0 || bits > (v6 ? 128 : 32))
+            {
+                fprintf(stderr,
+                        "oci2bin: --allow-egress: CIDR prefix out of range "
+                        "'%s'\n", host);
                 return -1;
             }
             if (egress_append_rule(rules, sizeof(rules), &off, v6, host, port)
@@ -5771,23 +5858,41 @@ static int apply_egress_allowlist(struct container_opts* opts,
      * simply fail (deny), which is still safe. */
     if (hoff > 0 && rootfs)
     {
-        char hosts_path[PATH_MAX];
-        if (snprintf(hosts_path, sizeof(hosts_path), "%s/etc/hosts", rootfs)
-                < (int)sizeof(hosts_path))
+        int rootfs_fd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (rootfs_fd < 0)
         {
-            int hfd = open(hosts_path,
-                           O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0644);
-            if (hfd >= 0)
+            fprintf(stderr,
+                    "oci2bin: --allow-egress: warning: could not open "
+                    "rootfs to pin hostnames (%s)\n", strerror(errno));
+        }
+        else
+        {
+            if (mkdirat(rootfs_fd, "etc", 0755) < 0 && errno != EEXIST)
             {
-                write_all_fd(hfd, hosts_add, hoff);
-                close(hfd);
+                fprintf(stderr,
+                        "oci2bin: --allow-egress: warning: could not create "
+                        "/etc to pin hostnames (%s)\n", strerror(errno));
             }
-            else
+            int hfd = openat_beneath(rootfs_fd, "etc/hosts",
+                                     O_WRONLY | O_APPEND | O_CREAT, 0644);
+            if (hfd < 0)
             {
                 fprintf(stderr,
                         "oci2bin: --allow-egress: warning: could not pin "
                         "hostnames in /etc/hosts (%s)\n", strerror(errno));
             }
+            else if (write_all_fd(hfd, hosts_add, hoff) != 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --allow-egress: warning: could not write "
+                        "hostname pins to /etc/hosts (%s)\n", strerror(errno));
+                close(hfd);
+            }
+            else
+            {
+                close(hfd);
+            }
+            close(rootfs_fd);
         }
     }
 
@@ -6611,6 +6716,11 @@ install_plain_secret(const char* src, const char* dst, const char* ctr)
 static int install_tpm2_secret(const char* cred_name, const char* dst_path,
                                const char* ctr)
 {
+    if (ensure_regular_file_target(dst_path, "--secret tpm2", 0400) < 0)
+    {
+        return -1;
+    }
+
     char creds_bin[PATH_MAX];
     if (find_helper_binary("systemd-creds", creds_bin,
                            sizeof(creds_bin)) < 0)
@@ -10391,7 +10501,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     }
 
     /* Mount /tmp as fresh tmpfs so container cannot see host /tmp */
-    mkdir("/tmp", 01777);
+    if (mkdir("/tmp", 01777) < 0 && errno != EEXIST)
+    {
+        perror("mkdir /tmp (non-fatal)");
+    }
     if (mount("tmpfs", "/tmp", "tmpfs",
               MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=1777") < 0)
     {
@@ -15680,6 +15793,79 @@ static int mcp_name_valid(const char* s)
     return 1;
 }
 
+static long mcp_parse_request_id(const char* json)
+{
+    const char* p = json_skip_to_toplevel_value(json, "id");
+    if (!p)
+    {
+        return -1;
+    }
+
+    if (*p == '"')
+    {
+        p++;
+        char buf[64];
+        size_t len = 0;
+        while (*p && *p != '"' && *p != '\\' && len + 1 < sizeof(buf))
+        {
+            buf[len++] = *p++;
+        }
+        if (*p != '"')
+        {
+            return -1;
+        }
+        buf[len] = '\0';
+        long id = -1;
+        (void)parse_id_value(buf, LONG_MAX, &id);
+        return id;
+    }
+
+    while (*p && isspace((unsigned char)*p))
+    {
+        p++;
+    }
+    errno = 0;
+    char* endp = NULL;
+    long id = strtol(p, &endp, 10);
+    if (endp == p || errno == ERANGE)
+    {
+        return -1;
+    }
+    return id;
+}
+
+static pid_t mcp_parse_detached_pid(const char* output)
+{
+    const char* p = output;
+    while (p && *p)
+    {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        {
+            p++;
+        }
+        errno = 0;
+        char* endp = NULL;
+        long pid = strtol(p, &endp, 10);
+        if (endp != p && errno != ERANGE && pid > 0 && pid <= INT_MAX)
+        {
+            while (*endp == ' ' || *endp == '\t' || *endp == '\r')
+            {
+                endp++;
+            }
+            if (*endp == '\0' || *endp == '\n')
+            {
+                return (pid_t)pid;
+            }
+        }
+        p = strchr(p, '\n');
+        if (p)
+        {
+            p++;
+        }
+    }
+    return -1;
+}
+
 /* Write JSON-RPC success response to stdout */
 static void mcp_send_result(long id, const char* result_json)
 {
@@ -15808,21 +15994,11 @@ static void mcp_tool_run_container(long id, const char* args_json,
         return;
     }
 
-    /* Build log path */
+    /* Detached named containers write lifecycle logs in the container state dir. */
     char log_path[PATH_MAX];
-    if (snprintf(log_path, sizeof(log_path),
-                 "/tmp/oci2bin-mcp-%s.log", name) >= (int)sizeof(log_path))
+    if (container_log_path(name, log_path, sizeof(log_path)) < 0)
     {
-        mcp_send_error(id, -32603, "run_container: container name too long");
-        if (name != auto_name)
-        {
-            free(name);
-        }
-        free(image);
-        free(net);
-        free(env_arr);
-        free(vol_arr);
-        return;
+        log_path[0] = '\0';
     }
 
     /* Parse env and volumes */
@@ -15908,31 +16084,28 @@ static void mcp_tool_run_container(long id, const char* args_json,
     }
     ctr_argv[ai] = NULL;
 
-    /* Open log file before fork.  O_NOFOLLOW prevents a symlink attack on the
-     * predictable /tmp/oci2bin-mcp-<name>.log path. */
-    int log_fd = open(log_path,
-                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
-                      0600);
-    if (log_fd < 0)
+    int out_pipe[2];
+    if (pipe2(out_pipe, O_CLOEXEC) < 0)
     {
-        mcp_send_error(id, -32603, "run_container: cannot open log file");
+        mcp_send_error(id, -32603, "run_container: pipe failed");
         goto cleanup_env;
     }
 
     pid_t child = fork();
     if (child < 0)
     {
-        close(log_fd);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
         mcp_send_error(id, -32603, "run_container: fork failed");
         goto cleanup_env;
     }
 
     if (child == 0)
     {
-        /* Redirect stdout+stderr to log file */
-        dup2(log_fd, STDOUT_FILENO);
-        dup2(log_fd, STDERR_FILENO);
-        close(log_fd);
+        close(out_pipe[0]);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(out_pipe[1], STDERR_FILENO);
+        close(out_pipe[1]);
         /* stdin = /dev/null */
         int null_fd = open("/dev/null", O_RDONLY);
         if (null_fd >= 0)
@@ -15945,13 +16118,133 @@ static void mcp_tool_run_container(long id, const char* args_json,
         _exit(127);
     }
 
-    close(log_fd);
+    close(out_pipe[1]);
+    int pipe_flags = fcntl(out_pipe[0], F_GETFL, 0);
+    if (pipe_flags >= 0)
+    {
+        (void)fcntl(out_pipe[0], F_SETFL, pipe_flags | O_NONBLOCK);
+    }
+
+    char   launch_output[4096];
+    size_t out_len = 0;
+    int    status = 0;
+    int    child_done = 0;
+    int    waited_ms = 0;
+    while (!child_done && waited_ms < 30000)
+    {
+        for (;;)
+        {
+            char chunk[512];
+            ssize_t r = read(out_pipe[0], chunk, sizeof(chunk));
+            if (r > 0)
+            {
+                size_t room = sizeof(launch_output) - out_len - 1;
+                if (room > 0)
+                {
+                    size_t copy = (size_t)r < room ? (size_t)r : room;
+                    memcpy(launch_output + out_len, chunk, copy);
+                    out_len += copy;
+                }
+                continue;
+            }
+            if (r < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+
+        pid_t w = waitpid(child, &status, WNOHANG);
+        if (w == child)
+        {
+            child_done = 1;
+            break;
+        }
+        if (w < 0 && errno == ECHILD)
+        {
+            child_done = 1;
+            status = 0;
+            break;
+        }
+
+        struct pollfd pfd;
+        pfd.fd = out_pipe[0];
+        pfd.events = POLLIN | POLLHUP;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, 100);
+        if (pr < 0 && errno != EINTR)
+        {
+            break;
+        }
+        waited_ms += 100;
+    }
+
+    for (;;)
+    {
+        char chunk[512];
+        ssize_t r = read(out_pipe[0], chunk, sizeof(chunk));
+        if (r > 0)
+        {
+            size_t room = sizeof(launch_output) - out_len - 1;
+            if (room > 0)
+            {
+                size_t copy = (size_t)r < room ? (size_t)r : room;
+                memcpy(launch_output + out_len, chunk, copy);
+                out_len += copy;
+            }
+            continue;
+        }
+        if (r < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        break;
+    }
+    close(out_pipe[0]);
+    launch_output[out_len] = '\0';
+
+    if (!child_done)
+    {
+        kill(child, SIGTERM);
+        for (int t = 0; t < 20; t++)
+        {
+            if (waitpid(child, NULL, WNOHANG) == child)
+            {
+                child_done = 1;
+                break;
+            }
+            struct timespec ts = {0, 100000000};
+            nanosleep(&ts, NULL);
+        }
+        if (!child_done)
+        {
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+        }
+        mcp_send_error(id, -32603,
+                       "run_container: timed out waiting for detach");
+        goto cleanup_env;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    {
+        mcp_send_error(id, -32603,
+                       "run_container: container failed to detach");
+        goto cleanup_env;
+    }
+
+    pid_t detached_pid = mcp_parse_detached_pid(launch_output);
+    if (detached_pid <= 0)
+    {
+        mcp_send_error(id, -32603,
+                       "run_container: container did not report detached PID");
+        goto cleanup_env;
+    }
 
     /* Track the container */
     int slot = g_mcp_n_ctrs++;
     size_t name_len = strlen(name);
     memcpy(g_mcp_ctrs[slot].name, name, name_len + 1);
-    g_mcp_ctrs[slot].pid = child;
+    g_mcp_ctrs[slot].pid = detached_pid;
     size_t log_path_len = strlen(log_path);
     memcpy(g_mcp_ctrs[slot].log_path, log_path, log_path_len + 1);
 
@@ -16052,23 +16345,41 @@ static void mcp_tool_stop_container(long id, const char* args_json)
 
     /* Wait up to 10 seconds */
     int exit_code = -1;
+    int is_child = 1;
     for (int t = 0; t < 100; t++)
     {
         struct timespec ts = {0, 100000000}; /* 100 ms */
         nanosleep(&ts, NULL);
         int status;
-        if (waitpid(pid, &status, WNOHANG) == pid)
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid)
         {
             exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            break;
+        }
+        if (w < 0 && errno == ECHILD)
+        {
+            is_child = 0;
+        }
+        if (kill(pid, 0) < 0 && errno == ESRCH)
+        {
+            exit_code = 0;
             break;
         }
     }
     if (exit_code == -1)
     {
         kill(pid, SIGKILL);
-        int status;
-        waitpid(pid, &status, 0);
-        exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        if (is_child)
+        {
+            int status;
+            waitpid(pid, &status, 0);
+            exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        else
+        {
+            exit_code = 0;
+        }
     }
     g_mcp_ctrs[idx].pid = -1;
 
@@ -16645,9 +16956,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
         }
 
         /* Parse id */
-        char* id_s = json_get_string(line, "id");
-        long  id   = id_s ? strtol(id_s, NULL, 10) : -1;
-        free(id_s);
+        long id = mcp_parse_request_id(line);
 
         /* Parse method */
         char* method = json_get_string(line, "method");
