@@ -237,8 +237,8 @@ class TestBuildPolyglotIntegration(unittest.TestCase):
 # ── TestPolyglotPageAlignment ────────────────────────────────────────────────
 
 def _phdrs(data):
-    """Yield (p_type, p_offset, p_vaddr) for each program header in an ELF64
-    image. Works on the polyglot too: its ELF header lives in bytes 0-63."""
+    """Yield (p_type, p_offset, p_vaddr, p_align) for each program header in an
+    ELF64 image. Works on the polyglot too: its ELF header lives in bytes 0-63."""
     e_phoff = struct.unpack_from('<Q', data, 32)[0]
     e_phentsize = struct.unpack_from('<H', data, 54)[0]
     e_phnum = struct.unpack_from('<H', data, 56)[0]
@@ -247,17 +247,24 @@ def _phdrs(data):
         p_type = struct.unpack_from('<I', data, off)[0]
         p_offset = struct.unpack_from('<Q', data, off + 8)[0]
         p_vaddr = struct.unpack_from('<Q', data, off + 16)[0]
-        yield p_type, p_offset, p_vaddr
+        p_align = struct.unpack_from('<Q', data, off + 48)[0]
+        yield p_type, p_offset, p_vaddr, p_align
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'),
                      'loader is a static Linux ELF')
 class TestPolyglotPageAlignment(unittest.TestCase):
-    """Regression: a polyglot's PT_LOAD segments must satisfy
-    p_offset == p_vaddr (mod page_size) for every page size a target kernel
-    might use, or the kernel rejects execve() with EINVAL. The builder shifts
-    segments by PAGE_SIZE (64 KiB); a 4 KiB shift loaded fine on x86_64 but
-    segfaulted on 16 KiB-page aarch64 kernels such as the Raspberry Pi 5.
+    """Regression: shifting the loader's segments into the polyglot must
+    preserve each PT_LOAD's p_offset == p_vaddr (mod p_align). The kernel
+    requires p_offset == p_vaddr (mod runtime_page_size), and a correctly
+    linked binary always has runtime_page_size dividing p_align, so preserving
+    congruence mod p_align preserves it for every page size the target can use.
+
+    The builder shifts segments by PAGE_SIZE (64 KiB). A 4 KiB shift kept
+    congruence for x86_64 (p_align 0x1000) but broke it for aarch64, whose
+    static binaries are linked with p_align 0x10000 (64 KiB) -- so the shift
+    must be a multiple of 64 KiB. The old 4 KiB shift segfaulted on 16 KiB-page
+    aarch64 kernels such as the Raspberry Pi 5.
     """
 
     PT_LOAD = 1
@@ -309,19 +316,22 @@ class TestPolyglotPageAlignment(unittest.TestCase):
             with open(out, 'rb') as f:
                 return f.read()
 
-    def test_load_segments_are_page_size_agnostic(self):
+    def test_load_segments_preserve_align_congruence(self):
         data = self._build_polyglot()
-        loads = [(o, v) for t, o, v in _phdrs(data) if t == self.PT_LOAD]
+        loads = [(o, v, a) for t, o, v, a in _phdrs(data) if t == self.PT_LOAD]
         self.assertGreater(len(loads), 0, 'no PT_LOAD segments in polyglot')
-        # 64 KiB congruence implies congruence for every smaller power-of-two
-        # page size (4/16/64 KiB), covering x86_64 and all aarch64 configs.
-        for p_offset, p_vaddr in loads:
-            for page in (0x1000, 0x4000, 0x10000):
-                self.assertEqual(
-                    p_offset % page, p_vaddr % page,
-                    msg=(f'PT_LOAD offset=0x{p_offset:x} vaddr=0x{p_vaddr:x} '
-                         f'not congruent mod {page:#x}: execve would EINVAL on '
-                         f'a {page // 1024} KiB-page kernel'))
+        checked = 0
+        for p_offset, p_vaddr, p_align in loads:
+            if p_align <= 1:
+                continue  # no alignment constraint on this segment
+            checked += 1
+            self.assertEqual(
+                p_offset % p_align, p_vaddr % p_align,
+                msg=(f'PT_LOAD offset=0x{p_offset:x} vaddr=0x{p_vaddr:x} '
+                     f'not congruent mod p_align={p_align:#x}: the segment '
+                     f'shift broke ELF load alignment and execve() would '
+                     f'EINVAL on any kernel whose page size divides p_align'))
+        self.assertGreater(checked, 0, 'no PT_LOAD segment had a page p_align')
 
 
 if __name__ == '__main__':
