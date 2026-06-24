@@ -1302,7 +1302,18 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     image_name_for_meta overrides image_name in the embedded metadata block.
     """
 
-    PAGE_SIZE = 4096
+    # The loader is placed at this file offset in the polyglot, and every ELF
+    # segment's p_offset is shifted by the same amount. The kernel's ELF loader
+    # requires p_offset % page_size == p_vaddr % page_size for each PT_LOAD, so
+    # the shift must be a multiple of the *target's runtime* page size. Because
+    # we may be cross-compiling, the build host can't know that page size, so we
+    # use 64 KiB — the largest page size aarch64 supports (it also runs 4 KiB and
+    # 16 KiB kernels, e.g. the Raspberry Pi 5 'rpi-2712' kernel uses 16 KiB) and
+    # a multiple of x86_64's 4 KiB. The loader is itself linked with 64 KiB
+    # segment alignment, so a 64 KiB shift preserves congruence for every page
+    # size on both architectures. A 4 KiB shift here loads fine on x86_64 but is
+    # rejected with EINVAL by 16 KiB/64 KiB aarch64 kernels.
+    PAGE_SIZE = 65536
     TAR_BLOCK = 512
 
     # 1. Parse the loader ELF
@@ -1410,23 +1421,23 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
 
     # 3. Calculate layout
     #
-    # ELF mmap requires: p_offset % PAGE_SIZE == p_vaddr % PAGE_SIZE
+    # ELF mmap requires: p_offset % page_size == p_vaddr % page_size
     # Original loader has segments at page-aligned file offsets (0, 0xc000, ...).
     # We need to shift them so that alignment is preserved.
     # Solution: pad the first tar entry data so the loader binary starts at
-    # file offset PAGE_SIZE (4096). Then shift all segment offsets by PAGE_SIZE.
+    # file offset PAGE_SIZE (64 KiB). Then shift all segment offsets by PAGE_SIZE.
     #
     # Layout:
     # [0-511]           Tar header #1 (name field = ELF header, ustar at 257)
-    # [512-4095]        Tar entry #1 data: 3584 bytes NUL padding (part of tar file content)
-    # [4096-4096+L]     Tar entry #1 data continues: the loader binary
-    # [4096+L padded]   Tar header #2: "oci.tar"
+    # [512-65535]       Tar entry #1 data: pre_pad NUL bytes (part of tar file content)
+    # [65536-65536+L]   Tar entry #1 data continues: the loader binary
+    # [65536+L padded]  Tar header #2: "oci.tar"
     # [+512]            Tar entry #2 data: OCI tar
     # [end]             Tar EOF (two zero blocks)
     #
     # The tar entry #1 file size = pre_pad + loader_size
 
-    pre_pad = PAGE_SIZE - TAR_BLOCK  # 3584 bytes before loader in tar data
+    pre_pad = PAGE_SIZE - TAR_BLOCK  # NUL bytes before loader in tar data
     tar_entry1_content_size = pre_pad + loader_size
     tar_entry1_padded = ((tar_entry1_content_size + TAR_BLOCK - 1) // TAR_BLOCK) * TAR_BLOCK
 

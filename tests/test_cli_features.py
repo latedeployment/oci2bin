@@ -348,9 +348,14 @@ class TestCliFeatures(unittest.TestCase):
         bin_dir = install_root / "bin"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         bin_dir.mkdir(parents=True, exist_ok=True)
-        (scripts_dir / "sign_binary.py").write_bytes(
+        verifier_script = scripts_dir / "sign_binary.py"
+        verifier_script.write_bytes(
             (ROOT / "scripts" / "sign_binary.py").read_bytes()
         )
+        # The loader refuses to exec a group/world-writable verifier helper
+        # (loader.c). `make install` stages it 0644; mirror that here so the
+        # test does not depend on the runner's umask (e.g. 0002 on Debian).
+        verifier_script.chmod(0o644)
 
         binary = self._build_binary(
             "signed-install/bin/current.bin",

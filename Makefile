@@ -366,7 +366,7 @@ test-all-fuzz: test-all
 	bash scripts/fuzz_run.sh $(FUZZ_SECONDS)
 
 test-c: $(TEST_C_BIN)
-	@echo "=== C unit tests (x86_64) ==="
+	@echo "=== C unit tests ($(ARCH)) ==="
 	@$(TEST_C_BIN)
 
 $(TEST_C_BIN): $(TESTS_DIR)/test_c_units.c src/loader.c
@@ -374,7 +374,7 @@ $(TEST_C_BIN): $(TESTS_DIR)/test_c_units.c src/loader.c
 	$(TEST_ENV) $(CC) -static -Wno-return-local-addr -o $@ $<
 
 test-c-stubs: $(TEST_C_STUBS_BIN)
-	@echo "=== C stub-based tests (syscall stubs, x86_64) ==="
+	@echo "=== C stub-based tests (syscall stubs, $(ARCH)) ==="
 	@$(TEST_C_STUBS_BIN)
 
 $(TEST_C_STUBS_BIN): $(TESTS_DIR)/test_c_stubs.c src/loader.c
@@ -397,7 +397,9 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_add_files -v
 	$(TEST_ENV) python3 -m unittest tests.test_build_meta -v
 	@echo "=== Polyglot structure tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
+	$(TEST_ENV) python3 -m unittest \
+		tests.test_polyglot.TestExistingPolyglot \
+		tests.test_polyglot.TestPolyglotPageAlignment -v
 	@echo "=== Embed loader unit tests (no Docker) ==="
 	$(TEST_ENV) python3 -m unittest \
 		tests.test_embed_loader.TestEmbedLoaderLayer \

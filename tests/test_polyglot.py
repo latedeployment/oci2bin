@@ -29,7 +29,10 @@ bp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bp)
 
 IMG = ROOT / 'oci2bin.img'
-PAGE_SIZE = 4096
+# Must match build_polyglot.PAGE_SIZE: the loader is placed at this file offset
+# and every ELF segment p_offset is shifted by it. 64 KiB keeps the segments
+# loadable on 4/16/64 KiB-page kernels (the Raspberry Pi 5 kernel uses 16 KiB).
+PAGE_SIZE = 65536
 VADDR_BASE = 0x400000
 
 
@@ -111,7 +114,7 @@ class TestExistingPolyglot(unittest.TestCase):
         self.assertNotIn(patched_marker, self.data)
 
     def test_patched_flag_in_loader_region(self):
-        # The loader binary starts at PAGE_SIZE (4096). The OCI data starts somewhere
+        # The loader binary starts at PAGE_SIZE. The OCI data starts somewhere
         # after that. Patched flag (=1 as uint64 LE) must appear in the loader region.
         patched_flag = struct.pack('<Q', 1)
         loader_region = self.data[512:PAGE_SIZE * 2]  # conservative upper bound
@@ -229,6 +232,96 @@ class TestBuildPolyglotIntegration(unittest.TestCase):
             self.assertNotIn(struct.pack('<Q', 0xAAAAAAAAAAAAAAAA), data)
             # Executable
             self.assertTrue(os.access(output, os.X_OK))
+
+
+# ── TestPolyglotPageAlignment ────────────────────────────────────────────────
+
+def _phdrs(data):
+    """Yield (p_type, p_offset, p_vaddr) for each program header in an ELF64
+    image. Works on the polyglot too: its ELF header lives in bytes 0-63."""
+    e_phoff = struct.unpack_from('<Q', data, 32)[0]
+    e_phentsize = struct.unpack_from('<H', data, 54)[0]
+    e_phnum = struct.unpack_from('<H', data, 56)[0]
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type = struct.unpack_from('<I', data, off)[0]
+        p_offset = struct.unpack_from('<Q', data, off + 8)[0]
+        p_vaddr = struct.unpack_from('<Q', data, off + 16)[0]
+        yield p_type, p_offset, p_vaddr
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'),
+                     'loader is a static Linux ELF')
+class TestPolyglotPageAlignment(unittest.TestCase):
+    """Regression: a polyglot's PT_LOAD segments must satisfy
+    p_offset == p_vaddr (mod page_size) for every page size a target kernel
+    might use, or the kernel rejects execve() with EINVAL. The builder shifts
+    segments by PAGE_SIZE (64 KiB); a 4 KiB shift loaded fine on x86_64 but
+    segfaulted on 16 KiB-page aarch64 kernels such as the Raspberry Pi 5.
+    """
+
+    PT_LOAD = 1
+
+    @classmethod
+    def setUpClass(cls):
+        import platform
+        loader = ROOT / 'build' / f'loader-{platform.machine()}'
+        if not loader.exists():
+            loader = ROOT / 'build' / 'loader'
+        if not loader.exists():
+            # Build one from source so the test is self-contained (no Docker).
+            if not (gcc := __import__('shutil').which('gcc')):
+                raise unittest.SkipTest('no prebuilt loader and gcc unavailable')
+            cls._tmp = tempfile.TemporaryDirectory(prefix='oci2bin-pgalign-')
+            loader = Path(cls._tmp.name) / 'loader'
+            build = subprocess.run(
+                [gcc, '-static', '-O2', '-s', '-o', str(loader),
+                 str(ROOT / 'src' / 'loader.c')],
+                capture_output=True, text=True,
+            )
+            if build.returncode != 0:
+                raise unittest.SkipTest(f'loader build failed: {build.stderr}')
+        cls.loader = loader
+
+    @classmethod
+    def tearDownClass(cls):
+        if tmp := getattr(cls, '_tmp', None):
+            tmp.cleanup()
+
+    def _build_polyglot(self):
+        with tempfile.TemporaryDirectory() as td:
+            # Any tar works — the builder embeds it verbatim; the ELF layout
+            # (what we assert on) is independent of the payload's contents.
+            tar_path = os.path.join(td, 'payload.tar')
+            with tarfile.open(tar_path, 'w') as tf:
+                info = tarfile.TarInfo('hello')
+                info.size = 0
+                tf.addfile(info)
+            out = os.path.join(td, 'out.img')
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'scripts' / 'build_polyglot.py'),
+                 '--loader', str(self.loader), '--tar', tar_path,
+                 '--image-name', 'test:latest', '--output', out],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0,
+                             f'build_polyglot.py failed:\n{result.stderr}')
+            with open(out, 'rb') as f:
+                return f.read()
+
+    def test_load_segments_are_page_size_agnostic(self):
+        data = self._build_polyglot()
+        loads = [(o, v) for t, o, v in _phdrs(data) if t == self.PT_LOAD]
+        self.assertGreater(len(loads), 0, 'no PT_LOAD segments in polyglot')
+        # 64 KiB congruence implies congruence for every smaller power-of-two
+        # page size (4/16/64 KiB), covering x86_64 and all aarch64 configs.
+        for p_offset, p_vaddr in loads:
+            for page in (0x1000, 0x4000, 0x10000):
+                self.assertEqual(
+                    p_offset % page, p_vaddr % page,
+                    msg=(f'PT_LOAD offset=0x{p_offset:x} vaddr=0x{p_vaddr:x} '
+                         f'not congruent mod {page:#x}: execve would EINVAL on '
+                         f'a {page // 1024} KiB-page kernel'))
 
 
 if __name__ == '__main__':
