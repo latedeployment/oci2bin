@@ -4,6 +4,26 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Generated binaries run on 16 KiB / 64 KiB-page aarch64 kernels (e.g.
+  Raspberry Pi 5).** `scripts/build_polyglot.py` shifted every ELF segment by a
+  hardcoded 4 KiB when embedding the loader in the polyglot. The kernel's ELF
+  loader requires `p_offset ≡ p_vaddr (mod runtime_page_size)` for each
+  `PT_LOAD`, so a 4 KiB shift loaded fine on x86_64 (4 KiB pages) but was
+  rejected with `EINVAL` — manifesting as an immediate SIGSEGV / "During startup
+  program terminated" — on aarch64 kernels using 16 KiB pages (the Pi 5
+  `rpi-2712` kernel) or 64 KiB pages. The shift is now 64 KiB, the largest page
+  size aarch64 supports and a multiple of x86_64's 4 KiB, so the polyglot loads
+  on every page size on both architectures. A regression test
+  (`TestPolyglotPageAlignment`) verifies the congruence for 4K/16K/64K pages.
+
+- **`--check-update` test no longer depends on the runner's umask.** The CLI
+  feature test staged the verifier helper with the process umask; on a host with
+  umask `0002` (Debian default) it became group-writable, which the loader
+  correctly refuses to execute. The test now stages it `0644` to match
+  `make install`.
+
 ## [0.17.0] - 2026-06-14
 
 ### Fixed
