@@ -36,6 +36,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Fat binaries (x86 + arm in one file) | `oci2bin --arch all alpine:latest` |
 | Volume mounts | `./myapp -v /data:/data` |
 | Read-only container | `./myapp --read-only` |
+| Ephemeral writable root | `./myapp --ephemeral-root` |
 | Custom seccomp profile | `./myapp --seccomp-profile profile.json` |
 | Diff two image binaries | `oci2bin diff image_v1 image_v2` |
 | Sign and verify the binary | `oci2bin sign myapp.bin --key priv.pem` |
@@ -1356,13 +1357,23 @@ How it works and what to know:
 
 ### Read-only containers
 
-`--read-only` mounts the rootfs read-only via overlayfs. Writes go to a temporary upper layer discarded on exit. The on-disk rootfs is never modified.
+`--read-only` bind-remounts the image root genuinely read-only. The runtime
+still mounts `/tmp` as tmpfs and, by default, `/run` as tmpfs; add more
+writable locations explicitly with `--tmpfs PATH` or `-v`.
 
 ```bash
-./alpine_latest --read-only /bin/sh -c 'touch /test'
+./alpine_latest --read-only /bin/sh -c 'touch /test'  # fails: read-only
+./alpine_latest --read-only --tmpfs /var/cache
 ```
 
-If overlayfs is not available, a warning is printed and the container runs read-write.
+The request fails closed if the root cannot be remounted read-only.
+
+Use `--ephemeral-root` for the previous behavior: a writable overlay whose
+temporary upper layer is discarded when the container exits.
+
+```bash
+./alpine_latest --ephemeral-root /bin/sh -c 'touch /test'
+```
 
 ### Lazy rootfs extraction (probe-only, reserved for future use)
 

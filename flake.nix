@@ -13,7 +13,7 @@
         version = "0.1.0";
         src = ./.;
 
-        nativeBuildInputs = [ pkgs.makeWrapper ];
+        nativeBuildInputs = [ pkgs.makeWrapper pkgs.python3 ];
 
         buildPhase = ''
           gcc -static -O2 -s -Wall -Wextra -o loader src/loader.c
@@ -24,7 +24,8 @@
 
           install -m 755 loader                        $out/share/oci2bin/build/loader-x86_64
           install -m 644 src/loader.c                  $out/share/oci2bin/src/loader.c
-          install -m 644 scripts/build_polyglot.py     $out/share/oci2bin/scripts/build_polyglot.py
+          python3 scripts/package_manifest.py install-scripts \
+              --dest $out/share/oci2bin/scripts
 
           install -m 755 oci2bin $out/share/oci2bin/oci2bin-inner
           # Loader is pre-compiled; remove the compiler runtime check

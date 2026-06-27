@@ -76,6 +76,7 @@ Common runtime options:
 --allow-egress HOST:PORT
 --allow-egress CIDR:PORT
 --read-only
+--ephemeral-root
 --overlay-persist DIR
 --tmpfs PATH
 --lazy

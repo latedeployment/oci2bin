@@ -1,0 +1,20 @@
+# Runtime Python helpers installed under share/oci2bin/scripts and bundled in
+# wheels under oci2bin_pkg/scripts. Paths are repository-root relative.
+scripts/add_files.py
+scripts/build_polyglot.py
+scripts/diff_fs.py
+scripts/diff_images.py
+scripts/dockerfile_build.py
+scripts/doctor.py
+scripts/explain.py
+scripts/freeze.py
+scripts/from_chroot.py
+scripts/inspect_image.py
+scripts/merge_layers.py
+scripts/oci_layout_to_tar.py
+scripts/pod_stack.py
+scripts/reconstruct.py
+scripts/sbom_generate.py
+scripts/sign_binary.py
+scripts/squash_layers.py
+scripts/strip_image.py

@@ -90,6 +90,7 @@ This page is a checklist of the feature surface documented by the site.
 | SSH agent forwarding | `--ssh-agent` |
 | tmpfs mount | `--tmpfs PATH` |
 | Read-only rootfs | `--read-only` |
+| Ephemeral writable root | `--ephemeral-root` |
 | Disable auto tmpfs | `--no-auto-tmpfs` |
 | Persistent overlay state | `--overlay-persist DIR` |
 | Lazy rootfs extraction probe | `--lazy` |

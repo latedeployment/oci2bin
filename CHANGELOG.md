@@ -4,6 +4,14 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **`--read-only` now makes the image root genuinely read-only.** The old
+  writable throwaway-overlay behavior is available explicitly as
+  `--ephemeral-root`. Writable locations under a read-only root must be tmpfs
+  or bind mounts; `/tmp` remains tmpfs and `/run` is auto-mounted as tmpfs
+  unless `--no-auto-tmpfs` is used.
+
 ### Fixed
 
 - **Generated binaries run on 16 KiB / 64 KiB-page aarch64 kernels (e.g.

@@ -99,7 +99,8 @@
 #   --net host|none|slirp|pasta|slirp:H:C
 #                         Network: host (default), none (isolated),
 #                         slirp (slirp4netns), pasta, or slirp with port forward
-#   --read-only           Mount rootfs read-only via overlayfs
+#   --read-only           Bind-remount the image root read-only
+#   --ephemeral-root      Writable temporary overlay discarded on exit
 #   --overlay-persist DIR Persist overlay upper layer to DIR (state survives restarts)
 #   --ssh-agent           Forward host SSH_AUTH_SOCK into the container
 #   -p HOST_PORT:CTR_PORT Publish a port from the container to the host;

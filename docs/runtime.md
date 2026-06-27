@@ -252,6 +252,9 @@ Read-only rootfs:
 ./app.bin --read-only
 ```
 
+`--read-only` makes the image root mount genuinely read-only. `/tmp` remains a
+runtime tmpfs and `/run` is automatically mounted as tmpfs unless disabled.
+
 Writable tmpfs for selected paths:
 
 ```bash
@@ -263,6 +266,15 @@ Disable automatic tmpfs handling:
 ```bash
 ./app.bin --read-only --no-auto-tmpfs
 ```
+
+Writable throwaway root:
+
+```bash
+./app.bin --ephemeral-root
+```
+
+`--ephemeral-root` uses a writable temporary overlay and discards its upper
+layer on exit.
 
 Persist overlay state:
 

@@ -43,6 +43,7 @@ MAKEINFO  ?= $(or $(shell command -v texi2any 2>/dev/null),\
                makeinfo)
 MAN_DIR    = doc
 INFO_DIR   = doc
+PACKAGE_SCRIPT_MANIFEST = packaging/oci2bin-scripts.txt
 
 LIBKRUN ?= 0
 ifeq ($(LIBKRUN),1)
@@ -66,7 +67,7 @@ KERNEL_VERSION = 6.1.166
 VMLINUX_OUT    = build/vmlinux
 
 .PHONY: all clean clean-all polyglot loader loader-x86_64 loader-aarch64 loader-all \
-        loader-libkrun kernel doc install uninstall test test-unit \
+        loader-libkrun kernel doc sync-package-data install uninstall test test-unit \
         test-unit-aarch64 test-integration test-integration-redis \
         test-integration-nginx test-integration-encrypt test-integration-live \
         test-integration-services \
@@ -143,6 +144,9 @@ polyglot: build/loader-$(ARCH)
 
 # Install the CLI tool system-wide.
 # Bakes the current loader binary into the install; run 'make loader' first.
+sync-package-data:
+	python3 scripts/package_manifest.py --manifest $(PACKAGE_SCRIPT_MANIFEST) sync-package
+
 install: build/loader-$(ARCH)
 	install -d $(PREFIX)/bin
 	install -d $(PREFIX)/share/oci2bin/scripts
@@ -150,19 +154,8 @@ install: build/loader-$(ARCH)
 	install -d $(PREFIX)/share/oci2bin/src
 	install -m 755 oci2bin $(PREFIX)/bin/oci2bin
 	ln -sf $(PREFIX)/bin/oci2bin $(PREFIX)/bin/oci2vm
-	install -m 644 scripts/add_files.py        $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/build_polyglot.py   $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/diff_images.py      $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/doctor.py           $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/explain.py          $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/inspect_image.py    $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/merge_layers.py     $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/oci_layout_to_tar.py $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/reconstruct.py      $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/sbom_generate.py    $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/sign_binary.py      $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/squash_layers.py    $(PREFIX)/share/oci2bin/scripts/
-	install -m 644 scripts/strip_image.py      $(PREFIX)/share/oci2bin/scripts/
+	python3 scripts/package_manifest.py --manifest $(PACKAGE_SCRIPT_MANIFEST) \
+		install-scripts --dest $(PREFIX)/share/oci2bin/scripts
 	install -m 644 src/loader.c $(PREFIX)/share/oci2bin/src/
 	[ -f build/loader-x86_64  ] && install -m 755 build/loader-x86_64  $(PREFIX)/share/oci2bin/build/ || true
 	[ -f build/loader-aarch64 ] && install -m 755 build/loader-aarch64 $(PREFIX)/share/oci2bin/build/ || true
@@ -416,8 +409,11 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_reproducible_build -v
 	@echo "=== Dockerfile safe-resolve unit tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_safe_resolve -v
+	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_run_parse -v
 	@echo "=== Dockerfile RUN env construction tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_run_env -v
+	@echo "=== Packaging manifest/install smoke tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_packaging_manifest -v
 	@echo "=== MCP params shape tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_mcp_params_shape -v
 	@echo "=== .dockerignore tests ==="
@@ -432,6 +428,8 @@ test-python:
 	$(TEST_ENV) python3 -m unittest tests.test_diff_fs -v
 	@echo "=== oci2bin freeze/thaw tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_freeze -v
+	@echo "=== strip/merge image metadata tests ==="
+	$(TEST_ENV) python3 -m unittest tests.test_strip_image tests.test_merge_layers -v
 	@echo "=== --compress-binary helper tests ==="
 	$(TEST_ENV) python3 -m unittest tests.test_compress_binary -v
 	@echo "=== pod-stack orchestrator tests ==="

@@ -1112,6 +1112,48 @@ static void test_stub_parse_u64_text(void)
                   "parse_u64_text: trailing tab OK");
 }
 
+static void test_stub_mount_rootfs_read_only(void)
+{
+    stub_reset();
+    ASSERT_INT_EQ(mount_rootfs_read_only("/rootfs"), 0,
+                  "read-only rootfs: two-step bind remount succeeds");
+    ASSERT_INT_EQ(stub_count("mount"), 2,
+                  "read-only rootfs: exactly two mount calls");
+    ASSERT((g_stub_calls[0].arg0 & (MS_BIND | MS_REC)) ==
+           (MS_BIND | MS_REC),
+           "read-only rootfs: first mount is recursive bind");
+    ASSERT((g_stub_calls[1].arg0 &
+            (MS_BIND | MS_REMOUNT | MS_RDONLY)) ==
+           (MS_BIND | MS_REMOUNT | MS_RDONLY),
+           "read-only rootfs: second mount is read-only remount");
+
+    stub_reset();
+    g_stub_mount_fail_after = 1;
+    g_stub_mount_errno = EPERM;
+    ASSERT_INT_EQ(mount_rootfs_read_only("/rootfs"), -1,
+                  "read-only rootfs: remount failure is fatal");
+    ASSERT_INT_EQ(stub_count("umount2"), 1,
+                  "read-only rootfs: failed remount detaches bind");
+}
+
+static void test_stub_make_mount_tree_private(void)
+{
+    stub_reset();
+    ASSERT_INT_EQ(make_mount_tree_private(), 0,
+                  "mount namespace private: succeeds");
+    ASSERT_INT_EQ(stub_count("mount"), 1,
+                  "mount namespace private: one mount call");
+    ASSERT((g_stub_calls[0].arg0 & (MS_REC | MS_PRIVATE)) ==
+           (MS_REC | MS_PRIVATE),
+           "mount namespace private: recursive private propagation");
+
+    stub_reset();
+    g_stub_mount_retval = -1;
+    g_stub_mount_errno = EPERM;
+    ASSERT_INT_EQ(make_mount_tree_private(), -1,
+                  "mount namespace private: failure is fatal");
+}
+
 /* ── test_stub_container_main ─────────────────────────────────────────────
  *
  * container_main() is the heart of the runtime: it sets up mounts, chroot,
@@ -1251,6 +1293,8 @@ int main(void)
     test_stub_cg_write();
     test_stub_read_text_file_at();
     test_stub_parse_u64_text();
+    test_stub_mount_rootfs_read_only();
+    test_stub_make_mount_tree_private();
     test_stub_container_main();
 
     printf("1..%d\n", tap_test_num);

@@ -18,6 +18,8 @@ Pure Python, stdlib only.
 """
 
 import argparse
+import gzip
+import hashlib
 import io
 import json
 import os
@@ -100,7 +102,8 @@ def validate_prefix(p):
 
 def _norm(name):
     """Normalise a tar member name: strip leading './' and '/'."""
-    return name.removeprefix('./').lstrip('/')
+    normalized = name.removeprefix('./').lstrip('/')
+    return '' if normalized == '.' else normalized
 
 
 def should_strip(name, prefixes):
@@ -123,7 +126,7 @@ def _iter_layer_names(input_tar):
                 if not member.isfile():
                     continue
                 name = member.name
-                if not (name.endswith('/layer.tar') or
+                if not (name == 'layer.tar' or name.endswith('/layer.tar') or
                         (name.endswith('.tar') and '/' in name)):
                     continue
                 f = img_tf.extractfile(member)
@@ -221,6 +224,55 @@ def strip_layer(layer_bytes, prefixes):
     return dst.getvalue()
 
 
+_SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _is_oci_blob_path(name):
+    parts = name.split('/')
+    return len(parts) == 3 and parts[0] == 'blobs' and \
+        parts[1] == 'sha256' and _SHA256_RE.fullmatch(parts[2]) is not None
+
+
+def _config_name_for_digest(old_name, config_bytes):
+    digest = _sha256(config_bytes)
+    base = os.path.basename(old_name)
+    if _is_oci_blob_path(old_name):
+        return f'blobs/sha256/{digest}'
+    if '/' not in old_name and base.endswith('.json') and \
+            _SHA256_RE.fullmatch(base[:-5]):
+        return f'{digest}.json'
+    return old_name
+
+
+def _layer_name_for_digest(old_name, layer_bytes):
+    if _is_oci_blob_path(old_name):
+        return f'blobs/sha256/{_sha256(layer_bytes)}'
+    return old_name
+
+
+def _layer_diff_id(layer_bytes):
+    raw = gzip.decompress(layer_bytes) if layer_bytes[:2] == b'\x1f\x8b' \
+        else layer_bytes
+    return f'sha256:{_sha256(raw)}'
+
+
+def _copy_member_info(member, name=None, size=None):
+    info = tarfile.TarInfo(name=name or member.name)
+    info.size = member.size if size is None else size
+    info.mode = member.mode
+    info.uid = member.uid
+    info.gid = member.gid
+    info.uname = member.uname
+    info.gname = member.gname
+    info.mtime = member.mtime
+    info.type = member.type
+    return info
+
+
 # ── main entry point ─────────────────────────────────────────────────────────
 
 def strip_image(input_tar, output_tar, prefixes=None, autodetect=False):
@@ -256,37 +308,120 @@ def strip_image(input_tar, output_tar, prefixes=None, autodetect=False):
             sys.exit(1)
 
         manifest = json.loads(manifest_bytes)
-        layer_names = set()
+        layer_names = []
         for entry in manifest:
-            layer_names.update(entry.get('Layers', []))
+            layer_names.extend(entry.get('Layers', []))
+
+        layer_records = {}
+        for layer_name in dict.fromkeys(layer_names):
+            try:
+                member = src_tf.getmember(layer_name)
+            except KeyError:
+                print(f"strip_image: layer not found: {layer_name}",
+                      file=sys.stderr)
+                sys.exit(1)
+            f = src_tf.extractfile(member)
+            if f is None:
+                print(f"strip_image: cannot read layer: {layer_name}",
+                      file=sys.stderr)
+                sys.exit(1)
+            original = f.read()
+            stripped = strip_layer(original, active)
+            stripped_total += len(original) - len(stripped)
+            layer_records[layer_name] = {
+                'member': member,
+                'bytes': stripped,
+                'name': _layer_name_for_digest(layer_name, stripped),
+                'diff_id': _layer_diff_id(stripped),
+            }
+
+        config_records = {}
+        rewritten_manifest = []
+        for entry in manifest:
+            new_entry = dict(entry)
+            old_layers = entry.get('Layers', [])
+            new_layers = [layer_records[name]['name'] for name in old_layers]
+            new_entry['Layers'] = new_layers
+
+            config_name = entry.get('Config')
+            if not config_name:
+                print("strip_image: manifest entry missing Config",
+                      file=sys.stderr)
+                sys.exit(1)
+            try:
+                config_member = src_tf.getmember(config_name)
+            except KeyError:
+                print(f"strip_image: config not found: {config_name}",
+                      file=sys.stderr)
+                sys.exit(1)
+            config_f = src_tf.extractfile(config_member)
+            if config_f is None:
+                print(f"strip_image: cannot read config: {config_name}",
+                      file=sys.stderr)
+                sys.exit(1)
+            config = json.loads(config_f.read())
+            rootfs = config.setdefault('rootfs', {})
+            rootfs['type'] = rootfs.get('type', 'layers')
+            rootfs['diff_ids'] = [
+                layer_records[name]['diff_id'] for name in old_layers
+            ]
+            config_bytes = json.dumps(
+                config, separators=(',', ':')).encode()
+            new_config_name = _config_name_for_digest(config_name,
+                                                      config_bytes)
+            config_records[config_name] = {
+                'member': config_member,
+                'bytes': config_bytes,
+                'name': new_config_name,
+            }
+            new_entry['Config'] = new_config_name
+            rewritten_manifest.append(new_entry)
+
+        rewritten_manifest_bytes = json.dumps(
+            rewritten_manifest, separators=(',', ':')).encode()
+        layer_name_set = set(layer_records)
+        config_name_set = set(config_records)
+        written_names = set()
 
         with tarfile.open(output_tar, 'w') as out_tf:
             for member in members:
                 f = src_tf.extractfile(member) if member.isfile() else None
 
-                if member.name in layer_names and f is not None:
-                    original = f.read()
-                    stripped = strip_layer(original, active)
-                    stripped_total += len(original) - len(stripped)
-                    info = tarfile.TarInfo(name=member.name)
-                    info.size = len(stripped)
-                    info.mode = member.mode
-                    info.mtime = member.mtime
-                    out_tf.addfile(info, io.BytesIO(stripped))
+                if member.name in layer_name_set:
+                    rec = layer_records[member.name]
+                    if rec['name'] in written_names:
+                        continue
+                    info = _copy_member_info(
+                        rec['member'], name=rec['name'],
+                        size=len(rec['bytes']))
+                    out_tf.addfile(info, io.BytesIO(rec['bytes']))
+                    written_names.add(rec['name'])
+                elif member.name in config_name_set:
+                    rec = config_records[member.name]
+                    if rec['name'] in written_names:
+                        continue
+                    info = _copy_member_info(
+                        rec['member'], name=rec['name'],
+                        size=len(rec['bytes']))
+                    out_tf.addfile(info, io.BytesIO(rec['bytes']))
+                    written_names.add(rec['name'])
                 elif member.name == 'manifest.json':
                     info = tarfile.TarInfo(name='manifest.json')
-                    info.size = len(manifest_bytes)
-                    info.mode = member.mode
-                    out_tf.addfile(info, io.BytesIO(manifest_bytes))
-                elif f is not None:
-                    data = f.read()
-                    info = tarfile.TarInfo(name=member.name)
-                    info.size = len(data)
+                    info.size = len(rewritten_manifest_bytes)
                     info.mode = member.mode
                     info.mtime = member.mtime
+                    out_tf.addfile(info, io.BytesIO(rewritten_manifest_bytes))
+                elif f is not None:
+                    data = f.read()
+                    if member.name in written_names:
+                        continue
+                    info = _copy_member_info(member, size=len(data))
                     out_tf.addfile(info, io.BytesIO(data))
+                    written_names.add(member.name)
                 else:
-                    out_tf.addfile(member)
+                    if member.name not in written_names:
+                        out_tf.addfile(member)
+                        written_names.add(member.name)
 
     print(f"strip_image: stripped ~{stripped_total // 1024} KiB")
 

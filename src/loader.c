@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <dirent.h>
 #include <ftw.h>
 #include <poll.h>
@@ -223,9 +224,12 @@ static signed char g_kernel_feature_state[KERNEL_FEATURE_MAX];
 static int write_all_fd(int fd, const char* data, size_t len);
 static char* run_cmd_capture(char* const argv[], size_t* out_len);
 static int run_cmd(char* const argv[]);
+static int run_cmd_umask(char* const argv[], mode_t child_umask);
 static void rm_rf_dir(const char* path);
 static int json_escape_string(const char* src, char* dst, size_t dstsz);
 static int path_has_dotdot_component(const char* path);
+static int openat_beneath(int rootfs_fd, const char* relpath,
+                          int flags, mode_t mode);
 static unsigned long long current_effective_caps(void);
 
 static int kernel_feature_state_from_syscall(long rc, int err)
@@ -517,8 +521,11 @@ struct container_opts
      * host = share host IPC (default); container:<PID> = join that IPC ns */
     pid_t ipc_join_pid; /* >0: join this PID's IPC namespace */
 
-    /* --read-only  (mount overlay so rootfs is not modified) */
+    /* --read-only  (bind-remount the root mount read-only) */
     int read_only;
+
+    /* --ephemeral-root  (writable temporary overlay discarded on exit) */
+    int ephemeral_root;
 
     /* --overlay-persist DIR  (persist overlay upper layer across runs) */
     char* overlay_persist;
@@ -1372,13 +1379,15 @@ static const char* opts_net_mode(const struct container_opts* opts)
 static void debug_dump_opts(const struct container_opts* opts)
 {
     debug_log("opts.summary",
-              "vm=%d vmm=%s net=%s ipc_join_pid=%d read_only=%d detach=%d "
-              "no_seccomp=%d no_userns_remap=%d debug=%d",
+              "vm=%d vmm=%s net=%s ipc_join_pid=%d read_only=%d "
+              "ephemeral_root=%d detach=%d no_seccomp=%d "
+              "no_userns_remap=%d debug=%d",
               opts->use_vm,
               opts->vmm ? opts->vmm : "(default)",
               opts_net_mode(opts),
               (int)opts->ipc_join_pid,
               opts->read_only,
+              opts->ephemeral_root,
               opts->detach,
               opts->no_seccomp,
               opts->no_userns_remap,
@@ -2263,6 +2272,160 @@ static int json_parse_string_array(const char* arr, char** out, int max)
     return count;
 }
 
+/*
+ * Strict string-array parser used for security-sensitive manifest paths.
+ * Unlike json_parse_string_array(), this rejects malformed arrays, trailing
+ * data, non-string elements, and arrays larger than the caller's limit.
+ * Returns the element count, or -1 after freeing any partial output.
+ */
+static int json_parse_string_array_strict(const char* arr, char** out, int max)
+{
+    if (!arr || !out || max < 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    int count = 0;
+    const char* p = arr;
+    while (isspace((unsigned char)*p))
+    {
+        p++;
+    }
+    if (*p++ != '[')
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    while (isspace((unsigned char)*p))
+    {
+        p++;
+    }
+    if (*p == ']')
+    {
+        p++;
+        while (isspace((unsigned char)*p))
+        {
+            p++;
+        }
+        if (*p == '\0')
+        {
+            return 0;
+        }
+        errno = EINVAL;
+        return -1;
+    }
+
+    while (*p)
+    {
+        if (*p != '"' || count >= max)
+        {
+            errno = count >= max ? E2BIG : EINVAL;
+            goto fail;
+        }
+        p++;
+        char decoded[PATH_MAX];
+        size_t decoded_len = 0;
+        while (*p && *p != '"')
+        {
+            unsigned char c = (unsigned char)*p++;
+            if (c < 0x20)
+            {
+                errno = EINVAL;
+                goto fail;
+            }
+            if (c == '\\')
+            {
+                if (!*p)
+                {
+                    errno = EINVAL;
+                    goto fail;
+                }
+                switch (*p++)
+                {
+                    case '"':
+                        c = '"';
+                        break;
+                    case '\\':
+                        c = '\\';
+                        break;
+                    case '/':
+                        c = '/';
+                        break;
+                    default:
+                        /*
+                         * Layer paths do not need JSON control escapes or
+                         * Unicode escapes. Reject them instead of accepting
+                         * malformed or ambiguously decoded filesystem paths.
+                         */
+                        errno = EINVAL;
+                        goto fail;
+                }
+            }
+            if (decoded_len + 1 >= sizeof(decoded))
+            {
+                errno = ENAMETOOLONG;
+                goto fail;
+            }
+            decoded[decoded_len++] = (char)c;
+        }
+        if (*p != '"')
+        {
+            errno = EINVAL;
+            goto fail;
+        }
+        if (decoded_len == 0)
+        {
+            errno = EINVAL;
+            goto fail;
+        }
+        out[count] = malloc(decoded_len + 1);
+        if (!out[count])
+        {
+            goto fail;
+        }
+        memcpy(out[count], decoded, decoded_len);
+        out[count][decoded_len] = '\0';
+        count++;
+        p++;
+        while (isspace((unsigned char)*p))
+        {
+            p++;
+        }
+        if (*p == ']')
+        {
+            p++;
+            while (isspace((unsigned char)*p))
+            {
+                p++;
+            }
+            if (*p == '\0')
+            {
+                return count;
+            }
+            errno = EINVAL;
+            goto fail;
+        }
+        if (*p++ != ',')
+        {
+            errno = EINVAL;
+            goto fail;
+        }
+        while (isspace((unsigned char)*p))
+        {
+            p++;
+        }
+    }
+
+    errno = EINVAL;
+fail:
+    for (int i = 0; i < count; i++)
+    {
+        free(out[i]);
+        out[i] = NULL;
+    }
+    return -1;
+}
+
 /* JSON-escape src into dst (capacity dstsz).  Escapes " and \.
  * Returns 0 on success, -1 if the output would be truncated. */
 static int json_escape_string(const char* src, char* dst, size_t dstsz)
@@ -2533,7 +2696,10 @@ static int tar_entry_name_unsafe(const char* name)
  */
 static int tar_layer_prescan(const char* tar_path)
 {
-    char* argv[] = { "tar", "-tf", (char*)tar_path, NULL };
+    char* argv[] =
+    {
+        "tar", "-tf", (char*)tar_path, "--quoting-style=escape", NULL
+    };
     size_t out_len = 0;
     char* out = run_cmd_capture(argv, &out_len);
     if (!out)
@@ -2543,17 +2709,37 @@ static int tar_layer_prescan(const char* tar_path)
         return -1;
     }
     int rc = 0;
+    size_t entry_count = 0;
     char* p = out;
     char* end = out + out_len;
     while (p < end)
     {
         char* nl = memchr(p, '\n', (size_t)(end - p));
         size_t line_len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        if (++entry_count > 1000000u)
+        {
+            fprintf(stderr,
+                    "oci2bin: rejecting tar with too many entries\n");
+            rc = -1;
+            break;
+        }
         if (line_len > 0 && line_len < PATH_MAX)
         {
             char name[PATH_MAX];
             memcpy(name, p, line_len);
             name[line_len] = '\0';
+            /*
+             * With escape quoting, a backslash denotes either an escaped
+             * control byte/newline or a literal backslash. Reject both so
+             * line-oriented validation cannot be bypassed ambiguously.
+             */
+            if (strchr(name, '\\'))
+            {
+                fprintf(stderr,
+                        "oci2bin: rejecting tar entry with escaped path\n");
+                rc = -1;
+                break;
+            }
             /* tar may emit a trailing '/' for directory entries */
             if (line_len > 0 && name[line_len - 1] == '/')
             {
@@ -2574,10 +2760,10 @@ static int tar_layer_prescan(const char* tar_path)
                 break;
             }
         }
-        else if (line_len >= PATH_MAX)
+        else
         {
             fprintf(stderr,
-                    "oci2bin: rejecting tar entry with overlong path\n");
+                    "oci2bin: rejecting tar entry with empty or overlong path\n");
             rc = -1;
             break;
         }
@@ -2602,9 +2788,9 @@ static int tar_layer_prescan(const char* tar_path)
  *   - '..' that would escape rootfs_fd as -EXDEV
  *
  * Returns the new fd on success, -1 with errno set on failure.
- * On kernels without openat2 (rare since 5.6) errno is ENOSYS — the
- * caller must fall back to openat_beneath() for those cases. Static
- * link with musl/glibc both expose syscall(2).
+ * On kernels without openat2 (rare since 5.6), this helper falls back to
+ * openat_beneath(), which rejects all symlink components. Static links with
+ * musl/glibc both expose syscall(2).
  */
 static int openat2_in_root(int rootfs_fd, const char* relpath,
                            int flags, mode_t mode)
@@ -2618,6 +2804,15 @@ static int openat2_in_root(int rootfs_fd, const char* relpath,
                       sizeof(how));
     if (rc < 0)
     {
+        if (errno == ENOSYS || errno == EINVAL)
+        {
+            /*
+             * Older kernels lack openat2(). The component-by-component
+             * fallback is stricter because it rejects all symlinks, but it
+             * preserves confinement and fails closed.
+             */
+            return openat_beneath(rootfs_fd, relpath, flags, mode);
+        }
         return -1;
     }
     return (int)rc;
@@ -2736,9 +2931,573 @@ static int mkdir_p_in_root(int rootfs_fd, const char* relpath)
     return 0;
 }
 
-/* Forward declarations for safe_merge_layer recursion. */
-static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
-                           int cur_dir_fd, const char* rel_dir);
+struct layer_hardlink
+{
+    dev_t dev;
+    ino_t ino;
+    char* rootfs_path;
+    struct layer_hardlink* next;
+};
+
+struct layer_merge_ctx
+{
+    int rootfs_fd;
+    struct layer_hardlink** hardlink_buckets;
+    size_t hardlink_count;
+    size_t entry_count;
+    char* copy_buf;
+};
+
+#define MAX_LAYER_HARDLINKS 65536u
+#define MAX_LAYER_XATTR_BYTES (1024u * 1024u)
+#define MAX_LAYER_ENTRIES 1000000u
+#define MAX_LAYER_DEPTH 256u
+#define LAYER_HARDLINK_BUCKETS 4096u
+#define LAYER_COPY_BUFFER_SIZE 65536u
+
+/* Forward declaration for safe_merge_layer recursion. */
+static int safe_merge_walk(struct layer_merge_ctx* ctx, int cur_dir_fd,
+                           const char* rel_dir, unsigned int depth);
+
+static int open_parent_in_root(int rootfs_fd, const char* relpath,
+                               int* parent_fd_out, char* leaf,
+                               size_t leaf_size)
+{
+    if (!relpath || !*relpath || tar_entry_name_unsafe(relpath))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s", relpath);
+    if (n < 0 || (size_t)n >= sizeof(path))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    char* slash = strrchr(path, '/');
+    const char* leaf_src = path;
+    int parent_fd;
+    if (slash)
+    {
+        *slash = '\0';
+        leaf_src = slash + 1;
+        parent_fd = openat2_in_root(rootfs_fd, path,
+                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    }
+    else
+    {
+        parent_fd = dup(rootfs_fd);
+    }
+    if (parent_fd < 0)
+    {
+        return -1;
+    }
+    n = snprintf(leaf, leaf_size, "%s", leaf_src);
+    if (n < 0 || (size_t)n >= leaf_size || leaf[0] == '\0')
+    {
+        close(parent_fd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    *parent_fd_out = parent_fd;
+    return 0;
+}
+
+static int remove_tree_at_depth(int parent_fd, const char* name,
+                                unsigned int depth)
+{
+    if (depth > MAX_LAYER_DEPTH)
+    {
+        errno = ELOOP;
+        return -1;
+    }
+    struct stat st;
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) < 0)
+    {
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (!S_ISDIR(st.st_mode))
+    {
+        return unlinkat(parent_fd, name, 0);
+    }
+
+    int dir_fd = openat(parent_fd, name,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir_fd < 0)
+    {
+        return -1;
+    }
+    int scan_fd = openat(dir_fd, ".",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (scan_fd < 0)
+    {
+        close(dir_fd);
+        return -1;
+    }
+    DIR* dir = fdopendir(scan_fd);
+    if (!dir)
+    {
+        close(scan_fd);
+        close(dir_fd);
+        return -1;
+    }
+
+    int rc = 0;
+    struct dirent* de;
+    errno = 0;
+    while ((de = readdir(dir)) != NULL)
+    {
+        if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                 (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+        {
+            continue;
+        }
+        if (remove_tree_at_depth(dir_fd, de->d_name, depth + 1) < 0)
+        {
+            rc = -1;
+            break;
+        }
+        errno = 0;
+    }
+    if (!de && errno != 0)
+    {
+        rc = -1;
+    }
+    int close_rc = closedir(dir);
+    close(dir_fd);
+    if (rc < 0 || close_rc < 0)
+    {
+        return -1;
+    }
+    return unlinkat(parent_fd, name, AT_REMOVEDIR);
+}
+
+static int remove_tree_at(int parent_fd, const char* name)
+{
+    return remove_tree_at_depth(parent_fd, name, 0);
+}
+
+static int remove_path_in_root(int rootfs_fd, const char* relpath)
+{
+    int parent_fd;
+    char leaf[NAME_MAX + 1];
+    if (open_parent_in_root(rootfs_fd, relpath, &parent_fd,
+                            leaf, sizeof(leaf)) < 0)
+    {
+        return errno == ENOENT ? 0 : -1;
+    }
+    int rc = remove_tree_at(parent_fd, leaf);
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return rc;
+}
+
+static int clear_directory_fd(int dir_fd)
+{
+    int scan_fd = openat(dir_fd, ".",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (scan_fd < 0)
+    {
+        return -1;
+    }
+    DIR* dir = fdopendir(scan_fd);
+    if (!dir)
+    {
+        close(scan_fd);
+        return -1;
+    }
+    int rc = 0;
+    struct dirent* de;
+    errno = 0;
+    while ((de = readdir(dir)) != NULL)
+    {
+        if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                 (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+        {
+            continue;
+        }
+        if (remove_tree_at(dir_fd, de->d_name) < 0)
+        {
+            rc = -1;
+            break;
+        }
+        errno = 0;
+    }
+    if (!de && errno != 0)
+    {
+        rc = -1;
+    }
+    if (closedir(dir) < 0)
+    {
+        rc = -1;
+    }
+    return rc;
+}
+
+static int clear_directory_in_root(int rootfs_fd, const char* relpath)
+{
+    int dir_fd;
+    if (!relpath || !*relpath)
+    {
+        dir_fd = dup(rootfs_fd);
+    }
+    else
+    {
+        dir_fd = openat2_in_root(rootfs_fd, relpath,
+                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                 O_CLOEXEC, 0);
+    }
+    if (dir_fd < 0)
+    {
+        return errno == ENOENT ? 0 : -1;
+    }
+    int rc = clear_directory_fd(dir_fd);
+    int saved = errno;
+    close(dir_fd);
+    errno = saved;
+    return rc;
+}
+
+static int ensure_parent_in_root(int rootfs_fd, const char* relpath)
+{
+    char parent[PATH_MAX];
+    int n = snprintf(parent, sizeof(parent), "%s", relpath);
+    if (n < 0 || (size_t)n >= sizeof(parent))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char* slash = strrchr(parent, '/');
+    if (!slash)
+    {
+        return 0;
+    }
+    *slash = '\0';
+    return mkdir_p_in_root(rootfs_fd, parent);
+}
+
+static int ensure_directory_in_root(int rootfs_fd, const char* relpath)
+{
+    if (ensure_parent_in_root(rootfs_fd, relpath) < 0)
+    {
+        return -1;
+    }
+
+    int parent_fd;
+    char leaf[NAME_MAX + 1];
+    if (open_parent_in_root(rootfs_fd, relpath, &parent_fd,
+                            leaf, sizeof(leaf)) < 0)
+    {
+        return -1;
+    }
+    struct stat st;
+    if (fstatat(parent_fd, leaf, &st, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+        if (S_ISDIR(st.st_mode))
+        {
+            close(parent_fd);
+            return 0;
+        }
+        if (remove_tree_at(parent_fd, leaf) < 0)
+        {
+            int saved = errno;
+            close(parent_fd);
+            errno = saved;
+            return -1;
+        }
+    }
+    else if (errno != ENOENT)
+    {
+        int saved = errno;
+        close(parent_fd);
+        errno = saved;
+        return -1;
+    }
+    int rc = mkdirat(parent_fd, leaf, 0700);
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return rc;
+}
+
+static int copy_fd_xattrs(int src_fd, int dst_fd)
+{
+    ssize_t names_len = flistxattr(src_fd, NULL, 0);
+    if (names_len < 0)
+    {
+        if (errno == ENOTSUP || errno == EOPNOTSUPP)
+        {
+            return 0;
+        }
+        return -1;
+    }
+    if (names_len == 0)
+    {
+        return 0;
+    }
+    if ((size_t)names_len > MAX_LAYER_XATTR_BYTES)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+
+    char* names = malloc((size_t)names_len);
+    if (!names)
+    {
+        return -1;
+    }
+    ssize_t got = flistxattr(src_fd, names, (size_t)names_len);
+    if (got != names_len)
+    {
+        free(names);
+        return -1;
+    }
+
+    int rc = 0;
+    size_t total_bytes = (size_t)names_len;
+    for (char* name = names; name < names + names_len;)
+    {
+        size_t remaining = (size_t)((names + names_len) - name);
+        size_t name_len = strnlen(name, remaining);
+        if (name_len == 0 || name_len == remaining)
+        {
+            errno = EINVAL;
+            rc = -1;
+            break;
+        }
+        ssize_t value_len = fgetxattr(src_fd, name, NULL, 0);
+        if (value_len < 0 ||
+                (size_t)value_len > MAX_LAYER_XATTR_BYTES - total_bytes)
+        {
+            if (value_len >= 0)
+            {
+                errno = E2BIG;
+            }
+            rc = -1;
+            break;
+        }
+        total_bytes += (size_t)value_len;
+        void* value = malloc(value_len > 0 ? (size_t)value_len : 1);
+        if (!value)
+        {
+            rc = -1;
+            break;
+        }
+        ssize_t value_got = fgetxattr(src_fd, name, value,
+                                      (size_t)value_len);
+        if (value_got != value_len ||
+                fsetxattr(dst_fd, name, value, (size_t)value_len, 0) < 0)
+        {
+            free(value);
+            rc = -1;
+            break;
+        }
+        free(value);
+        name += name_len + 1;
+    }
+    free(names);
+    return rc;
+}
+
+static int apply_fd_metadata(int src_fd, int dst_fd, const struct stat* st)
+{
+    /*
+     * The extraction subprocess uses --no-same-permissions. Strip set-ID
+     * bits again here so a tar implementation cannot reintroduce them via
+     * staging metadata; preserve the sticky bit on directories.
+     */
+    mode_t safe_mode = st->st_mode & 01777;
+    if (fchown(dst_fd, st->st_uid, st->st_gid) < 0 ||
+            fchmod(dst_fd, safe_mode) < 0 ||
+            copy_fd_xattrs(src_fd, dst_fd) < 0)
+    {
+        return -1;
+    }
+    struct timespec times[2] = { st->st_atim, st->st_mtim };
+    return futimens(dst_fd, times);
+}
+
+static size_t hardlink_bucket(const struct stat* st)
+{
+    uint64_t key = (uint64_t)st->st_ino;
+    key ^= (uint64_t)st->st_dev + 0x9e3779b97f4a7c15ULL +
+           (key << 6) + (key >> 2);
+    return (size_t)(key % LAYER_HARDLINK_BUCKETS);
+}
+
+static struct layer_hardlink* find_hardlink(struct layer_merge_ctx* ctx,
+        const struct stat* st)
+{
+    size_t bucket = hardlink_bucket(st);
+    for (struct layer_hardlink* h = ctx->hardlink_buckets[bucket];
+            h; h = h->next)
+    {
+        if (h->dev == st->st_dev && h->ino == st->st_ino)
+        {
+            return h;
+        }
+    }
+    return NULL;
+}
+
+static int remember_hardlink(struct layer_merge_ctx* ctx,
+                             const struct stat* st, const char* relpath)
+{
+    if (ctx->hardlink_count >= MAX_LAYER_HARDLINKS)
+    {
+        errno = E2BIG;
+        return -1;
+    }
+    struct layer_hardlink* h = calloc(1, sizeof(*h));
+    if (!h)
+    {
+        return -1;
+    }
+    h->rootfs_path = strdup(relpath);
+    if (!h->rootfs_path)
+    {
+        free(h);
+        return -1;
+    }
+    h->dev = st->st_dev;
+    h->ino = st->st_ino;
+    size_t bucket = hardlink_bucket(st);
+    h->next = ctx->hardlink_buckets[bucket];
+    ctx->hardlink_buckets[bucket] = h;
+    ctx->hardlink_count++;
+    return 0;
+}
+
+static void free_hardlinks(struct layer_merge_ctx* ctx)
+{
+    if (!ctx->hardlink_buckets)
+    {
+        return;
+    }
+    for (size_t i = 0; i < LAYER_HARDLINK_BUCKETS; i++)
+    {
+        struct layer_hardlink* h = ctx->hardlink_buckets[i];
+        while (h)
+        {
+            struct layer_hardlink* next = h->next;
+            free(h->rootfs_path);
+            free(h);
+            h = next;
+        }
+    }
+    free(ctx->hardlink_buckets);
+    ctx->hardlink_buckets = NULL;
+    ctx->hardlink_count = 0;
+}
+
+static int create_hardlink_in_root(struct layer_merge_ctx* ctx,
+                                   const char* source_rel,
+                                   const char* dest_rel)
+{
+    if (remove_path_in_root(ctx->rootfs_fd, dest_rel) < 0 ||
+            ensure_parent_in_root(ctx->rootfs_fd, dest_rel) < 0)
+    {
+        return -1;
+    }
+    int source_fd = openat2_in_root(ctx->rootfs_fd, source_rel,
+                                    O_PATH | O_NOFOLLOW | O_CLOEXEC, 0);
+    if (source_fd < 0)
+    {
+        return -1;
+    }
+    int parent_fd;
+    char leaf[NAME_MAX + 1];
+    if (open_parent_in_root(ctx->rootfs_fd, dest_rel, &parent_fd,
+                            leaf, sizeof(leaf)) < 0)
+    {
+        close(source_fd);
+        return -1;
+    }
+    int rc = linkat(source_fd, "", parent_fd, leaf, AT_EMPTY_PATH);
+    int saved = errno;
+    close(parent_fd);
+    close(source_fd);
+    errno = saved;
+    return rc;
+}
+
+static int apply_whiteouts(struct layer_merge_ctx* ctx, int cur_dir_fd,
+                           const char* rel_dir)
+{
+    int scan_fd = openat(cur_dir_fd, ".",
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (scan_fd < 0)
+    {
+        return -1;
+    }
+    DIR* dir = fdopendir(scan_fd);
+    if (!dir)
+    {
+        close(scan_fd);
+        return -1;
+    }
+    int rc = 0;
+    struct dirent* de;
+    errno = 0;
+    while ((de = readdir(dir)) != NULL)
+    {
+        if (strncmp(de->d_name, ".wh.", 4) != 0)
+        {
+            errno = 0;
+            continue;
+        }
+        if (++ctx->entry_count > MAX_LAYER_ENTRIES)
+        {
+            errno = E2BIG;
+            rc = -1;
+            break;
+        }
+        if (strcmp(de->d_name, ".wh..wh..opq") == 0)
+        {
+            if (clear_directory_in_root(ctx->rootfs_fd, rel_dir) < 0)
+            {
+                rc = -1;
+                break;
+            }
+            errno = 0;
+            continue;
+        }
+        const char* target_name = de->d_name + 4;
+        if (*target_name == '\0')
+        {
+            errno = EINVAL;
+            rc = -1;
+            break;
+        }
+        char target[PATH_MAX];
+        int n = rel_dir[0] ?
+                snprintf(target, sizeof(target), "%s/%s",
+                         rel_dir, target_name) :
+                snprintf(target, sizeof(target), "%s", target_name);
+        if (n < 0 || (size_t)n >= sizeof(target) ||
+                remove_path_in_root(ctx->rootfs_fd, target) < 0)
+        {
+            rc = -1;
+            break;
+        }
+        errno = 0;
+    }
+    if (!de && errno != 0)
+    {
+        rc = -1;
+    }
+    if (closedir(dir) < 0)
+    {
+        rc = -1;
+    }
+    return rc;
+}
 
 /*
  * safe_merge_layer: walk `stage_path` (a directory containing a
@@ -2765,7 +3524,22 @@ static int safe_merge_layer(int rootfs_fd, const char* stage_path)
         perror("oci2bin: open stage dir");
         return -1;
     }
-    int rc = safe_merge_walk(rootfs_fd, stage_fd, stage_fd, "");
+    struct layer_merge_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.rootfs_fd = rootfs_fd;
+    ctx.hardlink_buckets = calloc(LAYER_HARDLINK_BUCKETS,
+                                  sizeof(*ctx.hardlink_buckets));
+    ctx.copy_buf = malloc(LAYER_COPY_BUFFER_SIZE);
+    if (!ctx.hardlink_buckets || !ctx.copy_buf)
+    {
+        free(ctx.hardlink_buckets);
+        free(ctx.copy_buf);
+        close(stage_fd);
+        return -1;
+    }
+    int rc = safe_merge_walk(&ctx, stage_fd, "", 0);
+    free_hardlinks(&ctx);
+    free(ctx.copy_buf);
     close(stage_fd);
     return rc;
 }
@@ -2775,11 +3549,22 @@ static int safe_merge_layer(int rootfs_fd, const char* stage_path)
  * into directories. rel_dir is the path relative to stage_root_fd
  * (used for log messages and to compute the rootfs-relative path).
  */
-static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
-                           int cur_dir_fd, const char* rel_dir)
+static int safe_merge_walk(struct layer_merge_ctx* ctx, int cur_dir_fd,
+                           const char* rel_dir, unsigned int depth)
 {
-    (void)stage_root_fd;
-    int dup_fd = dup(cur_dir_fd);
+    if (depth > MAX_LAYER_DEPTH)
+    {
+        errno = ELOOP;
+        return -1;
+    }
+    if (apply_whiteouts(ctx, cur_dir_fd, rel_dir) < 0)
+    {
+        fprintf(stderr, "oci2bin: failed to apply whiteout in %s: %s\n",
+                rel_dir[0] ? rel_dir : "/", strerror(errno));
+        return -1;
+    }
+    int dup_fd = openat(cur_dir_fd, ".",
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dup_fd < 0)
     {
         perror("oci2bin: dup stage fd");
@@ -2794,6 +3579,7 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
     }
     int rc = 0;
     struct dirent* de;
+    errno = 0;
     while ((de = readdir(d)) != NULL)
     {
         if (de->d_name[0] == '.' &&
@@ -2801,6 +3587,18 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
                  (de->d_name[1] == '.' && de->d_name[2] == '\0')))
         {
             continue;
+        }
+        if (strncmp(de->d_name, ".wh.", 4) == 0)
+        {
+            errno = 0;
+            continue;
+        }
+        if (++ctx->entry_count > MAX_LAYER_ENTRIES)
+        {
+            fprintf(stderr, "oci2bin: layer contains too many entries\n");
+            errno = E2BIG;
+            rc = -1;
+            break;
         }
         char rel_path[PATH_MAX];
         int n;
@@ -2816,14 +3614,16 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
         if (n < 0 || (size_t)n >= sizeof(rel_path))
         {
             fprintf(stderr,
-                    "oci2bin: layer entry path too long, skipping\n");
-            continue;
+                    "oci2bin: layer entry path too long\n");
+            rc = -1;
+            break;
         }
         if (tar_entry_name_unsafe(rel_path))
         {
             fprintf(stderr,
-                    "oci2bin: skipping unsafe layer entry: %s\n", rel_path);
-            continue;
+                    "oci2bin: unsafe layer entry: %s\n", rel_path);
+            rc = -1;
+            break;
         }
         struct stat st;
         if (fstatat(cur_dir_fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0)
@@ -2834,9 +3634,7 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
         }
         if (S_ISDIR(st.st_mode))
         {
-            if (mkdirat_in_root(rootfs_fd, rel_path,
-                                st.st_mode & 0777) < 0 &&
-                    errno != EEXIST)
+            if (ensure_directory_in_root(ctx->rootfs_fd, rel_path) < 0)
             {
                 fprintf(stderr,
                         "oci2bin: mkdir failed for %s: %s\n",
@@ -2853,40 +3651,62 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
                 rc = -1;
                 break;
             }
-            int sub_rc = safe_merge_walk(rootfs_fd, stage_root_fd,
-                                         sub_fd, rel_path);
-            close(sub_fd);
+            int sub_rc = safe_merge_walk(ctx, sub_fd, rel_path, depth + 1);
             if (sub_rc < 0)
             {
+                close(sub_fd);
                 rc = -1;
                 break;
             }
+            int dst_fd = openat2_in_root(ctx->rootfs_fd, rel_path,
+                                         O_RDONLY | O_DIRECTORY |
+                                         O_NOFOLLOW | O_CLOEXEC, 0);
+            if (dst_fd < 0 ||
+                    apply_fd_metadata(sub_fd, dst_fd, &st) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: metadata failed for directory %s: %s\n",
+                        rel_path, strerror(errno));
+                if (dst_fd >= 0)
+                {
+                    close(dst_fd);
+                }
+                close(sub_fd);
+                rc = -1;
+                break;
+            }
+            close(dst_fd);
+            close(sub_fd);
         }
         else if (S_ISREG(st.st_mode))
         {
-            /* Ensure parent dir exists in rootfs (legitimate case:
-             * staging dir got created implicitly by tar before any
-             * file in it). */
-            char parent[PATH_MAX];
-            int pn = snprintf(parent, sizeof(parent), "%s", rel_path);
-            if (pn < 0 || (size_t)pn >= sizeof(parent))
+            struct layer_hardlink* prior = NULL;
+            if (st.st_nlink > 1)
             {
-                rc = -1;
-                break;
+                prior = find_hardlink(ctx, &st);
             }
-            char* slash = strrchr(parent, '/');
-            if (slash)
+            if (prior)
             {
-                *slash = '\0';
-                if (mkdir_p_in_root(rootfs_fd, parent) < 0 &&
-                        errno != EEXIST)
+                if (create_hardlink_in_root(ctx, prior->rootfs_path,
+                                            rel_path) < 0)
                 {
                     fprintf(stderr,
-                            "oci2bin: mkdir -p failed for %s: %s\n",
-                            parent, strerror(errno));
+                            "oci2bin: hardlink failed for %s: %s\n",
+                            rel_path, strerror(errno));
                     rc = -1;
                     break;
                 }
+                errno = 0;
+                continue;
+            }
+            if (remove_path_in_root(ctx->rootfs_fd, rel_path) < 0 ||
+                    ensure_parent_in_root(ctx->rootfs_fd, rel_path) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: replace failed for %s: %s\n",
+                        rel_path, strerror(errno));
+                rc = -1;
+                break;
             }
             int src_fd = openat(cur_dir_fd, de->d_name,
                                 O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -2896,10 +3716,9 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
                 rc = -1;
                 break;
             }
-            int dst_fd = openat2_in_root(rootfs_fd, rel_path,
-                                         O_WRONLY | O_CREAT | O_TRUNC |
-                                         O_CLOEXEC,
-                                         st.st_mode & 0777);
+            int dst_fd = openat2_in_root(ctx->rootfs_fd, rel_path,
+                                         O_WRONLY | O_CREAT | O_EXCL |
+                                         O_NOFOLLOW | O_CLOEXEC, 0600);
             if (dst_fd < 0)
             {
                 fprintf(stderr,
@@ -2909,11 +3728,11 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
                 rc = -1;
                 break;
             }
-            char buf[65536];
             int copy_err = 0;
             while (1)
             {
-                ssize_t r = read(src_fd, buf, sizeof(buf));
+                ssize_t r = read(src_fd, ctx->copy_buf,
+                                 LAYER_COPY_BUFFER_SIZE);
                 if (r < 0)
                 {
                     if (errno == EINTR)
@@ -2928,16 +3747,27 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
                 {
                     break;
                 }
-                if (write_all_fd(dst_fd, buf, (size_t)r) < 0)
+                if (write_all_fd(dst_fd, ctx->copy_buf, (size_t)r) < 0)
                 {
                     perror("oci2bin: write rootfs file");
                     copy_err = 1;
                     break;
                 }
             }
-            close(src_fd);
-            close(dst_fd);
-            if (copy_err)
+            if (!copy_err && apply_fd_metadata(src_fd, dst_fd, &st) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: metadata failed for file %s: %s\n",
+                        rel_path, strerror(errno));
+                copy_err = 1;
+            }
+            if (close(src_fd) < 0 || close(dst_fd) < 0)
+            {
+                copy_err = 1;
+            }
+            if (copy_err ||
+                    (st.st_nlink > 1 &&
+                     remember_hardlink(ctx, &st, rel_path) < 0))
             {
                 rc = -1;
                 break;
@@ -2945,58 +3775,45 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
         }
         else if (S_ISLNK(st.st_mode))
         {
-            char target[PATH_MAX];
+            char target[PATH_MAX + 1];
             ssize_t tlen = readlinkat(cur_dir_fd, de->d_name,
-                                      target, sizeof(target) - 1);
+                                      target, PATH_MAX);
             if (tlen < 0)
             {
                 perror("oci2bin: readlinkat stage symlink");
                 rc = -1;
                 break;
             }
+            if (tlen >= PATH_MAX)
+            {
+                fprintf(stderr,
+                        "oci2bin: symlink target too long for %s\n",
+                        rel_path);
+                errno = ENAMETOOLONG;
+                rc = -1;
+                break;
+            }
             target[tlen] = '\0';
-            /* Ensure parent dir exists in rootfs */
-            char parent[PATH_MAX];
-            int pn = snprintf(parent, sizeof(parent), "%s", rel_path);
-            if (pn < 0 || (size_t)pn >= sizeof(parent))
+            if (remove_path_in_root(ctx->rootfs_fd, rel_path) < 0 ||
+                    ensure_parent_in_root(ctx->rootfs_fd, rel_path) < 0)
             {
                 rc = -1;
                 break;
             }
-            char* slash = strrchr(parent, '/');
             int parent_fd;
-            const char* leaf;
-            if (slash)
-            {
-                *slash = '\0';
-                if (mkdir_p_in_root(rootfs_fd, parent) < 0 &&
-                        errno != EEXIST)
-                {
-                    rc = -1;
-                    break;
-                }
-                parent_fd = openat2_in_root(rootfs_fd, parent,
-                                            O_DIRECTORY | O_PATH | O_CLOEXEC,
-                                            0);
-                leaf = slash + 1;
-            }
-            else
-            {
-                parent_fd = dup(rootfs_fd);
-                leaf = rel_path;
-            }
-            if (parent_fd < 0)
+            char leaf[NAME_MAX + 1];
+            if (open_parent_in_root(ctx->rootfs_fd, rel_path, &parent_fd,
+                                    leaf, sizeof(leaf)) < 0)
             {
                 rc = -1;
                 break;
             }
-            /* Remove any existing file at the destination so the
-             * symlink call doesn't fail with EEXIST. The unlinkat
-             * uses parent_fd which was resolved with RESOLVE_IN_ROOT
-             * so this cannot reach outside the rootfs. */
-            unlinkat(parent_fd, leaf, 0);
-            if (symlinkat(target, parent_fd, leaf) < 0 &&
-                    errno != EEXIST)
+            struct timespec times[2] = { st.st_atim, st.st_mtim };
+            if (symlinkat(target, parent_fd, leaf) < 0 ||
+                    fchownat(parent_fd, leaf, st.st_uid, st.st_gid,
+                             AT_SYMLINK_NOFOLLOW) < 0 ||
+                    utimensat(parent_fd, leaf, times,
+                              AT_SYMLINK_NOFOLLOW) < 0)
             {
                 fprintf(stderr,
                         "oci2bin: symlinkat failed for %s -> %s: %s\n",
@@ -3009,14 +3826,55 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
         }
         else
         {
-            /* char/block devices, fifos, sockets — skip with a note.
-             * These are rare in container images and creating them
-             * usually requires CAP_MKNOD anyway. */
-            debug_log("layer.merge.skip_special",
-                      "path=%s mode=0%o", rel_path, (unsigned)st.st_mode);
+            if (!S_ISFIFO(st.st_mode))
+            {
+                fprintf(stderr,
+                        "oci2bin: refusing unsafe or unsupported layer "
+                        "entry type for %s\n",
+                        rel_path);
+                rc = -1;
+                break;
+            }
+            if (remove_path_in_root(ctx->rootfs_fd, rel_path) < 0 ||
+                    ensure_parent_in_root(ctx->rootfs_fd, rel_path) < 0)
+            {
+                rc = -1;
+                break;
+            }
+            int parent_fd;
+            char leaf[NAME_MAX + 1];
+            if (open_parent_in_root(ctx->rootfs_fd, rel_path, &parent_fd,
+                                    leaf, sizeof(leaf)) < 0)
+            {
+                rc = -1;
+                break;
+            }
+            int create_rc = mkfifoat(parent_fd, leaf, 0600);
+            struct timespec times[2] = { st.st_atim, st.st_mtim };
+            if (create_rc < 0 ||
+                    fchownat(parent_fd, leaf, st.st_uid, st.st_gid, 0) < 0 ||
+                    fchmodat(parent_fd, leaf, st.st_mode & 01777, 0) < 0 ||
+                    utimensat(parent_fd, leaf, times, 0) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: special file failed for %s: %s\n",
+                        rel_path, strerror(errno));
+                close(parent_fd);
+                rc = -1;
+                break;
+            }
+            close(parent_fd);
         }
+        errno = 0;
     }
-    closedir(d);
+    if (!de && errno != 0)
+    {
+        rc = -1;
+    }
+    if (closedir(d) < 0)
+    {
+        rc = -1;
+    }
     return rc;
 }
 
@@ -3026,8 +3884,8 @@ static int safe_merge_walk(int rootfs_fd, int stage_root_fd,
  * symlink-safe primitives. Removes the staging directory before
  * returning. Returns 0 on success, -1 on failure.
  */
-static int safe_extract_layer(int rootfs_fd, const char* tar_path,
-                              const char* tmpdir_parent, int layer_idx)
+static int safe_extract_layer_path(int rootfs_fd, const char* tar_path,
+                                   const char* tmpdir_parent, int layer_idx)
 {
     if (tar_layer_prescan(tar_path) < 0)
     {
@@ -3052,9 +3910,11 @@ static int safe_extract_layer(int rootfs_fd, const char* tar_path,
     char* tar_argv[] =
     {
         "tar", "xf", (char*)tar_path, "-C", stage,
-        "--no-same-permissions", "--no-same-owner", NULL
+        "--no-same-permissions", "--no-same-owner",
+        "--xattrs", "--xattrs-include=*", "--acls",
+        "--delay-directory-restore", "--keep-directory-symlink", NULL
     };
-    int tar_rc = run_cmd(tar_argv);
+    int tar_rc = run_cmd_umask(tar_argv, 0);
     int merge_rc = -1;
     if (tar_rc == 0)
     {
@@ -3066,6 +3926,45 @@ static int safe_extract_layer(int rootfs_fd, const char* tar_path,
         return -1;
     }
     return merge_rc;
+}
+
+/*
+ * Extract a layer from an already-open regular file. Passing /proc/self/fd/N
+ * to tar prevents a manifest-controlled path from being swapped for a
+ * symlink between validation and extraction.
+ */
+static int safe_extract_layer_fd(int rootfs_fd, int tar_fd,
+                                 const char* tmpdir_parent, int layer_idx)
+{
+    struct stat st;
+    if (fstat(tar_fd, &st) < 0 || !S_ISREG(st.st_mode))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    int inherited_fd = fcntl(tar_fd, F_DUPFD, 3);
+    if (inherited_fd < 0)
+    {
+        return -1;
+    }
+    char proc_path[64];
+    int n = snprintf(proc_path, sizeof(proc_path),
+                     "/proc/self/fd/%d", inherited_fd);
+    if (n < 0 || (size_t)n >= sizeof(proc_path))
+    {
+        close(inherited_fd);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int rc = safe_extract_layer_path(rootfs_fd, proc_path,
+                                     tmpdir_parent, layer_idx);
+    int saved = errno;
+    if (close(inherited_fd) < 0 && rc == 0)
+    {
+        return -1;
+    }
+    errno = saved;
+    return rc;
 }
 
 static ssize_t read_all_fd(int fd, char* buf, size_t len)
@@ -4167,7 +5066,8 @@ static int write_proc(const char* path, const char* data, size_t len)
 }
 
 /* Run a command, wait for it. Returns exit status (0 = success, -1 = error). */
-static int run_cmd(char* const argv[])
+static int run_cmd_internal(char* const argv[], int set_child_umask,
+                            mode_t child_umask)
 {
     if (g_debug && argv && argv[0])
     {
@@ -4184,6 +5084,10 @@ static int run_cmd(char* const argv[])
     }
     if (pid == 0)
     {
+        if (set_child_umask)
+        {
+            umask(child_umask);
+        }
         execvp(argv[0], argv);
         perror("execvp");
         _exit(127);
@@ -4201,6 +5105,16 @@ static int run_cmd(char* const argv[])
     debug_log("run_cmd.exit", "status=%d", WIFEXITED(status) ?
               WEXITSTATUS(status) : -1);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int run_cmd(char* const argv[])
+{
+    return run_cmd_internal(argv, 0, 0);
+}
+
+static int run_cmd_umask(char* const argv[], mode_t child_umask)
+{
+    return run_cmd_internal(argv, 1, child_umask);
 }
 
 /*
@@ -4924,9 +5838,12 @@ static int extract_embedded_oci_layout(const char* self_path,
                 "oci2bin: OCI tar contains unsafe entry names; refusing\n");
         return -1;
     }
-    char* tar_argv[] = {"tar", "xf", (char*)tar_input, "-C", oci_dir_out,
-                        "--no-same-permissions", "--no-same-owner", NULL
-                       };
+    char* tar_argv[] =
+    {
+        "tar", "xf", (char*)tar_input, "-C", oci_dir_out,
+        "--no-same-permissions", "--no-same-owner",
+        "--keep-directory-symlink", NULL
+    };
     if (run_cmd(tar_argv) != 0)
     {
         fprintf(stderr, "oci2bin: failed to extract OCI tar\n");
@@ -4965,15 +5882,16 @@ static char* extract_oci_rootfs(const char* self_path)
     }
 
     /* 3. Read manifest.json */
-    char manifest_path[PATH_MAX];
-    if (snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", oci_dir)
-            >= (int)sizeof(manifest_path))
+    int oci_dir_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (oci_dir_fd < 0)
     {
-        fprintf(stderr, "oci2bin: manifest path too long\n");
+        perror("oci2bin: open OCI layout");
         return NULL;
     }
     size_t manifest_size;
-    char* manifest = read_file(manifest_path, &manifest_size);
+    char* manifest = read_file_beneath(oci_dir_fd, "manifest.json",
+                                       &manifest_size);
+    close(oci_dir_fd);
     if (!manifest)
     {
         fprintf(stderr, "oci2bin: cannot read manifest.json\n");
@@ -5009,28 +5927,49 @@ static char* extract_oci_rootfs(const char* self_path)
     }
 
     char* layers[MAX_LAYERS];
-    int nlayers = json_parse_string_array(layers_json, layers, MAX_LAYERS);
+    memset(layers, 0, sizeof(layers));
+    int nlayers = json_parse_string_array_strict(layers_json, layers,
+                  MAX_LAYERS);
+    if (nlayers < 0)
+    {
+        fprintf(stderr, "oci2bin: malformed or oversized Layers array\n");
+        free(config_path_rel);
+        free(layers_json);
+        free(manifest);
+        return NULL;
+    }
     debug_log("extract.manifest", "config=%s layers=%d",
               safe_str(config_path_rel), nlayers);
 
+    int layer_failed = 0;
+    oci_dir_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (oci_dir_fd < 0)
+    {
+        perror("oci2bin: open OCI layout for layers");
+        layer_failed = 1;
+    }
     for (int i = 0; i < nlayers; i++)
     {
+        if (layer_failed)
+        {
+            break;
+        }
         /* Reject any layer path that tries to traverse out of oci_dir */
         if (path_has_dotdot_component(layers[i]) || layers[i][0] == '/')
         {
             fprintf(stderr, "oci2bin: rejecting dangerous layer path: %s\n", layers[i]);
-            free(layers[i]);
-            continue;
+            layer_failed = 1;
+            break;
         }
 
-        char layer_path[PATH_MAX];
-        int lplen = snprintf(layer_path, sizeof(layer_path), "%s/%s", oci_dir,
-                             layers[i]);
-        if (lplen < 0 || (size_t)lplen >= sizeof(layer_path))
+        int layer_fd = openat_beneath(oci_dir_fd, layers[i], O_RDONLY, 0);
+        if (layer_fd < 0)
         {
-            fprintf(stderr, "oci2bin: layer path too long, skipping: %s\n", layers[i]);
-            free(layers[i]);
-            continue;
+            fprintf(stderr,
+                    "oci2bin: cannot safely open layer %s: %s\n",
+                    layers[i], strerror(errno));
+            layer_failed = 1;
+            break;
         }
 
         /* Open the rootfs as a directory fd for safe-merge primitives. */
@@ -5038,16 +5977,37 @@ static char* extract_oci_rootfs(const char* self_path)
         if (rootfs_fd < 0)
         {
             perror("oci2bin: open rootfs for layer merge");
-            free(layers[i]);
-            continue;
+            close(layer_fd);
+            layer_failed = 1;
+            break;
         }
-        if (safe_extract_layer(rootfs_fd, layer_path, tmpdir, i) < 0)
+        if (safe_extract_layer_fd(rootfs_fd, layer_fd, tmpdir, i) < 0)
         {
             fprintf(stderr,
                     "oci2bin: failed to extract layer %s\n", layers[i]);
+            layer_failed = 1;
         }
+        close(layer_fd);
         close(rootfs_fd);
+        if (layer_failed)
+        {
+            break;
+        }
+    }
+    if (oci_dir_fd >= 0)
+    {
+        close(oci_dir_fd);
+    }
+    for (int i = 0; i < nlayers; i++)
+    {
         free(layers[i]);
+    }
+    if (layer_failed)
+    {
+        free(config_path_rel);
+        free(layers_json);
+        free(manifest);
+        return NULL;
     }
 
     /* 6. Read the image config to get Cmd/Entrypoint */
@@ -5062,19 +6022,19 @@ static char* extract_oci_rootfs(const char* self_path)
         free(manifest);
         return NULL;
     }
-    char config_full_path[PATH_MAX];
-    int cfplen = snprintf(config_full_path, sizeof(config_full_path), "%s/%s",
-                          oci_dir, config_path_rel);
-    if (cfplen < 0 || (size_t)cfplen >= sizeof(config_full_path))
+    oci_dir_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (oci_dir_fd < 0)
     {
-        fprintf(stderr, "oci2bin: config path too long\n");
+        perror("oci2bin: open OCI layout for config");
         free(config_path_rel);
         free(layers_json);
         free(manifest);
         return NULL;
     }
     size_t config_size;
-    char* config = read_file(config_full_path, &config_size);
+    char* config = read_file_beneath(oci_dir_fd, config_path_rel,
+                                     &config_size);
+    close(oci_dir_fd);
     if (config)
     {
         /* Write parsed entrypoint/env info for use inside the container */
@@ -10007,6 +10967,46 @@ static int resolve_user(const char* spec, uid_t* out_uid, gid_t* out_gid)
     return 0;
 }
 
+static int mount_rootfs_read_only(const char* rootfs)
+{
+    if (mount(rootfs, rootfs, NULL, MS_BIND | MS_REC, NULL) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --read-only bind mount failed: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    if (mount(NULL, rootfs, NULL,
+              MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0)
+    {
+        int saved = errno;
+        if (umount2(rootfs, MNT_DETACH) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --read-only cleanup failed: %s\n",
+                    strerror(errno));
+        }
+        fprintf(stderr,
+                "oci2bin: --read-only remount failed: %s\n",
+                strerror(saved));
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
+static int make_mount_tree_private(void)
+{
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: make mount namespace private failed: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 static int container_main(const char* rootfs, struct container_opts *opts)
 {
     debug_log("container_main.begin", "rootfs=%s", rootfs);
@@ -10072,6 +11072,65 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     if (opts->gdb)
     {
         setup_gdb_in_rootfs(rootfs);
+    }
+
+    /*
+     * Prepare every directory that will become a post-chroot mountpoint before
+     * --read-only remounts the root. These are host-side paths under the
+     * extracted rootfs, validated by mkdir_p_secure() component by component.
+     */
+    {
+        static const struct
+        {
+            const char* path;
+            mode_t mode;
+        } required[] =
+        {
+            {"/proc", 0555},
+            {"/tmp", 01777},
+        };
+        for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++)
+        {
+            char dst[PATH_MAX];
+            int n = snprintf(dst, sizeof(dst), "%s%s",
+                             rootfs, required[i].path);
+            if (n < 0 || (size_t)n >= sizeof(dst) ||
+                    mkdir_p_secure(dst, required[i].mode,
+                                   "--read-only mountpoint") < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: cannot prepare mountpoint %s\n",
+                        required[i].path);
+                return 1;
+            }
+        }
+        if (opts->read_only && !opts->no_auto_tmpfs)
+        {
+            char dst[PATH_MAX];
+            int n = snprintf(dst, sizeof(dst), "%s/run", rootfs);
+            if (n < 0 || (size_t)n >= sizeof(dst) ||
+                    mkdir_p_secure(dst, 0755,
+                                   "--read-only /run") < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: cannot prepare mountpoint /run\n");
+                return 1;
+            }
+        }
+        for (int i = 0; i < opts->n_tmpfs; i++)
+        {
+            char dst[PATH_MAX];
+            int n = snprintf(dst, sizeof(dst), "%s%s",
+                             rootfs, opts->tmpfs_mounts[i]);
+            if (n < 0 || (size_t)n >= sizeof(dst) ||
+                    mkdir_p_secure(dst, 0755, "--tmpfs") < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: cannot prepare tmpfs mountpoint %s\n",
+                        opts->tmpfs_mounts[i]);
+                return 1;
+            }
+        }
     }
 
     /* Append --add-host entries to /etc/hosts before chroot */
@@ -10340,10 +11399,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* --read-only / --overlay-persist: mount overlayfs.
-     * For --read-only:       upper/work live in a tmpdir (discarded on exit).
+    /* --ephemeral-root / --overlay-persist: mount a writable overlayfs.
+     * For --ephemeral-root:  upper/work live in a tmpdir (discarded on exit).
      * For --overlay-persist: upper/work live in the user-specified dir (kept). */
-    if (opts->read_only || opts->overlay_persist)
+    if (opts->ephemeral_root || opts->overlay_persist)
     {
         char upper[PATH_MAX];
         char work[PATH_MAX];
@@ -10397,7 +11456,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
         else
         {
-            /* --read-only: derive tmpdir by stripping "/rootfs" suffix */
+            /* --ephemeral-root: derive tmpdir by stripping "/rootfs" suffix */
             char tmpdir[PATH_MAX];
             int tmpdir_ok = 0;
             int tlen = snprintf(tmpdir, sizeof(tmpdir), "%s", rootfs);
@@ -10446,14 +11505,14 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                 if (mount("overlay", rootfs, "overlay", 0,
                           overlay_opts) < 0)
                 {
-                    /* Both --read-only and --overlay-persist are
+                    /* Both --ephemeral-root and --overlay-persist are
                      * explicit flags — silently degrading to
                      * read-write on overlayfs failure would defeat
                      * the user's request. Fail closed. */
                     fprintf(stderr,
                             "oci2bin: %s requested but overlayfs"
                             " mount failed: %s\n",
-                            opts->read_only ? "--read-only"
+                            opts->ephemeral_root ? "--ephemeral-root"
                             : "--overlay-persist",
                             strerror(errno));
                     return 1;
@@ -10475,8 +11534,21 @@ static int container_main(const char* rootfs, struct container_opts *opts)
             fprintf(stderr,
                     "oci2bin: %s requested but overlay upper/work"
                     " could not be prepared\n",
-                    opts->read_only ? "--read-only"
+                    opts->ephemeral_root ? "--ephemeral-root"
                     : "--overlay-persist");
+            return 1;
+        }
+    }
+
+    /*
+     * --read-only is an actual read-only root mount. Clone the complete rootfs
+     * mount tree, then change only the top bind mount to read-only; explicit
+     * submounts such as -v, /dev and tmpfs retain their own mount flags.
+     */
+    if (opts->read_only)
+    {
+        if (mount_rootfs_read_only(rootfs) < 0)
+        {
             return 1;
         }
     }
@@ -11272,8 +12344,9 @@ static void usage(const char* prog)
             "                      hostnames resolved+pinned at launch).\n"
             "                      Requires --net slirp|pasta and 'nft'\n"
             "                      (may be repeated)\n"
-            "  --read-only         Mount rootfs read-only via overlayfs;\n"
+            "  --read-only         Bind-remount the image root read-only;\n"
             "                      auto-mounts /run as tmpfs (see --no-auto-tmpfs)\n"
+            "  --ephemeral-root    Writable temporary overlay discarded on exit\n"
             "  --no-auto-tmpfs     Do not auto-mount /run as tmpfs with --read-only\n"
             "  --overlay-persist DIR\n"
             "                      Persist the overlay upper layer to DIR;\n"
@@ -12464,6 +13537,14 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--read-only") == 0)
         {
             opts->read_only = 1;
+            opts->ephemeral_root = 0;
+            opts->overlay_persist = NULL;
+        }
+        else if (strcmp(argv[i], "--ephemeral-root") == 0)
+        {
+            opts->read_only = 0;
+            opts->ephemeral_root = 1;
+            opts->overlay_persist = NULL;
         }
         else if (strcmp(argv[i], "--overlay-persist") == 0)
         {
@@ -12482,6 +13563,8 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         " contain '..'\n");
                 return -1;
             }
+            opts->read_only = 0;
+            opts->ephemeral_root = 0;
             opts->overlay_persist = argv[i];
         }
         else if (strcmp(argv[i], "--ssh-agent") == 0)
@@ -13304,7 +14387,11 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 {
                     opts->net = (char*)"none";
                 }
-                opts->read_only = 1;
+                if (!opts->read_only && !opts->ephemeral_root &&
+                        !opts->overlay_persist)
+                {
+                    opts->read_only = 1;
+                }
                 opts->cap_drop_all = 1;
                 /* Sane baseline caps: enough to drop privilege via
                  * setuid/setgid, do typical file ops, and bind to
@@ -17689,6 +18776,10 @@ int main(int argc, char* argv[])
             return 1;
         }
         debug_log("main.unshare", "flags=0x%x", ns_flags);
+    }
+    if (make_mount_tree_private() < 0)
+    {
+        return 1;
     }
 
     /* 10c. Time namespace: shift monotonic and boottime clocks when

@@ -1,0 +1,4 @@
+include oci2bin
+include packaging/oci2bin-scripts.txt
+include scripts/*.py
+include src/loader.c

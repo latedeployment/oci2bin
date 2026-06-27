@@ -160,6 +160,184 @@ class SafeResolveTest(unittest.TestCase):
             _MOD._do_copy(state, "src /dst")
         self.assertFalse(os.path.exists(os.path.join(outside, "payload")))
 
+    def test_copy_source_symlink_escape_rejected(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        outside = os.path.join(self.tmp, "outside.txt")
+        os.makedirs(ctx)
+        with open(outside, "w") as f:
+            f.write("host data")
+        os.symlink(outside, os.path.join(ctx, "outside-link"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._do_copy(state, "outside-link /copied")
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.rootfs, "copied")))
+
+    def test_copy_absolute_source_is_context_relative(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(ctx)
+        with open(os.path.join(ctx, "payload"), "w") as f:
+            f.write("context data")
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        _MOD._do_copy(state, "/payload /copied")
+        with open(os.path.join(self.rootfs, "copied")) as f:
+            self.assertEqual(f.read(), "context data")
+
+    def test_copy_absolute_glob_is_context_relative(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(os.path.join(ctx, "files"))
+        with open(os.path.join(ctx, "files", "payload.txt"), "w") as f:
+            f.write("context data")
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        _MOD._do_copy(state, "/files/*.txt /copied/")
+        with open(os.path.join(self.rootfs, "copied", "payload.txt")) as f:
+            self.assertEqual(f.read(), "context data")
+
+    def test_copy_parent_traversal_rejected(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(ctx)
+        outside = os.path.join(self.tmp, "outside.txt")
+        with open(outside, "w") as f:
+            f.write("host data")
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._do_copy(state, "../outside.txt /copied")
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.rootfs, "copied")))
+
+    def test_copy_glob_parent_traversal_rejected(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(ctx)
+        with open(os.path.join(self.tmp, "outside.txt"), "w") as f:
+            f.write("host data")
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._do_copy(state, "../*.txt /copied/")
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.rootfs, "copied", "outside.txt")))
+
+    def test_copy_glob_through_symlinked_directory_rejected(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(ctx)
+        os.makedirs(outside)
+        with open(os.path.join(outside, "secret.txt"), "w") as f:
+            f.write("host data")
+        os.symlink(outside, os.path.join(ctx, "outside-dir"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._do_copy(state, "outside-dir/*.txt /copied/")
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.rootfs, "copied", "secret.txt")))
+
+    def test_copy_recursive_glob_does_not_follow_unrelated_symlink(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(os.path.join(ctx, "inside"))
+        os.makedirs(outside)
+        with open(os.path.join(ctx, "inside", "safe.txt"), "w") as f:
+            f.write("context data")
+        with open(os.path.join(outside, "secret.txt"), "w") as f:
+            f.write("host data")
+        os.symlink(outside, os.path.join(ctx, "outside-dir"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        _MOD._do_copy(state, "**/*.txt /copied/")
+        self.assertTrue(os.path.exists(
+            os.path.join(self.rootfs, "copied", "safe.txt")))
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.rootfs, "copied", "secret.txt")))
+
+    def test_copy_recursive_glob_does_not_include_hidden_paths(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(os.path.join(ctx, ".private"))
+        os.makedirs(os.path.join(ctx, "public"))
+        with open(os.path.join(ctx, ".private", "secret.txt"), "w") as f:
+            f.write("host data")
+        with open(os.path.join(ctx, "public", "safe.txt"), "w") as f:
+            f.write("context data")
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        _MOD._do_copy(state, "**/*.txt /copied/")
+        self.assertTrue(os.path.exists(
+            os.path.join(self.rootfs, "copied", "safe.txt")))
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.rootfs, "copied", "secret.txt")))
+
+    def test_copy_glob_through_internal_symlinked_directory(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(os.path.join(ctx, "real"))
+        with open(os.path.join(ctx, "real", "payload.txt"), "w") as f:
+            f.write("context data")
+        os.symlink("real", os.path.join(ctx, "alias"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        _MOD._do_copy(state, "alias/*.txt /copied/")
+        with open(os.path.join(self.rootfs, "copied", "payload.txt")) as f:
+            self.assertEqual(f.read(), "context data")
+
+    def test_copy_internal_source_symlink_is_resolved(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(ctx)
+        with open(os.path.join(ctx, "payload"), "w") as f:
+            f.write("context data")
+        os.symlink("payload", os.path.join(ctx, "payload-link"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        _MOD._do_copy(state, "payload-link /copied")
+        copied = os.path.join(self.rootfs, "copied")
+        self.assertFalse(os.path.islink(copied))
+        with open(copied) as f:
+            self.assertEqual(f.read(), "context data")
+
+    def test_copy_internal_symlink_keeps_lexical_basename(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(ctx)
+        with open(os.path.join(ctx, "payload"), "w") as f:
+            f.write("context data")
+        os.symlink("payload", os.path.join(ctx, "payload-link"))
+        os.makedirs(os.path.join(self.rootfs, "copied"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        _MOD._do_copy(state, "payload-link /copied/")
+        self.assertTrue(os.path.exists(
+            os.path.join(self.rootfs, "copied", "payload-link")))
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.rootfs, "copied", "payload")))
+
+    def test_copy_symlink_cannot_bypass_dockerignore(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(ctx)
+        with open(os.path.join(ctx, ".dockerignore"), "w") as f:
+            f.write("secret.txt\n")
+        with open(os.path.join(ctx, "secret.txt"), "w") as f:
+            f.write("host data")
+        os.symlink("secret.txt", os.path.join(ctx, "public-link"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._do_copy(state, "public-link /copied")
+        self.assertFalse(os.path.lexists(
+            os.path.join(self.rootfs, "copied")))
+
     def test_run_bind_source_symlink_escape_rejected(self):
         ctx = os.path.join(self.tmp, "ctx")
         outside = os.path.join(self.tmp, "outside")
@@ -173,6 +351,57 @@ class SafeResolveTest(unittest.TestCase):
             _MOD._mount_bind(
                 {"type": "bind", "source": "outside-link",
                  "target": "/mnt"},
+                state,
+            )
+
+    def test_run_bind_absolute_source_is_context_relative(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(ctx)
+        with open(os.path.join(ctx, "payload"), "w") as f:
+            f.write("context data")
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        cmd, cleanup = _MOD._mount_bind(
+            {"type": "bind", "source": "/payload", "target": "/mnt"},
+            state,
+        )
+        self.assertIn(os.path.join(ctx, "payload"), cmd)
+        self.assertIsNone(cleanup)
+
+    def test_run_bind_source_cannot_bypass_dockerignore(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        os.makedirs(ctx)
+        with open(os.path.join(ctx, ".dockerignore"), "w") as f:
+            f.write("secret.txt\n")
+        with open(os.path.join(ctx, "secret.txt"), "w") as f:
+            f.write("host data")
+        os.symlink("secret.txt", os.path.join(ctx, "public-link"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._mount_bind(
+                {"type": "bind", "source": "public-link",
+                 "target": "/mnt"},
+                state,
+            )
+
+    def test_run_bind_target_symlink_escape_rejected(self):
+        ctx = os.path.join(self.tmp, "ctx")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(ctx)
+        os.makedirs(outside)
+        with open(os.path.join(ctx, "payload"), "w") as f:
+            f.write("context data")
+        os.symlink(os.path.join(outside, "target"),
+                   os.path.join(self.rootfs, "mnt"))
+
+        state = _MOD._State(ctx, {}, {}, "amd64")
+        state.rootfs = self.rootfs
+        with self.assertRaises(SystemExit):
+            _MOD._mount_bind(
+                {"type": "bind", "source": "payload", "target": "/mnt"},
                 state,
             )
 

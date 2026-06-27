@@ -7,16 +7,18 @@ No Docker or filesystem access required.
 """
 
 import io
+import hashlib
 import json
 import sys
 import os
 import tarfile
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
 from strip_image import (
     _norm, validate_prefix, should_strip, strip_layer,
-    autodetect_extra_prefixes, STRIP_PREFIXES,
+    autodetect_extra_prefixes, strip_image, STRIP_PREFIXES,
 )
 
 
@@ -60,6 +62,53 @@ def _make_image_tar(layers):
             li.size = len(layer_bytes)
             tf.addfile(li, io.BytesIO(layer_bytes))
     return buf.getvalue()
+
+
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _make_configured_image_tar(layers, config_name=None):
+    """
+    Build a minimal docker-save tar with a config rootfs.diff_ids list.
+
+    layers: list of (layer_filename, raw_tar_bytes) pairs.
+    """
+    diff_ids = [f'sha256:{_sha256(layer_bytes)}'
+                for _name, layer_bytes in layers]
+    config = {
+        'architecture': 'amd64',
+        'config': {},
+        'rootfs': {'type': 'layers', 'diff_ids': diff_ids},
+    }
+    config_bytes = json.dumps(config, separators=(',', ':')).encode()
+    if config_name is None:
+        config_name = f'{_sha256(config_bytes)}.json'
+    manifest = json.dumps([{
+        'Config': config_name,
+        'RepoTags': ['test:latest'],
+        'Layers': [fn for fn, _ in layers],
+    }], separators=(',', ':')).encode()
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:') as tf:
+        ci = tarfile.TarInfo(name=config_name)
+        ci.size = len(config_bytes)
+        tf.addfile(ci, io.BytesIO(config_bytes))
+        mi = tarfile.TarInfo(name='manifest.json')
+        mi.size = len(manifest)
+        tf.addfile(mi, io.BytesIO(manifest))
+        for name, layer_bytes in layers:
+            li = tarfile.TarInfo(name=name)
+            li.size = len(layer_bytes)
+            tf.addfile(li, io.BytesIO(layer_bytes))
+    return buf.getvalue()
+
+
+def _read_member(tf, name):
+    f = tf.extractfile(name)
+    assert f is not None
+    return f.read()
 
 
 class TestNorm(unittest.TestCase):
@@ -237,6 +286,70 @@ class TestStripLayer(unittest.TestCase):
         names = _layer_names(result)
         self.assertNotIn('root/.cache/pip/wheels/foo', names)
         self.assertIn('usr/bin/pip3', names)
+
+
+class TestStripImageMetadata(unittest.TestCase):
+
+    def _strip_bytes(self, image_bytes):
+        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as src:
+            src.write(image_bytes)
+            src_path = src.name
+        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as dst:
+            dst_path = dst.name
+        try:
+            strip_image(src_path, dst_path, prefixes=['usr/share/doc/'])
+            with open(dst_path, 'rb') as f:
+                return f.read()
+        finally:
+            os.unlink(src_path)
+            os.unlink(dst_path)
+
+    def test_recomputes_diff_ids_and_config_name(self):
+        layer = _make_layer_tar('usr/share/doc/pkg/README', 'usr/bin/app')
+        image = _make_configured_image_tar([('layer.tar', layer)])
+        out = self._strip_bytes(image)
+
+        with tarfile.open(fileobj=io.BytesIO(out), mode='r:') as tf:
+            manifest = json.loads(_read_member(tf, 'manifest.json'))[0]
+            config_name = manifest['Config']
+            config_bytes = _read_member(tf, config_name)
+            config = json.loads(config_bytes)
+            layer_bytes = _read_member(tf, 'layer.tar')
+
+        self.assertEqual(config_name, f'{_sha256(config_bytes)}.json')
+        self.assertEqual(config['rootfs']['diff_ids'],
+                         [f'sha256:{_sha256(layer_bytes)}'])
+        self.assertEqual(_layer_names(layer_bytes), ['usr/bin/app'])
+
+    def test_recomputes_oci_blob_layer_and_config_names(self):
+        layer = _make_layer_tar('usr/share/doc/pkg/README', 'usr/bin/app')
+        old_layer_name = f'blobs/sha256/{_sha256(layer)}'
+        config = {
+            'architecture': 'amd64',
+            'config': {},
+            'rootfs': {'type': 'layers',
+                       'diff_ids': [f'sha256:{_sha256(layer)}']},
+        }
+        config_bytes = json.dumps(config, separators=(',', ':')).encode()
+        old_config_name = f'blobs/sha256/{_sha256(config_bytes)}'
+        image = _make_configured_image_tar(
+            [(old_layer_name, layer)], config_name=old_config_name)
+        out = self._strip_bytes(image)
+
+        with tarfile.open(fileobj=io.BytesIO(out), mode='r:') as tf:
+            manifest = json.loads(_read_member(tf, 'manifest.json'))[0]
+            layer_name = manifest['Layers'][0]
+            layer_bytes = _read_member(tf, layer_name)
+            config_name = manifest['Config']
+            config_bytes = _read_member(tf, config_name)
+            config = json.loads(config_bytes)
+
+        self.assertEqual(layer_name, f'blobs/sha256/{_sha256(layer_bytes)}')
+        self.assertEqual(config_name, f'blobs/sha256/{_sha256(config_bytes)}')
+        self.assertNotEqual(layer_name, old_layer_name)
+        self.assertNotEqual(config_name, old_config_name)
+        self.assertEqual(config['rootfs']['diff_ids'],
+                         [f'sha256:{_sha256(layer_bytes)}'])
 
 
 class TestAutodetectExtraPrefixes(unittest.TestCase):

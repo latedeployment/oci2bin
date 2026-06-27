@@ -41,7 +41,6 @@ Usage:
 
 import argparse
 import fnmatch
-import glob as _glob
 import io
 import json
 import os
@@ -113,38 +112,124 @@ def _parse_kvs(spec: str) -> dict:
     return result
 
 
+def _read_shell_word(text: str, start: int) -> tuple:
+    """Return (raw_word, end_index), respecting simple shell quotes."""
+    i = start
+    quote = ""
+    escaped = False
+    while i < len(text):
+        ch = text[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if quote:
+            if quote == "'" and ch == "'":
+                quote = ""
+            elif quote == '"' and ch == '"':
+                quote = ""
+            elif quote == '"' and ch == "\\":
+                escaped = True
+            i += 1
+            continue
+        if ch.isspace():
+            break
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            i += 1
+            continue
+        i += 1
+    return text[start:i], i
+
+
+def _shell_word_token(raw: str):
+    """Unquote a single shell word, returning None when malformed."""
+    try:
+        parts = shlex.split(raw, comments=False, posix=True)
+    except ValueError:
+        return None
+    if len(parts) != 1:
+        return None
+    return parts[0]
+
+
 def _parse_run_line(args: str) -> tuple:
     """
-    Split RUN [--mount=...] [--network=...] CMD into (cmd_str, [mount_dicts]).
+    Split RUN [--mount=...] CMD into (cmd_str, [mount_dicts], [unsupported]).
 
-    Handles both '--mount=type=...' and '--mount type=...' forms.
-    Unrecognised leading flags (--network, --security) are silently ignored.
+    Handles both '--mount=type=...' and '--mount type=...' forms. Only the
+    leading BuildKit option words are parsed; the command remainder is returned
+    byte-for-byte for /bin/sh so shell operators, redirections, expansions and
+    quoting keep their Dockerfile semantics. Unrecognised leading flags are
+    treated as part of the command.
     """
     mounts = []
-    try:
-        parts = shlex.split(args)
-    except ValueError:
-        return args, []
-
-    i = 0
-    while i < len(parts):
-        part = parts[i]
-        if part.startswith("--mount="):
-            mounts.append(_parse_kvs(part[len("--mount="):]))
-            i += 1
-        elif part == "--mount" and i + 1 < len(parts):
-            mounts.append(_parse_kvs(parts[i + 1]))
-            i += 2
-        elif part in ("--network", "--security") and i + 1 < len(parts):
-            i += 2  # skip value
-        elif part.startswith("--network=") or part.startswith("--security="):
-            i += 1  # skip
-        else:
+    unsupported = []
+    pos = 0
+    saw_option = False
+    while pos < len(args):
+        opt_start = pos
+        while opt_start < len(args) and args[opt_start].isspace():
+            opt_start += 1
+        if opt_start >= len(args):
+            pos = opt_start
             break
+        raw, word_end = _read_shell_word(args, opt_start)
+        token = _shell_word_token(raw)
+        if token is None:
+            if saw_option:
+                pos = opt_start
+                break
+            return args, [], []
+        if token.startswith("--mount="):
+            mounts.append(_parse_kvs(token[len("--mount="):]))
+            pos = word_end
+            saw_option = True
+            continue
+        if token == "--mount":
+            value_start = word_end
+            while value_start < len(args) and args[value_start].isspace():
+                value_start += 1
+            if value_start >= len(args):
+                pos = opt_start if saw_option else 0
+                break
+            value_raw, value_end = _read_shell_word(args, value_start)
+            value = _shell_word_token(value_raw)
+            if value is None:
+                pos = opt_start if saw_option else 0
+                break
+            mounts.append(_parse_kvs(value))
+            pos = value_end
+            saw_option = True
+            continue
+        if token in ("--network", "--security"):
+            value_start = word_end
+            while value_start < len(args) and args[value_start].isspace():
+                value_start += 1
+            if value_start >= len(args):
+                pos = opt_start if saw_option else 0
+                break
+            value_raw, value_end = _read_shell_word(args, value_start)
+            value = _shell_word_token(value_raw)
+            unsupported.append(
+                f"{token} {value if value is not None else value_raw}")
+            pos = value_end
+            saw_option = True
+            continue
+        if token.startswith("--network=") or token.startswith("--security="):
+            unsupported.append(token)
+            pos = word_end
+            saw_option = True
+            continue
+        pos = opt_start if saw_option else 0
+        break
 
-    # Reconstruct command preserving original quoting for /bin/sh -c
-    cmd = " ".join(shlex.quote(p) for p in parts[i:])
-    return cmd, mounts
+    cmd = args[pos:].lstrip() if saw_option else args
+    return cmd, mounts, unsupported
 
 
 # ── Layer extraction helpers ─────────────────────────────────────────────────
@@ -352,6 +437,115 @@ def _container_join(base: str, rel: str) -> str:
     if rel_posix in ("", "."):
         return posixpath.normpath(base)
     return posixpath.normpath(posixpath.join(base, rel_posix))
+
+
+def _context_source_candidate(context_dir: str, source: str) -> str:
+    """Map a Dockerfile source path to a lexical path below the context.
+
+    Docker treats a leading slash as relative to the build-context root, not
+    as a host absolute path.
+    """
+    if "\0" in source:
+        raise ValueError("source path contains a NUL byte")
+    rel = source.lstrip("/") if source.startswith("/") else source
+    return os.path.normpath(os.path.join(context_dir, rel))
+
+
+def _resolve_context_candidate(context_dir: str, candidate: str) -> str:
+    """Resolve a host candidate and require it to stay in the context."""
+    real_context = os.path.realpath(context_dir)
+    resolved = os.path.realpath(os.path.normpath(candidate))
+    if resolved != real_context and \
+            not resolved.startswith(real_context + os.sep):
+        raise ValueError(
+            f"{candidate!r} resolves outside the build context "
+            f"({resolved!r})")
+    return resolved
+
+
+def _glob_component_matches(name: str, pattern: str) -> bool:
+    """Match one glob component using Python glob's hidden-file rule."""
+    if name.startswith(".") and not pattern.startswith("."):
+        return False
+    return fnmatch.fnmatchcase(name, pattern)
+
+
+def _expand_context_glob(context_dir: str, source: str) -> list:
+    """Expand a source glob without recursively following symlinked dirs.
+
+    Explicit traversal through an internal directory symlink is supported
+    after confinement validation. A broad ``**`` does not descend through
+    symlinks, preventing host-tree traversal before candidates are checked.
+    """
+    candidate = _context_source_candidate(context_dir, source)
+    rel_pattern = os.path.relpath(candidate, context_dir).replace(os.sep, "/")
+    components = [part for part in rel_pattern.split("/")
+                  if part not in ("", ".")]
+    if any(part == ".." for part in components):
+        raise ValueError(f"{source!r} escapes the build context")
+    if not any(any(char in part for char in "*?[")
+               for part in components):
+        return [candidate]
+
+    results = []
+
+    def scan_dir(path: str, ancestors: frozenset) -> tuple:
+        resolved = _resolve_context_candidate(context_dir, path)
+        try:
+            st = os.stat(resolved)
+        except FileNotFoundError:
+            return [], ancestors
+        if not os.path.isdir(resolved):
+            return [], ancestors
+        key = (st.st_dev, st.st_ino)
+        if key in ancestors:
+            return [], ancestors
+        try:
+            entries = sorted(os.scandir(resolved), key=lambda entry: entry.name)
+        except (FileNotFoundError, NotADirectoryError):
+            return [], ancestors
+        return entries, ancestors | {key}
+
+    def expand(path: str, index: int, ancestors: frozenset) -> None:
+        if index == len(components):
+            if os.path.lexists(path):
+                results.append(path)
+            return
+
+        component = components[index]
+        entries, child_ancestors = scan_dir(path, ancestors)
+        if component == "**":
+            expand(path, index + 1, ancestors)
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                child = os.path.join(path, entry.name)
+                if entry.is_dir(follow_symlinks=False):
+                    expand(child, index, child_ancestors)
+                elif index + 1 == len(components):
+                    results.append(child)
+            return
+
+        for entry in entries:
+            if not _glob_component_matches(entry.name, component):
+                continue
+            child = os.path.join(path, entry.name)
+            expand(child, index + 1, child_ancestors)
+
+    expand(context_dir, 0, frozenset())
+    return list(dict.fromkeys(results))
+
+
+def _context_source_ignored(state: "_State", candidate: str,
+                            resolved: str) -> bool:
+    """Check .dockerignore against both lexical and symlink-resolved paths."""
+    if not state.dockerignore.patterns:
+        return False
+    real_context = os.path.realpath(state.context_dir)
+    lexical_rel = os.path.relpath(candidate, state.context_dir)
+    resolved_rel = os.path.relpath(resolved, real_context)
+    return (state.dockerignore.matches(lexical_rel) or
+            state.dockerignore.matches(resolved_rel))
 
 
 def _copy_leaf(src_path: str, dest_host: str) -> None:
@@ -615,23 +809,44 @@ def _mount_bind(m: dict, state: _State) -> tuple:
         print("error: --mount=type=bind requires target=", file=sys.stderr)
         sys.exit(1)
 
-    real_context = os.path.realpath(state.context_dir)
-    src = os.path.normpath(os.path.join(state.context_dir, src_rel))
-    src_real = os.path.realpath(src)
-    if src_real != real_context and \
-            not src_real.startswith(real_context + os.sep):
-        print(f"error: --mount=type=bind source escapes build context: {src_rel}",
+    try:
+        candidate = _context_source_candidate(state.context_dir, src_rel)
+        src = _resolve_context_candidate(state.context_dir, candidate)
+    except ValueError:
+        print(f"error: --mount=type=bind source escapes build context: "
+              f"{src_rel}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(src):
+        print(f"error: --mount=type=bind source not found: {src_rel}",
               file=sys.stderr)
         sys.exit(1)
-    src = src_real
+    if _context_source_ignored(state, candidate, src):
+        print(f"error: --mount=type=bind source excluded by .dockerignore: "
+              f"{src_rel}", file=sys.stderr)
+        sys.exit(1)
 
-    dst_in_rootfs = _safe_resolve(state.rootfs, "/" + dst.lstrip("/"))
+    try:
+        dst_in_rootfs = _safe_resolve_follow(
+            state.rootfs, "/" + dst.lstrip("/"))
+    except ValueError as exc:
+        print(f"error: --mount=type=bind target escapes rootfs: {exc}",
+              file=sys.stderr)
+        sys.exit(1)
     is_dir = os.path.isdir(src)
     if is_dir:
+        if os.path.lexists(dst_in_rootfs) and \
+                not os.path.isdir(dst_in_rootfs):
+            print("error: --mount=type=bind directory source requires a "
+                  "directory target", file=sys.stderr)
+            sys.exit(1)
         os.makedirs(dst_in_rootfs, exist_ok=True)
     else:
+        if os.path.isdir(dst_in_rootfs):
+            print("error: --mount=type=bind file source requires a file "
+                  "target", file=sys.stderr)
+            sys.exit(1)
         os.makedirs(os.path.dirname(dst_in_rootfs), exist_ok=True)
-        if not os.path.exists(dst_in_rootfs):
+        if not os.path.lexists(dst_in_rootfs):
             with open(dst_in_rootfs, "w"):
                 pass
 
@@ -944,45 +1159,41 @@ def _do_copy(state: _State, args: str) -> None:
                       file=sys.stderr)
                 sys.exit(1)
 
-    resolved: list = []
+    candidates: list = []
     for src in srcs:
-        if any(c in src for c in ("*", "?", "[")):
-            matched = _glob.glob(
-                os.path.join(state.context_dir, src), recursive=True)
-            resolved.extend(sorted(matched))
-        else:
-            resolved.append(os.path.join(state.context_dir, src))
+        try:
+            candidates.extend(_expand_context_glob(state.context_dir, src))
+        except ValueError as exc:
+            print(f"error: COPY source escapes build context: {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+    candidates = list(dict.fromkeys(candidates))
 
-    # Apply .dockerignore: drop sources matching ignored patterns. A
-    # negated rule (`!keep.log`) is honoured because matches() walks
-    # the full pattern list with later-wins semantics.
-    if state.dockerignore.patterns:
-        kept = []
-        for sp in resolved:
-            rel = os.path.relpath(sp, state.context_dir)
-            if state.dockerignore.matches(rel):
-                continue
-            kept.append(sp)
-        resolved = kept
+    sources = []
+    for candidate in candidates:
+        try:
+            src_path = _resolve_context_candidate(
+                state.context_dir, candidate)
+        except ValueError as exc:
+            print(f"error: COPY source escapes build context: {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+        if _context_source_ignored(state, candidate, src_path):
+            continue
+        sources.append((candidate, src_path))
 
-    if not resolved:
+    if not sources:
         print(f"error: COPY: no files matched: {srcs}", file=sys.stderr)
         sys.exit(1)
 
-    for src_path in resolved:
-        src_path = os.path.normpath(src_path)
-        if not src_path.startswith(state.context_dir + os.sep) and \
-                src_path != state.context_dir:
-            print(f"error: COPY source escapes build context: {src_path}",
-                  file=sys.stderr)
-            sys.exit(1)
+    for candidate, src_path in sources:
         if not os.path.lexists(src_path):
             print(f"error: COPY source not found: {src_path}", file=sys.stderr)
             sys.exit(1)
         if os.path.isdir(src_path) and not os.path.islink(src_path):
             _copy_dir_contents(state, src_path, dst_container)
         else:
-            if dst_is_dir or len(resolved) > 1:
+            if dst_is_dir or len(sources) > 1:
                 try:
                     dst_dir = _safe_resolve_follow(state.rootfs,
                                                    dst_container)
@@ -992,7 +1203,7 @@ def _do_copy(state: _State, args: str) -> None:
                     sys.exit(1)
                 os.makedirs(dst_dir, exist_ok=True)
                 dest_container = posixpath.join(
-                    dst_container, os.path.basename(src_path))
+                    dst_container, os.path.basename(candidate))
                 try:
                     dest = _safe_resolve(state.rootfs, dest_container)
                 except ValueError as exc:
@@ -1013,7 +1224,14 @@ def _do_run(state: _State, args: str) -> None:
     inside the new mount namespace and torn down automatically on exit;
     secret/ssh mounts leave no trace in the image layer.
     """
-    cmd, mounts = _parse_run_line(args)
+    cmd, mounts, unsupported = _parse_run_line(args)
+    if unsupported:
+        print("error: unsupported RUN option(s): " +
+              ", ".join(unsupported),
+              file=sys.stderr)
+        print("error: RUN --network and --security are not implemented; "
+              "refusing to silently degrade", file=sys.stderr)
+        sys.exit(1)
 
     sh = os.path.join(state.rootfs, "bin", "sh")
     if not os.path.exists(sh):

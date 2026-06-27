@@ -435,9 +435,19 @@ shared memory segments.
 .SS Isolation
 .TP
 .B \-\-read\-only
-Mount the rootfs read-only via overlayfs.
-Writes go to a temporary upper layer discarded on exit.
-Falls back to read-write with a warning if overlayfs is unavailable.
+Bind-remount the image root read-only.
+The runtime keeps
+.B /tmp
+on tmpfs and automatically mounts
+.B /run
+on tmpfs unless
+.B \-\-no\-auto\-tmpfs
+is used.
+The run aborts if the read-only remount fails.
+.
+.TP
+.B \-\-ephemeral\-root
+Use a writable temporary overlay whose upper layer is discarded on exit.
 .
 .TP
 .BI \-\-cap\-drop " CAP"

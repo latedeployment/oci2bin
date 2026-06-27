@@ -697,14 +697,20 @@ Join the network namespace of process @var{PID}.
 @opindex --read-only
 @cindex overlayfs
 
-@option{--read-only} mounts the rootfs read-only via overlayfs.  Writes
-go to a temporary upper layer discarded on exit; the on-disk rootfs is
-never modified.  Falls back to read-write with a warning if overlayfs is
-unavailable.
+@option{--read-only} bind-remounts the image root read-only.  The runtime
+mounts @file{/tmp} as tmpfs and, unless @option{--no-auto-tmpfs} is used,
+also mounts @file{/run} as tmpfs.  Additional writable paths require
+@option{--tmpfs}, @option{-v}, or another explicit mount.  Failure to make
+the root read-only aborts the run.
+
+@opindex --ephemeral-root
+@option{--ephemeral-root} instead provides a writable temporary overlay.
+Its upper layer is discarded on exit.
 
 @example
 ./my-app --read-only
 ./my-app --read-only --tmpfs /tmp --tmpfs /var/run
+./my-app --ephemeral-root
 @end example
 
 @node Capabilities

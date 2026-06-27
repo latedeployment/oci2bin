@@ -176,6 +176,46 @@ static void test_json_parse_string_array(void)
     ASSERT_INT_EQ(n_esc, 1, "json_parse_string_array: escaped-quote element count");
     /* The parser skips over backslash-escaped characters */
     free(out_esc[0]);
+
+    char* strict[2] = {NULL, NULL};
+    ASSERT_INT_EQ(json_parse_string_array_strict(
+                      "[\"one\",\"two\"]", strict, 2), 2,
+                  "json string array strict: valid array accepted");
+    free(strict[0]);
+    free(strict[1]);
+    strict[0] = NULL;
+    strict[1] = NULL;
+    ASSERT_INT_EQ(json_parse_string_array_strict(
+                      "[\"one\",7]", strict, 2), -1,
+                  "json string array strict: non-string rejected");
+    ASSERT_INT_EQ(json_parse_string_array_strict(
+                      "[\"one\",\"two\",\"three\"]", strict, 2), -1,
+                  "json string array strict: oversized array rejected");
+    ASSERT_INT_EQ(json_parse_string_array_strict(
+                      "[\"unterminated]", strict, 2), -1,
+                  "json string array strict: malformed array rejected");
+    ASSERT_INT_EQ(json_parse_string_array_strict(
+                      "[\"dir\\/layer.tar\"]", strict, 2), 1,
+                  "json string array strict: escaped slash accepted");
+    ASSERT_STR_EQ(strict[0], "dir/layer.tar",
+                  "json string array strict: escaped slash decoded");
+    free(strict[0]);
+    strict[0] = NULL;
+    ASSERT_INT_EQ(json_parse_string_array_strict(
+                      "[\"bad\\qescape\"]", strict, 2), -1,
+                  "json string array strict: invalid escape rejected");
+    ASSERT_INT_EQ(json_parse_string_array_strict(
+                      "[\"\"]", strict, 2), -1,
+                  "json string array strict: empty path rejected");
+
+    char long_json[PATH_MAX + 8];
+    long_json[0] = '[';
+    long_json[1] = '"';
+    memset(long_json + 2, 'a', PATH_MAX);
+    memcpy(long_json + 2 + PATH_MAX, "\"]", 3);
+    ASSERT_INT_EQ(json_parse_string_array_strict(
+                      long_json, strict, 2), -1,
+                  "json string array strict: overlong path rejected");
 }
 
 static void test_path_has_dotdot_component(void)
@@ -1303,6 +1343,56 @@ static void test_parse_opts_misc_flags(void)
         ASSERT_INT_EQ(r, 0, "parse_opts: --read-only returns 0");
         ASSERT_INT_EQ(opts.read_only, 1,
                       "parse_opts: --read-only sets flag");
+    }
+
+    /* --ephemeral-root */
+    {
+        char* argv[] = {"prog", "--ephemeral-root", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --ephemeral-root returns 0");
+        ASSERT_INT_EQ(opts.ephemeral_root, 1,
+                      "parse_opts: --ephemeral-root sets flag");
+    }
+
+    /* rootfs mode flags: last explicit mode wins */
+    {
+        char arg[] = "/var/overlay";
+        char* argv[] = {"prog", "--read-only", "--overlay-persist", arg,
+                        NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(4, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --overlay-persist overrides --read-only");
+        ASSERT_INT_EQ(opts.read_only, 0,
+                      "parse_opts: --overlay-persist clears read_only");
+        ASSERT_STR_EQ(opts.overlay_persist, "/var/overlay",
+                      "parse_opts: overlay-persist stored after read-only");
+    }
+    {
+        char arg[] = "/var/overlay";
+        char* argv[] = {"prog", "--overlay-persist", arg, "--read-only",
+                        NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(4, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --read-only overrides --overlay-persist");
+        ASSERT_INT_EQ(opts.read_only, 1,
+                      "parse_opts: --read-only set after overlay-persist");
+        ASSERT_NULL(opts.overlay_persist,
+                    "parse_opts: --read-only clears overlay_persist");
+    }
+    {
+        char* argv[] = {"prog", "--profile", "prod", "--ephemeral-root",
+                        NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(4, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: --ephemeral-root overrides prod profile");
+        ASSERT_INT_EQ(opts.read_only, 0,
+                      "parse_opts: --ephemeral-root clears profile read_only");
+        ASSERT_INT_EQ(opts.ephemeral_root, 1,
+                      "parse_opts: --ephemeral-root remains active");
     }
 
     /* --overlay-persist DIR */
@@ -3194,10 +3284,10 @@ static void test_safe_merge_layer_blocks_escape(void)
         close(pfd);
     }
 
-    /* Merge layer 2 — the file open in rootfs will fail because
-     * "escape" resolves via RESOLVE_IN_ROOT to a non-existent
-     * <rootfs>/<victim_path>, blocking the escape. */
-    safe_merge_layer(rfd, stage2);
+    /* Merge layer 2. OCI type-replacement semantics require the directory
+     * to replace the old symlink before its child is copied. */
+    ASSERT_INT_EQ(safe_merge_layer(rfd, stage2), 0,
+                  "merge test: layer 2 replaces symlink with directory");
 
     char victim_poison[256];
     snprintf(victim_poison, sizeof(victim_poison), "%s/victim/poison", tdir);
@@ -3205,19 +3295,16 @@ static void test_safe_merge_layer_blocks_escape(void)
     int vrc = lstat(victim_poison, &vst);
     ASSERT(vrc < 0,
            "merge test: poison did NOT escape into victim/");
+    ASSERT(lstat(rootfs_escape, &st) == 0 && S_ISDIR(st.st_mode),
+           "merge test: rootfs symlink replaced by directory");
+    char rootfs_poison[320];
+    snprintf(rootfs_poison, sizeof(rootfs_poison),
+             "%s/rootfs/escape/poison", tdir);
+    ASSERT(lstat(rootfs_poison, &st) == 0 && S_ISREG(st.st_mode),
+           "merge test: replacement directory contains layer file");
 
     close(rfd);
-
-    /* Best-effort cleanup */
-    unlink(layer1_link);
-    unlink(layer2_file);
-    rmdir(layer2_dir);
-    rmdir(stage2);
-    unlink(rootfs_escape);
-    rmdir(rootfs);
-    rmdir(stage);
-    rmdir(victim);
-    rmdir(tdir);
+    rm_rf_dir(tdir);
 }
 
 /* ── test_safe_merge_walk_contents ────────────────────────────────────────── */
@@ -3275,7 +3362,7 @@ static void test_safe_merge_walk_contents(void)
     snprintf(sl, sizeof(sl), "%s/sub/link", stage);
     symlink("target", sl);
 
-    /* A special file (FIFO) that must be skipped, not copied. */
+    /* A special file (FIFO) must be recreated. */
     char fifo[320];
     snprintf(fifo, sizeof(fifo), "%s/pipe", stage);
     int have_fifo = (mkfifo(fifo, 0644) == 0);
@@ -3318,12 +3405,13 @@ static void test_safe_merge_walk_contents(void)
     ASSERT(lstat(r3, &st) == 0 && S_ISLNK(st.st_mode),
            "safe_merge_walk: nested symlink recreated");
 
-    /* FIFO skipped: must not appear in the rootfs. */
+    /* FIFO recreated with its file type intact. */
     if (have_fifo)
     {
         char rp[320];
         snprintf(rp, sizeof(rp), "%s/pipe", rootfs);
-        ASSERT(lstat(rp, &st) != 0, "safe_merge_walk: special file skipped");
+        ASSERT(lstat(rp, &st) == 0 && S_ISFIFO(st.st_mode),
+               "safe_merge_walk: FIFO recreated");
     }
     else
     {
@@ -4313,8 +4401,24 @@ static void test_build_merged_argv(void)
 static void write_fixture(const char* dir, const char* name,
                           const char* content, char* out, size_t outsz)
 {
-    snprintf(out, outsz, "%s/%s", dir, name);
-    FILE* f = fopen(out, "w");
+    char local[PATH_MAX];
+    char* path = out;
+    size_t path_size = outsz;
+    if (!path || path_size == 0)
+    {
+        path = local;
+        path_size = sizeof(local);
+    }
+    int n = snprintf(path, path_size, "%s/%s", dir, name);
+    if (n < 0 || (size_t)n >= path_size)
+    {
+        if (path_size > 0)
+        {
+            path[0] = '\0';
+        }
+        return;
+    }
+    FILE* f = fopen(path, "w");
     if (f)
     {
         if (content[0] != '\0')
@@ -4967,7 +5071,12 @@ static int write_tar_one_entry(const char* path, const char* entry)
         return -1;
     }
     memset(block, 0, sizeof(block));
-    snprintf((char*)block, 100, "%s", entry);          /* name[100]   */
+    int n = snprintf((char*)block, 100, "%s", entry);  /* name[100]   */
+    if (n < 0 || n >= 100)
+    {
+        close(fd);
+        return -1;
+    }
     memcpy(block + 100, "0000644", 8);                 /* mode        */
     memcpy(block + 108, "0000000", 8);                 /* uid         */
     memcpy(block + 116, "0000000", 8);                 /* gid         */
@@ -4983,7 +5092,12 @@ static int write_tar_one_entry(const char* path, const char* entry)
         sum += block[i];
     }
     char ck[8];
-    snprintf(ck, sizeof(ck), "%06o", sum);
+    n = snprintf(ck, sizeof(ck), "%06o", sum);
+    if (n < 0 || (size_t)n >= sizeof(ck))
+    {
+        close(fd);
+        return -1;
+    }
     memcpy(block + 148, ck, 6);
     block[154] = '\0';
     block[155] = ' ';
@@ -5049,7 +5163,15 @@ static void test_tar_layer_prescan_and_extract(void)
     ASSERT_INT_EQ(tar_layer_prescan(badtar), -1,
                   "tar_layer_prescan: rejects ../ entry");
 
-    /* 4. safe_extract_layer merges a benign layer into the rootfs. */
+    /* 4. Escaped control bytes cannot confuse line-oriented validation. */
+    char escapedtar[256];
+    snprintf(escapedtar, sizeof(escapedtar), "%s/escaped.tar", tdir);
+    ASSERT_INT_EQ(write_tar_one_entry(escapedtar, "safe\n../evil"), 0,
+                  "tar_layer_prescan: crafted escaped-name tar written");
+    ASSERT_INT_EQ(tar_layer_prescan(escapedtar), -1,
+                  "tar_layer_prescan: rejects escaped entry names");
+
+    /* 5. safe_extract_layer merges a benign layer into the rootfs. */
     char rootfs[256];
     snprintf(rootfs, sizeof(rootfs), "%s/rootfs", tdir);
     mkdir(rootfs, 0755);
@@ -5057,8 +5179,14 @@ static void test_tar_layer_prescan_and_extract(void)
     ASSERT(rfd >= 0, "safe_extract_layer: rootfs fd opened");
     if (rfd >= 0)
     {
-        ASSERT_INT_EQ(safe_extract_layer(rfd, goodtar, tdir, 0), 0,
-                      "safe_extract_layer: benign layer extracts");
+        int layer_fd = open(goodtar, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        ASSERT(layer_fd >= 0, "safe_extract_layer: layer fd opened");
+        if (layer_fd >= 0)
+        {
+            ASSERT_INT_EQ(safe_extract_layer_fd(rfd, layer_fd, tdir, 0), 0,
+                          "safe_extract_layer: benign layer extracts");
+            close(layer_fd);
+        }
         char extracted[320];
         snprintf(extracted, sizeof(extracted), "%s/hello.txt", rootfs);
         ASSERT(lstat(extracted, &st) == 0 && S_ISREG(st.st_mode),
@@ -5066,15 +5194,261 @@ static void test_tar_layer_prescan_and_extract(void)
         close(rfd);
     }
 
-    /* 5. safe_extract_layer rejects a malicious layer (prescan fails). */
+    /* 6. safe_extract_layer rejects a malicious layer (prescan fails). */
     int rfd2 = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (rfd2 >= 0)
     {
-        ASSERT_INT_EQ(safe_extract_layer(rfd2, badtar, tdir, 1), -1,
-                      "safe_extract_layer: rejects malicious layer");
+        int layer_fd = open(badtar, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        ASSERT(layer_fd >= 0, "safe_extract_layer: bad layer fd opened");
+        if (layer_fd >= 0)
+        {
+            ASSERT_INT_EQ(safe_extract_layer_fd(rfd2, layer_fd, tdir, 1), -1,
+                          "safe_extract_layer: rejects malicious layer");
+            close(layer_fd);
+        }
         close(rfd2);
     }
 
+    rm_rf_dir(tdir);
+}
+
+/* ── test_oci_layer_semantics ────────────────────────────────────────────── */
+
+static void test_oci_layer_semantics(void)
+{
+    if (access("/usr/bin/tar", X_OK) != 0 && access("/bin/tar", X_OK) != 0)
+    {
+        ASSERT(1, "OCI layer semantics: skipped (tar not installed)");
+        return;
+    }
+
+    char tmpl[] = "/tmp/oci2bin-layer-semantics-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "OCI layer semantics: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    char rootfs[320], stage[320], path[512];
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs", tdir);
+    snprintf(stage, sizeof(stage), "%s/layer", tdir);
+    mkdir(rootfs, 0755);
+    mkdir(stage, 0755);
+
+    write_fixture(rootfs, "gone.txt", "lower", path, sizeof(path));
+    snprintf(path, sizeof(path), "%s/opaque", rootfs);
+    mkdir(path, 0755);
+    write_fixture(path, "old.txt", "old", NULL, 0);
+    snprintf(path, sizeof(path), "%s/replace-dir", rootfs);
+    mkdir(path, 0755);
+    write_fixture(path, "child", "old", NULL, 0);
+    write_fixture(rootfs, "replace-file", "old", path, sizeof(path));
+
+    write_fixture(stage, ".wh.gone.txt", "", path, sizeof(path));
+    snprintf(path, sizeof(path), "%s/opaque", stage);
+    mkdir(path, 0755);
+    write_fixture(path, ".wh..wh..opq", "", NULL, 0);
+    write_fixture(path, "new.txt", "new", NULL, 0);
+    write_fixture(stage, "replace-dir", "now-file", path, sizeof(path));
+    chmod(path, 06751);
+    struct timespec file_times[2] =
+    {
+        { .tv_sec = 123456700, .tv_nsec = 0 },
+        { .tv_sec = 123456789, .tv_nsec = 0 }
+    };
+    utimensat(AT_FDCWD, path, file_times, 0);
+
+    snprintf(path, sizeof(path), "%s/replace-file", stage);
+    mkdir(path, 0711);
+    write_fixture(path, "child", "new", NULL, 0);
+
+    char hard_a[512], hard_b[512];
+    write_fixture(stage, "hard-a", "linked", hard_a, sizeof(hard_a));
+    snprintf(hard_b, sizeof(hard_b), "%s/hard-b", stage);
+    ASSERT_INT_EQ(link(hard_a, hard_b), 0,
+                  "OCI layer semantics: stage hardlink created");
+
+    char fifo[512];
+    snprintf(fifo, sizeof(fifo), "%s/fifo", stage);
+    int have_fifo = (mkfifo(fifo, 0620) == 0);
+
+    int have_xattr = 0;
+    const char xattr_value[] = "kept";
+    if (setxattr(hard_a, "user.oci2bin-test", xattr_value,
+                 sizeof(xattr_value) - 1, 0) == 0)
+    {
+        have_xattr = 1;
+    }
+
+    char layer_tar[320];
+    snprintf(layer_tar, sizeof(layer_tar), "%s/layer.tar", tdir);
+    char* mk[] =
+    {
+        "tar", "cf", layer_tar, "-C", stage, ".",
+        "--xattrs", "--xattrs-include=*", "--acls", NULL
+    };
+    ASSERT_INT_EQ(run_cmd(mk), 0,
+                  "OCI layer semantics: layer tar created");
+
+    int rfd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT(rfd >= 0, "OCI layer semantics: rootfs opened");
+    if (rfd >= 0)
+    {
+        int layer_fd = open(layer_tar,
+                            O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        ASSERT(layer_fd >= 0,
+               "OCI layer semantics: layer fd opened");
+        if (layer_fd >= 0)
+        {
+            ASSERT_INT_EQ(safe_extract_layer_fd(rfd, layer_fd, tdir, 7), 0,
+                          "OCI layer semantics: layer applied");
+            close(layer_fd);
+        }
+        close(rfd);
+    }
+
+    struct stat st, hard_st;
+    snprintf(path, sizeof(path), "%s/gone.txt", rootfs);
+    ASSERT(lstat(path, &st) < 0 && errno == ENOENT,
+           "OCI layer semantics: whiteout removed lower file");
+    snprintf(path, sizeof(path), "%s/.wh.gone.txt", rootfs);
+    ASSERT(lstat(path, &st) < 0 && errno == ENOENT,
+           "OCI layer semantics: whiteout marker not copied");
+    snprintf(path, sizeof(path), "%s/opaque/old.txt", rootfs);
+    ASSERT(lstat(path, &st) < 0 && errno == ENOENT,
+           "OCI layer semantics: opaque directory removed lower children");
+    snprintf(path, sizeof(path), "%s/opaque/new.txt", rootfs);
+    ASSERT(lstat(path, &st) == 0 && S_ISREG(st.st_mode),
+           "OCI layer semantics: opaque directory kept layer child");
+
+    snprintf(path, sizeof(path), "%s/replace-dir", rootfs);
+    ASSERT(lstat(path, &st) == 0 && S_ISREG(st.st_mode),
+           "OCI layer semantics: regular file replaced directory");
+    ASSERT_INT_EQ((int)(st.st_mode & 07777), 0751,
+                  "OCI layer semantics: mode preserved and set-ID stripped");
+    ASSERT_INT_EQ((int)st.st_mtim.tv_sec, 123456789,
+                  "OCI layer semantics: file mtime preserved");
+    snprintf(path, sizeof(path), "%s/replace-file/child", rootfs);
+    ASSERT(lstat(path, &st) == 0 && S_ISREG(st.st_mode),
+           "OCI layer semantics: directory replaced regular file");
+
+    snprintf(path, sizeof(path), "%s/hard-a", rootfs);
+    ASSERT_INT_EQ(lstat(path, &st), 0,
+                  "OCI layer semantics: first hardlink exists");
+    snprintf(path, sizeof(path), "%s/hard-b", rootfs);
+    ASSERT_INT_EQ(lstat(path, &hard_st), 0,
+                  "OCI layer semantics: second hardlink exists");
+    ASSERT(st.st_dev == hard_st.st_dev && st.st_ino == hard_st.st_ino,
+           "OCI layer semantics: hardlink identity preserved");
+    if (have_xattr)
+    {
+        char value[16];
+        ssize_t value_len = getxattr(path, "user.oci2bin-test",
+                                     value, sizeof(value));
+        ASSERT(value_len == (ssize_t)(sizeof(xattr_value) - 1) &&
+               memcmp(value, xattr_value, sizeof(xattr_value) - 1) == 0,
+               "OCI layer semantics: xattr preserved");
+    }
+    else
+    {
+        ASSERT(1, "OCI layer semantics: xattr unavailable (skipped)");
+    }
+    if (have_fifo)
+    {
+        snprintf(path, sizeof(path), "%s/fifo", rootfs);
+        ASSERT(lstat(path, &st) == 0 && S_ISFIFO(st.st_mode),
+               "OCI layer semantics: FIFO preserved");
+    }
+    else
+    {
+        ASSERT(1, "OCI layer semantics: FIFO unavailable (skipped)");
+    }
+
+    char unsafe_stage[320], socket_path[512];
+    snprintf(unsafe_stage, sizeof(unsafe_stage), "%s/unsafe-layer", tdir);
+    mkdir(unsafe_stage, 0755);
+    snprintf(socket_path, sizeof(socket_path), "%s/socket", unsafe_stage);
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (socket_fd >= 0)
+    {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        int socket_path_len = snprintf(addr.sun_path, sizeof(addr.sun_path),
+                                       "%s", socket_path);
+        if (socket_path_len >= 0 &&
+                (size_t)socket_path_len < sizeof(addr.sun_path) &&
+                bind(socket_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
+        {
+            rfd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            ASSERT(rfd >= 0, "OCI layer semantics: rootfs reopened");
+            if (rfd >= 0)
+            {
+                ASSERT_INT_EQ(safe_merge_layer(rfd, unsafe_stage), -1,
+                              "OCI layer semantics: socket entry rejected");
+                close(rfd);
+            }
+        }
+        else
+        {
+            ASSERT(1, "OCI layer semantics: Unix socket unavailable (skipped)");
+        }
+        close(socket_fd);
+    }
+    else
+    {
+        ASSERT(1, "OCI layer semantics: Unix socket unavailable (skipped)");
+    }
+
+    rm_rf_dir(tdir);
+}
+
+static void test_oci_layer_depth_limit(void)
+{
+    char tmpl[] = "/tmp/oci2bin-layer-depth-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "OCI layer depth: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    char rootfs[PATH_MAX], stage[PATH_MAX], nested[PATH_MAX];
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs", tdir);
+    snprintf(stage, sizeof(stage), "%s/stage", tdir);
+    mkdir(rootfs, 0755);
+    mkdir(stage, 0755);
+    int n = snprintf(nested, sizeof(nested), "%s", stage);
+    int built = n >= 0 && (size_t)n < sizeof(nested);
+    for (unsigned int i = 0; built && i <= MAX_LAYER_DEPTH; i++)
+    {
+        size_t len = strlen(nested);
+        if (len + 3 > sizeof(nested))
+        {
+            built = 0;
+            break;
+        }
+        memcpy(nested + len, "/d", 3);
+        if (mkdir(nested, 0755) < 0)
+        {
+            built = 0;
+        }
+    }
+    ASSERT(built, "OCI layer depth: overdeep fixture created");
+
+    int rfd = open(rootfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT(rfd >= 0, "OCI layer depth: rootfs opened");
+    if (rfd >= 0 && built)
+    {
+        ASSERT_INT_EQ(safe_merge_layer(rfd, stage), -1,
+                      "OCI layer depth: excessive recursion rejected");
+        close(rfd);
+    }
+    else if (rfd >= 0)
+    {
+        close(rfd);
+    }
     rm_rf_dir(tdir);
 }
 
@@ -5623,6 +5997,8 @@ int main(void)
     test_ensure_bind_mount_target();
     test_ensure_regular_file_target();
     test_tar_layer_prescan_and_extract();
+    test_oci_layer_semantics();
+    test_oci_layer_depth_limit();
     test_mkdir_in_root();
     test_json_get_object();
     test_json_get_longlong();

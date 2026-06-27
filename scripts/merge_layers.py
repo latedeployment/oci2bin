@@ -17,9 +17,11 @@ Pure Python, stdlib only.
 """
 
 import argparse
+import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 
@@ -58,6 +60,42 @@ def get_config(tf, config_name):
     return json.loads(data)
 
 
+_SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _is_oci_blob_path(name):
+    parts = name.split('/')
+    return len(parts) == 3 and parts[0] == 'blobs' and \
+        parts[1] == 'sha256' and _SHA256_RE.fullmatch(parts[2]) is not None
+
+
+def _config_name_for_digest(old_name, config_bytes):
+    digest = _sha256(config_bytes)
+    base = os.path.basename(old_name)
+    if _is_oci_blob_path(old_name):
+        return f'blobs/sha256/{digest}'
+    if '/' not in old_name and base.endswith('.json') and \
+            _SHA256_RE.fullmatch(base[:-5]):
+        return f'{digest}.json'
+    return old_name
+
+
+def _config_diff_ids(config, layer_count, source):
+    diff_ids = config.get('rootfs', {}).get('diff_ids', [])
+    if not isinstance(diff_ids, list) or len(diff_ids) != layer_count:
+        print(
+            f"merge_layers: {source} layer count does not match "
+            "config.rootfs.diff_ids",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return diff_ids
+
+
 def copy_layers(src_tf, layer_names, out_tf, seen_layers):
     """Copy layer tarballs from src_tf to out_tf, skipping already-copied ones."""
     for layer_name in layer_names:
@@ -88,23 +126,32 @@ def merge(base_tar, layer_tars, output_tar):
         base_config_name = base_manifest['Config']
         base_config = get_config(base_tf, base_config_name)
         base_layers = base_manifest['Layers']
+        base_diff_ids = _config_diff_ids(base_config, len(base_layers),
+                                         base_tar)
 
         # Collect overlay layer info
         overlay_configs = []
         overlay_layers_list = []
+        overlay_diff_ids_list = []
         for lt in layer_tars:
             with tarfile.open(lt, 'r') as overlay_tf:
                 ov_manifest = get_manifest(overlay_tf)
                 ov_config = get_config(overlay_tf, ov_manifest['Config'])
+                ov_layers = ov_manifest['Layers']
                 overlay_configs.append(ov_config)
-                overlay_layers_list.append(ov_manifest['Layers'])
+                overlay_layers_list.append(ov_layers)
+                overlay_diff_ids_list.append(
+                    _config_diff_ids(ov_config, len(ov_layers), lt))
 
         # Merged layer list: base layers first, then each overlay's layers
         all_layers = list(base_layers)
-        for ov_layers in overlay_layers_list:
-            for layer in ov_layers:
+        all_diff_ids = list(base_diff_ids)
+        for ov_layers, ov_diff_ids in zip(overlay_layers_list,
+                                          overlay_diff_ids_list):
+            for layer, diff_id in zip(ov_layers, ov_diff_ids):
                 if layer not in all_layers:
                     all_layers.append(layer)
+                    all_diff_ids.append(diff_id)
 
         # Merged config: start from base, override Cmd/Entrypoint/Env from last overlay
         merged_config = base_config
@@ -116,9 +163,22 @@ def merge(base_tar, layer_tars, output_tar):
                 val = container_cfg.get(key)
                 if val is not None:
                     base_cfg[key] = val
+        merged_config.setdefault('rootfs', {})['type'] = \
+            merged_config.get('rootfs', {}).get('type', 'layers')
+        merged_config['rootfs']['diff_ids'] = all_diff_ids
 
-        merged_config_json = json.dumps(merged_config).encode()
-        merged_config_name = base_config_name  # reuse same filename
+        if len(all_layers) != len(all_diff_ids):
+            print(
+                "merge_layers: final layer count does not match "
+                "config.rootfs.diff_ids",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        merged_config_json = json.dumps(
+            merged_config, separators=(',', ':')).encode()
+        merged_config_name = _config_name_for_digest(base_config_name,
+                                                    merged_config_json)
 
         # Merged manifest
         merged_manifest = [{
@@ -126,7 +186,8 @@ def merge(base_tar, layer_tars, output_tar):
             'RepoTags': base_manifest.get('RepoTags', []),
             'Layers': all_layers,
         }]
-        merged_manifest_json = json.dumps(merged_manifest).encode()
+        merged_manifest_json = json.dumps(
+            merged_manifest, separators=(',', ':')).encode()
 
         seen_layers = set()
         with tarfile.open(output_tar, 'w') as out_tf:
