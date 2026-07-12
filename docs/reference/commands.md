@@ -61,7 +61,7 @@ Common build options:
 Common runtime options:
 
 ```text
--v HOST:CONTAINER
+-v HOST:CONTAINER[:ro|:rw]
 -e KEY=VALUE
 --env-file FILE
 --secret HOST_FILE[:CONTAINER_PATH]
@@ -106,6 +106,7 @@ Common runtime options:
 --security-opt label=TYPE:VAL
 --no-userns-remap
 --strict
+--allow-degraded
 --init
 --detach
 --name NAME

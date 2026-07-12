@@ -882,13 +882,17 @@ See [docs: Run Binaries → Rootless Requirements](docs/runtime.md) for details.
 
 ### Volume mounts
 
-`-v HOST:CONTAINER` bind-mounts a host directory into the container. The mount point is created inside the container if it does not exist. May be repeated.
+`-v HOST:CONTAINER[:ro|:rw]` bind-mounts a host directory into the container. The mount point is created inside the container if it does not exist. `:ro` remounts the mount read-only after binding; `:rw` (the default) leaves it writable. May be repeated.
+
+A volume that fails to validate or mount aborts the run — oci2bin does not silently start a workload without a mount it explicitly requested.
 
 ```bash
 ./alpine_latest -v /data:/data /bin/ls /data
 
+./alpine_latest -v /etc/myapp:/etc/myapp:ro /bin/cat /etc/myapp/config.yaml
+
 ./alpine_latest \
-  -v /data/input:/input \
+  -v /data/input:/input:ro \
   -v /data/output:/output \
   /bin/sh -c 'cp /input/file /output/'
 ```
@@ -896,6 +900,8 @@ See [docs: Run Binaries → Rootless Requirements](docs/runtime.md) for details.
 ### Secrets
 
 `--secret HOST_FILE[:CONTAINER_PATH]` bind-mounts a single host file into the container read-only. If no container path is given, the file lands at `/run/secrets/<basename>`. The mount is enforced read-only with `MS_NOEXEC|MS_NOSUID|MS_NODEV`. May be repeated.
+
+A secret that fails to validate or install aborts the run — oci2bin does not silently start a workload without a credential it explicitly requested.
 
 ```bash
 ./my-app --secret ~/.config/api_key           # → /run/secrets/api_key
@@ -966,8 +972,10 @@ apply to all forked children as well.
 ./my-app --memory 1g --cpus 2 --pids-limit 256
 ```
 
-Requires cgroup v2 (`/sys/fs/cgroup/cgroup.controllers` must exist). If cgroup
-v2 is unavailable, a warning is printed and the container runs unconstrained.
+Requires cgroup v2 (`/sys/fs/cgroup/cgroup.controllers` must exist). If
+`--memory`, `--cpus`, or `--pids-limit` was explicitly requested and cgroup
+v2 setup fails, the run aborts rather than starting unconstrained — pass
+`--allow-degraded` to opt into the old warn-and-continue behavior instead.
 The loader creates `/sys/fs/cgroup/oci2bin-<pid>/`, moves itself in, sets the
 limits, then calls `unshare(CLONE_NEWCGROUP)` so the container only sees its
 own cgroup subtree. The cgroup dir is removed on exit.

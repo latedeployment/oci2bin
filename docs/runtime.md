@@ -142,6 +142,15 @@ Multiple mounts:
   -v /srv/app/output:/output
 ```
 
+Append `:ro` to remount a mount read-only (`:rw` is the default and may be
+given explicitly):
+
+```bash
+./app.bin -v /srv/app/config:/etc/app/config:ro
+```
+
+A `-v` that fails to validate or mount aborts the run.
+
 ## Secrets
 
 Host file secret:
@@ -161,6 +170,8 @@ TPM2-sealed credential:
 ```bash
 ./app.bin --secret tpm2:dbpass:/run/secrets/db_password
 ```
+
+A `--secret` that fails to validate or install aborts the run.
 
 ## SSH Agent
 
@@ -325,6 +336,15 @@ cgroup v2 limits:
 
 ```bash
 ./app.bin --memory 512m --cpus 0.5 --pids-limit 100
+```
+
+If `--memory`, `--cpus`, or `--pids-limit` is requested but cgroup v2 setup
+fails (e.g. no `/sys/fs/cgroup/cgroup.controllers`, or no writable subtree),
+the run aborts rather than starting unconstrained. Pass `--allow-degraded` to
+run without enforcement instead:
+
+```bash
+./app.bin --memory 512m --allow-degraded
 ```
 
 Resource presets:

@@ -268,6 +268,49 @@ static void test_parse_opts(void)
         ASSERT_INT_EQ(opts.n_vols, 2, "parse_opts: two -v n_vols=2");
     }
 
+    /* -v HOST:CONTAINER:ro */
+    {
+        char spec[] = "/host:/ctr:ro";
+        char* argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: -v :ro returns 0");
+        ASSERT_STR_EQ(opts.vol_host[0], "/host", "parse_opts: -v :ro host split");
+        ASSERT_STR_EQ(opts.vol_ctr[0],  "/ctr",  "parse_opts: -v :ro ctr split"
+                      " (suffix stripped)");
+        ASSERT_INT_EQ(opts.vol_ro[0], 1, "parse_opts: -v :ro sets vol_ro=1");
+    }
+
+    /* -v HOST:CONTAINER:rw (explicit default) */
+    {
+        char spec[] = "/host:/ctr:rw";
+        char* argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: -v :rw returns 0");
+        ASSERT_INT_EQ(opts.vol_ro[0], 0, "parse_opts: -v :rw sets vol_ro=0");
+    }
+
+    /* -v HOST:CONTAINER (no suffix) defaults to rw */
+    {
+        char spec[] = "/host:/ctr";
+        char* argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: -v no suffix returns 0");
+        ASSERT_INT_EQ(opts.vol_ro[0], 0,
+                      "parse_opts: -v no suffix defaults vol_ro=0");
+    }
+
+    /* -v HOST:CONTAINER:bogus is rejected */
+    {
+        char spec[] = "/host:/ctr:bogus";
+        char* argv[] = {"prog", "-v", spec, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, -1, "parse_opts: -v invalid suffix returns -1");
+    }
+
     /* --entrypoint */
     {
         char* argv[] = {"prog", "--entrypoint", "/bin/bash", NULL};
@@ -3514,6 +3557,23 @@ static void test_parse_opts_strict(void)
         ASSERT_INT_EQ(r, 0, "parse_opts: --strict returns 0");
         ASSERT_INT_EQ(opts.strict, 1,
                       "parse_opts: --strict sets opts.strict");
+    }
+    {
+        char* argv[] = {"prog", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(1, argv, &opts);
+        ASSERT_INT_EQ(r, 0,
+                      "parse_opts: no --allow-degraded default 0");
+        ASSERT_INT_EQ(opts.allow_degraded, 0,
+                      "parse_opts: opts.allow_degraded defaults to 0");
+    }
+    {
+        char* argv[] = {"prog", "--allow-degraded", NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(2, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --allow-degraded returns 0");
+        ASSERT_INT_EQ(opts.allow_degraded, 1,
+                      "parse_opts: --allow-degraded sets opts.allow_degraded");
     }
 }
 

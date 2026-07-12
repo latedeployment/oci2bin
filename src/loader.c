@@ -483,10 +483,15 @@ static void debug_log(const char* event, const char* fmt, ...)
 
 struct container_opts
 {
-    /* -v host:container  (up to MAX_VOLUMES pairs) */
+    /* -v host:container[:ro|:rw]  (up to MAX_VOLUMES pairs) */
     char* vol_host[MAX_VOLUMES];
     char* vol_ctr[MAX_VOLUMES];
+    int   vol_ro[MAX_VOLUMES];   /* 1 = remount read-only after bind */
     int   n_vols;
+
+    /* --allow-degraded  (opt out of --memory/--cpus/--pids-limit fail-closed
+     * behaviour when cgroup v2 setup fails; see setup_cgroup()) */
+    int allow_degraded;
 
     /* --secret HOST_FILE[:CONTAINER_PATH]  (read-only file mounts)
      * --secret tpm2:CRED_NAME[:CONTAINER_PATH]  (TPM2-sealed via systemd-creds) */
@@ -7352,8 +7357,18 @@ done:
  * unreachable.  So we must do the mounts BEFORE chroot.  See container_main()
  * for the ordering.
  */
-static void setup_volumes(const char* rootfs, struct container_opts *opts)
+/*
+ * Bind-mount every requested -v volume. A volume the user explicitly
+ * requested that cannot be validated or mounted is a fail-closed error:
+ * silently starting the workload without a mount it asked for (e.g. a
+ * config or data directory it expects to find populated) is a correctness
+ * and security regression, not a degradation to warn-and-continue about.
+ * Returns 0 if every requested volume mounted, -1 on the first failure
+ * (caller aborts the run).
+ */
+static int setup_volumes(const char* rootfs, struct container_opts *opts)
 {
+    int mounted = 0;
     for (int i = 0; i < opts->n_vols; i++)
     {
         const char* host_path = opts->vol_host[i];
@@ -7363,14 +7378,14 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
         {
             fprintf(stderr, "oci2bin: -v host path must be absolute and clean: %s\n",
                     host_path);
-            continue;
+            return -1;
         }
         if (!path_is_absolute_and_clean(ctr_path))
         {
             fprintf(stderr,
                     "oci2bin: -v container path must be absolute and clean: %s\n",
                     ctr_path);
-            continue;
+            return -1;
         }
         char dst[PATH_MAX];
         int dlen = snprintf(dst, sizeof(dst), "%s%s", rootfs, ctr_path);
@@ -7378,12 +7393,12 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
         {
             fprintf(stderr, "oci2bin: -v destination path too long: %s%s\n", rootfs,
                     ctr_path);
-            continue;
+            return -1;
         }
 
         if (ensure_bind_mount_target(host_path, dst, "-v") < 0)
         {
-            continue;
+            return -1;
         }
 
         /* Bind mount: host path → container path (pre-chroot, both accessible) */
@@ -7391,19 +7406,40 @@ static void setup_volumes(const char* rootfs, struct container_opts *opts)
         {
             fprintf(stderr, "oci2bin: bind mount %s -> %s failed: %s\n",
                     host_path, opts->vol_ctr[i], strerror(errno));
+            return -1;
         }
-        else
+        if (opts->vol_ro[i])
         {
-            fprintf(stderr, "oci2bin: mounted %s -> %s\n",
-                    host_path, opts->vol_ctr[i]);
+            /* Matches the two-step pattern in mount_rootfs_read_only():
+             * the initial MS_BIND|MS_REC mount above already brought in
+             * any submounts, so the remount itself does not need MS_REC. */
+            if (mount(NULL, dst, NULL,
+                      MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: -v read-only remount %s failed: %s\n",
+                        opts->vol_ctr[i], strerror(errno));
+                if (umount2(dst, MNT_DETACH) < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: warning: could not unmount writable"
+                            " volume %s: %s\n", dst, strerror(errno));
+                }
+                return -1;
+            }
         }
+        fprintf(stderr, "oci2bin: mounted %s -> %s%s\n",
+                host_path, opts->vol_ctr[i], opts->vol_ro[i] ? " (ro)" : "");
+        mounted++;
     }
-    /* Emit a single mount audit event summarising volume count */
+    /* Emit a single mount audit event summarising the volumes that actually
+     * mounted (not merely requested — a failure aborts before this point). */
     {
         char extra[64];
-        snprintf(extra, sizeof(extra), "\"volumes\":%d", opts->n_vols);
+        snprintf(extra, sizeof(extra), "\"volumes\":%d", mounted);
         audit_emit("mount", extra);
     }
+    return 0;
 }
 
 /*
@@ -7770,11 +7806,19 @@ static int install_tpm2_secret(const char* cred_name, const char* dst_path,
     return rc;
 }
 
-static void setup_secrets(const char* rootfs, struct container_opts *opts)
+/*
+ * Bind-mount/install every requested --secret. A secret the user explicitly
+ * requested that cannot be validated or installed is a fail-closed error —
+ * see setup_volumes() for the same reasoning: a workload that expects a
+ * credential at a fixed path must not silently start without it.
+ * Returns 0 if every requested secret installed, -1 on the first failure
+ * (caller aborts the run).
+ */
+static int setup_secrets(const char* rootfs, struct container_opts *opts)
 {
     if (opts->n_secrets == 0)
     {
-        return;
+        return 0;
     }
 
     char run_secrets[PATH_MAX];
@@ -7782,7 +7826,7 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
             >= (int)sizeof(run_secrets))
     {
         fprintf(stderr, "oci2bin: rootfs path too long for /run/secrets\n");
-        return;
+        return -1;
     }
     /* mkdir /run first in case it doesn't exist */
     char run_dir[PATH_MAX];
@@ -7790,12 +7834,12 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
                  rootfs) >= (int)sizeof(run_dir))
     {
         fprintf(stderr, "oci2bin: rootfs path too long for /run\n");
-        return;
+        return -1;
     }
     if (mkdir_p_secure(run_dir, 0755, "--secret") < 0 ||
             mkdir_p_secure(run_secrets, 0700, "--secret") < 0)
     {
-        return;
+        return -1;
     }
 
     for (int i = 0; i < opts->n_secrets; i++)
@@ -7813,7 +7857,7 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
                 fprintf(stderr,
                         "oci2bin: --secret container path must be absolute"
                         " and clean: %s\n", ctr);
-                continue;
+                return -1;
             }
         }
         else
@@ -7828,14 +7872,14 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
             {
                 fprintf(stderr,
                         "oci2bin: --secret cannot derive basename\n");
-                continue;
+                return -1;
             }
             int n = snprintf(ctr_buf, sizeof(ctr_buf), "/run/secrets/%s", base);
             if (n < 0 || (size_t)n >= sizeof(ctr_buf))
             {
                 fprintf(stderr,
                         "oci2bin: --secret container path too long\n");
-                continue;
+                return -1;
             }
             ctr = ctr_buf;
         }
@@ -7847,13 +7891,16 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
         {
             fprintf(stderr, "oci2bin: --secret destination path too long: %s%s\n",
                     rootfs, ctr);
-            continue;
+            return -1;
         }
 
         if (cred)
         {
             /* TPM2-sealed secret: decrypt and install (memfd_secret or file) */
-            install_tpm2_secret(cred, dst, ctr);
+            if (install_tpm2_secret(cred, dst, ctr) < 0)
+            {
+                return -1;
+            }
             continue;
         }
 
@@ -7863,11 +7910,15 @@ static void setup_secrets(const char* rootfs, struct container_opts *opts)
             fprintf(stderr,
                     "oci2bin: --secret host path must be absolute and clean: %s\n",
                     src);
-            continue;
+            return -1;
         }
 
-        install_plain_secret(src, dst, ctr);
+        if (install_plain_secret(src, dst, ctr) < 0)
+        {
+            return -1;
+        }
     }
+    return 0;
 }
 
 /* ── capability management ───────────────────────────────────────────────── */
@@ -11066,9 +11117,23 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* Set up volume bind mounts BEFORE chroot (host paths still reachable) */
-    setup_volumes(rootfs, opts);
-    setup_secrets(rootfs, opts);
+    /* Set up volume bind mounts BEFORE chroot (host paths still reachable).
+     * Both fail closed: a requested -v/--secret that cannot be validated or
+     * mounted aborts the run rather than starting the workload without it. */
+    if (setup_volumes(rootfs, opts) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: -v: failed to set up a requested volume;"
+                " aborting\n");
+        return 1;
+    }
+    if (setup_secrets(rootfs, opts) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --secret: failed to install a requested secret;"
+                " aborting\n");
+        return 1;
+    }
     if (opts->gdb)
     {
         setup_gdb_in_rootfs(rootfs);
@@ -12307,8 +12372,10 @@ static void usage(const char* prog)
             "                      net=host. No --device exposure through MCP.\n"
             "\n"
             "Options:\n"
-            "  -v HOST:CONTAINER   Bind mount a host path into the container\n"
-            "                      (may be repeated)\n"
+            "  -v HOST:CONTAINER[:ro|:rw]\n"
+            "                      Bind mount a host path into the container;\n"
+            "                      optional :ro remounts it read-only, :rw is the\n"
+            "                      default (may be repeated)\n"
             "  -p HOST_PORT:CTR_PORT\n"
             "                      Publish a container port to the host via slirp\n"
             "                      (may be repeated; implies --net slirp)\n"
@@ -12459,6 +12526,9 @@ static void usage(const char* prog)
             "  --strict            Fail closed on every security-relevant degradation\n"
             "                     (seccomp install / NO_NEW_PRIVS / landlock-unsupported /\n"
             "                     cap drop/add rejected) — never silently continue\n"
+            "  --allow-degraded    Run without enforcement if --memory/--cpus/\n"
+            "                     --pids-limit were requested but cgroup v2 setup\n"
+            "                     failed (default: refuse to start unconstrained)\n"
             "  --                  End of options; remaining args are CMD\n"
             "\n"
             "Examples:\n"
@@ -13054,15 +13124,39 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         spec);
                 return -1;
             }
-            if (!path_is_absolute_and_clean(colon + 1))
+            char* ctr_part = colon + 1;
+            int   vol_ro   = 0;
+            char* opt_colon = strchr(ctr_part, ':');
+            if (opt_colon)
+            {
+                *opt_colon = '\0';
+                const char* suffix = opt_colon + 1;
+                if (strcmp(suffix, "ro") == 0)
+                {
+                    vol_ro = 1;
+                }
+                else if (strcmp(suffix, "rw") == 0)
+                {
+                    vol_ro = 0;
+                }
+                else
+                {
+                    fprintf(stderr,
+                            "oci2bin: -v option suffix must be ':ro' or"
+                            " ':rw': %s\n", suffix);
+                    return -1;
+                }
+            }
+            if (!path_is_absolute_and_clean(ctr_part))
             {
                 fprintf(stderr,
                         "oci2bin: -v container path must be absolute and clean: %s\n",
-                        colon + 1);
+                        ctr_part);
                 return -1;
             }
             opts->vol_host[opts->n_vols] = spec;
-            opts->vol_ctr[opts->n_vols]  = colon + 1;
+            opts->vol_ctr[opts->n_vols]  = ctr_part;
+            opts->vol_ro[opts->n_vols]   = vol_ro;
             opts->n_vols++;
         }
         else if (strcmp(argv[i], "-p") == 0)
@@ -14360,6 +14454,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--strict") == 0)
         {
             opts->strict = 1;
+        }
+        else if (strcmp(argv[i], "--allow-degraded") == 0)
+        {
+            opts->allow_degraded = 1;
         }
         else if (strcmp(argv[i], "--profile") == 0)
         {
@@ -17115,8 +17213,11 @@ static void mcp_tool_run_container(long id, const char* args_json,
                 /* Strip optional :ro or :rw option suffix */
                 const char* ctr_end = strchr(ctr_part, ':');
                 char        ctr_buf[PATH_MAX];
+                int suffix_ok = 1;
                 if (ctr_end)
                 {
+                    suffix_ok = strcmp(ctr_end + 1, "ro") == 0 ||
+                                strcmp(ctr_end + 1, "rw") == 0;
                     size_t clen = (size_t)(ctr_end - ctr_part);
                     if (clen < sizeof(ctr_buf))
                     {
@@ -17125,7 +17226,8 @@ static void mcp_tool_run_container(long id, const char* args_json,
                         ctr_part = ctr_buf;
                     }
                 }
-                if (path_is_absolute_and_clean(host_part) &&
+                if (suffix_ok &&
+                        path_is_absolute_and_clean(host_part) &&
                         !path_has_dotdot_component(host_part) &&
                         path_is_absolute_and_clean(ctr_part) &&
                         !path_has_dotdot_component(ctr_part))
@@ -18697,6 +18799,20 @@ int main(int argc, char* argv[])
         fprintf(stderr,
                 "oci2bin: --metrics-socket requires cgroup v2 support"
                 " and a writable cgroup subtree\n");
+        return 1;
+    }
+    /* Explicit resource ceilings are a security/isolation control, not a
+     * cosmetic feature — silently running unconstrained when the caller
+     * asked for --memory/--cpus/--pids-limit is a fail-open regression.
+     * Abort unless the caller opted into degraded mode explicitly. */
+    if (!cg_did_setup && !opts.allow_degraded &&
+            (opts.cg_memory_bytes > 0 || opts.cg_cpu_quota > 0 ||
+             opts.cg_pids > 0))
+    {
+        fprintf(stderr,
+                "oci2bin: --memory/--cpus/--pids-limit requested but"
+                " cgroup v2 setup failed; refusing to run unconstrained"
+                " (pass --allow-degraded to run without enforcement)\n");
         return 1;
     }
     debug_log("main.cgroup", "enabled=%d dir=%s", cg_did_setup,

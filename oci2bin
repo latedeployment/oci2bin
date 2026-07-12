@@ -90,7 +90,9 @@
 #                         Embed a pinned canonical digest for runtime integrity checks
 #
 # Runtime options (passed directly to the output binary):
-#   -v HOST:CONTAINER     Bind mount a host path into the container
+#   -v HOST:CONTAINER[:ro|:rw]
+#                         Bind mount a host path into the container; optional
+#                         :ro remounts it read-only, :rw is the default
 #   --secret HOST_FILE[:CONTAINER_PATH]
 #                         Bind mount a host file read-only into the container;
 #                         defaults to /run/secrets/<basename> (may be repeated)

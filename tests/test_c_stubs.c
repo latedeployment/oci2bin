@@ -657,18 +657,19 @@ static void test_stub_setup_volumes(void)
     ASSERT_INT_EQ(stub_count("mount"), 0,
                   "setup_volumes: host path with .. → skipped, no mount");
 
-    /* Case F: mount fails → logged but no crash; function completes */
+    /* Case F: mount fails → logged, no crash, fails closed */
     stub_reset();
     opts.n_vols       = 1;
     opts.vol_host[0]  = "/tmp";
     opts.vol_ctr[0]   = "/data";
     g_stub_mount_retval = -1;
     g_stub_mount_errno  = EPERM;
-    setup_volumes(rootfs, &opts);
+    ASSERT_INT_EQ(setup_volumes(rootfs, &opts), -1,
+                  "setup_volumes: failed mount fails closed (-1)");
     ASSERT_INT_EQ(stub_count("mount"), 1,
                   "setup_volumes: failed mount still attempted once");
 
-    /* Case G: two valid volumes → two mount calls */
+    /* Case G: two valid volumes → two mount calls, returns 0 */
     stub_reset();
     g_stub_mount_retval = 0;
     opts.n_vols       = 2;
@@ -676,9 +677,63 @@ static void test_stub_setup_volumes(void)
     opts.vol_ctr[0]   = "/data";
     opts.vol_host[1]  = "/var";
     opts.vol_ctr[1]   = "/var";
-    setup_volumes(rootfs, &opts);
+    opts.vol_ro[0]    = 0;
+    opts.vol_ro[1]    = 0;
+    ASSERT_INT_EQ(setup_volumes(rootfs, &opts), 0,
+                  "setup_volumes: all volumes mounted returns 0");
     ASSERT_INT_EQ(stub_count("mount"), 2,
                   "setup_volumes: two valid volumes → two mount calls");
+
+    /* Case H: first of two volumes fails → second is never attempted
+     * (fail-closed short-circuit, not warn-and-continue) */
+    stub_reset();
+    g_stub_mount_fail_after = 0;
+    g_stub_mount_errno      = EPERM;
+    opts.n_vols       = 2;
+    opts.vol_host[0]  = "/tmp";
+    opts.vol_ctr[0]   = "/data";
+    opts.vol_host[1]  = "/var";
+    opts.vol_ctr[1]   = "/var";
+    ASSERT_INT_EQ(setup_volumes(rootfs, &opts), -1,
+                  "setup_volumes: first volume failure fails closed (-1)");
+    ASSERT_INT_EQ(stub_count("mount"), 1,
+                  "setup_volumes: second volume never attempted after"
+                  " first fails");
+
+    /* Case I: :ro volume → two mount calls (bind + read-only remount) */
+    stub_reset();
+    g_stub_mount_fail_after = -1;
+    g_stub_mount_retval     = 0;
+    opts.n_vols       = 1;
+    opts.vol_host[0]  = "/tmp";
+    opts.vol_ctr[0]   = "/data";
+    opts.vol_ro[0]    = 1;
+    ASSERT_INT_EQ(setup_volumes(rootfs, &opts), 0,
+                  "setup_volumes: :ro volume mounts successfully");
+    ASSERT_INT_EQ(stub_count("mount"), 2,
+                  "setup_volumes: :ro volume → bind + remount calls");
+    ASSERT((g_stub_calls[0].arg0 & (MS_BIND | MS_REC)) ==
+           (MS_BIND | MS_REC),
+           "setup_volumes: :ro first mount is recursive bind");
+    ASSERT((g_stub_calls[1].arg0 & (MS_BIND | MS_REMOUNT | MS_RDONLY)) ==
+           (MS_BIND | MS_REMOUNT | MS_RDONLY),
+           "setup_volumes: :ro second mount is read-only remount");
+    opts.vol_ro[0] = 0;
+
+    /* Case J: :ro remount itself fails → fails closed and detaches */
+    stub_reset();
+    g_stub_mount_fail_after = 1; /* bind succeeds, remount fails */
+    g_stub_mount_errno      = EPERM;
+    opts.n_vols       = 1;
+    opts.vol_host[0]  = "/tmp";
+    opts.vol_ctr[0]   = "/data";
+    opts.vol_ro[0]    = 1;
+    ASSERT_INT_EQ(setup_volumes(rootfs, &opts), -1,
+                  "setup_volumes: :ro remount failure fails closed (-1)");
+    ASSERT_INT_EQ(stub_count("umount2"), 1,
+                  "setup_volumes: :ro remount failure detaches the bind");
+    opts.vol_ro[0] = 0;
+    g_stub_mount_fail_after = -1;
 
     /* cleanup */
     char dp[PATH_MAX];
@@ -943,7 +998,8 @@ static void test_stub_setup_secrets(void)
     /* Case A: zero secrets → no mount calls */
     stub_reset();
     opts.n_secrets = 0;
-    setup_secrets(rootfs, &opts);
+    ASSERT_INT_EQ(setup_secrets(rootfs, &opts), 0,
+                  "setup_secrets: zero secrets returns 0");
     ASSERT_INT_EQ(stub_count("mount"), 0,
                   "setup_secrets: zero secrets → no mount calls");
 
@@ -953,7 +1009,8 @@ static void test_stub_setup_secrets(void)
     opts.secret_host[0] = src_path;
     opts.secret_ctr[0]  = NULL;
     opts.secret_cred[0] = NULL;
-    setup_secrets(rootfs, &opts);
+    ASSERT_INT_EQ(setup_secrets(rootfs, &opts), 0,
+                  "setup_secrets: one valid secret returns 0");
     /*
      * install_plain_secret tries make_memfd_secret (syscall returns ENOSYS),
      * falls back to a direct bind-mount.  Either way, mount() is called once.
@@ -961,25 +1018,41 @@ static void test_stub_setup_secrets(void)
     ASSERT(stub_count("mount") >= 1,
            "setup_secrets: one secret → at least one mount call");
 
-    /* Case C: relative host path is rejected */
+    /* Case C: relative host path is rejected and fails closed */
     stub_reset();
     opts.n_secrets      = 1;
     opts.secret_host[0] = "relative/secret";
     opts.secret_ctr[0]  = NULL;
     opts.secret_cred[0] = NULL;
-    setup_secrets(rootfs, &opts);
+    ASSERT_INT_EQ(setup_secrets(rootfs, &opts), -1,
+                  "setup_secrets: relative host path fails closed (-1)");
     ASSERT_INT_EQ(stub_count("mount"), 0,
                   "setup_secrets: relative host path → skipped, no mount");
 
-    /* Case D: invalid container path (non-absolute) is rejected */
+    /* Case D: invalid container path (non-absolute) is rejected and fails
+     * closed */
     stub_reset();
     opts.n_secrets      = 1;
     opts.secret_host[0] = src_path;
     opts.secret_ctr[0]  = "run/secrets/mykey"; /* not absolute */
     opts.secret_cred[0] = NULL;
-    setup_secrets(rootfs, &opts);
+    ASSERT_INT_EQ(setup_secrets(rootfs, &opts), -1,
+                  "setup_secrets: non-absolute container path fails"
+                  " closed (-1)");
     ASSERT_INT_EQ(stub_count("mount"), 0,
                   "setup_secrets: non-absolute container path → skipped");
+
+    /* Case E: mount fails → fails closed instead of warn-and-continue */
+    stub_reset();
+    opts.n_secrets       = 1;
+    opts.secret_host[0]  = src_path;
+    opts.secret_ctr[0]   = NULL;
+    opts.secret_cred[0]  = NULL;
+    g_stub_mount_retval  = -1;
+    g_stub_mount_errno   = EPERM;
+    ASSERT_INT_EQ(setup_secrets(rootfs, &opts), -1,
+                  "setup_secrets: failed mount fails closed (-1)");
+    g_stub_mount_retval  = 0;
 
     unlink(src_path);
     /* cleanup rootfs */

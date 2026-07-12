@@ -4,6 +4,15 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`-v HOST:CONTAINER:ro`** — an optional `:ro`/`:rw` suffix on `-v` remounts
+  the bind mount read-only (`:rw` is the default). The runtime CLI parser and
+  the MCP volume validator now agree on the same syntax.
+- **`--allow-degraded`** — opts out of the new cgroup fail-closed behavior
+  (see Changed) and restores the old warn-and-continue behavior for
+  `--memory`/`--cpus`/`--pids-limit`.
+
 ### Changed
 
 - **`--read-only` now makes the image root genuinely read-only.** The old
@@ -11,6 +20,18 @@ All notable changes to oci2bin are documented here.
   `--ephemeral-root`. Writable locations under a read-only root must be tmpfs
   or bind mounts; `/tmp` remains tmpfs and `/run` is auto-mounted as tmpfs
   unless `--no-auto-tmpfs` is used.
+
+- **`-v` and `--secret` now fail closed.** A volume or secret that fails to
+  validate or mount used to print a warning and let the workload start
+  without it. It now aborts the run — matching how `--read-only` and
+  `--seccomp-profile` already treat explicit-flag failures as fatal.
+
+- **`--memory`/`--cpus`/`--pids-limit` now fail closed by default.** If
+  cgroup v2 setup fails, the run used to print a warning and continue
+  unconstrained. It now aborts unless `--allow-degraded` is passed.
+
+- **`-v`'s mount audit event reports the number of volumes that actually
+  mounted**, not the number requested.
 
 ### Fixed
 

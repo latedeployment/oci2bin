@@ -84,7 +84,7 @@ This page is a checklist of the feature surface documented by the site.
 
 | Feature | Command |
 | --- | --- |
-| Bind mount | `-v HOST:CONTAINER` |
+| Bind mount | `-v HOST:CONTAINER[:ro\|:rw]` |
 | Runtime secret file | `--secret HOST[:CONTAINER]` |
 | TPM2-sealed secret | `--secret tpm2:NAME[:CONTAINER]` |
 | SSH agent forwarding | `--ssh-agent` |
@@ -137,6 +137,7 @@ This page is a checklist of the feature surface documented by the site.
 | Landlock filesystem sandbox | automatic; force `--landlock`, disable `--no-landlock` |
 | Force single-ID userns fallback | `--no-userns-remap` |
 | Fail-closed on degradations | `--strict` |
+| Opt out of cgroup fail-closed | `--allow-degraded` |
 | gdb debugging | `--gdb` |
 | AppArmor profile | `--security-opt apparmor=PROFILE` |
 | SELinux label | `--security-opt label=TYPE:VAL` |

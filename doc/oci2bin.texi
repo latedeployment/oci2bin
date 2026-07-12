@@ -187,7 +187,9 @@ Capability and seccomp controls; generate a least-privilege profile.
 @item --landlock / --no-landlock / --security-opt apparmor=|label=
 Landlock sandbox (auto by default); AppArmor/SELinux confinement.
 @item --memory / --cpus / --pids-limit / --ulimit T=N / --size NAME
-cgroup v2 limits, setrlimit, and resource presets.
+cgroup v2 limits, setrlimit, and resource presets.  A requested cgroup
+limit aborts the run if cgroup v2 setup fails, unless @option{--allow-degraded}
+is given.
 @item --profile dev|prod|locked-down
 Apply a bundle of runtime defaults.
 @item --init / --detach / --name N / -it
@@ -423,13 +425,17 @@ binary name replace the default command:
 
 @opindex -v
 
-@option{-v HOST:CONTAINER} bind-mounts a host path into the container.
+@option{-v HOST:CONTAINER[:ro|:rw]} bind-mounts a host path into the container.
 The mount point is created inside the container if it does not exist.
 The container path must be absolute and must not contain @code{..}.
-May be repeated (up to 32).
+An optional @code{:ro} suffix remounts the mount read-only after binding;
+@code{:rw} is the default and may be given explicitly.
+May be repeated (up to 32).  A volume that fails to validate or mount
+aborts the run.
 
 @example
 ./alpine_latest -v /data:/data /bin/ls /data
+./alpine_latest -v /data/config:/etc/app/config:ro /bin/ls /etc/app/config
 ./alpine_latest -v /data/input:/input -v /data/output:/output \
   /bin/sh -c 'cp /input/file /output/'
 @end example
@@ -442,7 +448,8 @@ May be repeated (up to 32).
 @option{--secret HOST_FILE[:CONTAINER_PATH]} bind-mounts a single host
 file into the container read-only.  If @var{CONTAINER_PATH} is omitted,
 the file lands at @file{/run/secrets/@var{basename}}.  Enforced with
-@code{MS_RDONLY|MS_NOEXEC|MS_NOSUID|MS_NODEV}.  May be repeated.
+@code{MS_RDONLY|MS_NOEXEC|MS_NOSUID|MS_NODEV}.  May be repeated.  A secret
+that fails to validate or install aborts the run.
 
 @example
 ./my-app --secret ~/.config/api_key           # -> /run/secrets/api_key
@@ -526,6 +533,24 @@ Both soft and hard limits are set to @var{N}.  May be repeated.
 @example
 ./my-app --ulimit nofile=1024 --ulimit nproc=64
 ./my-app --ulimit as=536870912     # 512 MiB virtual memory
+@end example
+
+@opindex --memory
+@opindex --cpus
+@opindex --pids-limit
+@opindex --allow-degraded
+@cindex cgroup v2
+
+@option{--memory SIZE}, @option{--cpus N}, and @option{--pids-limit N} set
+cgroup v2 hard limits across the whole container process tree.  If one of
+these is requested but cgroup v2 setup fails (no
+@file{/sys/fs/cgroup/cgroup.controllers}, or no writable subtree), the run
+aborts rather than starting unconstrained.  Pass @option{--allow-degraded}
+to run without enforcement instead.
+
+@example
+./my-app --memory 512m --cpus 0.5 --pids-limit 100
+./my-app --memory 512m --allow-degraded   # run even if cgroup setup fails
 @end example
 
 @node SSH Agent Forwarding

@@ -224,14 +224,20 @@ These options are passed to the generated binary at run time.
 .
 .SS Volume mounts
 .TP
-.BI \-v " HOST:CONTAINER"
+.BI \-v " HOST:CONTAINER\fR[:\fIro\fR|\fIrw\fR]"
 Bind-mount
 .I HOST
 path into the container at
 .IR CONTAINER .
 The container path must be absolute and must not contain
 .BR .. .
+An optional
+.B :ro
+suffix remounts the mount read-only after binding;
+.B :rw
+is the default and may be given explicitly.
 May be repeated (up to 32).
+A volume that fails to validate or mount aborts the run.
 .
 .TP
 .BI \-\-secret " HOST_FILE\fR[:\fICONTAINER_PATH\fR]"
@@ -243,6 +249,7 @@ is omitted, the file lands at
 Enforced with
 .BR MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV .
 May be repeated.
+A secret that fails to validate or install aborts the run.
 .
 .TP
 .BI \-\-tmpfs " PATH"
@@ -511,6 +518,17 @@ Apply an AppArmor profile or SELinux exec label (compile-time support required).
 .BI \-\-memory " SIZE" \fR, \fB\-\-cpus " N" \fR, \fB\-\-pids\-limit " N"
 cgroup v2 hard limits on memory, CPU, and PID count for the whole container
 tree.
+If cgroup v2 setup fails, the run aborts rather than starting unconstrained;
+pass
+.B \-\-allow\-degraded
+to opt into running without enforcement instead.
+.
+.TP
+.B \-\-allow\-degraded
+Run without cgroup enforcement if
+.BR \-\-memory / \-\-cpus / \-\-pids\-limit
+was requested but cgroup v2 setup failed. Without this flag such a failure
+is fatal.
 .
 .TP
 .BI \-\-size " NAME"
