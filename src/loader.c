@@ -10558,7 +10558,12 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
     }
     ptrace(PTRACE_SYSCALL, child, NULL, NULL);
 
+    /* n_pid_states already bounds every read to entries gs_pid_in_syscall()
+     * has filled in, so this is belt-and-braces — but leaving the array
+     * indeterminate makes static analyzers flag a use-of-uninitialized path
+     * they cannot rule out, and the zeroing costs nothing here. */
     struct gs_pid_state pid_states[GEN_SECCOMP_MAX_PIDS];
+    memset(pid_states, 0, sizeof(pid_states));
     int n_pid_states = 0;
     int child_exit   = 0;
 
