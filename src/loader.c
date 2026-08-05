@@ -18365,13 +18365,39 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
         return;
     }
 
-    /* Auto-generate name if not provided */
+    /* Auto-generate a name if the caller did not supply a usable one.
+     * This used to be "ctr-<getpid()>" — the *server's* pid, which does not
+     * change for the life of the session, so every auto-named container after
+     * the first collided with it and was rejected. Combine a counter with a
+     * scan of the tracking table so the result is unique among live
+     * containers. */
+    static unsigned long auto_seq;
     char auto_name[MCP_NAME_MAX];
     if (!name || !mcp_name_valid(name))
     {
         free(name);
-        snprintf(auto_name, sizeof(auto_name), "ctr-%d", (int)getpid());
-        name = auto_name;
+        name = NULL;
+        for (int tries = 0; tries < MCP_MAX_CONTAINERS + 1; tries++)
+        {
+            snprintf(auto_name, sizeof(auto_name), "ctr-%d-%lu",
+                     (int)getpid(), auto_seq++);
+            if (mcp_find_ctr(auto_name) < 0)
+            {
+                name = auto_name;
+                break;
+            }
+        }
+        if (!name)
+        {
+            mcp_send_error(id, -32603,
+                           "run_container: could not allocate a unique"
+                           " container name");
+            free(image);
+            free(net);
+            free(env_arr);
+            free(vol_arr);
+            return;
+        }
     }
 
     /* Net mode: default none; host only if allow_net AND caller asked */
@@ -18381,20 +18407,10 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
         net_mode = "host";
     }
 
-    if (g_mcp_n_ctrs >= MCP_MAX_CONTAINERS)
-    {
-        mcp_send_error(id, -32603,
-                       "run_container: too many tracked containers");
-        if (name != auto_name)
-        {
-            free(name);
-        }
-        free(image);
-        free(net);
-        free(env_arr);
-        free(vol_arr);
-        return;
-    }
+    /* Capacity is decided by mcp_alloc_ctr_slot(), which reclaims slots from
+     * stopped containers. Pre-checking g_mcp_n_ctrs here would reject new
+     * containers forever once the high-water mark hit the limit, even with
+     * every slot free. */
 
     if (mcp_find_ctr(name) >= 0)
     {

@@ -19,6 +19,16 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **MCP auto-generated container names are unique.** An unnamed
+  `run_container` was named `ctr-<pid>` using the *server's* pid, which is
+  constant for the session — so the second and every later auto-named
+  container collided with the first and was rejected as a duplicate. Names now
+  include a per-session counter and are checked against the tracking table.
+  A leftover capacity pre-check was also removed: it tested the table's
+  high-water mark rather than actual occupancy, which would have rejected new
+  containers forever once 64 had been launched, defeating the slot reuse added
+  alongside it.
+
 - **MCP JSON-RPC ids are echoed with their original type, and the unsolicited
   greeting is gone.** Every request id was parsed into a `long`, so a string id
   like `"abc-123"` came back as a number and an unparseable one silently became
