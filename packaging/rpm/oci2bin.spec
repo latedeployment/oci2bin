@@ -1,5 +1,5 @@
 Name:           oci2bin
-Version:        0.17.0
+Version:        0.18.0
 Release:        1%{?dist}
 Summary:        Convert OCI/Docker images into self-contained ELF executables
 
@@ -42,6 +42,8 @@ make install PREFIX=%{buildroot}/usr
 %{_infodir}/oci2bin.info*
 
 %changelog
+* Thu Aug 06 2026 latedeployment - 0.18.0-1
+- Update to v0.18.0
 * Fri Apr 18 2026 latedeployment - 0.9.0-1
 - Update to v0.9.0; install all helper scripts
 * Tue Mar 10 2026 latedeployment - 0.1.0-1

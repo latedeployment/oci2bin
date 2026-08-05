@@ -1,7 +1,7 @@
 .\" Man page for oci2bin
 .\" Generate HTML: groff -man -Thtml doc/oci2bin.1
 .\" Generate PDF:  groff -man -Tpdf  doc/oci2bin.1 > oci2bin.pdf
-.TH OCI2BIN 1 "2026-03-12" "oci2bin 0.1.0" "User Commands"
+.TH OCI2BIN 1 "2026-08-06" "oci2bin 0.18.0" "User Commands"
 .
 .SH NAME
 oci2bin \- convert Docker/OCI images into self-contained rootless container executables
@@ -946,6 +946,23 @@ Polyglot builder script.
 .I src/loader.c
 Loader source code.
 .RE
+.
+.SH LOCAL TEST TARGETS
+.TP
+.B make test\-unit
+Run the fast unit suite without requiring Docker or Podman.
+.TP
+.B make test\-all
+Run the full unit sweep on native x86_64 and cross-compiled aarch64.
+This target does not require Docker or Podman.
+.TP
+.B make test
+Run the unit and container-engine integration tests.
+.TP
+.B make test\-asan
+Run the C unit suite under AddressSanitizer, UndefinedBehaviorSanitizer,
+and LeakSanitizer.
+These tests run locally; the project does not use hosted CI for tests.
 .
 .SH EXIT STATUS
 The exit status of the container process is propagated to the caller.

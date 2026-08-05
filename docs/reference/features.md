@@ -232,3 +232,12 @@ This page is a checklist of the feature surface documented by the site.
 | Notification label | `--notify-name NAME` |
 | Audit logging | `--audit-log PATH` |
 | First-run env hint | automatic; `--no-hint` / `--require-hint` |
+
+## Local Validation
+
+| Feature | Command |
+| --- | --- |
+| Unit tests without a container engine | `make test-unit` |
+| Full x86_64 and aarch64 unit sweep, without a container engine | `make test-all` |
+| Unit and container-engine integration tests | `make test` |
+| C tests under ASan, UBSan, and LSan | `make test-asan` |

@@ -6,7 +6,7 @@
 @c %**end of header
 
 @copying
-This manual is for oci2bin (version 0.1.0).
+This manual is for oci2bin (version 0.18.0).
 
 Copyright @copyright{} 2026 latedeployment.
 
@@ -24,7 +24,7 @@ under the terms of the MIT License.
 @titlepage
 @title oci2bin Manual
 @subtitle Convert Docker/OCI images into self-contained rootless container executables
-@subtitle Version 0.1.0
+@subtitle Version 0.18.0
 @author The oci2bin project
 @page
 @vskip 0pt plus 1filll
@@ -245,6 +245,23 @@ make install  # install to /usr/local (override with PREFIX=~/.local)
 
 After installation @command{oci2bin} is on your @env{PATH}.  To use it
 without installing, run it directly from the repository root.
+
+@section Local Test Targets
+
+@table @command
+@item make test-unit
+Run the fast unit suite without requiring Docker or Podman.
+@item make test-all
+Run the full unit sweep on native x86_64 and cross-compiled aarch64.
+This target does not require Docker or Podman.
+@item make test
+Run the unit and container-engine integration tests.
+@item make test-asan
+Run the C unit suite under AddressSanitizer, UndefinedBehaviorSanitizer,
+and LeakSanitizer.
+@end table
+
+These tests run locally; the project does not use hosted CI for tests.
 
 @section Quick Start
 

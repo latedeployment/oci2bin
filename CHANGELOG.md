@@ -4,6 +4,8 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-06
+
 ### Added
 
 - **`make test-asan`** — runs the C unit suite under AddressSanitizer,
@@ -108,6 +110,8 @@ All notable changes to oci2bin are documented here.
   filesystem has an identical `st_dev`. Cleanup now detaches every mount under
   the tmpdir first, and `rm_rf_dir()` consults `/proc/self/mountinfo` and
   refuses to delete at or below any live mount point regardless of device.
+  Mountinfo's octal path escapes are decoded before comparison, so mountpoints
+  containing spaces or other escaped characters remain protected.
   The bug predates this release; any binary built before it is affected.
 
 - **`--seccomp-profile` refuses profiles it cannot represent.** The parser
@@ -115,9 +119,11 @@ All notable changes to oci2bin are documented here.
   ignored everything that narrows *when* a rule applies — a profile permitting
   `ioctl` only for specific request codes was applied as "permit `ioctl`",
   with no warning that the restriction had been dropped. Profiles using
-  `args`, `includes` or `excludes` are now rejected, as are profiles whose
-  `architectures` list excludes the running architecture. `errnoRet` warns
-  instead of failing, since it changes only the reported errno.
+  non-empty `args`, `includes` or `excludes` are now rejected, while the empty
+  arrays and objects emitted by Docker's default profile are accepted.
+  Malformed or incorrectly typed values still fail closed, as do profiles
+  whose `architectures` list excludes the running architecture. `errnoRet`
+  warns instead of failing, since it changes only the reported errno.
   Two silent fail-open paths are closed as well: an unrecognised syscall name
   in a deny list (which could not be blocked) is now an error rather than a
   skipped entry, and a profile listing more syscalls than the loader's table
@@ -145,21 +151,12 @@ All notable changes to oci2bin are documented here.
   is `setuptools>=77` for SPDX support. Built wheels now carry
   `Metadata-Version: 2.4` and `License-Expression: MIT`.
 
-- **The AUR package no longer skips source verification.** `PKGBUILD` used
-  `sha256sums=('SKIP')`, so the downloaded release tarball was never checked.
-  It now pins the real v0.17.0 checksum. The accompanying `.SRCINFO` was worse
-  than stale — its `source` URL still pointed at **v0.1.0** and it was missing
-  the `gcc` dependency and the `texinfo` makedepend — so it has been
-  regenerated to mirror the `PKGBUILD`, and `make check-version` now checks
-  that embedded URL too.
-
 - **The project version is now consistent across all sources.** `pyproject.toml`
-  said `0.17.0`, the polyglot builder `0.14.0`, the RPM spec and AUR `PKGBUILD`
-  `0.9.0`, the AUR `.SRCINFO` `0.1.0`, the Nix flake `0.1.0`, and the MCP
-  `serverInfo` `1.0` — six different values, two of them inside the same AUR
-  package. All are now `0.17.0`, the loader carries a single `OCI2BIN_VERSION`
-  constant, and the new `make check-version` (wired into `make test-unit`)
-  fails the build if they drift apart again.
+  said `0.17.0`, the polyglot builder `0.14.0`, the RPM spec `0.9.0`, the Nix
+  flake `0.1.0`, and the MCP `serverInfo` `1.0`. All are now `0.17.0`, the
+  loader carries a single `OCI2BIN_VERSION` constant, and the new
+  `make check-version` (wired into `make test-unit`) fails the build if they
+  drift apart again.
 
 
 - **`make test-python` discovers every unit test module.** The target enumerated
@@ -245,7 +242,10 @@ All notable changes to oci2bin are documented here.
   `--allow-mount`/`--allow-mount-rw`, a spec with no suffix is mounted `:ro`
   rather than inheriting the CLI's read-write default, and `:rw` on a
   read-only root is refused. Prefix matching is component-aware, so a root of
-  `/srv/data` does not admit `/srv/dataset`.
+  `/srv/data` does not admit `/srv/dataset`; matching also uses resolved paths,
+  so a static symlink cannot escape the allowlisted root or change its
+  read-only policy. Validation and mounting remain separate path-based
+  operations; this does not pin the target against a concurrent replacement.
 
 - **`--read-only` now makes the image root genuinely read-only.** The old
   writable throwaway-overlay behavior is available explicitly as
@@ -1304,8 +1304,8 @@ All notable changes to oci2bin are documented here.
   `mknod()` under a `tmpfs` `/dev`: `null`, `zero`, `urandom`, `random`, `tty`.
   Bind-mounting the host `/dev` is not possible in rootless user namespaces; this
   approach works without any host privileges.
-- **Nix flake, AUR PKGBUILD, and RPM spec** — packaging for NixOS, Arch Linux
-  (AUR), and Fedora (Copr) added under `flake.nix` and `packaging/`.
+- **Nix flake and RPM spec** — packaging for NixOS and Fedora (Copr) added
+  under `flake.nix` and `packaging/`.
 
 ### Fixed
 
@@ -1346,9 +1346,8 @@ Initial public release.
   test-unit`); integration tests covering volume mounts, entrypoint override,
   argument passthrough, exit-code forwarding, and Docker-import round-trip (`make
   test`).
-- **Packaging** — Nix flake (`flake.nix`), AUR `PKGBUILD`
-  (`packaging/aur/`), and RPM spec (`packaging/rpm/`) for NixOS, Arch, and
-  Fedora.
+- **Packaging** — Nix flake (`flake.nix`) and RPM spec
+  (`packaging/rpm/`) for NixOS and Fedora.
 - **Security hardening** — static linking, `chroot` + namespace isolation,
   `MS_NOSUID|MS_NODEV` mounts, `..` path validation on all external inputs,
   `snprintf` truncation checks on all `PATH_MAX` buffers, no `system()`/`popen()`

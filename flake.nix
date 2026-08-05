@@ -10,7 +10,7 @@
     {
       packages.x86_64-linux.default = pkgs.stdenv.mkDerivation {
         pname = "oci2bin";
-        version = "0.17.0";
+        version = "0.18.0";
         src = ./.;
 
         nativeBuildInputs = [ pkgs.makeWrapper pkgs.python3 ];

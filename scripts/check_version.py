@@ -3,10 +3,9 @@
 check_version.py — assert every place the project version is written agrees.
 
 The version is duplicated across the Python package, the polyglot builder, the
-loader, and three distro packaging files. They have drifted apart before (at
-one point six different values were in the tree simultaneously, including two
-inside the same AUR package). This is the cheap guard: it does not generate
-anything, it just fails when they disagree.
+loader, and distro packaging files. They have drifted apart before. This is
+the cheap guard: it does not generate anything, it just fails when they
+disagree.
 
 `pyproject.toml` is the canonical source. Run via `make check-version`.
 """
@@ -27,15 +26,6 @@ SOURCES = [
      r'(?m)^#define\s+OCI2BIN_VERSION\s+"([^"]+)"'),
     ("packaging/rpm/oci2bin.spec", "packaging/rpm/oci2bin.spec",
      r"(?m)^Version:\s*(\S+)"),
-    ("packaging/aur/PKGBUILD", "packaging/aur/PKGBUILD",
-     r"(?m)^pkgver=(\S+)"),
-    ("packaging/aur/.SRCINFO (pkgver)", "packaging/aur/.SRCINFO",
-     r"(?m)^\s*pkgver\s*=\s*(\S+)"),
-    # .SRCINFO repeats the version inside the source URL, and that copy drifted
-    # independently of its own pkgver (pkgver said 0.1.0 while the URL said
-    # 0.1.0 and the PKGBUILD said 0.9.0). Check the URL separately.
-    ("packaging/aur/.SRCINFO (source url)", "packaging/aur/.SRCINFO",
-     r"(?m)^\s*source\s*=\s*\S+/archive/refs/tags/v(\S+)\.tar\.gz"),
     ("flake.nix", "flake.nix",
      r'(?m)^\s*version\s*=\s*"([^"]+)"\s*;'),
 ]

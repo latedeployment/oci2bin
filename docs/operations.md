@@ -335,3 +335,29 @@ oci2bin mcp-serve
 
 The MCP server exposes `oci2bin` functionality to AI agents through structured
 tool calls.
+
+## Local Validation
+
+Run the fast unit suite without Docker or Podman:
+
+```bash
+make test-unit
+```
+
+Run the full unit sweep on native x86_64 and cross-compiled aarch64:
+
+```bash
+make test-all
+```
+
+This target does not require Docker or Podman. Container-engine integration
+tests are separate under `make test`.
+
+Check the C unit suite with AddressSanitizer, UndefinedBehaviorSanitizer, and
+LeakSanitizer:
+
+```bash
+make test-asan
+```
+
+These targets run locally; the project does not use hosted CI for tests.
