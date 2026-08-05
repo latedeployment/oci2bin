@@ -17,15 +17,27 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# (path, regex with one capture group holding the version)
+# (label, path, regex with one capture group holding the version)
 SOURCES = [
-    ("pyproject.toml", r'(?m)^version\s*=\s*"([^"]+)"'),
-    ("scripts/build_polyglot.py", r"(?m)^OCI2BIN_VERSION\s*=\s*'([^']+)'"),
-    ("src/loader.c", r'(?m)^#define\s+OCI2BIN_VERSION\s+"([^"]+)"'),
-    ("packaging/rpm/oci2bin.spec", r"(?m)^Version:\s*(\S+)"),
-    ("packaging/aur/PKGBUILD", r"(?m)^pkgver=(\S+)"),
-    ("packaging/aur/.SRCINFO", r"(?m)^\s*pkgver\s*=\s*(\S+)"),
-    ("flake.nix", r'(?m)^\s*version\s*=\s*"([^"]+)"\s*;'),
+    ("pyproject.toml", "pyproject.toml",
+     r'(?m)^version\s*=\s*"([^"]+)"'),
+    ("scripts/build_polyglot.py", "scripts/build_polyglot.py",
+     r"(?m)^OCI2BIN_VERSION\s*=\s*'([^']+)'"),
+    ("src/loader.c", "src/loader.c",
+     r'(?m)^#define\s+OCI2BIN_VERSION\s+"([^"]+)"'),
+    ("packaging/rpm/oci2bin.spec", "packaging/rpm/oci2bin.spec",
+     r"(?m)^Version:\s*(\S+)"),
+    ("packaging/aur/PKGBUILD", "packaging/aur/PKGBUILD",
+     r"(?m)^pkgver=(\S+)"),
+    ("packaging/aur/.SRCINFO (pkgver)", "packaging/aur/.SRCINFO",
+     r"(?m)^\s*pkgver\s*=\s*(\S+)"),
+    # .SRCINFO repeats the version inside the source URL, and that copy drifted
+    # independently of its own pkgver (pkgver said 0.1.0 while the URL said
+    # 0.1.0 and the PKGBUILD said 0.9.0). Check the URL separately.
+    ("packaging/aur/.SRCINFO (source url)", "packaging/aur/.SRCINFO",
+     r"(?m)^\s*source\s*=\s*\S+/archive/refs/tags/v(\S+)\.tar\.gz"),
+    ("flake.nix", "flake.nix",
+     r'(?m)^\s*version\s*=\s*"([^"]+)"\s*;'),
 ]
 
 CANONICAL = "pyproject.toml"
@@ -35,16 +47,16 @@ def main():
     found = {}
     missing = []
 
-    for rel, pattern in SOURCES:
+    for label, rel, pattern in SOURCES:
         path = ROOT / rel
         if not path.exists():
-            missing.append(f"{rel}: file not found")
+            missing.append(f"{label}: file not found")
             continue
         match = re.search(pattern, path.read_text())
         if not match:
-            missing.append(f"{rel}: no version match for {pattern!r}")
+            missing.append(f"{label}: no version match for {pattern!r}")
             continue
-        found[rel] = match.group(1)
+        found[label] = match.group(1)
 
     if missing:
         for problem in missing:

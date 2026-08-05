@@ -15,6 +15,14 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **The AUR package no longer skips source verification.** `PKGBUILD` used
+  `sha256sums=('SKIP')`, so the downloaded release tarball was never checked.
+  It now pins the real v0.17.0 checksum. The accompanying `.SRCINFO` was worse
+  than stale — its `source` URL still pointed at **v0.1.0** and it was missing
+  the `gcc` dependency and the `texinfo` makedepend — so it has been
+  regenerated to mirror the `PKGBUILD`, and `make check-version` now checks
+  that embedded URL too.
+
 - **The project version is now consistent across all sources.** `pyproject.toml`
   said `0.17.0`, the polyglot builder `0.14.0`, the RPM spec and AUR `PKGBUILD`
   `0.9.0`, the AUR `.SRCINFO` `0.1.0`, the Nix flake `0.1.0`, and the MCP
