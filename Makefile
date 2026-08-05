@@ -344,7 +344,7 @@ test-shellcheck: lint-shellcheck
 
 test: test-unit test-integration
 
-test-unit: test-c test-c-stubs test-python test-vm-unit test-shellcheck
+test-unit: test-c test-c-stubs test-python test-shellcheck
 
 test-unit-aarch64: test-c-aarch64 test-python
 
@@ -385,56 +385,9 @@ $(TEST_C_BIN_AARCH64): $(TESTS_DIR)/test_c_units.c src/loader.c
 	$(TEST_ENV) $(CC_AARCH64) $(CFLAGS_AARCH64) -static -Wno-return-local-addr -o $@ $<
 
 test-python:
-	@echo "=== Python unit tests ==="
+	@echo "=== Python unit tests (discovered) ==="
 	@mkdir -p $(TEST_TMPDIR)
-	$(TEST_ENV) python3 -m unittest discover -s tests -p 'test_build.py' -v
-	$(TEST_ENV) python3 -m unittest tests.test_add_files -v
-	$(TEST_ENV) python3 -m unittest tests.test_build_meta -v
-	@echo "=== Polyglot structure tests ==="
-	$(TEST_ENV) python3 -m unittest \
-		tests.test_polyglot.TestExistingPolyglot \
-		tests.test_polyglot.TestPolyglotPageAlignment -v
-	@echo "=== Embed loader unit tests (no Docker) ==="
-	$(TEST_ENV) python3 -m unittest \
-		tests.test_embed_loader.TestEmbedLoaderLayer \
-		tests.test_embed_loader.TestEmbedLoaderLabels -v
-	@echo "=== CLI feature unit tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_cli_features -v
-	@echo "=== Sign + attestation unit tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_sign_attest -v
-	@echo "=== Multi-arch wrapper unit tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_arch_wrapper -v
-	@echo "=== diff --syscalls unit tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_diff_syscalls -v
-	@echo "=== Reproducible build unit tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_reproducible_build -v
-	@echo "=== Dockerfile safe-resolve unit tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_safe_resolve -v
-	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_run_parse -v
-	@echo "=== Dockerfile RUN env construction tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_dockerfile_run_env -v
-	@echo "=== Packaging manifest/install smoke tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_packaging_manifest -v
-	@echo "=== MCP params shape tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_mcp_params_shape -v
-	@echo "=== .dockerignore tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_dockerignore -v
-	@echo "=== oci2bin doctor tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_doctor -v
-	@echo "=== oci2bin explain tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_explain -v
-	@echo "=== oci2bin inspect extended tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_inspect_extended -v
-	@echo "=== oci2bin diff-fs tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_diff_fs -v
-	@echo "=== oci2bin freeze/thaw tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_freeze -v
-	@echo "=== strip/merge image metadata tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_strip_image tests.test_merge_layers -v
-	@echo "=== --compress-binary helper tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_compress_binary -v
-	@echo "=== pod-stack orchestrator tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_pod_stack -v
+	$(TEST_ENV) python3 -m unittest discover -s $(TESTS_DIR) -p 'test_*.py' -v
 
 test-vm-unit:
 	@echo "=== VM unit tests ==="

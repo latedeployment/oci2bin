@@ -15,6 +15,12 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **`make test-python` runs every test module.** The target enumerated modules
+  by hand and had fallen behind by five (`test_dockerfile_from_arch`,
+  `test_encrypt`, `test_require_signed`, `test_service_matrix`,
+  `test_user_labels`) — 337 of 381 tests were running. It now uses unittest
+  discovery, so a new `tests/test_*.py` is picked up automatically.
+
 - **`--secret tpm2:NAME` never actually read the sealed credential.** The
   loader ran `systemd-creds decrypt --name NAME - -`, where the first `-`
   means "read the ciphertext from stdin" — and the helper inherited the
