@@ -15,6 +15,17 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **`--verify-key` works on a distributed binary.** Verification shelled out to
+  `../scripts/sign_binary.py` resolved relative to the executable, so it only
+  ever worked from inside a source checkout — a copied binary failed with
+  `verifier: cannot open verifier script`, which is precisely the situation
+  runtime verification exists for. The verifier is now embedded in the loader,
+  mirroring what `--require-signed` already did; the only difference is that
+  the public key comes from the `--verify-key` argument rather than the
+  embedded metadata. Still needs `python3` and `openssl` at runtime, as
+  documented. (`--self-update` continues to require the external helper
+  module and is not yet standalone.)
+
 - **`-v` no longer deletes the host directory it mounted.** This was data loss
   on an ordinary successful run: `./app -v ~/data:/data true` erased the
   contents of `~/data`. `main()` unshares `CLONE_NEWNS` *before* forking, so

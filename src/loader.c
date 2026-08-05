@@ -15409,6 +15409,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
 
 /* ── binary signature verification ──────────────────────────────────────── */
 
+static int run_python_helper(const char* script, const char* arg1,
+                             const char* arg2, const char* arg3,
+                             const char* arg4);
+
 /*
  * Verify the binary signature by delegating to sign_binary.py via execvp.
  * Never uses a shell. Returns 0 on success, -1 on failure.
@@ -15472,6 +15476,19 @@ static int open_verifier_script_fd(char* fd_path, size_t fd_path_size)
     return script_fd;
 }
 
+/*
+ * Verify the embedded signature against a caller-supplied public key.
+ *
+ * The verifier is embedded here rather than loaded from
+ * ../scripts/sign_binary.py next to the executable: a generated binary is
+ * meant to be copied around on its own, and away from a source checkout that
+ * path does not exist, so --verify-key could never succeed on a real
+ * deployment. This mirrors what enforce_require_signed() already does, the
+ * difference being where the public key comes from — a file here, the
+ * embedded metadata there.
+ *
+ * Needs python3 and openssl at runtime, same as the --require-signed path.
+ */
 static int verify_signature(const char* self_path, const char* key_path)
 {
     if (path_has_dotdot_component(key_path))
@@ -15482,24 +15499,47 @@ static int verify_signature(const char* self_path, const char* key_path)
         return -1;
     }
 
-    char fd_path[32];
-    int script_fd = open_verifier_script_fd(fd_path, sizeof(fd_path));
-    if (script_fd < 0)
-    {
-        return -1;
-    }
-    char* args[] =
-    {
-        "/usr/bin/python3",
-        fd_path,
-        "verify",
-        "--key", (char*)key_path,
-        "--in", (char*)self_path,
-        NULL
-    };
-    int rc = run_cmd(args);
-    close(script_fd);
-    if (rc != 0)
+    static const char script[] =
+        "import os,struct,subprocess,sys,tempfile\n"
+        "SIGMAGIC=b'OCI2BIN_SIG\\x00'\n"
+        "TRAILER=b'OCI2BIN_SIG_END\\x00'\n"
+        "ALGOS={1:'sha256',3:'sha512'}\n"
+        "path,keyfile=sys.argv[1],sys.argv[2]\n"
+        "data=open(path,'rb').read()\n"
+        "block_start=None\n"
+        "sig=None\n"
+        "algo='sha256'\n"
+        "if len(data)>=20 and data[-20:-4]==TRAILER:\n"
+        " tot=struct.unpack('>I',data[-4:])[0]\n"
+        " if 0<tot<=len(data):\n"
+        "  bs=len(data)-tot\n"
+        "  if data[bs:bs+len(SIGMAGIC)]==SIGMAGIC:\n"
+        "   block_start=bs\n"
+        "   off=bs+len(SIGMAGIC)\n"
+        "   ver=data[off];off+=1\n"
+        "   if ver>=2:\n"
+        "    algo=ALGOS.get(data[off],'sha256');off+=1\n"
+        "   off+=32\n"
+        "   siglen=struct.unpack('>H',data[off:off+2])[0];off+=2\n"
+        "   sig=data[off:off+siglen]\n"
+        "if sig is None:\n"
+        " sys.stderr.write('oci2bin: --verify-key: no signature block "
+        "present\\n');sys.exit(1)\n"
+        "content=data[:block_start]\n"
+        "with tempfile.TemporaryDirectory(prefix='oci2bin-vk-') as td:\n"
+        " sf=os.path.join(td,'sig.der');open(sf,'wb').write(sig)\n"
+        " try:\n"
+        "  r=subprocess.run(['openssl','dgst','-'+algo,'-verify',keyfile,"
+        "'-signature',sf],input=content,stdout=subprocess.DEVNULL,"
+        "stderr=subprocess.DEVNULL)\n"
+        " except FileNotFoundError:\n"
+        "  sys.stderr.write('oci2bin: --verify-key: openssl not found; "
+        "cannot verify\\n');sys.exit(1)\n"
+        " if r.returncode!=0:\n"
+        "  sys.exit(1)\n"
+        "sys.exit(0)\n";
+
+    if (run_python_helper(script, self_path, key_path, NULL, NULL) != 0)
     {
         fprintf(stderr,
                 "oci2bin: signature verification failed — "
