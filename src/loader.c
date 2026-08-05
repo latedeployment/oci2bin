@@ -16325,6 +16325,110 @@ static void cleanup_cgroup(void)
  */
 static int s_oci_rootfs_cleaned = 0;
 
+/*
+ * Lazily detach every mount at or below 'prefix' in our mount namespace,
+ * deepest first, so the subsequent rm_rf_dir() has nothing left to cross.
+ *
+ * This runs in the parent, which shares the container's mount namespace
+ * (main() unshares CLONE_NEWNS before forking), so the -v/--secret binds the
+ * child installed are still listed here. Detaching them is what lets the
+ * tmpdir be removed; rm_rf_dir()'s FTW_MOUNT is the backstop for anything
+ * that could not be unmounted.
+ */
+/*
+ * Collect every mount point at or below 'prefix' from /proc/self/mountinfo,
+ * in the order the kernel lists them (parents before children).
+ *
+ * Returns the count and stores a malloc'd array in *out (caller frees), or 0
+ * with *out == NULL when there are none or the scan fails. A failure here is
+ * reported as "no mounts", so callers must treat that as the unsafe case.
+ */
+static size_t collect_mounts_below(const char* prefix,
+                                   char (**out)[PATH_MAX])
+{
+    *out = NULL;
+    FILE* f = fopen("/proc/self/mountinfo", "r");
+    if (!f)
+    {
+        return 0;
+    }
+
+    char (*points)[PATH_MAX] = NULL;
+    size_t n_points = 0, cap_points = 0;
+    size_t prefix_len = strlen(prefix);
+    char line[8192];
+
+    while (fgets(line, sizeof(line), f))
+    {
+        /* mountinfo field 5 is the mount point, space-separated. */
+        char* p = line;
+        for (int field = 0; field < 4 && p; field++)
+        {
+            p = strchr(p, ' ');
+            if (p)
+            {
+                p++;
+            }
+        }
+        if (!p)
+        {
+            continue;
+        }
+        char* end = strchr(p, ' ');
+        if (!end)
+        {
+            continue;
+        }
+        *end = '\0';
+        if (strncmp(p, prefix, prefix_len) != 0)
+        {
+            continue;
+        }
+        /* Match the prefix itself or a path beneath it, not "/tmp/abcd" when
+         * the prefix is "/tmp/abc". */
+        if (p[prefix_len] != '\0' && p[prefix_len] != '/')
+        {
+            continue;
+        }
+        if (strlen(p) >= PATH_MAX)
+        {
+            continue;
+        }
+        if (n_points == cap_points)
+        {
+            size_t new_cap = cap_points ? cap_points * 2 : 16;
+            void* grown = realloc(points, new_cap * sizeof(*points));
+            if (!grown)
+            {
+                break;
+            }
+            points = grown;
+            cap_points = new_cap;
+        }
+        snprintf(points[n_points], PATH_MAX, "%s", p);
+        n_points++;
+    }
+    fclose(f);
+
+    *out = points;
+    return n_points;
+}
+
+/*
+ * Lazily detach every mount at or below 'prefix', deepest first.
+ */
+static void unmount_tree_below(const char* prefix)
+{
+    char (*points)[PATH_MAX] = NULL;
+    size_t n_points = collect_mounts_below(prefix, &points);
+    while (n_points > 0)
+    {
+        n_points--;
+        umount2(points[n_points], MNT_DETACH);
+    }
+    free(points);
+}
+
 static void cleanup_oci_rootfs(void)
 {
     if (s_oci_rootfs_cleaned || s_oci_rootfs[0] == '\0')
@@ -16338,6 +16442,7 @@ static void cleanup_oci_rootfs(void)
     if (last_slash)
     {
         *last_slash = '\0';
+        unmount_tree_below(s_oci_rootfs);
         rm_rf_dir(s_oci_rootfs);
     }
 }
@@ -16526,11 +16631,40 @@ static pid_t fork_into_cgroup(const struct container_opts* opts)
  * Used instead of "rm -rf" to avoid forking after CLONE_NEWPID, which would
  * fail with ENOMEM because the child PID namespace is already destroyed.
  */
+/*
+ * Mount points the in-progress rm_rf_dir() must not delete through. nftw()
+ * gives the callback no user-data pointer, so this is file-static; rm_rf_dir()
+ * is not called concurrently.
+ */
+static char (*s_rm_protect)[PATH_MAX] = NULL;
+static size_t s_rm_protect_n = 0;
+
+/* Is 'path' one of the protected mount points, or inside one? */
+static int rm_path_is_protected(const char* path)
+{
+    for (size_t i = 0; i < s_rm_protect_n; i++)
+    {
+        size_t len = strlen(s_rm_protect[i]);
+        if (strncmp(path, s_rm_protect[i], len) == 0 &&
+                (path[len] == '\0' || path[len] == '/'))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int rm_entry(const char* path, const struct stat* sb,
                     int typeflag, struct FTW* ftwbuf)
 {
     (void)sb;
     (void)ftwbuf;
+    /* Never delete through a live mount: the contents belong to whatever is
+     * mounted there, typically the user's own -v host directory. */
+    if (rm_path_is_protected(path))
+    {
+        return 0;
+    }
     if (typeflag == FTW_DP)
     {
         return rmdir(path);
@@ -16538,9 +16672,32 @@ static int rm_entry(const char* path, const struct stat* sb,
     return unlink(path);
 }
 
+/*
+ * Recursively delete 'path'.
+ *
+ * FTW_MOUNT is load-bearing, not a tidiness flag. main() unshares CLONE_NEWNS
+ * *before* forking, so the parent shares the container's mount namespace and
+ * still sees every bind mount setup_volumes()/setup_secrets() created inside
+ * the rootfs. Without FTW_MOUNT the exit-time cleanup of the rootfs tmpdir
+ * walks straight through a live `-v /host/dir:/ctr` bind and deletes the
+ * user's host files. FTW_PHYS alone does not help: the mountpoint is a real
+ * directory, not a symlink.
+ *
+ * Callers that need the tmpdir to actually disappear should detach the mounts
+ * under it first (see unmount_tree_below()); anything still mounted is left
+ * in place, which leaks a directory but never destroys data outside it.
+ */
 static void rm_rf_dir(const char* path)
 {
-    nftw(path, rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+    /* FTW_MOUNT alone is not enough: it compares st_dev, and a bind mount of
+     * a directory from the same filesystem (the common `-v /tmp/x:/data`
+     * case) has an identical device number, so the walk descends right into
+     * it. Consult the mount table instead. */
+    s_rm_protect_n = collect_mounts_below(path, &s_rm_protect);
+    nftw(path, rm_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT);
+    free(s_rm_protect);
+    s_rm_protect = NULL;
+    s_rm_protect_n = 0;
 }
 
 /* ── VM backend ──────────────────────────────────────────────────────────── */

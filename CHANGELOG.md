@@ -15,6 +15,18 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **`-v` no longer deletes the host directory it mounted.** This was data loss
+  on an ordinary successful run: `./app -v ~/data:/data true` erased the
+  contents of `~/data`. `main()` unshares `CLONE_NEWNS` *before* forking, so
+  the parent shares the container's mount namespace and its exit-time cleanup
+  of the rootfs tmpdir walked straight through the still-live bind mount.
+  `FTW_PHYS` did not help — a mountpoint is a real directory, not a symlink —
+  and neither does `FTW_MOUNT` on its own, because a bind mount from the same
+  filesystem has an identical `st_dev`. Cleanup now detaches every mount under
+  the tmpdir first, and `rm_rf_dir()` consults `/proc/self/mountinfo` and
+  refuses to delete at or below any live mount point regardless of device.
+  The bug predates this release; any binary built before it is affected.
+
 - **`--seccomp-profile` refuses profiles it cannot represent.** The parser
   understands only a uniform allow/deny list of syscall names, but silently
   ignored everything that narrows *when* a rule applies — a profile permitting

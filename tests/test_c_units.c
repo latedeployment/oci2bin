@@ -6082,6 +6082,177 @@ static void test_parse_opts_overlay_persist_injection(void)
                   "overlay-persist: '..' still rejected");
 }
 
+/*
+ * A --seccomp-profile using constructs the parser does not implement must be
+ * refused, not silently applied as something broader. `args` is the sharp
+ * case: "allow ioctl only for request X" would otherwise become "allow
+ * ioctl".
+ */
+static void test_seccomp_profile_check_supported(void)
+{
+    const char* plain =
+        "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"syscalls\":["
+        "{\"names\":[\"read\",\"write\"],\"action\":\"SCMP_ACT_ALLOW\"}]}";
+    ASSERT_INT_EQ(seccomp_profile_check_supported(plain), 0,
+                  "seccomp: plain allow-list profile accepted");
+
+    const char* with_args =
+        "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"syscalls\":["
+        "{\"names\":[\"ioctl\"],\"action\":\"SCMP_ACT_ALLOW\","
+        "\"args\":[{\"index\":1,\"value\":21505,\"op\":\"SCMP_CMP_EQ\"}]}]}";
+    ASSERT_INT_EQ(seccomp_profile_check_supported(with_args), -1,
+                  "seccomp: profile with \"args\" rejected");
+
+    const char* with_includes =
+        "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"syscalls\":["
+        "{\"names\":[\"clone\"],\"action\":\"SCMP_ACT_ALLOW\","
+        "\"includes\":{\"caps\":[\"CAP_SYS_ADMIN\"]}}]}";
+    ASSERT_INT_EQ(seccomp_profile_check_supported(with_includes), -1,
+                  "seccomp: profile with \"includes\" rejected");
+
+    const char* with_excludes =
+        "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"syscalls\":["
+        "{\"names\":[\"clone\"],\"action\":\"SCMP_ACT_ALLOW\","
+        "\"excludes\":{\"arches\":[\"s390x\"]}}]}";
+    ASSERT_INT_EQ(seccomp_profile_check_supported(with_excludes), -1,
+                  "seccomp: profile with \"excludes\" rejected");
+
+    /* errnoRet only changes the reported errno, so it warns rather than
+     * failing — the permit/deny decision is unaffected. */
+    const char* with_errno =
+        "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"defaultErrnoRet\":1,"
+        "\"syscalls\":[{\"names\":[\"read\"],\"action\":\"SCMP_ACT_ALLOW\"}]}";
+    ASSERT_INT_EQ(seccomp_profile_check_supported(with_errno), 0,
+                  "seccomp: errnoRet warns but is accepted");
+
+    /* A bare substring that is not an object key must not trip the check. */
+    const char* substring_only =
+        "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"comment\":\"no args here\","
+        "\"syscalls\":[{\"names\":[\"read\"],\"action\":\"SCMP_ACT_ALLOW\"}]}";
+    ASSERT_INT_EQ(seccomp_profile_check_supported(substring_only), 0,
+                  "seccomp: 'args' inside a string value is not a key");
+
+    /* architectures must include the arch we are running on. */
+#ifdef __aarch64__
+    const char* self = "SCMP_ARCH_AARCH64";
+    const char* other = "SCMP_ARCH_X86_64";
+#else
+    const char* self = "SCMP_ARCH_X86_64";
+    const char* other = "SCMP_ARCH_AARCH64";
+#endif
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"architectures\":[\"%s\"],"
+             "\"syscalls\":[{\"names\":[\"read\"],"
+             "\"action\":\"SCMP_ACT_ALLOW\"}]}", self);
+    ASSERT_INT_EQ(seccomp_profile_check_supported(buf), 0,
+                  "seccomp: architectures listing our arch accepted");
+    snprintf(buf, sizeof(buf),
+             "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"architectures\":[\"%s\"],"
+             "\"syscalls\":[{\"names\":[\"read\"],"
+             "\"action\":\"SCMP_ACT_ALLOW\"}]}", other);
+    ASSERT_INT_EQ(seccomp_profile_check_supported(buf), -1,
+                  "seccomp: architectures excluding our arch rejected");
+}
+
+static void test_json_has_key(void)
+{
+    ASSERT_INT_EQ(json_has_key("{\"args\":[1]}", "args"), 1,
+                  "json_has_key: finds key followed by colon");
+    ASSERT_INT_EQ(json_has_key("{\"args\" : [1]}", "args"), 1,
+                  "json_has_key: tolerates space before colon");
+    ASSERT_INT_EQ(json_has_key("{\"note\":\"args\"}", "args"), 0,
+                  "json_has_key: ignores the word as a string value");
+    ASSERT_INT_EQ(json_has_key("{\"names\":[\"read\"]}", "args"), 0,
+                  "json_has_key: absent key returns 0");
+}
+
+/*
+ * Data-loss regression: rm_rf_dir() must not cross a mount point.
+ *
+ * The parent shares the container's mount namespace (main() unshares
+ * CLONE_NEWNS before forking), so at exit-time cleanup the -v bind mounts are
+ * still live inside the rootfs tmpdir. Without FTW_MOUNT the recursive delete
+ * followed the bind into the user's host directory and erased it — a plain
+ * `./app -v ~/data:/data true` destroyed ~/data.
+ *
+ * Runs in a throwaway user+mount namespace so it needs no privileges; if the
+ * kernel refuses the unshare the test reports a TAP skip rather than failing.
+ */
+static void test_rm_rf_dir_does_not_cross_mounts(void)
+{
+    char host_tmpl[] = "/tmp/oci2bin-rmrf-host-XXXXXX";
+    char cont_tmpl[] = "/tmp/oci2bin-rmrf-cont-XXXXXX";
+    char* host = mkdtemp(host_tmpl);
+    char* cont = mkdtemp(cont_tmpl);
+    ASSERT(host && cont, "rm_rf_dir/mount: mkdtemp host + container trees");
+    if (!host || !cont)
+    {
+        return;
+    }
+
+    char precious[320];
+    snprintf(precious, sizeof(precious), "%s/precious.txt", host);
+    int fd = open(precious, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT(fd >= 0, "rm_rf_dir/mount: create host file");
+    if (fd >= 0)
+    {
+        ASSERT_INT_EQ(write_all_fd(fd, "keep me", 7), 0,
+                      "rm_rf_dir/mount: write host file");
+        close(fd);
+    }
+
+    char mnt[320];
+    snprintf(mnt, sizeof(mnt), "%s/data", cont);
+    ASSERT_INT_EQ(mkdir(mnt, 0755), 0, "rm_rf_dir/mount: create mountpoint");
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "rm_rf_dir/mount: fork");
+    if (pid == 0)
+    {
+        /* Child: private namespaces, bind the host dir in, then rm -rf the
+         * container tree exactly as cleanup_oci_rootfs() would. */
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0)
+        {
+            _exit(42); /* namespaces unavailable -> skip */
+        }
+        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
+        {
+            _exit(42);
+        }
+        if (mount(host, mnt, NULL, MS_BIND, NULL) < 0)
+        {
+            _exit(42);
+        }
+        rm_rf_dir(cont);
+        _exit(0);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int skipped = (WIFEXITED(status) && WEXITSTATUS(status) == 42);
+
+    if (skipped)
+    {
+        tap_test_num++;
+        printf("ok %d - rm_rf_dir/mount: host file survives"
+               " # SKIP namespaces unavailable\n", tap_test_num);
+    }
+    else
+    {
+        struct stat st;
+        ASSERT_INT_EQ(lstat(precious, &st), 0,
+                      "rm_rf_dir/mount: host file survives rm_rf_dir");
+        ASSERT(st.st_size == 7,
+               "rm_rf_dir/mount: host file contents intact");
+    }
+
+    unlink(precious);
+    rmdir(host);
+    rmdir(mnt);
+    rmdir(cont);
+}
+
 static void test_credential_file_is_safe(void)
 {
     char tmpl[] = "/tmp/oci2bin-cred-test-XXXXXX";
@@ -6311,6 +6482,9 @@ int main(void)
     test_parse_opts_cdi();
     test_cdi_resolve();
     test_credstore_candidate_path();
+    test_rm_rf_dir_does_not_cross_mounts();
+    test_json_has_key();
+    test_seccomp_profile_check_supported();
     test_path_equals_normalized();
     test_parse_opts_overlay_persist_injection();
     test_credential_file_is_safe();
