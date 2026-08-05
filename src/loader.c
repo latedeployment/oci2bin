@@ -69,6 +69,13 @@
 #endif
 #endif
 
+/*
+ * Project version as reported by the loader (currently the MCP serverInfo).
+ * One of several places the version lives; `make check-version` asserts they
+ * all agree, so update them together.
+ */
+#define OCI2BIN_VERSION "0.17.0"
+
 #ifndef __NR_mseal
 #if defined(__x86_64__) || defined(__aarch64__)
 #define __NR_mseal 462
@@ -18612,7 +18619,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
         "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{"
         "\"protocolVersion\":\"2024-11-05\","
         "\"capabilities\":{\"tools\":{}},"
-        "\"serverInfo\":{\"name\":\"oci2bin\",\"version\":\"1.0\"}"
+        "\"serverInfo\":{\"name\":\"oci2bin\",\"version\":\"" OCI2BIN_VERSION "\"}"
         "}}\n";
     write_all_fd(STDOUT_FILENO, init_resp, strlen(init_resp));
 
@@ -18667,7 +18674,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
             const char* resp =
                 "{\"protocolVersion\":\"2024-11-05\","
                 "\"capabilities\":{\"tools\":{}},"
-                "\"serverInfo\":{\"name\":\"oci2bin\",\"version\":\"1.0\"}}";
+                "\"serverInfo\":{\"name\":\"oci2bin\",\"version\":\"" OCI2BIN_VERSION "\"}}";
             mcp_send_result(id, resp);
         }
         else if (strcmp(method, "notifications/initialized") == 0 ||

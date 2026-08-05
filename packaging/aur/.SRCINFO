@@ -1,6 +1,6 @@
 pkgbase = oci2bin
 	pkgdesc = Convert OCI/Docker images into self-contained ELF executables
-	pkgver = 0.1.0
+	pkgver = 0.17.0
 	pkgrel = 1
 	url = https://github.com/latedeployment/oci2bin
 	arch = x86_64

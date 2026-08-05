@@ -71,7 +71,7 @@ VMLINUX_OUT    = build/vmlinux
         test-unit-aarch64 test-integration test-integration-redis \
         test-integration-nginx test-integration-encrypt test-integration-live \
         test-integration-services \
-        test-c test-c-aarch64 test-c-stubs test-python test-shellcheck \
+        test-c test-c-aarch64 test-c-stubs test-python test-shellcheck check-version \
         test-all test-all-fuzz \
         test-vm-unit test-vm \
         lint lint-clang lint-semgrep lint-scan-build lint-shellcheck \
@@ -340,11 +340,18 @@ lint-shellcheck:
 
 test-shellcheck: lint-shellcheck
 
+# Fail if the project version has drifted apart across pyproject, the builder,
+# the loader and the distro packaging files.
+check-version:
+	@echo "=== version consistency ==="
+	$(TEST_ENV) python3 scripts/check_version.py
+
+
 # ── Test targets ──────────────────────────────────────────────────────────────
 
 test: test-unit test-integration
 
-test-unit: test-c test-c-stubs test-python test-shellcheck
+test-unit: test-c test-c-stubs test-python test-shellcheck check-version
 
 test-unit-aarch64: test-c-aarch64 test-python
 

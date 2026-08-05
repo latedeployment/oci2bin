@@ -15,6 +15,15 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **The project version is now consistent across all sources.** `pyproject.toml`
+  said `0.17.0`, the polyglot builder `0.14.0`, the RPM spec and AUR `PKGBUILD`
+  `0.9.0`, the AUR `.SRCINFO` `0.1.0`, the Nix flake `0.1.0`, and the MCP
+  `serverInfo` `1.0` — six different values, two of them inside the same AUR
+  package. All are now `0.17.0`, the loader carries a single `OCI2BIN_VERSION`
+  constant, and the new `make check-version` (wired into `make test-unit`)
+  fails the build if they drift apart again.
+
+
 - **`make test-python` runs every test module.** The target enumerated modules
   by hand and had fallen behind by five (`test_dockerfile_from_arch`,
   `test_encrypt`, `test_require_signed`, `test_service_matrix`,

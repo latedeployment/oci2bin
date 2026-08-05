@@ -1,5 +1,5 @@
 Name:           oci2bin
-Version:        0.9.0
+Version:        0.17.0
 Release:        1%{?dist}
 Summary:        Convert OCI/Docker images into self-contained ELF executables
 
