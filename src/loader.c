@@ -12973,16 +12973,20 @@ static void usage(const char* prog)
     fprintf(stderr,
             "Usage: %s [OPTIONS] [-- CMD [ARGS...]]\n"
             "       %s [OPTIONS] CMD [ARGS...]\n"
-            "       %s mcp-serve [--allow-net]\n"
+            "       %s mcp-serve [--allow-net] [--allow-mount PATH]\n"
             "\n"
             "Subcommands:\n"
-            "  mcp-serve [--allow-net]\n"
+            "  mcp-serve [--allow-net] [--allow-mount PATH]\n"
+            "            [--allow-mount-rw PATH]\n"
             "                      Start a JSON-RPC 2.0 MCP server on stdin/stdout.\n"
             "                      Exposes tools: run_container, exec_in_container,\n"
             "                      list_containers, stop_container, inspect_image,\n"
             "                      get_logs. Network is forced to 'none' unless\n"
             "                      --allow-net is passed here AND the caller requests\n"
             "                      net=host. No --device exposure through MCP.\n"
+            "                      Host mounts are denied unless a root is allowed\n"
+            "                      with --allow-mount (read-only) or\n"
+            "                      --allow-mount-rw; both may be repeated.\n"
             "\n"
             "Options:\n"
             "  -v HOST:CONTAINER[:ro|:rw]\n"
@@ -17975,6 +17979,56 @@ struct mcp_ctr
 static struct mcp_ctr g_mcp_ctrs[MCP_MAX_CONTAINERS];
 static int            g_mcp_n_ctrs;
 
+/*
+ * Host-mount policy for the MCP server.
+ *
+ * An MCP session is driven by whatever is on the other end of the pipe,
+ * typically a model. Validating that a volume spec is a well-formed absolute
+ * path says nothing about whether the caller should be allowed to mount it,
+ * and the old code accepted any path read-write — `/etc`, `$HOME`, `/` — so a
+ * single run_container request could hand out the whole host filesystem.
+ *
+ * Default is therefore deny-everything; the operator opts in per root with
+ * --allow-mount (read-only) or --allow-mount-rw. Mirrors how --allow-net
+ * already gates the one other host-reaching capability.
+ */
+#define MCP_MAX_MOUNT_ROOTS 16
+
+struct mcp_mount_root
+{
+    char path[PATH_MAX];
+    int  writable;
+};
+
+static struct mcp_mount_root g_mcp_mount_roots[MCP_MAX_MOUNT_ROOTS];
+static int                   g_mcp_n_mount_roots;
+
+/*
+ * Is 'host_path' inside an allowed root? Returns the root, or NULL.
+ * Matches on path components so /srv/dataset is not treated as being under
+ * an allowed /srv/data.
+ */
+static const struct mcp_mount_root* mcp_mount_root_for(const char* host_path)
+{
+    for (int i = 0; i < g_mcp_n_mount_roots; i++)
+    {
+        const char* root = g_mcp_mount_roots[i].path;
+        size_t len = strlen(root);
+        if (strncmp(host_path, root, len) != 0)
+        {
+            continue;
+        }
+        /* Exact match, or the next char starts a new component. A root of
+         * "/" matches everything below it. */
+        if (host_path[len] == '\0' || host_path[len] == '/' ||
+                (len == 1 && root[0] == '/'))
+        {
+            return &g_mcp_mount_roots[i];
+        }
+    }
+    return NULL;
+}
+
 /* Validate an MCP container name: alphanumeric, '-', '_', '.' only */
 static int mcp_name_valid(const char* s)
 {
@@ -18252,17 +18306,55 @@ static void mcp_tool_run_container(long id, const char* args_json,
                 {
                     ok = 1;
                 }
+                if (ok)
+                {
+                    /* Shape is fine; now the policy question. */
+                    const struct mcp_mount_root* root =
+                        mcp_mount_root_for(host_part);
+                    if (!root)
+                    {
+                        ok = -1; /* not under any allowed root */
+                    }
+                    else if (!root->writable && ctr_end &&
+                             strcmp(ctr_end + 1, "rw") == 0)
+                    {
+                        ok = -2; /* rw asked for on a read-only root */
+                    }
+                }
                 *colon = ':'; /* restore for argv */
             }
-            if (!ok)
+            if (ok != 1)
             {
-                fprintf(stderr,
-                        "oci2bin: MCP: rejecting invalid volume spec: %s\n",
-                        vol_strs[i]);
-                mcp_send_error(id, -32602,
-                               "run_container: invalid volume spec"
-                               " (expected HOST:CONTAINER[:ro|:rw],"
-                               " both absolute and clean)");
+                if (ok == -1)
+                {
+                    fprintf(stderr,
+                            "oci2bin: MCP: host path not under an allowed"
+                            " mount root: %s\n", vol_strs[i]);
+                    mcp_send_error(id, -32602,
+                                   "run_container: host path is not under an"
+                                   " allowed mount root (start mcp-serve with"
+                                   " --allow-mount PATH)");
+                }
+                else if (ok == -2)
+                {
+                    fprintf(stderr,
+                            "oci2bin: MCP: read-write mount refused: %s\n",
+                            vol_strs[i]);
+                    mcp_send_error(id, -32602,
+                                   "run_container: read-write mount refused;"
+                                   " this root was allowed read-only"
+                                   " (use --allow-mount-rw to permit writes)");
+                }
+                else
+                {
+                    fprintf(stderr,
+                            "oci2bin: MCP: rejecting invalid volume spec: %s\n",
+                            vol_strs[i]);
+                    mcp_send_error(id, -32602,
+                                   "run_container: invalid volume spec"
+                                   " (expected HOST:CONTAINER[:ro|:rw],"
+                                   " both absolute and clean)");
+                }
                 goto cleanup_env;
             }
         }
@@ -18283,11 +18375,28 @@ static void mcp_tool_run_container(long id, const char* args_json,
         ctr_argv[ai++] = "-e";
         ctr_argv[ai++] = env_strs[i];
     }
+    /* Mounts are read-only unless the caller said :rw (and the root allowed
+     * it, checked during validation). A spec with no suffix gets :ro rather
+     * than inheriting the CLI's read-write default — an MCP caller should
+     * have to ask for write access explicitly. */
+    char vol_ro_bufs[MCP_VOL_MAX][PATH_MAX];
     for (int i = 0; i < n_vol &&
             ai < (int)(sizeof(ctr_argv) / sizeof(ctr_argv[0])) - 3; i++)
     {
+        const char* spec = vol_strs[i];
+        const char* first = strchr(spec, ':');
+        const char* second = first ? strchr(first + 1, ':') : NULL;
+        if (!second)
+        {
+            int n = snprintf(vol_ro_bufs[i], sizeof(vol_ro_bufs[i]),
+                             "%s:ro", spec);
+            if (n > 0 && (size_t)n < sizeof(vol_ro_bufs[i]))
+            {
+                spec = vol_ro_bufs[i];
+            }
+        }
         ctr_argv[ai++] = "-v";
-        ctr_argv[ai++] = vol_strs[i];
+        ctr_argv[ai++] = (char*)spec;
     }
     ctr_argv[ai] = NULL;
 
@@ -19418,6 +19527,57 @@ int main(int argc, char* argv[])
             if (strcmp(argv[i], "--allow-net") == 0)
             {
                 allow_net = 1;
+            }
+            else if (strcmp(argv[i], "--allow-mount") == 0 ||
+                     strcmp(argv[i], "--allow-mount-rw") == 0)
+            {
+                int writable = (strcmp(argv[i], "--allow-mount-rw") == 0);
+                if (i + 1 >= argc)
+                {
+                    fprintf(stderr,
+                            "oci2bin: mcp-serve: %s requires a PATH\n",
+                            argv[i]);
+                    return 1;
+                }
+                i++;
+                if (!path_is_absolute_and_clean(argv[i]))
+                {
+                    fprintf(stderr,
+                            "oci2bin: mcp-serve: mount root must be absolute"
+                            " and clean: %s\n", argv[i]);
+                    return 1;
+                }
+                if (g_mcp_n_mount_roots >= MCP_MAX_MOUNT_ROOTS)
+                {
+                    fprintf(stderr,
+                            "oci2bin: mcp-serve: too many mount roots"
+                            " (max %d)\n", MCP_MAX_MOUNT_ROOTS);
+                    return 1;
+                }
+                struct mcp_mount_root* r =
+                        &g_mcp_mount_roots[g_mcp_n_mount_roots];
+                int n = snprintf(r->path, sizeof(r->path), "%s", argv[i]);
+                if (n < 0 || (size_t)n >= sizeof(r->path))
+                {
+                    fprintf(stderr,
+                            "oci2bin: mcp-serve: mount root too long\n");
+                    return 1;
+                }
+                /* Trim a trailing slash so /srv/data/ and /srv/data behave
+                 * the same in mcp_mount_root_for(). */
+                size_t rl = strlen(r->path);
+                while (rl > 1 && r->path[rl - 1] == '/')
+                {
+                    r->path[--rl] = '\0';
+                }
+                r->writable = writable;
+                g_mcp_n_mount_roots++;
+            }
+            else
+            {
+                fprintf(stderr,
+                        "oci2bin: mcp-serve: unknown option: %s\n", argv[i]);
+                return 1;
             }
         }
         return mcp_serve_main(self_path, allow_net);

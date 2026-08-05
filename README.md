@@ -3031,7 +3031,7 @@ When subordinate-ID remapping is unavailable, oci2bin falls back to a single-ID 
 `oci2bin` binaries expose a [Model Context Protocol](https://modelcontextprotocol.io/) server for AI tools via the `mcp-serve` subcommand:
 
 ```bash
-./my-app mcp-serve [--allow-net]
+./my-app mcp-serve [--allow-net] [--allow-mount PATH] [--allow-mount-rw PATH]
 ```
 
 The server reads newline-delimited JSON-RPC 2.0 requests from stdin and writes responses to stdout. It exposes six tools:
@@ -3048,9 +3048,13 @@ The server reads newline-delimited JSON-RPC 2.0 requests from stdin and writes r
 **Security defaults enforced in MCP mode:**
 
 - Network is forced to `--net none` unless `--allow-net` was passed to `mcp-serve` **and** the caller explicitly requests `net="host"`.
+- **Host mounts are denied by default.** A `volumes` entry is rejected unless its host path lies under a root the operator allowed with `--allow-mount PATH` (read-only) or `--allow-mount-rw PATH`. Both may be repeated (max 16). Without either flag no host path can be mounted at all.
+- **Mounts are read-only unless asked otherwise.** A spec with no `:ro`/`:rw` suffix is mounted read-only, and `:rw` is refused on a root allowed with `--allow-mount`. This inverts the CLI's `-v` default: an MCP caller has to ask for write access explicitly, and the operator has to have granted it.
 - `--device` flags are never exposed through MCP.
 - Container names are validated: only `[a-zA-Z0-9._-]` characters allowed.
 - Image paths must be absolute and clean (no `..` components).
+
+Remember that the other end of an MCP session is typically a model. Grant the narrowest root that works — `--allow-mount /srv/dataset`, not `--allow-mount /`.
 
 **Inspect support:**
 

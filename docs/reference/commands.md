@@ -163,7 +163,7 @@ oci2bin checkpoint NAME
 oci2bin restore NAME
 oci2bin top [--once] [--interval SEC]
 oci2bin doctor [--json]
-oci2bin mcp-serve [--allow-net]
+oci2bin mcp-serve [--allow-net] [--allow-mount PATH] [--allow-mount-rw PATH]
 ```
 
 ## Signing Commands
@@ -196,7 +196,9 @@ file's `name:`, default `stack`) with an optional service, and `-f` there means
 
 `mcp-serve` starts a stdio JSON-RPC MCP server. It keeps networking disabled by
 default; `--allow-net` only permits host networking when the MCP caller also
-requests it.
+requests it. Host mounts are denied outright unless a root is allowed with
+`--allow-mount` (read-only) or `--allow-mount-rw`; mounts with no explicit
+suffix are read-only, and `:rw` is refused on a read-only root.
 
 ## Build Without Docker
 

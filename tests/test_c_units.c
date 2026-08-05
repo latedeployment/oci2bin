@@ -6253,6 +6253,60 @@ static void test_rm_rf_dir_does_not_cross_mounts(void)
     rmdir(cont);
 }
 
+/*
+ * MCP host-mount policy. The server is driven by whatever is on the other end
+ * of the pipe, so "is this a well-formed absolute path" is not the same
+ * question as "may this be mounted".
+ */
+static void test_mcp_mount_root_policy(void)
+{
+    g_mcp_n_mount_roots = 0;
+
+    /* Default is deny-everything. */
+    ASSERT_NULL(mcp_mount_root_for("/etc"),
+                "mcp mounts: nothing allowed by default");
+    ASSERT_NULL(mcp_mount_root_for("/srv/data"),
+                "mcp mounts: arbitrary path denied by default");
+
+    snprintf(g_mcp_mount_roots[0].path, sizeof(g_mcp_mount_roots[0].path),
+             "%s", "/srv/data");
+    g_mcp_mount_roots[0].writable = 0;
+    g_mcp_n_mount_roots = 1;
+
+    ASSERT_NOT_NULL(mcp_mount_root_for("/srv/data"),
+                    "mcp mounts: the root itself is allowed");
+    ASSERT_NOT_NULL(mcp_mount_root_for("/srv/data/sub/file"),
+                    "mcp mounts: path under the root is allowed");
+    ASSERT_NULL(mcp_mount_root_for("/srv"),
+                "mcp mounts: parent of the root is denied");
+    ASSERT_NULL(mcp_mount_root_for("/etc"),
+                "mcp mounts: unrelated path is denied");
+    /* The prefix trap: /srv/dataset must not match a /srv/data root. */
+    ASSERT_NULL(mcp_mount_root_for("/srv/dataset"),
+                "mcp mounts: sibling sharing a prefix is denied");
+    ASSERT_NULL(mcp_mount_root_for("/srv/data-other"),
+                "mcp mounts: prefix with '-' suffix is denied");
+
+    const struct mcp_mount_root* r = mcp_mount_root_for("/srv/data/x");
+    ASSERT(r && r->writable == 0,
+           "mcp mounts: allowed root is read-only unless marked writable");
+
+    g_mcp_mount_roots[0].writable = 1;
+    r = mcp_mount_root_for("/srv/data/x");
+    ASSERT(r && r->writable == 1,
+           "mcp mounts: writable root reports writable");
+
+    /* A root of "/" opens everything — allowed, but only if asked for. */
+    g_mcp_n_mount_roots = 1;
+    snprintf(g_mcp_mount_roots[0].path, sizeof(g_mcp_mount_roots[0].path),
+             "%s", "/");
+    g_mcp_mount_roots[0].writable = 0;
+    ASSERT_NOT_NULL(mcp_mount_root_for("/anything/at/all"),
+                    "mcp mounts: root of '/' matches any path");
+
+    g_mcp_n_mount_roots = 0;
+}
+
 static void test_credential_file_is_safe(void)
 {
     char tmpl[] = "/tmp/oci2bin-cred-test-XXXXXX";
@@ -6482,6 +6536,7 @@ int main(void)
     test_parse_opts_cdi();
     test_cdi_resolve();
     test_credstore_candidate_path();
+    test_mcp_mount_root_policy();
     test_rm_rf_dir_does_not_cross_mounts();
     test_json_has_key();
     test_seccomp_profile_check_supported();

@@ -6,6 +6,10 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`mcp-serve --allow-mount PATH` / `--allow-mount-rw PATH`** — an explicit
+  allowlist of host directories the MCP server may bind into containers. Both
+  are repeatable (max 16 roots).
+
 - **`-v HOST:CONTAINER:ro`** — an optional `:ro`/`:rw` suffix on `-v` remounts
   the bind mount read-only (`:rw` is the default). The runtime CLI parser and
   the MCP volume validator now agree on the same syntax.
@@ -176,6 +180,16 @@ All notable changes to oci2bin are documented here.
   are capped at 4 MiB, matching plain-file secrets.
 
 ### Changed
+
+- **MCP host mounts are now denied by default and read-only when allowed.**
+  The server validated that a `volumes` entry was a well-formed absolute path
+  but applied no policy, so any MCP caller — typically a model — could mount
+  any host path, read-write: `/etc`, `$HOME`, `/`. A volume is now rejected
+  unless its host path is under a root the operator allowed with
+  `--allow-mount`/`--allow-mount-rw`, a spec with no suffix is mounted `:ro`
+  rather than inheriting the CLI's read-write default, and `:rw` on a
+  read-only root is refused. Prefix matching is component-aware, so a root of
+  `/srv/data` does not admit `/srv/dataset`.
 
 - **`--read-only` now makes the image root genuinely read-only.** The old
   writable throwaway-overlay behavior is available explicitly as

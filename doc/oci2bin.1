@@ -780,8 +780,18 @@ Bring a declarative stack of binaries up and down (see the documentation for
 the stack-file format).
 .
 .TP
-.B oci2bin mcp\-serve \fR[\fB\-\-allow\-net\fR]
+.B oci2bin mcp\-serve \fR[\fB\-\-allow\-net\fR] [\fB\-\-allow\-mount \fIPATH\fR] [\fB\-\-allow\-mount\-rw \fIPATH\fR]
 Serve the Model Context Protocol interface for AI-agent integration.
+Host mounts requested over MCP are denied unless their host path lies under a
+root allowed with
+.B \-\-allow\-mount
+(read-only) or
+.BR \-\-allow\-mount\-rw ,
+each repeatable up to 16 times. A mount with no explicit
+.BR :ro / :rw
+suffix is made read-only, and
+.B :rw
+is refused on a read-only root.
 .
 .TP
 .B oci2bin from\-chroot \fIDIR\fR \fR[\fB\-o \fIOUT\fR] [\fB\-\-entrypoint \fICMD\fR] ...

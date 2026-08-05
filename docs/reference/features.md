@@ -226,6 +226,7 @@ This page is a checklist of the feature surface documented by the site.
 | Host capability checks (build host) | `oci2bin doctor`, `oci2bin doctor --json` |
 | Host capability checks (runtime host) | `./app.bin --doctor` |
 | MCP server | `oci2bin mcp-serve` |
+| MCP host-mount allowlist (deny by default) | `mcp-serve --allow-mount PATH` / `--allow-mount-rw PATH` |
 | Prometheus metrics socket | `--metrics-socket PATH` |
 | Notifications | `--notify ntfy://...`, `gotify://`, `discord://`, `slack://`, `https://` |
 | Notification label | `--notify-name NAME` |
