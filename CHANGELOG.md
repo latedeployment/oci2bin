@@ -15,6 +15,19 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **`--seccomp-profile` refuses profiles it cannot represent.** The parser
+  understands only a uniform allow/deny list of syscall names, but silently
+  ignored everything that narrows *when* a rule applies — a profile permitting
+  `ioctl` only for specific request codes was applied as "permit `ioctl`",
+  with no warning that the restriction had been dropped. Profiles using
+  `args`, `includes` or `excludes` are now rejected, as are profiles whose
+  `architectures` list excludes the running architecture. `errnoRet` warns
+  instead of failing, since it changes only the reported errno.
+  Two silent fail-open paths are closed as well: an unrecognised syscall name
+  in a deny list (which could not be blocked) is now an error rather than a
+  skipped entry, and a profile listing more syscalls than the loader's table
+  holds is rejected instead of being applied truncated.
+
 - **`oci2bin diff` compares file contents, not just sizes.** Regular files were
   compared by length alone, so two files of identical size but different bytes
   were reported as unchanged — the module docstring already claimed a

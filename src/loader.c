@@ -10906,6 +10906,105 @@ static char** json_parse_names_array(const char* json, const char* key,
 }
 
 /*
+ * Does 'json' contain the key "<key>" used as an object key (i.e. followed by
+ * a colon)?  Deliberately as simple as the rest of this parser — it exists to
+ * detect constructs we must refuse, so a false positive costs a rejected
+ * profile (safe) rather than a silently weakened filter (not safe).
+ */
+static int json_has_key(const char* json, const char* key)
+{
+    char needle[64];
+    int n = snprintf(needle, sizeof(needle), "\"%s\"", key);
+    if (n < 0 || (size_t)n >= sizeof(needle))
+    {
+        return 0;
+    }
+    const char* p = json;
+    while ((p = strstr(p, needle)) != NULL)
+    {
+        const char* q = p + n;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')
+        {
+            q++;
+        }
+        if (*q == ':')
+        {
+            return 1;
+        }
+        p += n;
+    }
+    return 0;
+}
+
+/*
+ * Refuse profiles that use OCI seccomp features this parser does not
+ * implement.
+ *
+ * The parser understands exactly one thing: a uniform allow- or deny-list of
+ * syscall names. Everything below narrows *when* a rule applies, so silently
+ * ignoring it yields a filter broader than what the author wrote — a profile
+ * that permits ioctl only for specific request codes would be applied as
+ * "permit ioctl", with no indication anything was dropped. Failing the run is
+ * the honest outcome.
+ *
+ * errnoRet is deliberately only a warning: it changes which errno a blocked
+ * call reports, not whether the call is permitted.
+ *
+ * Returns 0 if the profile is representable, -1 otherwise.
+ */
+static int seccomp_profile_check_supported(const char* json)
+{
+    static const char* const unsupported[] =
+    {
+        "args",     /* per-argument filters */
+        "includes", /* conditional application (arches/caps/minKernel) */
+        "excludes",
+    };
+    for (size_t i = 0;
+            i < sizeof(unsupported) / sizeof(unsupported[0]); i++)
+    {
+        if (json_has_key(json, unsupported[i]))
+        {
+            fprintf(stderr,
+                    "oci2bin: --seccomp-profile: profile uses \"%s\", which"
+                    " this loader does not implement.\n"
+                    "oci2bin: applying it would produce a filter weaker than"
+                    " the profile describes, so the run is aborted rather"
+                    " than silently ignoring it.\n",
+                    unsupported[i]);
+            return -1;
+        }
+    }
+
+    if (json_has_key(json, "errnoRet") || json_has_key(json, "defaultErrnoRet"))
+    {
+        fprintf(stderr,
+                "oci2bin: --seccomp-profile: warning: errnoRet is ignored;"
+                " blocked syscalls report the built-in errno. Whether a call"
+                " is permitted is unaffected.\n");
+    }
+
+    /* Top-level "architectures" lists the arches the profile was written for.
+     * If ours is not among them the rules were never meant to apply here. */
+    if (json_has_key(json, "architectures"))
+    {
+#ifdef __aarch64__
+        const char* self_arch = "SCMP_ARCH_AARCH64";
+#else
+        const char* self_arch = "SCMP_ARCH_X86_64";
+#endif
+        if (!strstr(json, self_arch))
+        {
+            fprintf(stderr,
+                    "oci2bin: --seccomp-profile: profile declares"
+                    " \"architectures\" that do not include %s\n", self_arch);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
  * Apply a Docker-compatible JSON seccomp profile.
  * Returns 0 on success, -1 on error.
  */
@@ -10923,6 +11022,12 @@ static int apply_seccomp_profile(const char* profile_path)
     {
         fprintf(stderr, "oci2bin: --seccomp-profile: cannot read '%s': %s\n",
                 profile_path, strerror(errno));
+        return -1;
+    }
+
+    if (seccomp_profile_check_supported(json) < 0)
+    {
+        free(json);
         return -1;
     }
 
@@ -10945,6 +11050,8 @@ static int apply_seccomp_profile(const char* profile_path)
     int n_listed = 0;
     int listed_is_allow = -1; /* -1 = unset; 0 = deny; 1 = allow */
     int mixed_actions   = 0;  /* set if profile has conflicting entry actions */
+    int overflowed      = 0;  /* set if the profile lists more than we can hold */
+    char unknown_name[64] = {0}; /* first syscall name we could not resolve */
 
     /* Find each "syscalls" entry object and collect names+action */
     const char* p = json;
@@ -11002,12 +11109,25 @@ static int apply_seccomp_profile(const char* profile_path)
         {
             for (int ni = 0; ni < n_names; ni++)
             {
-                if (n_listed < 256)
+                if (!overflowed && n_listed >= (int)(sizeof(listed_nrs) /
+                                                     sizeof(listed_nrs[0])))
+                {
+                    /* Dropping entries here silently would matter most in the
+                     * case we can least afford: on a denylist, every name past
+                     * the cap would simply stay permitted. */
+                    overflowed = 1;
+                }
+                if (!overflowed)
                 {
                     int nr = syscall_name_to_nr(names[ni]);
                     if (nr >= 0)
                     {
                         listed_nrs[n_listed++] = nr;
+                    }
+                    else if (!unknown_name[0])
+                    {
+                        snprintf(unknown_name, sizeof(unknown_name), "%s",
+                                 names[ni]);
                     }
                 }
                 free(names[ni]);
@@ -11016,6 +11136,37 @@ static int apply_seccomp_profile(const char* profile_path)
         }
 
         p++;
+    }
+
+    if (overflowed)
+    {
+        fprintf(stderr,
+                "oci2bin: --seccomp-profile: profile lists more than %d"
+                " syscalls, which exceeds this loader's limit; refusing to"
+                " apply a truncated filter\n",
+                (int)(sizeof(listed_nrs) / sizeof(listed_nrs[0])));
+        free(json);
+        return -1;
+    }
+
+    /* An unrecognised name on a denylist means we would not block something
+     * the profile says to block — fail closed. On an allowlist the syscall
+     * simply stays denied, which is the safe direction, so warn only. */
+    if (unknown_name[0])
+    {
+        if (default_is_allow)
+        {
+            fprintf(stderr,
+                    "oci2bin: --seccomp-profile: unknown syscall '%s' in a"
+                    " deny list; this loader cannot block it, so the profile"
+                    " would be weaker than written\n", unknown_name);
+            free(json);
+            return -1;
+        }
+        fprintf(stderr,
+                "oci2bin: --seccomp-profile: warning: unknown syscall '%s'"
+                " is not in this loader's table; it stays denied\n",
+                unknown_name);
     }
 
     if (listed_is_allow == -1)
