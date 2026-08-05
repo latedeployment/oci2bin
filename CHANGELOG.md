@@ -23,6 +23,15 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **Image descriptors are cross-checked before extraction.** Nothing verified
+  that the embedded payload belonged to this loader, so an image built for a
+  different architecture, or a manifest whose layer count disagreed with the
+  config's `rootfs.diff_ids`, was unpacked in full and only surfaced later as a
+  confusing exec failure. The architecture, `os` and layer count are now
+  validated up front and a mismatch aborts before a single layer is written.
+  (This is descriptor consistency only — layer content digests are still not
+  verified; `--pin-digest` remains the way to detect payload tampering.)
+
 - **The sanitizer leak baseline is clean.** ASan reported 16 leaks totalling
   140 bytes, in the CDI and health-check paths. `devices[]`, `env_vars[]` and
   `vol_*[]` hold a mix of plain argv pointers and `strdup()`ed copies

@@ -6007,6 +6007,105 @@ static int extract_embedded_oci_layout(const char* self_path,
 }
 
 /*
+ * Cross-check the image descriptors before a single layer is unpacked.
+ *
+ * Nothing verified that the payload actually belongs to this loader: an
+ * arm64 image inside an x86_64 binary, or a manifest listing a different
+ * number of layers than the config's rootfs.diff_ids, was extracted happily
+ * and only surfaced later as a confusing exec failure.
+ *
+ * This is descriptor consistency only — it does not hash the layers. See the
+ * note in extract_oci_rootfs() about digest verification.
+ *
+ * Returns 0 when consistent, -1 otherwise (caller aborts).
+ */
+static int verify_oci_descriptors(const char* oci_dir,
+                                  const char* config_path_rel,
+                                  int nlayers)
+{
+    int dir_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0)
+    {
+        perror("oci2bin: open OCI layout for descriptor check");
+        return -1;
+    }
+    size_t cfg_size = 0;
+    char* config = read_file_beneath(dir_fd, config_path_rel, &cfg_size);
+    close(dir_fd);
+    if (!config)
+    {
+        fprintf(stderr,
+                "oci2bin: cannot read image config '%s' for verification\n",
+                safe_str(config_path_rel));
+        return -1;
+    }
+
+    int rc = 0;
+
+    /* Architecture: the loader is compiled for one. OCI uses GOARCH names;
+     * accept the uname spellings too since some tooling emits those. */
+#ifdef __aarch64__
+    const char* want_a = "arm64";
+    const char* want_b = "aarch64";
+#else
+    const char* want_a = "amd64";
+    const char* want_b = "x86_64";
+#endif
+    char* arch = json_get_string(config, "architecture");
+    if (arch && strcmp(arch, want_a) != 0 && strcmp(arch, want_b) != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: image architecture '%s' does not match this"
+                " binary (%s); refusing to extract\n", arch, want_a);
+        rc = -1;
+    }
+    free(arch);
+
+    char* os_str = json_get_string(config, "os");
+    if (rc == 0 && os_str && strcmp(os_str, "linux") != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: image os '%s' is not linux; refusing to extract\n",
+                os_str);
+        rc = -1;
+    }
+    free(os_str);
+
+    /* Layer count must agree between manifest and config. */
+    if (rc == 0)
+    {
+        char* rootfs_obj = json_get_object(config, "rootfs");
+        if (rootfs_obj)
+        {
+            char* diff_ids = json_get_array(rootfs_obj, "diff_ids");
+            if (diff_ids)
+            {
+                char* ids[MAX_LAYERS];
+                int n_ids = json_parse_string_array(diff_ids, ids,
+                                                    MAX_LAYERS);
+                for (int i = 0; i < n_ids; i++)
+                {
+                    free(ids[i]);
+                }
+                if (n_ids > 0 && n_ids != nlayers)
+                {
+                    fprintf(stderr,
+                            "oci2bin: manifest lists %d layer(s) but the"
+                            " config declares %d diff_id(s); refusing to"
+                            " extract\n", nlayers, n_ids);
+                    rc = -1;
+                }
+                free(diff_ids);
+            }
+            free(rootfs_obj);
+        }
+    }
+
+    free(config);
+    return rc;
+}
+
+/*
  * Extract the OCI tar data from ourselves into a temp directory,
  * then parse manifest.json and extract layers into a rootfs.
  *
@@ -6094,6 +6193,18 @@ static char* extract_oci_rootfs(const char* self_path)
     }
     debug_log("extract.manifest", "config=%s layers=%d",
               safe_str(config_path_rel), nlayers);
+
+    if (verify_oci_descriptors(oci_dir, config_path_rel, nlayers) < 0)
+    {
+        free(config_path_rel);
+        free(layers_json);
+        free(manifest);
+        for (int i = 0; i < nlayers; i++)
+        {
+            free(layers[i]);
+        }
+        return NULL;
+    }
 
     int layer_failed = 0;
     oci_dir_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -8900,7 +9011,10 @@ static void health_resolve(const struct container_opts* opts,
  * Release the argv health_resolve() built. Every entry is heap-owned (either
  * strdup()'d here or taken over from the parsed JSON array), so this is
  * unambiguous. Safe to call twice.
+ *
+ * Unused in the product build for the same reason as free_owned_opts().
  */
+__attribute__((unused))
 static void free_health_state(struct health_state* hs)
 {
     for (int i = 0; i < MAX_HEALTH_ARGS && hs->argv[i]; i++)
@@ -13436,7 +13550,14 @@ static char* opts_own(struct container_opts* opts, char* p)
     return p;
 }
 
-/* Release every heap string recorded by opts_own(). Safe to call twice. */
+/*
+ * Release every heap string recorded by opts_own(). Safe to call twice.
+ *
+ * Unused in the product build — a real run execs the workload and the OS
+ * reclaims everything — but kept so the lifetime is expressible and the
+ * sanitizer baseline can stay clean. See `make test-asan`.
+ */
+__attribute__((unused))
 static void free_owned_opts(struct container_opts* opts)
 {
     for (int i = 0; i < opts->n_owned; i++)
