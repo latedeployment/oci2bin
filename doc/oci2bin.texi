@@ -168,7 +168,10 @@ Override entrypoint, workdir, environment.
 @item -v H:C / --tmpfs P / --read-only / --overlay-persist DIR
 Bind mounts, tmpfs, read-only rootfs, persistent overlay upper layer.
 @item --secret H[:C] / --secret tpm2:NAME / --ssh-agent
-File secrets (memfd_secret-backed), TPM2-sealed secrets, SSH-agent forwarding.
+File secrets (read-only bind mounts), sealed systemd credentials, SSH-agent
+forwarding.  @code{tpm2:NAME} reads the sealed blob from the system credential
+stores (@file{/etc/credstore.encrypted} and friends), needs root and
+@command{systemd-creds}, and is rejected together with @option{--vm}.
 @item --device /dev/H[:C] / --gpus all|N|CDI / --cdi-device KIND=DEV / --no-host-dev
 Expose device nodes, GPUs/CDI devices, or skip the host /dev nodes.
 @item --net host|none|slirp|pasta|container:PID / -p H:C / --allow-egress H:P

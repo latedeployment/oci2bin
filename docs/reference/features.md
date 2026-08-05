@@ -86,7 +86,7 @@ This page is a checklist of the feature surface documented by the site.
 | --- | --- |
 | Bind mount | `-v HOST:CONTAINER[:ro\|:rw]` |
 | Runtime secret file | `--secret HOST[:CONTAINER]` |
-| TPM2-sealed secret | `--secret tpm2:NAME[:CONTAINER]` |
+| TPM2-sealed secret (root; from credstore) | `--secret tpm2:NAME[:CONTAINER]` |
 | SSH agent forwarding | `--ssh-agent` |
 | tmpfs mount | `--tmpfs PATH` |
 | Read-only rootfs | `--read-only` |
@@ -167,7 +167,7 @@ This page is a checklist of the feature surface documented by the site.
 | Runtime age identity | `OCI2BIN_IDENTITY=FILE ./app.bin` |
 | Runtime password | `OCI2BIN_PASSWORD=... ./app.bin` |
 | Runtime password file | `OCI2BIN_PASSWORD_FILE=FILE ./app.bin` |
-| Kernel-protected secret memory | automatic with `memfd_secret` where available |
+| Memory-backed secret staging (ramfs, never swapped) | automatic for `--secret tpm2:` |
 | Show embedded attestation | `oci2bin attest-show --in app.bin` |
 | Verify recorded source-image attestation | `oci2bin attest verify --in app.bin [--recheck]` |
 

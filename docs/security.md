@@ -141,14 +141,24 @@ Use runtime secrets instead of baking sensitive values into the image:
 ./app.bin --secret /etc/ssl/private/key.pem:/run/secrets/tls_key
 ```
 
-TPM2-sealed credentials:
+TPM2-sealed credentials, read from the root-owned system credential stores
+(`/etc/credstore.encrypted` and friends) and decrypted with `systemd-creds`:
 
 ```bash
-./app.bin --secret tpm2:dbpass:/run/secrets/db_password
+sudo ./app.bin --secret tpm2:dbpass:/run/secrets/db_password
 ```
 
-On Linux kernels with `memfd_secret`, `oci2bin` can keep secret material out of
-page cache and swap where that path is available.
+Decryption needs root (`/var/lib/systemd/credential.secret` and `/dev/tpmrm0`
+are root-only), so this does not work in a rootless run. The credential file
+must be a regular file that is not group- or world-writable — `systemd-creds`
+will decrypt a host-key or `--with-key=null` blob just as readily as a
+TPM2-sealed one, so guarding write access to the store is what makes the
+`tpm2:` prefix meaningful. `--secret` is rejected with `--vm`.
+
+Secrets that exist only in memory (TPM2) are staged on a private `ramfs`
+mount, bind-mounted read-only at their destination, and the staging name is
+unlinked — the plaintext never reaches disk-backed storage or swap. Plain-file
+secrets are read-only bind mounts of the host file.
 
 ## Encrypted Payloads
 

@@ -165,10 +165,15 @@ Custom destination:
 ./app.bin --secret /etc/ssl/private/key.pem:/run/secrets/tls_key
 ```
 
-TPM2-sealed credential:
+TPM2-sealed credential, looked up in the system credential stores
+(`/etc/credstore.encrypted/NAME`, `…/NAME.cred`, and the `/run`, `/var/lib`
+and unencrypted variants). Requires root and `systemd-creds`; not supported
+with `--vm`:
 
 ```bash
-./app.bin --secret tpm2:dbpass:/run/secrets/db_password
+systemd-creds encrypt --with-key=tpm2 --name=dbpass /dev/stdin \
+    /etc/credstore.encrypted/dbpass
+sudo ./app.bin --secret tpm2:dbpass:/run/secrets/db_password
 ```
 
 A `--secret` that fails to validate or install aborts the run.

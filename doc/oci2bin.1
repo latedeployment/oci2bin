@@ -252,6 +252,39 @@ May be repeated.
 A secret that fails to validate or install aborts the run.
 .
 .TP
+.BI \-\-secret " tpm2:\fICRED_NAME\fR[:\fICONTAINER_PATH\fR]"
+Decrypt a sealed systemd credential and place the plaintext inside the
+container.
+The plaintext is staged on a private
+.B ramfs
+mount (never swapped, never disk-backed), bind-mounted read-only at the
+destination, and the staging name is then unlinked.
+.I CRED_NAME
+is looked up as both
+.I NAME
+and
+.I NAME.cred
+under
+.IR /etc/credstore.encrypted ,
+.IR /run/credstore.encrypted ,
+.IR /var/lib/credstore.encrypted ,
+and the unencrypted
+.I credstore
+variants of those directories, in that order.
+Requires
+.BR systemd-creds (1)
+in
+.BR PATH ,
+and root: decryption reads
+.I /var/lib/systemd/credential.secret
+and, for TPM2-bound credentials,
+.IR /dev/tpmrm0 .
+The credential file must be a regular file that is not group- or
+world-writable.
+Not supported together with
+.BR \-\-vm .
+.
+.TP
 .BI \-\-tmpfs " PATH"
 Mount a fresh in-memory filesystem at
 .I PATH
@@ -878,6 +911,13 @@ containing the output binary.
 .TP
 .I /proc/self/exe
 The loader reads its own OCI data by opening this path at runtime.
+.TP
+.IR /etc/credstore.encrypted/ ", " /run/credstore.encrypted/ ", " /var/lib/credstore.encrypted/
+System credential stores searched by
+.BI \-\-secret " tpm2:CRED_NAME"
+for a sealed credential, along with the unencrypted
+.I credstore
+variants of the same directories.
 .TP
 .I PREFIX/share/oci2bin/
 Shared resources installed by

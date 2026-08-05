@@ -13,6 +13,73 @@ All notable changes to oci2bin are documented here.
   (see Changed) and restores the old warn-and-continue behavior for
   `--memory`/`--cpus`/`--pids-limit`.
 
+### Fixed
+
+- **`--secret tpm2:NAME` never actually read the sealed credential.** The
+  loader ran `systemd-creds decrypt --name NAME - -`, where the first `-`
+  means "read the ciphertext from stdin" — and the helper inherited the
+  loader's own stdin, so nothing ever opened the credential file. Depending
+  on what stdin was attached to, the run hung waiting on terminal input or
+  aborted with a decrypt failure; the documented
+  `/etc/credstore/NAME.cred` flow could not work at all. `NAME` is now
+  resolved against the system credential stores
+  (`/etc/credstore.encrypted`, `/run/credstore.encrypted`,
+  `/var/lib/credstore.encrypted` and the unencrypted variants, each tried as
+  both `NAME` and `NAME.cred`), opened with `O_NOFOLLOW`, and fed to
+  `systemd-creds` on a dedicated stdin.
+
+- **Helpers no longer inherit the loader's stdin.** `run_cmd_capture()` binds
+  the child's stdin to `/dev/null` unless a caller supplies an explicit fd,
+  so a captured helper can never consume input meant for the workload.
+
+- **`--secret` was silently ignored under `--vm`.** Secrets are installed on
+  the container path only, so a VM run started without the requested
+  credential. The combination is now rejected, matching the fail-closed
+  handling of `--allow-egress`.
+
+- **Sealed credentials are validated before decryption.** The blob must be a
+  regular file (not a symlink) that is not group- or world-writable;
+  `systemd-creds` will otherwise decrypt an attacker-substituted host-key or
+  `--with-key=null` credential just as readily as a TPM2-sealed one.
+
+- **`memfd_secret`-backed secrets never worked; replaced with `ramfs`
+  staging.** The loader created a `memfd_secret` region and tried to
+  bind-mount `/proc/self/fd/<n>` onto the destination. That can never
+  succeed — `memfd_secret` and `memfd_create` inodes live on an internal
+  kernel mount, which `do_loopback()` rejects with `EINVAL` — so every
+  secret silently fell through to the fallback path, and the advertised
+  "never touches the page cache" property was not delivered. Worse, writes
+  to a secretmem fd fail with `EINVAL` outright, since secretmem implements
+  `mmap` but no read/write file operations. Secrets that exist only in
+  memory (TPM2) are now staged on a private `ramfs` mount (pages are never
+  swapped), bind-mounted read-only at the destination, with the staging name
+  unlinked afterwards so the read-only mount is the only path to the
+  plaintext. Plain-file secrets remain a read-only bind mount of the host
+  file. The stub test that covered the old path passed only because it
+  mocked `mount()`.
+
+- **`--tmpfs /run/` no longer shadows installed secrets.** `--tmpfs` accepts
+  any absolute path, so `/run/` and `//run` are valid spellings of `/run`,
+  but the `/run` special-casing used `strcmp()`. With `--tmpfs /run/ --secret
+  X` the tmpfs was mounted post-chroot over `/run/secrets/*`: the loader
+  reported installing the secret and the workload then could not find it.
+  Both comparison sites now normalize the path.
+
+- **`--overlay-persist` rejects `,` and `:` in the path.** It is interpolated
+  into the overlayfs option string, where `,` ends an option and `:`
+  separates lower layers, so either character allowed mount-option injection.
+
+- **Sealed credentials must be owned by root (or by the caller).** Rejecting
+  group- and world-writable files was not enough: an owner can `chmod` its
+  own file, so a mode-0400 blob owned by another unprivileged uid was
+  equally substitutable.
+
+- **Decrypted plaintext no longer lingers in freed heap.** The capture buffer
+  is grown by hand with an `explicit_bzero()` of the old block instead of
+  `realloc()`, which could copy and free credential bytes without clearing
+  them, and every error path now zeroes before freeing. Decrypted credentials
+  are capped at 4 MiB, matching plain-file secrets.
+
 ### Changed
 
 - **`--read-only` now makes the image root genuinely read-only.** The old

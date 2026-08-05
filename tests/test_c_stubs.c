@@ -744,89 +744,91 @@ static void test_stub_setup_volumes(void)
     rmdir(rootfs);
 }
 
-/* ── test_stub_bind_mount_memfd_secret ─────────────────────────────────────
+/* ── test_stub_install_staged_secret ───────────────────────────────────────
  *
- * bind_mount_memfd_secret(sfd, data, len, dst_path) does:
- *   1. ftruncate(sfd, len)
- *   2. write_all_fd(sfd, data, len)
- *   3. mount("/proc/self/fd/<n>", dst_path, NULL, MS_BIND, NULL)
- *   4. mount(NULL, dst_path, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY|…, NULL)
- *   5. close(sfd)
- *   → on success: 0, two mount calls
- *   → if first mount fails: -1, one mount call, no umount2
- *   → if second mount fails: -1, umount2 called once to clean up
+ * install_staged_secret(staging, slot, data, len, dst_path) does:
+ *   1. create <staging>/s<slot> (O_EXCL, 0400) and write the plaintext
+ *   2. mount(<staging>/s<slot>, dst_path, NULL, MS_BIND, NULL)
+ *   3. mount(NULL, dst_path, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY|…, NULL)
+ *   4. unlink the staging name (the bind mount keeps the inode)
+ *   → on success: 0, two mount calls, staging name gone
+ *   → if first mount fails: -1, one mount call, no umount2, staging wiped
+ *   → if second mount fails: -1, umount2 called once, staging wiped
  *
- * We pass a real tmpfile fd so ftruncate and write work without privileges.
+ * NOTE: this replaced a test for bind_mount_memfd_secret(), which mounted
+ * /proc/self/fd/<n> of a memfd_secret.  That test passed only because mount()
+ * was stubbed — on a real kernel the bind always failed with EINVAL, because
+ * memfd inodes live on an internal mount that do_loopback() refuses to clone.
+ * Keep any replacement honest about that: stubbing mount() cannot tell you
+ * whether a mount source is legal.
  */
-static void test_stub_bind_mount_memfd_secret(void)
+static void test_stub_install_staged_secret(void)
 {
     char dst_path[] = "/tmp/oci2bin-stubs-dst-XXXXXX";
     int  dst_fd     = mkstemp(dst_path);
-    ASSERT(dst_fd >= 0, "bind_mount_memfd_secret: mkstemp dst");
+    ASSERT(dst_fd >= 0, "install_staged_secret: mkstemp dst");
     if (dst_fd >= 0)
     {
         close(dst_fd);
     }
 
-    /* Helper: open a fresh writable tmpfile to use as the "memfd" */
-#define MAKE_SFD(name) \
-    char sfd_path_##name[] = "/tmp/oci2bin-stubs-sfd-XXXXXX"; \
-    int sfd_##name = mkstemp(sfd_path_##name);
+    char staging[] = "/tmp/oci2bin-stubs-stage-XXXXXX";
+    ASSERT(mkdtemp(staging) != NULL, "install_staged_secret: mkdtemp staging");
 
-    /* Case A: both mounts succeed → return 0, two mount calls */
+    const char* data = "top-secret-value";
+    size_t      len  = strlen(data);
+    char        sf[PATH_MAX];
+
+    /* Case A: both mounts succeed → 0, two mounts, staging name unlinked */
     stub_reset();
     {
-        MAKE_SFD(a);
-        ASSERT(sfd_a >= 0, "bind_mount_memfd_secret: mkstemp sfd A");
-        const char* data = "top-secret-value";
-        int rc = bind_mount_memfd_secret(sfd_a, data, strlen(data), dst_path);
-        ASSERT_INT_EQ(rc, 0,
-                      "bind_mount_memfd_secret: success returns 0");
+        int rc = install_staged_secret(staging, 0, data, len, dst_path);
+        ASSERT_INT_EQ(rc, 0, "install_staged_secret: success returns 0");
         ASSERT_INT_EQ(stub_count("mount"), 2,
-                      "bind_mount_memfd_secret: two mount calls on success");
+                      "install_staged_secret: two mount calls on success");
         ASSERT_INT_EQ(stub_count("umount2"), 0,
-                      "bind_mount_memfd_secret: no umount2 on success");
-        unlink(sfd_path_a); /* sfd_a already closed by the function */
+                      "install_staged_secret: no umount2 on success");
+        snprintf(sf, sizeof(sf), "%s/s0", staging);
+        ASSERT(access(sf, F_OK) != 0,
+               "install_staged_secret: staging name unlinked on success");
     }
 
-    /* Case B: first mount fails → return -1, one mount call, no umount2 */
+    /* Case B: first mount fails → -1, one mount call, no umount2 */
     stub_reset();
     g_stub_mount_retval = -1;
     g_stub_mount_errno  = EPERM;
     {
-        MAKE_SFD(b);
-        ASSERT(sfd_b >= 0, "bind_mount_memfd_secret: mkstemp sfd B");
-        const char* data = "secret";
-        int rc = bind_mount_memfd_secret(sfd_b, data, strlen(data), dst_path);
+        int rc = install_staged_secret(staging, 1, data, len, dst_path);
         ASSERT_INT_EQ(rc, -1,
-                      "bind_mount_memfd_secret: first mount fail returns -1");
+                      "install_staged_secret: first mount fail returns -1");
         ASSERT_INT_EQ(stub_count("mount"), 1,
-                      "bind_mount_memfd_secret: only first mount attempted");
+                      "install_staged_secret: only first mount attempted");
         ASSERT_INT_EQ(stub_count("umount2"), 0,
-                      "bind_mount_memfd_secret: no umount2 on first mount fail");
-        unlink(sfd_path_b);
+                      "install_staged_secret: no umount2 on first mount fail");
+        snprintf(sf, sizeof(sf), "%s/s1", staging);
+        ASSERT(access(sf, F_OK) != 0,
+               "install_staged_secret: staging wiped on first mount fail");
     }
 
-    /* Case C: second mount (remount ro) fails → umount2 called once to clean up */
+    /* Case C: remount ro fails → -1, umount2 once, staging wiped */
     stub_reset();
     g_stub_mount_fail_after = 1; /* succeed call 0, fail on call 1 */
     g_stub_mount_errno      = EPERM;
     {
-        MAKE_SFD(c);
-        ASSERT(sfd_c >= 0, "bind_mount_memfd_secret: mkstemp sfd C");
-        const char* data = "secret";
-        int rc = bind_mount_memfd_secret(sfd_c, data, strlen(data), dst_path);
+        int rc = install_staged_secret(staging, 2, data, len, dst_path);
         ASSERT_INT_EQ(rc, -1,
-                      "bind_mount_memfd_secret: second mount fail returns -1");
+                      "install_staged_secret: second mount fail returns -1");
         ASSERT_INT_EQ(stub_count("mount"), 2,
-                      "bind_mount_memfd_secret: both mounts attempted on second fail");
+                      "install_staged_secret: both mounts attempted");
         ASSERT_INT_EQ(stub_count("umount2"), 1,
-                      "bind_mount_memfd_secret: umount2 called once to clean up");
-        unlink(sfd_path_c);
+                      "install_staged_secret: umount2 called once to clean up");
+        snprintf(sf, sizeof(sf), "%s/s2", staging);
+        ASSERT(access(sf, F_OK) != 0,
+               "install_staged_secret: staging wiped on remount fail");
     }
 
     unlink(dst_path);
-#undef MAKE_SFD
+    rmdir(staging);
 }
 
 /* ── test_stub_run_as_init ─────────────────────────────────────────────────
@@ -1358,7 +1360,7 @@ int main(void)
     test_stub_apply_seccomp_filter();
     test_stub_apply_capabilities();
     test_stub_setup_volumes();
-    test_stub_bind_mount_memfd_secret();
+    test_stub_install_staged_secret();
     test_stub_run_as_init();
     test_stub_load_env_file();
     test_stub_resolve_user();

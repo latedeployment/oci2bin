@@ -5984,6 +5984,247 @@ static void test_cdi_resolve(void)
     rmdir(tdir);
 }
 
+/* ── --secret tpm2 credential sourcing ───────────────────────────────────── */
+
+static void test_credstore_candidate_path(void)
+{
+    char out[PATH_MAX];
+
+    ASSERT_INT_EQ(credstore_candidate_path(out, sizeof(out),
+                                           "/etc/credstore.encrypted",
+                                           "dbpass", 0), 0,
+                  "credstore_candidate_path: bare name returns 0");
+    ASSERT_STR_EQ(out, "/etc/credstore.encrypted/dbpass",
+                  "credstore_candidate_path: bare name joined");
+
+    ASSERT_INT_EQ(credstore_candidate_path(out, sizeof(out),
+                                           "/etc/credstore", "dbpass", 1), 0,
+                  "credstore_candidate_path: .cred suffix returns 0");
+    ASSERT_STR_EQ(out, "/etc/credstore/dbpass.cred",
+                  "credstore_candidate_path: .cred suffix joined");
+
+    /* Truncation must be reported, never silently shortened. */
+    char small[16];
+    ASSERT_INT_EQ(credstore_candidate_path(small, sizeof(small),
+                                           "/etc/credstore.encrypted",
+                                           "averylongcredentialname", 1), -1,
+                  "credstore_candidate_path: truncation rejected");
+
+    /* Every directory in the search list is absolute. */
+    size_t n_dirs = sizeof(CREDSTORE_DIRS) / sizeof(CREDSTORE_DIRS[0]);
+    int all_abs = 1;
+    for (size_t i = 0; i < n_dirs; i++)
+    {
+        if (CREDSTORE_DIRS[i][0] != '/')
+        {
+            all_abs = 0;
+        }
+    }
+    ASSERT(all_abs, "credstore dirs: all absolute paths");
+    ASSERT(n_dirs > 0, "credstore dirs: search list is non-empty");
+}
+
+/*
+ * `--tmpfs /run/` must be recognised as /run.  A plain strcmp() let the
+ * alternate spelling through, so the tmpfs was mounted post-chroot on top of
+ * the secrets setup_secrets() had already installed under /run.
+ */
+static void test_path_equals_normalized(void)
+{
+    ASSERT(path_equals_normalized("/run", "/run"),
+           "path_equals_normalized: identical paths match");
+    ASSERT(path_equals_normalized("/run/", "/run"),
+           "path_equals_normalized: trailing slash matches");
+    ASSERT(path_equals_normalized("/run///", "/run"),
+           "path_equals_normalized: multiple trailing slashes match");
+    ASSERT(path_equals_normalized("//run", "/run"),
+           "path_equals_normalized: leading double slash matches");
+    ASSERT(path_equals_normalized("/a//b", "/a/b"),
+           "path_equals_normalized: interior double slash matches");
+    ASSERT(!path_equals_normalized("/runx", "/run"),
+           "path_equals_normalized: /runx does not match /run");
+    ASSERT(!path_equals_normalized("/run", "/ru"),
+           "path_equals_normalized: prefix does not match");
+    ASSERT(!path_equals_normalized("/", "/run"),
+           "path_equals_normalized: root does not match /run");
+    ASSERT(!path_equals_normalized("/run/secrets", "/run"),
+           "path_equals_normalized: subpath does not match");
+}
+
+/* --overlay-persist is interpolated into the overlayfs option string, where
+ * ',' ends an option and ':' separates lower layers. */
+static void test_parse_opts_overlay_persist_injection(void)
+{
+    struct container_opts opts;
+
+    char ok_arg[] = "/srv/state";
+    char* ok_argv[] = {"prog", "--overlay-persist", ok_arg, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, ok_argv, &opts), 0,
+                  "overlay-persist: plain path accepted");
+
+    char comma[] = "/srv/state,upperdir=/etc";
+    char* comma_argv[] = {"prog", "--overlay-persist", comma, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, comma_argv, &opts), -1,
+                  "overlay-persist: ',' rejected (mount option injection)");
+
+    char colon[] = "/srv/state:/etc";
+    char* colon_argv[] = {"prog", "--overlay-persist", colon, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, colon_argv, &opts), -1,
+                  "overlay-persist: ':' rejected (lowerdir injection)");
+
+    char dotdot[] = "/srv/../etc";
+    char* dotdot_argv[] = {"prog", "--overlay-persist", dotdot, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, dotdot_argv, &opts), -1,
+                  "overlay-persist: '..' still rejected");
+}
+
+static void test_credential_file_is_safe(void)
+{
+    char tmpl[] = "/tmp/oci2bin-cred-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "credential_file_is_safe: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    char good[320];
+    snprintf(good, sizeof(good), "%s/good.cred", tdir);
+    int fd = open(good, O_WRONLY | O_CREAT | O_TRUNC, 0400);
+    ASSERT(fd >= 0, "credential_file_is_safe: create 0400 blob");
+    if (fd >= 0)
+    {
+        close(fd);
+    }
+    struct stat st;
+    ASSERT_INT_EQ(lstat(good, &st), 0, "credential_file_is_safe: lstat good");
+    ASSERT_INT_EQ(credential_file_is_safe(good, &st), 1,
+                  "credential_file_is_safe: accepts root-only regular file");
+
+    /* Group-writable: an attacker in the group could swap the blob. */
+    char gw[320];
+    snprintf(gw, sizeof(gw), "%s/groupwrite.cred", tdir);
+    fd = open(gw, O_WRONLY | O_CREAT | O_TRUNC, 0460);
+    if (fd >= 0)
+    {
+        close(fd);
+    }
+    ASSERT_INT_EQ(chmod(gw, 0460), 0, "credential_file_is_safe: chmod 0460");
+    ASSERT_INT_EQ(lstat(gw, &st), 0, "credential_file_is_safe: lstat gw");
+    ASSERT_INT_EQ(credential_file_is_safe(gw, &st), 0,
+                  "credential_file_is_safe: rejects group-writable");
+
+    /* World-writable. */
+    char ww[320];
+    snprintf(ww, sizeof(ww), "%s/worldwrite.cred", tdir);
+    fd = open(ww, O_WRONLY | O_CREAT | O_TRUNC, 0406);
+    if (fd >= 0)
+    {
+        close(fd);
+    }
+    ASSERT_INT_EQ(chmod(ww, 0406), 0, "credential_file_is_safe: chmod 0406");
+    ASSERT_INT_EQ(lstat(ww, &st), 0, "credential_file_is_safe: lstat ww");
+    ASSERT_INT_EQ(credential_file_is_safe(ww, &st), 0,
+                  "credential_file_is_safe: rejects world-writable");
+
+    /* A symlink must not pass: lstat reports the link, not its target, so a
+     * link pointing at an attacker-owned file cannot slip through. */
+    char link[320];
+    snprintf(link, sizeof(link), "%s/link.cred", tdir);
+    ASSERT_INT_EQ(symlink(good, link), 0,
+                  "credential_file_is_safe: create symlink");
+    ASSERT_INT_EQ(lstat(link, &st), 0, "credential_file_is_safe: lstat link");
+    ASSERT_INT_EQ(credential_file_is_safe(link, &st), 0,
+                  "credential_file_is_safe: rejects symlink");
+
+    /* A directory is not a credential. */
+    ASSERT_INT_EQ(lstat(tdir, &st), 0, "credential_file_is_safe: lstat dir");
+    ASSERT_INT_EQ(credential_file_is_safe(tdir, &st), 0,
+                  "credential_file_is_safe: rejects directory");
+
+    unlink(good);
+    unlink(gw);
+    unlink(ww);
+    unlink(link);
+    rmdir(tdir);
+}
+
+/*
+ * Regression test for the --secret tpm2 sourcing bug: the helper used to
+ * inherit the loader's own stdin, so `systemd-creds decrypt - -` read
+ * whatever the caller's terminal supplied instead of the sealed blob.
+ */
+static void test_run_cmd_capture_stdin(void)
+{
+    char tmpl[] = "/tmp/oci2bin-stdin-test-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "run_cmd_capture_stdin: mkdtemp");
+    if (!tdir)
+    {
+        return;
+    }
+
+    char blob[320];
+    snprintf(blob, sizeof(blob), "%s/blob", tdir);
+    const char* payload = "sealed-credential-bytes";
+    int wfd = open(blob, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT(wfd >= 0, "run_cmd_capture_stdin: create blob");
+    if (wfd >= 0)
+    {
+        ASSERT_INT_EQ(write_all_fd(wfd, payload, strlen(payload)), 0,
+                      "run_cmd_capture_stdin: write blob");
+        close(wfd);
+    }
+
+    /* An explicit fd is what the child reads on stdin. */
+    int fd = open(blob, O_RDONLY | O_CLOEXEC);
+    ASSERT(fd >= 0, "run_cmd_capture_stdin: open blob");
+    if (fd >= 0)
+    {
+        char* cat_argv[] = { "cat", NULL };
+        size_t len = 0;
+        char* out = run_cmd_capture_stdin(cat_argv, fd, &len);
+        close(fd);
+        ASSERT_NOT_NULL(out, "run_cmd_capture_stdin: capture succeeded");
+        if (out)
+        {
+            ASSERT(len == strlen(payload) &&
+                   memcmp(out, payload, len) == 0,
+                   "run_cmd_capture_stdin: child read the supplied fd");
+            free(out);
+        }
+    }
+
+    /* Without an fd the child gets /dev/null, never the caller's stdin.
+     * Feed our own stdin from the blob to prove it is NOT what leaks out. */
+    int saved_stdin = dup(STDIN_FILENO);
+    int blob_fd = open(blob, O_RDONLY);
+    if (blob_fd >= 0 && saved_stdin >= 0)
+    {
+        ASSERT(dup2(blob_fd, STDIN_FILENO) >= 0,
+               "run_cmd_capture_stdin: redirect our stdin to blob");
+        close(blob_fd);
+
+        char* cat_argv[] = { "cat", NULL };
+        size_t len = 1;
+        char* out = run_cmd_capture_stdin(cat_argv, -1, &len);
+        ASSERT_NOT_NULL(out, "run_cmd_capture_stdin: /dev/null run succeeded");
+        ASSERT_INT_EQ((int)len, 0,
+                      "run_cmd_capture_stdin: in_fd=-1 gives child empty stdin");
+        free(out);
+
+        dup2(saved_stdin, STDIN_FILENO);
+        close(saved_stdin);
+    }
+
+    unlink(blob);
+    rmdir(tdir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -6069,6 +6310,11 @@ int main(void)
     test_json_toplevel_and_object_array();
     test_parse_opts_cdi();
     test_cdi_resolve();
+    test_credstore_candidate_path();
+    test_path_equals_normalized();
+    test_parse_opts_overlay_persist_injection();
+    test_credential_file_is_safe();
+    test_run_cmd_capture_stdin();
 
     printf("1..%d\n", tap_test_num);
 

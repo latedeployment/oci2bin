@@ -16,7 +16,7 @@ A missing dependency never blocks an unrelated run. The rule is:
 
 - **Always-applied hardening degrades silently.** The default seccomp filter,
   Landlock sandbox, cgroup v2 limits, the full rootless UID/GID range
-  (`newuidmap`/`newgidmap`), `memfd_secret`-backed secrets, and `--notify`
+  (`newuidmap`/`newgidmap`), `ramfs`-backed secret staging, and `--notify`
   delivery all *warn and continue* (or fall back) when the kernel feature or
   helper is absent. A plain `./mybinary` needs only `tar` plus unprivileged
   user namespaces. (`--strict` is the opt-in that turns these degradations into
@@ -50,7 +50,7 @@ small. Each dependency below is needed **only** for the feature in its row.
 | `newuidmap` / `newgidmap` + `/etc/subuid`,`/etc/subgid` | Full rootless UID/GID range | Optional — falls back to single-ID mapping |
 | `nsenter` (util-linux) | `oci2bin exec`, `freeze` / `thaw` | Required for those subcommands |
 | `sqlite3` | `freeze` / `thaw` (DB-consistent snapshots) | Required for that subcommand |
-| `systemd-creds` | `--secret tpm2:NAME` | Required for TPM2 secrets |
+| `systemd-creds` | `--secret tpm2:NAME` | Required for TPM2 secrets (root only; also needs a credential in `/etc/credstore.encrypted` or another system credential store) |
 | `gdb` | `--gdb` | Required for that mode |
 | `openssl` + `python3` | `--verify-key`, `--require-signed`, `--pin-digest` runtime checks | Required if the binary enforces a signature/digest |
 | `curl` | `--notify` | Optional — notifications are silently skipped if absent |

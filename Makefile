@@ -328,6 +328,7 @@ lint-semgrep:
 # Checks the main CLI wrapper and all helper/test shell scripts.
 SHELL_SOURCES = oci2bin \
                 scripts/style.sh scripts/fetch_kernel.sh scripts/fuzz_run.sh \
+                scripts/test_tpm2_secret.sh \
                 tests/test_integration_redis.sh tests/test_integration_nginx.sh \
                 tests/test_integration_encrypt.sh tests/test_integration_live.sh \
                 tests/test_runtime.sh tests/test_vm_integration.sh

@@ -22,7 +22,7 @@ oci2bin alpine:latest    # produces ./alpine_latest
 | Daemonless pull (no Docker) | `oci2bin --pull-with skopeo redis:7-alpine` |
 | Inject secrets at runtime | `./myapp --secret /etc/ssl/key.pem:/run/secrets/key` |
 | TPM2-sealed secrets | `./myapp --secret tpm2:mykey` |
-| Kernel-protected secrets (no page cache, no swap) | automatic on Linux ≥ 5.14 via `memfd_secret` |
+| Memory-backed secrets (never written to disk) | automatic for `--secret tpm2:` via `ramfs` staging |
 | SSH agent forwarding in builds | `RUN --mount=type=ssh git clone git@github.com:org/repo` |
 | Persistent build cache across runs | `RUN --mount=type=cache,target=/var/cache/apt apt-get install ...` |
 | GPUs / CDI devices | `./myapp --gpus all` |
@@ -913,18 +913,39 @@ If the remount read-only step fails, the secret is not mounted at all.
 
 #### TPM2-sealed secrets via systemd-creds
 
-`--secret tpm2:CREDENTIAL_NAME[:CONTAINER_PATH]` decrypts a TPM2-sealed credential at container start and places the plaintext inside the container. The credential is decrypted using `systemd-creds decrypt` (from systemd ≥ 250) and written as a mode-0400 file on the container's tmpfs. The plaintext is zeroed in memory immediately after writing.
+`--secret tpm2:CREDENTIAL_NAME[:CONTAINER_PATH]` decrypts a sealed credential at container start and places the plaintext inside the container. `CREDENTIAL_NAME` is looked up in the system credential stores, in this order:
 
-```bash
-# Seal a secret with the TPM2 at image build time
-systemd-creds encrypt --name=dbpass /dev/stdin /etc/credstore/dbpass.cred
-
-# Unseal and inject at container start (no plaintext on disk)
-./my-app --secret tpm2:dbpass                        # → /run/secrets/dbpass
-./my-app --secret tpm2:dbpass:/run/secrets/db_pass   # custom path
+```
+/etc/credstore.encrypted/NAME        /etc/credstore.encrypted/NAME.cred
+/run/credstore.encrypted/NAME        /run/credstore.encrypted/NAME.cred
+/var/lib/credstore.encrypted/NAME    /var/lib/credstore.encrypted/NAME.cred
+/etc/credstore/NAME                  /etc/credstore/NAME.cred
+/run/credstore/NAME                  /run/credstore/NAME.cred
+/var/lib/credstore/NAME              /var/lib/credstore/NAME.cred
 ```
 
-**Requirements:** `systemd-creds` must be in `PATH`; the host must have a reachable TPM2 device. The credential name may contain only alphanumeric characters, `-`, `_`, and `.`.
+The first match is decrypted with `systemd-creds decrypt` (systemd ≥ 250). The plaintext is staged on a private `ramfs` mount (never swapped, never disk-backed), bind-mounted read-only at the destination, and the staging name is then unlinked — see [Secure secrets at runtime](#secure-secrets-at-runtime). The plaintext is zeroed in the loader's memory as soon as it has been written, and the decrypted credential is capped at 4 MiB.
+
+```bash
+# Seal a secret against the TPM2, into the system credential store (as root)
+systemd-creds encrypt --with-key=tpm2 --name=dbpass /dev/stdin \
+    /etc/credstore.encrypted/dbpass
+
+# Unseal and inject at container start
+sudo ./my-app --secret tpm2:dbpass                        # → /run/secrets/dbpass
+sudo ./my-app --secret tpm2:dbpass:/run/secrets/db_pass   # custom path
+```
+
+**Requirements:**
+
+- `systemd-creds` must be in `PATH`.
+- **Root is required.** Decryption reads the host credential key at `/var/lib/systemd/credential.secret` (mode 0600, root) and, for TPM2-bound credentials, `/dev/tpmrm0` (root:tss). Neither is reachable from a rootless run, which enters a user namespace before secrets are installed.
+- For `--with-key=tpm2` or `host+tpm2` credentials the host needs a working TPM2 — check with `systemd-analyze has-tpm2`.
+- The credential name may contain only alphanumeric characters, `-`, `_`, and `.`.
+- The credential file must be a regular file (not a symlink) that is not group- or world-writable; oci2bin refuses to decrypt one that is. See the caveat below for why.
+- Not supported with `--vm` — the guest cannot see host secret mounts, so the combination is rejected rather than booting without the credential.
+
+**Caveat on the `tpm2:` name.** `systemd-creds decrypt` accepts any credential it can decrypt — TPM2-sealed, host-key-only, or even `--with-key=null` (which is not encrypted at all) — and offers no way to demand TPM2 binding at decrypt time. oci2bin therefore cannot *prove* that a credential is TPM-bound; it guards the input path instead, by only reading from the root-owned system credential stores and refusing group- or world-writable files. Use `--with-key=tpm2` when sealing if you want actual TPM binding, and keep the credential stores root-owned.
 
 ### SSH agent forwarding
 
@@ -2241,22 +2262,36 @@ ssh deploy@remote-host.example.com /opt/app/myapp
 
 ## Secure secrets at runtime
 
-When `--secret` is used at runtime, oci2bin attempts to back the secret with
-`memfd_secret(2)` (Linux ≥ 5.14, `CONFIG_SECRETMEM=y`). The secret data is
-placed in a memory region that is excluded from the kernel's direct mapping,
-crash dumps, and swap. The container sees a normal file path
-(`/run/secrets/<name>`) via bind-mount of `/proc/self/fd/<n>`.
+How a secret reaches the container depends on where it comes from.
 
-On older kernels, oci2bin falls back transparently to a read-only bind-mount of
-the host file. The log line indicates which path was taken:
+**Plain-file secrets** (`--secret /host/path`) are exposed as a read-only
+bind-mount of the host file, remounted with
+`MS_RDONLY|MS_NOEXEC|MS_NOSUID|MS_NODEV`. The file already exists on the host,
+so nothing is copied:
 
 ```
-oci2bin: secret /run/secrets/mykey -> /run/secrets/mykey (memfd_secret)
-oci2bin: secret /run/secrets/mykey -> /run/secrets/mykey (read-only)
+oci2bin: secret /host/api_key -> /run/secrets/api_key (read-only)
 ```
 
-TPM2-sealed secrets (decrypted via `systemd-creds`) also use `memfd_secret` when
-available, so the decrypted plaintext never enters the page cache.
+**Secrets that only exist in memory** (`--secret tpm2:NAME`, decrypted at
+startup) are never written to disk-backed storage. oci2bin mounts a private
+`ramfs` — whose pages are never swapped — writes the plaintext there, binds
+that file onto the destination, remounts it read-only, and then unlinks the
+staging name so the read-only mount is the only path to it. The staging mount
+is torn down before the workload starts. If `ramfs` is unavailable the loader
+falls back to `tmpfs` and says so:
+
+```
+oci2bin: tpm2 secret 'dbpass' -> /run/secrets/dbpass (read-only, memory-backed)
+```
+
+> **Note:** earlier versions advertised `memfd_secret(2)`-backed secrets. That
+> approach cannot work and has been removed: `memfd_secret` and `memfd_create`
+> inodes live on an internal kernel mount, and the kernel refuses to bind-mount
+> from those (`EINVAL`), so the container could never be given a path to one.
+> Every secret silently took the fallback path. The `ramfs` staging above
+> delivers the intended property — plaintext that never touches disk — with a
+> mechanism the kernel actually permits.
 
 ---
 

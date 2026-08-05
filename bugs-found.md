@@ -202,6 +202,163 @@ work before it can be treated as an OCI-correct, fail-closed runtime.
     - Verified with new `parse_opts` regression tests (default off, flag
       sets `opts.allow_degraded`) on both x86_64 (`make test-unit`) and
       aarch64 (`make test-c-aarch64`).
+  - Follow-up gap closed (2026-07-19): the round-1 fix only caught the case
+    where `setup_cgroup()` failed outright (e.g. couldn't unshare the
+    cgroup namespace). It missed the case where the namespace setup
+    succeeded but an individual limit write failed — `cg_set()` discarded
+    `cg_write()`'s return value, so a failed `memory.max`/`cpu.max`/
+    `pids.max` write was silently ignored and the container started
+    unconstrained. `cg_set()` now returns the write result, `setup_cgroup()`
+    takes an `int *out_limits_failed` output param set when any requested
+    limit fails to apply, and the fail-closed check in `main()` (and the
+    `fork_into_cgroup()` fallback fork path) now aborts on either kind of
+    failure unless `--allow-degraded` is set. Verified with
+    `make clean && make test-unit` and `make test-c-aarch64`.
+
+- [x] `[High]` Overlay root mounting shadowed volume/secret submounts.
+  - `--ephemeral-root`/`--overlay-persist` mounted the overlay onto `rootfs`
+    inline, in the middle of `container_main()`, after some paths had already
+    set up submounts elsewhere. Overlayfs does not see into a separately
+    mounted `lowerdir`/`upperdir` submount at lookup time (a documented
+    kernel limitation, not simple mount-stacking), so anything mounted
+    before the overlay could be invisible or masked afterward depending on
+    ordering.
+  - Completed (2026-07-19):
+    - Extracted the inline block into `setup_overlay_root(rootfs, opts)` and
+      moved the call to the very start of the mount-setup sequence in
+      `container_main()`, before `setup_volumes()`, the pre-chroot `/run`
+      tmpfs block, and `setup_secrets()` — the overlay is now always the
+      first thing mounted onto `rootfs`, so nothing it mounts can shadow a
+      later submount.
+    - Verified with `make clean && make test-unit` and
+      `make test-c-aarch64`.
+  - Follow-up cleanup (2026-07-19, found by the mandatory CLAUDE.md
+    security-subagent review of this change): the `--ephemeral-root`
+    branch's two `mkdir()` calls for the overlay `upper`/`work` dirs had
+    their return values ignored, unconditionally setting `upper_ok = 1`
+    (a literal violation of CLAUDE.md's "check all mkdir return values"
+    rule, though not an exploitable one — a real failure there still made
+    the subsequent `mount("overlay", ...)` fail and the function return
+    -1). Added a `stat()`-based existence/type check after the `mkdir()`
+    calls, matching the `--overlay-persist` branch's existing pattern, so
+    the failure is reported specifically instead of falling through to a
+    generic overlay-mount error. Verified with `make clean && make
+    test-unit` and `make test-c-aarch64`.
+
+- [x] `[High]` `--read-only`'s automatic `/run` tmpfs mount shadowed secrets.
+  - The default `/run` tmpfs for `--read-only` was mounted post-chroot,
+    after `setup_secrets()` had already bind-mounted secrets at their
+    default `/run/secrets/<name>` location — the later tmpfs mount hid
+    them from the workload.
+  - Completed (2026-07-19):
+    - The `/run` tmpfs (for `--read-only` or an explicit `--tmpfs /run`) is
+      now mounted pre-chroot, immediately after `setup_overlay_root()` and
+      before `setup_secrets()`, using a local `run_tmpfs_preinstalled` flag.
+      The post-chroot generic `--tmpfs` loop skips `/run` when the flag is
+      set instead of mounting it a second time.
+    - This also removes the redundant post-chroot "mount /run as tmpfs for
+      --read-only" block that used to duplicate this logic after chroot.
+    - Verified with `make clean && make test-unit` and
+      `make test-c-aarch64`.
+  - Follow-up gap closed (2026-07-19, found by the mandatory CLAUDE.md
+    security-subagent review of this change): if the pre-chroot `/run`
+    tmpfs `mount()` call itself failed, the code only logged a warning and
+    left `run_tmpfs_preinstalled` at 0. `setup_secrets()` would then still
+    bind-mount secrets under the plain (non-tmpfs) `/run`, and the
+    post-chroot generic `--tmpfs` loop — which only skips remounting
+    `/run` when `run_tmpfs_preinstalled` is set — would mount a fresh
+    tmpfs over it, reintroducing the exact secret-shadowing bug this fix
+    targets, through the one path where the pre-chroot mount silently
+    degrades. Now `return 1` on that `mount()` failure instead of
+    continuing, consistent with the fail-closed handling already applied
+    to `-v`/`--secret` a few lines later in the same function. Verified
+    with `make clean && make test-unit` and `make test-c-aarch64`.
+
+- [x] `[Medium]` `-v host:ctr:ro` used a non-recursive remount.
+  - The `:ro` suffix bind-mounted the host path then did a plain
+    `MS_BIND | MS_REMOUNT | MS_RDONLY`, which the kernel only applies to the
+    top mount — any submount already nested under the host path (e.g. an
+    additional filesystem mounted inside a bind-mounted directory) stayed
+    writable from inside the container.
+  - Completed (2026-07-19):
+    - Added `recursive_remount_rdonly()`, which uses `mount_setattr(2)`
+      (`MOUNT_ATTR_RDONLY | AT_RECURSIVE`) to atomically make the whole
+      mount tree read-only, falling back to the old non-recursive
+      `MS_REMOUNT | MS_RDONLY` only when the syscall isn't available
+      (`ENOSYS`, i.e. pre-5.12 kernels) — any other failure is reported and
+      fails closed rather than silently degrading.
+      `mount_rootfs_read_only()` (used by plain `--read-only`) is
+      intentionally left as-is: its non-recursive top-only remount after a
+      recursive self-bind is already correct there, and explicit submounts
+      like a plain `-v` are meant to keep their own flags.
+    - Verified with `make clean && make test-unit` and
+      `make test-c-aarch64`.
+  - Follow-up gap closed (2026-07-19, found by the mandatory CLAUDE.md
+    security-subagent review of this change): `recursive_remount_rdonly()`
+    opens `path` with `O_PATH` before calling `mount_setattr(2)`. If that
+    `open()` itself failed (EMFILE/ENOMEM/EACCES/...), the code fell
+    through to the non-recursive fallback exactly as if the kernel lacked
+    `mount_setattr(2)` (`ENOSYS`) — silently accepting the weaker guarantee
+    the function's own doc comment says it never does, and printing no
+    warning. Restructured so an `open()` failure returns `-1` directly;
+    only a `mount_setattr(2)` call that actually returned `ENOSYS` falls
+    back to the non-recursive remount. Verified end-to-end (nested bind
+    mount inside a `-v ...:ro` volume rejects a write with "Read-only file
+    system") plus `make clean && make test-unit` and `make test-c-aarch64`.
+
+- [x] `[High]` MCP `run_container` silently dropped invalid volume specs.
+  - The MCP JSON-RPC handler validated each requested `-v` spec but simply
+    skipped ones that failed validation and launched the container anyway,
+    contradicting the fail-closed volume policy enforced by the CLI path
+    (`setup_volumes()`, see the earlier "Fail closed when requested volumes
+    or secrets cannot be mounted" entry) — an MCP client requesting an
+    invalid mount would get a running container missing a volume it
+    expected, with no error.
+  - Completed (2026-07-19):
+    - The validation loop now aborts the whole request
+      (`mcp_send_error(id, -32602, ...)` then `goto cleanup_env`) on the
+      first invalid spec instead of filtering it out and continuing.
+    - Verified the existing `cleanup_env:` cleanup path is safe to reuse
+      here: `json_parse_string_array()` always returns a count exactly
+      matching the number of allocated entries, so `n_vol` reflects real
+      allocations at every point the `goto` can fire.
+    - Verified the loader still compiles cleanly (`gcc -static -O2 -Wall
+      -Wextra`) and `make clean && make test-unit` passes.
+    - Verified end-to-end via `mcp-serve` over stdin/stdout: a request with
+      one valid and one invalid volume spec is rejected in full
+      (`-32602`), and `list_containers` afterward shows no container was
+      launched — no partial application of the request.
+
+- [x] `[Medium]` TPM2 secret plaintext fallback relied on mode 0400 alone.
+  - When `memfd_secret` isn't available, `install_tpm2_secret()`'s fallback
+    wrote the decrypted credential to a regular file with mode `0400` and
+    stopped there. Permission bits don't restrict root, so a
+    root-in-container workload (the common case for containers) could
+    `chmod`/rewrite/unlink the file despite the "read-only" intent.
+  - Completed (2026-07-19):
+    - The fallback now self-bind-mounts the file and remounts it
+      `MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV`,
+      matching the existing pattern already used by
+      `install_plain_secret()`'s bind-mount fallback, with `umount2(...,
+      MNT_DETACH)` cleanup if the remount fails. Enforcement is now at the
+      mount level, not just permission bits.
+    - Verified with `make clean && make test-unit` and
+      `make test-c-aarch64`.
+  - Follow-up gap closed (2026-07-19, found by the mandatory CLAUDE.md
+    security-subagent review of this change): unlike
+    `install_plain_secret()`'s fallback (which bind-mounts a pre-existing
+    host file and never writes secret bytes to a fresh location),
+    `install_tpm2_secret()`'s fallback writes the freshly-decrypted
+    plaintext directly to `dst_path` *before* the self-bind/remount. On
+    either mount step failing afterward — or on a short/failed
+    `write_all_fd()` — the function returned `-1` without touching the
+    file, leaving the decrypted credential sitting on disk protected only
+    by mode `0400` (which does not stop a root-owned process) until the
+    rootfs tmpdir is eventually swept by unlink-only cleanup, or not at
+    all on a hard kill. Added `wipe_and_unlink_secret_file()` (zero the
+    file's contents, then `unlink()`) and call it on every one of these
+    error paths before returning. Verified with `make clean && make
+    test-unit` and `make test-c-aarch64`.
 
 - [ ] `[High]` Replace or strictly constrain the custom seccomp parser.
   - It does not fully support argument filters, architecture conditions,
@@ -237,6 +394,144 @@ work before it can be treated as an OCI-correct, fail-closed runtime.
   - Generate unique automatic names.
   - Preserve string JSON-RPC IDs and remove the unsolicited initialization
     response.
+
+- [x] `[High]` `--secret tpm2:NAME` never read the sealed credential.
+  - `install_tpm2_secret()` ran `systemd-creds decrypt --name NAME - -`,
+    where the first `-` means "read the ciphertext from stdin", and
+    `run_cmd_capture()` only redirected the child's *stdout* — so the helper
+    inherited the loader's own stdin. Nothing in the tree ever opened a
+    credential file; `grep -r credstore` matched only the two doc files that
+    documented the (impossible) `/etc/credstore/NAME.cred` flow. With a TTY
+    on stdin the run blocked waiting for terminal input; with `/dev/null` it
+    aborted with a decrypt failure. It also consumed the stdin meant for the
+    workload, and a second `--secret tpm2:` could never work at all.
+  - Completed (2026-08-04):
+    - Added `open_tpm2_credential()`, which resolves `NAME` against
+      `CREDSTORE_DIRS` (`/etc/credstore.encrypted`, `/run/…`, `/var/lib/…`
+      plus the unencrypted variants, each tried as `NAME` and `NAME.cred`),
+      opens it `O_NOFOLLOW`, and returns the fd so the file that was checked
+      is the file that gets decrypted (no TOCTOU).
+    - Split `run_cmd_capture()` into `run_cmd_capture_stdin(argv, in_fd,
+      out_len)`. The child's stdin is now always replaced: with the caller's
+      fd, or `/dev/null` when `in_fd < 0`. No captured helper can consume
+      the loader's stdin again.
+    - Verified end-to-end on a real built binary: a missing credential now
+      prints the search list and aborts instead of hanging.
+
+- [x] `[High]` `memfd_secret`-backed secrets never worked, and the fallback
+      put TPM2 plaintext on disk.
+  - `bind_mount_memfd_secret()` wrote into a `memfd_secret` fd and
+    bind-mounted `/proc/self/fd/<n>` onto the destination. Two independent
+    reasons that cannot work: secretmem implements `mmap` but no read/write
+    file operations, so `write(2)` fails with `EINVAL`; and memfd inodes
+    live on an internal kernel mount (`MNT_INTERNAL`), which `do_loopback()`
+    rejects with `EINVAL`, so the bind always failed. Every secret silently
+    took the fallback path. For `--secret tpm2:` that fallback wrote the
+    decrypted credential to a regular file under the runtime tmpdir —
+    `OCI2BIN_TMPDIR`/`TMPDIR`/`/tmp`/`/var/tmp`, the last of which is
+    disk-backed — defeating the whole point of sealing it.
+  - The existing stub test passed only because it mocked `mount()`;
+    stubbing `mount()` cannot tell you whether a mount source is legal.
+  - Completed (2026-08-04):
+    - Removed the memfd path entirely, with a comment at
+      `mount_secret_staging()` explaining why it must not be reintroduced.
+    - Added `mount_secret_staging()` / `install_staged_secret()` /
+      `umount_secret_staging()`: mount a private `ramfs` (pages are never
+      swapped; `tmpfs` fallback with a warning) at
+      `<rootfs>/.oci2bin-secrets`, write the plaintext there, bind-mount it
+      onto the destination, remount
+      `MS_RDONLY|MS_NOEXEC|MS_NOSUID|MS_NODEV`, then unlink the staging
+      name so the read-only mount is the only path to the plaintext.
+      `setup_secrets()` tears the staging mount down on every exit path.
+    - Verified by probe that the installed secret survives the staging
+      teardown and stays read-only, and that plain-file secrets no longer
+      emit the `memfd_secret write: Invalid argument` warning.
+    - Replaced the stub test with one covering `install_staged_secret()`.
+
+- [x] `[Medium]` `--secret` was silently ignored under `--vm`.
+  - `setup_secrets()` is only called from `container_main()`; the VM
+    dispatch never looked at `opts.n_secrets`, so a VM run started without
+    a credential the caller explicitly asked for. `--allow-egress` two
+    lines earlier already rejected the same combination.
+  - Completed (2026-08-04): `--secret` with `--vm` is now a hard error,
+    matching the fail-closed contract documented for `setup_secrets()`.
+
+- [x] `[Medium]` Sealed credentials were decrypted without validating the
+      source file.
+  - `systemd-creds decrypt` accepts host-key and even `--with-key=null`
+    (unencrypted) blobs as readily as TPM2-sealed ones, and offers no flag
+    to demand TPM2 binding at decrypt time. Combined with the stdin bug
+    above, anything that could supply the loader's stdin could substitute
+    a credential of its own.
+  - Completed (2026-08-04): `credential_file_is_safe()` requires a regular
+    file (an `lstat` reporting a symlink fails this, so a link cannot
+    redirect past the check) that is not group- or world-writable. Since
+    the blob can no longer come from stdin and only the root-owned system
+    credential stores are searched, guarding the input path is the
+    enforceable half of the guarantee. Documented honestly: the `tpm2:`
+    prefix cannot prove TPM binding, so seal with `--with-key=tpm2`.
+
+- [x] `[High]` `--tmpfs /run/` bypassed the `/run` secret-shadowing fix.
+  - Found by the mandatory CLAUDE.md security review (2026-08-04). `--tmpfs`
+    parsing accepts any absolute path without `..`, so `/run/` and `//run`
+    are valid spellings — but both the pre-chroot `want_run_tmpfs` detection
+    and the post-chroot skip compared with a plain `strcmp(..., "/run")`.
+    With `--tmpfs /run/ --secret X` the tmpfs was therefore mounted
+    post-chroot on top of `/run/secrets/*`, exactly the fail-open the
+    pre-chroot `/run` mount exists to prevent.
+  - Reproduced end-to-end before fixing: the loader printed
+    `secret ... -> /run/secrets/apikey (read-only)` and the workload then
+    got `cat: can't open '/run/secrets/apikey': No such file or directory`
+    — the run started without a credential it had reported installing.
+  - Completed (2026-08-04): added `path_equals_normalized()` (collapses
+    runs of `/`, ignores trailing slashes) and used it at both comparison
+    sites. Unit-tested across 9 spellings; verified end-to-end that
+    `--tmpfs /run/ --secret X` now delivers the secret.
+
+- [x] `[Medium]` `--overlay-persist` allowed overlayfs mount-option injection.
+  - Found by the mandatory CLAUDE.md security review (2026-08-04). The path
+    is interpolated into `lowerdir=%s,upperdir=%s,workdir=%s`, where `,`
+    terminates an option and `:` separates lower layers, but only `..` was
+    rejected.
+  - Completed (2026-08-04): `parse_opts()` now rejects `,` and `:` in the
+    `--overlay-persist` path, with unit coverage.
+
+- [x] `[Medium]` Sealed credential ownership was not checked.
+  - Found by the mandatory CLAUDE.md security review (2026-08-04).
+    `credential_file_is_safe()` rejected group- and world-writable files,
+    but an owner can always `chmod` its own file — so a mode-0400 blob
+    owned by an arbitrary unprivileged uid was just as substitutable.
+  - Completed (2026-08-04): the credential must now be owned by uid 0 or by
+    the effective uid. Root takes the single-ID identity map
+    (`plan_userns_map()` returns early when the caller has
+    `CAP_SETUID`/`CAP_SETGID`), so a host root-owned credential reads as
+    uid 0 inside the namespace. A rootless run, where the host credential
+    is unmapped and reports as the overflow uid, gets an explicit pointer
+    at the root requirement rather than a confusing ownership complaint.
+
+- [x] `[Low]` `run_cmd_capture_stdin()` could exec a helper with no stdin.
+  - Found by the mandatory CLAUDE.md security review (2026-08-04). When
+    `in_fd < 0` and fd 0 was already closed, `open("/dev/null")` returned
+    fd 0; the `child_in == STDIN_FILENO` branch cleared `FD_CLOEXEC` on it,
+    and the unconditional `close(devnull)` immediately undid that.
+  - Completed (2026-08-04): the close is skipped when `devnull` *is* fd 0.
+
+- [x] `[Low]` `open_tpm2_credential()` could block indefinitely.
+  - Found by the mandatory CLAUDE.md security review (2026-08-04). A FIFO
+    planted under a candidate credential name would wedge the loader in
+    `open(O_RDONLY)` until a writer appeared.
+  - Completed (2026-08-04): opens with `O_NONBLOCK`, a no-op for the
+    regular files that survive the subsequent `fstat` check.
+
+- [x] `[Low]` Decrypted plaintext lingered in freed heap.
+  - `run_cmd_capture()` grew its buffer with `realloc()`, which may copy
+    and free the old block without zeroing it — leaving recoverable
+    credential bytes for any secret over 4 KiB. Several error paths also
+    `free()`d the buffer without zeroing.
+  - Completed (2026-08-04): buffer growth is now malloc + memcpy +
+    `explicit_bzero` + free, every error path zeroes before freeing, and
+    decrypted credentials are capped at `SECRET_MAX_BYTES` (4 MiB) to match
+    the plain-file secret limit.
 
 ## Correctness and Reliability
 

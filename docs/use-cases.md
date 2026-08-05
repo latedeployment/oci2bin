@@ -87,11 +87,13 @@ runtime mounts when each target has different local state.
 
 The default destination is `/run/secrets/<basename>`.
 
-With TPM2-sealed systemd credentials:
+With TPM2-sealed systemd credentials (the blob is read from the system
+credential stores; both steps need root):
 
 ```bash
-systemd-creds encrypt --name=dbpass /dev/stdin /etc/credstore/dbpass.cred
-./myapp --secret tpm2:dbpass:/run/secrets/db_password
+systemd-creds encrypt --with-key=tpm2 --name=dbpass /dev/stdin \
+    /etc/credstore.encrypted/dbpass
+sudo ./myapp --secret tpm2:dbpass:/run/secrets/db_password
 ```
 
 ## Build An Air-Gap Artifact

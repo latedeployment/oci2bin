@@ -376,6 +376,46 @@ def _check_rekor():
     return _result("rekor-cli (transparency log)", OK, "present")
 
 
+# Kept in sync with CREDSTORE_DIRS in src/loader.c.
+_CREDSTORE_DIRS = (
+    "/etc/credstore.encrypted",
+    "/run/credstore.encrypted",
+    "/var/lib/credstore.encrypted",
+    "/etc/credstore",
+    "/run/credstore",
+    "/var/lib/credstore",
+)
+
+
+def _check_tpm2_credstore():
+    # --secret tpm2:NAME needs systemd-creds, a credential store to read the
+    # sealed blob from, and (for TPM2-bound credentials) a working TPM2.
+    if _which("systemd-creds") is None:
+        return _result(
+            "TPM2 secrets (--secret tpm2:)", DEGRADED,
+            "systemd-creds missing — --secret tpm2: unavailable",
+            "install the systemd package")
+
+    stores = [d for d in _CREDSTORE_DIRS if os.path.isdir(d)]
+    has_tpm2 = os.path.exists("/dev/tpmrm0") or os.path.exists("/dev/tpm0")
+
+    if not stores:
+        return _result(
+            "TPM2 secrets (--secret tpm2:)", DEGRADED,
+            "systemd-creds present, but no credential store exists",
+            "create one: sudo mkdir -p -m 0700 /etc/credstore.encrypted")
+    if not has_tpm2:
+        return _result(
+            "TPM2 secrets (--secret tpm2:)", DEGRADED,
+            "credential stores: " + ", ".join(stores)
+            + "; no TPM2 device (/dev/tpmrm0) — only host-key credentials "
+              "can be decrypted",
+            "check with: systemd-analyze has-tpm2")
+    return _result(
+        "TPM2 secrets (--secret tpm2:)", OK,
+        "systemd-creds + /dev/tpmrm0; stores: " + ", ".join(stores))
+
+
 def _check_runtime_helpers():
     # Per-feature optional runtime helpers the loader/subcommands exec.
     tools = [
@@ -463,6 +503,7 @@ CHECKS = [
     _check_rekor,
     _check_tar_gzip_zstd,
     _check_age,
+    _check_tpm2_credstore,
     _check_runtime_helpers,
 ]
 

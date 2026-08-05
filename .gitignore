@@ -43,3 +43,6 @@ vm-backend-impl.md
 # Local Ralph-loop workflow file
 RALPH_WORK.md
 .claude/ralph-loop.local.md
+
+# Claude Code local config — never commit
+.claude/

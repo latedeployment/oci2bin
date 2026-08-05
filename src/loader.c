@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
@@ -74,10 +75,31 @@
 #endif
 #endif
 
-#ifndef __NR_memfd_secret
+#ifndef __NR_mount_setattr
 #if defined(__x86_64__) || defined(__aarch64__)
-#define __NR_memfd_secret 447
+#define __NR_mount_setattr 442
 #endif
+#endif
+
+/*
+ * mount_setattr(2) ABI (Linux 5.12+), provided by <linux/mount.h> on modern
+ * headers (pulled in via <sys/mount.h>). Defined manually only when the
+ * system headers predate it, so the loader still builds against older
+ * kernel headers; only reached behind __NR_mount_setattr and runtime
+ * ENOSYS detection, so an unsupported running kernel never uses it.
+ */
+#ifndef MOUNT_ATTR_RDONLY
+#define MOUNT_ATTR_RDONLY 0x00000001
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+struct mount_attr
+{
+    uint64_t attr_set;
+    uint64_t attr_clr;
+    uint64_t propagation;
+    uint64_t userns_fd;
+};
 #endif
 
 /* Landlock LSM (Linux 5.13+).  Probed at runtime; the syscall numbers are
@@ -222,6 +244,8 @@ enum kernel_feature_state
 static signed char g_kernel_feature_state[KERNEL_FEATURE_MAX];
 
 static int write_all_fd(int fd, const char* data, size_t len);
+static char* run_cmd_capture_stdin(char* const argv[], int in_fd,
+                                   size_t* out_len);
 static char* run_cmd_capture(char* const argv[], size_t* out_len);
 static int run_cmd(char* const argv[]);
 static int run_cmd_umask(char* const argv[], mode_t child_umask);
@@ -2619,6 +2643,49 @@ static int path_has_dotdot_component(const char* path)
 static int path_is_absolute_and_clean(const char* path)
 {
     return path && path[0] == '/' && !path_has_dotdot_component(path);
+}
+
+/*
+ * Compare two absolute paths while collapsing runs of '/' and ignoring
+ * trailing slashes, so "/run", "/run/" and "//run" all match.
+ *
+ * Used where a mountpoint decision must not be bypassable by an alternate
+ * spelling of the same path: `--tmpfs /run/` slipping past a plain strcmp()
+ * would be mounted post-chroot on top of the secrets setup_secrets() already
+ * installed under /run — the exact shadowing the pre-chroot /run mount exists
+ * to prevent.
+ */
+static int path_equals_normalized(const char* a, const char* b)
+{
+    while (*a && *b)
+    {
+        if (*a == '/' && *b == '/')
+        {
+            while (a[1] == '/')
+            {
+                a++;
+            }
+            while (b[1] == '/')
+            {
+                b++;
+            }
+        }
+        else if (*a != *b)
+        {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    while (*a == '/')
+    {
+        a++;
+    }
+    while (*b == '/')
+    {
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
 /*
@@ -5193,7 +5260,16 @@ static int run_age(char* const argv[])
  * Caller must free() the returned pointer.
  * Returns NULL on error (fork/pipe/exec failure or non-zero exit).
  */
-static char* run_cmd_capture(char* const argv[], size_t* out_len)
+/*
+ * Run argv[] and capture its stdout.
+ *
+ * 'in_fd' becomes the child's stdin.  Pass -1 for /dev/null: a helper we
+ * merely capture output from must never inherit our own stdin, which belongs
+ * to the container workload (and which a helper reading "-" would silently
+ * consume).  The caller keeps ownership of in_fd; it is not closed here.
+ */
+static char* run_cmd_capture_stdin(char* const argv[], int in_fd,
+                                   size_t* out_len)
 {
     int pipefd[2];
     if (pipe(pipefd) < 0)
@@ -5217,6 +5293,40 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len)
             _exit(127);
         }
         close(pipefd[1]);
+        /* Replace stdin unconditionally: either the caller's fd or
+         * /dev/null, but never the stdin we inherited ourselves. */
+        int child_in = in_fd;
+        int devnull  = -1;
+        if (child_in < 0)
+        {
+            devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (devnull < 0)
+            {
+                _exit(127);
+            }
+            child_in = devnull;
+        }
+        if (child_in == STDIN_FILENO)
+        {
+            /* dup2(n, n) is a no-op and would leave O_CLOEXEC set, so the fd
+             * would vanish across execvp.  Clear it explicitly. */
+            int fl = fcntl(STDIN_FILENO, F_GETFD);
+            if (fl < 0 || fcntl(STDIN_FILENO, F_SETFD, fl & ~FD_CLOEXEC) < 0)
+            {
+                _exit(127);
+            }
+        }
+        else if (dup2(child_in, STDIN_FILENO) < 0)
+        {
+            _exit(127);
+        }
+        if (devnull >= 0 && devnull != STDIN_FILENO)
+        {
+            /* When open() handed us fd 0 (stdin was closed), that fd IS the
+             * child's stdin now — closing it would exec the helper with no
+             * stdin at all, undoing the branch above. */
+            close(devnull);
+        }
         execvp(argv[0], argv);
         perror("execvp");
         _exit(127);
@@ -5240,22 +5350,32 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len)
             if (cap >= RUN_CMD_CAPTURE_MAX)
             {
                 /* Refuse to buffer more than RUN_CMD_CAPTURE_MAX of data */
-                fprintf(stderr, "oci2bin: systemd-creds output too large\n");
+                fprintf(stderr, "oci2bin: captured command output too large\n");
+                explicit_bzero(buf, len);
                 free(buf);
                 close(pipefd[0]);
                 waitpid(pid, NULL, 0);
                 return NULL;
             }
-            cap *= 2;
-            char* nb = realloc(buf, cap);
+            /* Grow by hand rather than realloc(): this buffer carries
+             * decrypted credential plaintext on the --secret tpm2 path, and
+             * realloc() may copy and free the old block without zeroing it,
+             * leaving recoverable plaintext in the heap. */
+            size_t newcap = cap * 2;
+            char*  nb     = malloc(newcap);
             if (!nb)
             {
+                explicit_bzero(buf, len);
                 free(buf);
                 close(pipefd[0]);
                 waitpid(pid, NULL, 0);
                 return NULL;
             }
+            memcpy(nb, buf, len);
+            explicit_bzero(buf, len);
+            free(buf);
             buf = nb;
+            cap = newcap;
         }
         ssize_t n = read(pipefd[0], buf + len, cap - len);
         if (n < 0)
@@ -5265,6 +5385,7 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len)
                 continue;
             }
             perror("oci2bin: read pipe");
+            explicit_bzero(buf, len);
             free(buf);
             close(pipefd[0]);
             waitpid(pid, NULL, 0);
@@ -5286,6 +5407,7 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len)
             continue;
         }
         perror("oci2bin: waitpid");
+        explicit_bzero(buf, len);
         free(buf);
         return NULL;
     }
@@ -5293,11 +5415,18 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len)
     {
         fprintf(stderr, "oci2bin: command exited with status %d\n",
                 WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        explicit_bzero(buf, len);
         free(buf);
         return NULL;
     }
     *out_len = len;
     return buf;
+}
+
+/* Capture a helper's stdout with its stdin bound to /dev/null. */
+static char* run_cmd_capture(char* const argv[], size_t* out_len)
+{
+    return run_cmd_capture_stdin(argv, -1, out_len);
 }
 
 /* Fork a daemon: exec argv[0] without waiting (child runs for the caller's
@@ -7358,6 +7487,60 @@ done:
  * for the ordering.
  */
 /*
+ * Recursively remount everything mounted at 'path' read-only.
+ *
+ * The classic mount(NULL, path, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY, NULL)
+ * only changes the flags of the single mount at 'path' — any submount
+ * nested beneath it (e.g. the host source of a `-v host:ctr:ro` itself
+ * containing other mount points) keeps its own, unrelated flags and stays
+ * writable. That is fine where submounts are meant to retain their own
+ * explicit flags (see mount_rootfs_read_only()'s "-v/dev/tmpfs keep their
+ * own mount flags" contract), but wrong for `-v ...:ro`, where the user
+ * asked for the whole tree they mounted to be read-only.
+ *
+ * Uses mount_setattr(2) with AT_RECURSIVE|MOUNT_ATTR_RDONLY (Linux 5.12+)
+ * to remount the entire subtree in one atomic call. Falls back to the
+ * non-recursive remount only when the kernel predates mount_setattr(2)
+ * (ENOSYS) — any other failure (e.g. EPERM) is returned as-is rather than
+ * silently accepting a weaker guarantee.
+ *
+ * Returns 0 on success, -1 on failure (errno set).
+ */
+static int recursive_remount_rdonly(const char* path)
+{
+#ifdef __NR_mount_setattr
+    int fd = open(path, O_PATH | O_CLOEXEC);
+    if (fd < 0)
+    {
+        /* open() failing (EMFILE/ENOMEM/EACCES/...) says nothing about
+         * whether the kernel has mount_setattr(2); it is not the ENOSYS
+         * case and must not silently fall back to the weaker
+         * non-recursive remount below. Fail closed. */
+        return -1;
+    }
+    struct mount_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.attr_set = MOUNT_ATTR_RDONLY;
+    long rc = syscall(__NR_mount_setattr, fd, "",
+                      AT_EMPTY_PATH | AT_RECURSIVE,
+                      &attr, sizeof(attr));
+    int saved_errno = errno;
+    close(fd);
+    if (rc == 0)
+    {
+        return 0;
+    }
+    if (saved_errno != ENOSYS)
+    {
+        errno = saved_errno;
+        return -1;
+    }
+    /* ENOSYS: kernel predates mount_setattr(2); fall back below. */
+#endif
+    return mount(NULL, path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL);
+}
+
+/*
  * Bind-mount every requested -v volume. A volume the user explicitly
  * requested that cannot be validated or mounted is a fail-closed error:
  * silently starting the workload without a mount it asked for (e.g. a
@@ -7410,11 +7593,10 @@ static int setup_volumes(const char* rootfs, struct container_opts *opts)
         }
         if (opts->vol_ro[i])
         {
-            /* Matches the two-step pattern in mount_rootfs_read_only():
-             * the initial MS_BIND|MS_REC mount above already brought in
-             * any submounts, so the remount itself does not need MS_REC. */
-            if (mount(NULL, dst, NULL,
-                      MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0)
+            /* Recursive: a `:ro` request covers the whole tree the user
+             * mounted, including any submount nested inside the host
+             * source directory — not just the top mount. */
+            if (recursive_remount_rdonly(dst) < 0)
             {
                 fprintf(stderr,
                         "oci2bin: -v read-only remount %s failed: %s\n",
@@ -7520,167 +7702,218 @@ static void setup_gdb_in_rootfs(const char* rootfs)
  * it lands at /run/secrets/<basename>.  Called pre-chroot.
  */
 /*
- * Decrypt a TPM2-sealed credential via systemd-creds and write the plaintext
- * to dst_path (on the rootfs tmpfs) with mode 0400.
+ * Decrypt a sealed credential via systemd-creds and place the plaintext at
+ * dst_path inside the rootfs, on a memory-backed staging mount and
+ * bind-mounted read-only.
  * Returns 0 on success, -1 on error.
  */
-/* ── memfd_secret helpers ─────────────────────────────────────────────────── */
-
 /*
- * Maximum size of a plain-file secret read into a memfd_secret region.
- * Secrets are typically small (keys, tokens, passwords); 4 MiB is generous.
+ * Zero a file's contents, then remove it.  Used on error paths that may have
+ * left decrypted secret material on a staging or destination file: unlinking
+ * alone would leave the bytes recoverable until the blocks are reused.
  */
-#define SECRET_MEMFD_MAX (4u * 1024u * 1024u)
-
-/*
- * Attempt to create a memfd_secret(2) file descriptor (Linux ≥ 5.14,
- * CONFIG_SECRETMEM=y).  Returns the fd on success or -1 with errno=ENOSYS
- * when the kernel does not support it (caller falls back silently).
- *
- * Pages backed by this fd are excluded from the kernel's direct mapping,
- * are unpageable, and do not appear in /proc/kcore or crash dumps.
- */
-static int
-make_memfd_secret(void)
+static void wipe_and_unlink_secret_file(const char* path, size_t len)
 {
-#ifdef __NR_memfd_secret
-    return (int)syscall(__NR_memfd_secret, (unsigned long)0);
-#else
-    errno = ENOSYS;
+    int fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0)
+    {
+        char zeros[4096];
+        memset(zeros, 0, sizeof(zeros));
+        size_t left = len;
+        while (left > 0)
+        {
+            size_t chunk = left < sizeof(zeros) ? left : sizeof(zeros);
+            ssize_t n = write(fd, zeros, chunk);
+            if (n <= 0)
+            {
+                break;
+            }
+            left -= (size_t)n;
+        }
+        close(fd);
+    }
+    else if (errno != ENOENT)
+    {
+        fprintf(stderr,
+                "oci2bin: warning: could not open %s to zero it (%s);"
+                " removing it unzeroed\n", path, strerror(errno));
+    }
+    if (unlink(path) < 0 && errno != ENOENT)
+    {
+        fprintf(stderr,
+                "oci2bin: warning: could not remove leftover secret"
+                " file %s: %s\n", path, strerror(errno));
+    }
+}
+
+/* ── secret staging (memory-backed) ──────────────────────────────────────── */
+
+/*
+* Maximum size of a secret held in memory before installation.
+* Secrets are typically small (keys, tokens, passwords); 4 MiB is generous.
+*/
+#define SECRET_MAX_BYTES (4u * 1024u * 1024u)
+
+/* Directory (relative to the rootfs) holding the staging mount. */
+#define SECRET_STAGING_DIR "/.oci2bin-secrets"
+
+/*
+* NOTE: an earlier version of this file staged secrets in a memfd_secret(2)
+* region and bind-mounted /proc/self/fd/<n> onto the destination.  That can
+* never work: memfd_secret and memfd_create inodes live on internal kernel
+* mounts (MNT_INTERNAL), and do_loopback() rejects those with EINVAL, so the
+* bind mount always failed and every secret silently fell through to the
+* fallback path.  Do not reintroduce it.
+*
+* What works instead is a real memory-backed mount that we own: stage the
+* plaintext in a file on it, bind-mount that file onto the destination,
+* remount read-only, then unlink the staging name.  The bind mount keeps the
+* inode alive, so afterwards the only way to the plaintext is the read-only
+* destination path.  ramfs is preferred over tmpfs because ramfs pages are
+* never written to swap.
+*/
+static int
+mount_secret_staging(const char* rootfs, char* out, size_t out_sz)
+{
+    int n = snprintf(out, out_sz, "%s%s", rootfs, SECRET_STAGING_DIR);
+    if (n < 0 || (size_t)n >= out_sz)
+    {
+        fprintf(stderr, "oci2bin: --secret staging path too long\n");
+        return -1;
+    }
+    if (mkdir_p_secure(out, 0700, "--secret staging") < 0)
+    {
+        return -1;
+    }
+    unsigned long flags = MS_NOSUID | MS_NODEV | MS_NOEXEC;
+    /* ramfs first: its pages are never swapped out. */
+    if (mount("ramfs", out, "ramfs", flags, "mode=0700") == 0)
+    {
+        return 0;
+    }
+    int ramfs_errno = errno;
+    if (mount("tmpfs", out, "tmpfs", flags, "mode=0700,size=8m") == 0)
+    {
+        fprintf(stderr,
+                "oci2bin: warning: --secret staging fell back to tmpfs"
+                " (ramfs: %s); secret pages may reach swap\n",
+                strerror(ramfs_errno));
+        return 0;
+    }
+    fprintf(stderr,
+            "oci2bin: --secret: cannot mount staging filesystem at %s"
+            " (ramfs: %s; tmpfs: %s)\n",
+            out, strerror(ramfs_errno), strerror(errno));
+    rmdir(out);
     return -1;
-#endif
+}
+
+/* Tear down the staging mount created by mount_secret_staging(). */
+static void
+umount_secret_staging(const char* staging)
+{
+    if (staging[0] == '\0')
+    {
+        return;
+    }
+    if (umount2(staging, MNT_DETACH) < 0 && errno != EINVAL && errno != ENOENT)
+    {
+        fprintf(stderr,
+                "oci2bin: warning: could not unmount secret staging %s: %s\n",
+                staging, strerror(errno));
+    }
+    if (rmdir(staging) < 0 && errno != ENOENT && errno != ENOTEMPTY)
+    {
+        fprintf(stderr,
+                "oci2bin: warning: could not remove secret staging %s: %s\n",
+                staging, strerror(errno));
+    }
 }
 
 /*
- * Write 'len' bytes from 'data' into the memfd_secret fd 'sfd', then
- * bind-mount the fd's /proc/self/fd/<n> path read-only onto 'dst_path'.
- *
- * 'sfd' is ALWAYS closed before this function returns (both on success and
- * failure), so the caller must not close it again.
- *
- * Returns 0 on success, -1 on failure (the bind-mount is cleaned up).
- */
+* Place 'len' bytes of secret material at dst_path, memory-backed and
+* read-only, using the staging mount.  'slot' distinguishes concurrent
+* secrets within the staging directory.
+*
+* On every failure path the staging file is zeroed and unlinked so no
+* plaintext is left behind.  Returns 0 on success, -1 on failure.
+*/
 static int
-bind_mount_memfd_secret(int sfd, const void* data, size_t len,
-                        const char* dst_path)
+install_staged_secret(const char* staging, int slot, const void* data,
+                      size_t len, const char* dst_path)
 {
-    if (ftruncate(sfd, (off_t)len) < 0)
+    char stage_file[PATH_MAX];
+    int n = snprintf(stage_file, sizeof(stage_file), "%s/s%d", staging, slot);
+    if (n < 0 || (size_t)n >= sizeof(stage_file))
     {
-        fprintf(stderr, "oci2bin: memfd_secret ftruncate: %s\n",
-                strerror(errno));
-        close(sfd);
+        fprintf(stderr, "oci2bin: --secret staging file path too long\n");
         return -1;
     }
-    if (write_all_fd(sfd, data, len) < 0)
+
+    int fd = open(stage_file, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0400);
+    if (fd < 0)
     {
-        fprintf(stderr, "oci2bin: memfd_secret write: %s\n",
-                strerror(errno));
-        close(sfd);
+        fprintf(stderr, "oci2bin: --secret: create staging file %s: %s\n",
+                stage_file, strerror(errno));
         return -1;
     }
-    char proc_path[64];
-    int n = snprintf(proc_path, sizeof(proc_path),
-                     "/proc/self/fd/%d", sfd);
-    if (n < 0 || (size_t)n >= sizeof(proc_path))
+    if (write_all_fd(fd, data, len) < 0)
     {
-        fprintf(stderr, "oci2bin: memfd_secret: fd path overflow\n");
-        close(sfd);
+        fprintf(stderr, "oci2bin: --secret: write staging file %s: %s\n",
+                stage_file, strerror(errno));
+        close(fd);
+        wipe_and_unlink_secret_file(stage_file, len);
         return -1;
     }
-    if (mount(proc_path, dst_path, NULL, MS_BIND, NULL) < 0)
+    close(fd);
+
+    if (mount(stage_file, dst_path, NULL, MS_BIND, NULL) < 0)
     {
-        fprintf(stderr,
-                "oci2bin: memfd_secret bind mount -> %s: %s\n",
+        fprintf(stderr, "oci2bin: --secret bind mount -> %s: %s\n",
                 dst_path, strerror(errno));
-        close(sfd);
+        wipe_and_unlink_secret_file(stage_file, len);
         return -1;
     }
     if (mount(NULL, dst_path, NULL,
-              MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOEXEC | MS_NOSUID | MS_NODEV,
-              NULL) < 0)
+              MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOEXEC | MS_NOSUID |
+              MS_NODEV, NULL) < 0)
     {
-        fprintf(stderr,
-                "oci2bin: memfd_secret remount ro %s: %s\n",
+        fprintf(stderr, "oci2bin: --secret remount read-only %s: %s\n",
                 dst_path, strerror(errno));
-        umount2(dst_path, MNT_DETACH);
-        close(sfd);
+        if (umount2(dst_path, MNT_DETACH) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: warning: could not unmount writable"
+                    " secret %s: %s\n", dst_path, strerror(errno));
+        }
+        wipe_and_unlink_secret_file(stage_file, len);
         return -1;
     }
-    close(sfd);
+
+    /* The bind mount holds the inode; dropping the staging name leaves the
+    * read-only destination as the only path to the plaintext. */
+    if (unlink(stage_file) < 0 && errno != ENOENT)
+    {
+        fprintf(stderr,
+                "oci2bin: warning: could not unlink staging secret %s: %s\n",
+                stage_file, strerror(errno));
+    }
     return 0;
 }
 
 /*
- * Expose a plain host file as a read-only secret inside the container.
- *
- * Tries memfd_secret first: reads the file into a kernel-protected anonymous
- * memory region and bind-mounts /proc/self/fd/<n> onto dst_path so the
- * container sees a normal path but the data never touches the page cache.
- *
- * Falls back to a standard read-only bind-mount when:
- *   - the kernel lacks memfd_secret (Linux < 5.14)
- *   - the file is larger than SECRET_MEMFD_MAX
- *   - any step in the memfd path fails
- */
+* Expose a plain host file as a read-only secret inside the container:
+* a bind mount of the host file, remounted read-only.
+*
+* The host file already exists on the host filesystem, so there is nothing
+* to be gained by copying its contents into memory first — see the note on
+* mount_secret_staging() for why the old memfd_secret attempt could not
+* work.  Secrets that only exist in memory (TPM2) go through
+* install_staged_secret() instead.
+*/
 static int
 install_plain_secret(const char* src, const char* dst, const char* ctr)
 {
-    int sfd = make_memfd_secret();
-    if (sfd >= 0)
-    {
-        int used_memfd = 0;
-        /* Open first, then fstat the fd to avoid a TOCTOU race. */
-        int rfd = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        struct stat st_s;
-        if (rfd >= 0 &&
-                fstat(rfd, &st_s) == 0 &&
-                st_s.st_size >= 0 &&
-                (size_t)st_s.st_size <= SECRET_MEMFD_MAX)
-        {
-            size_t flen = (size_t)st_s.st_size;
-            char*  fbuf = malloc(flen + 1);
-            if (fbuf)
-            {
-                /* Use read_all_fd to handle short reads correctly. */
-                ssize_t nread = read_all_fd(rfd, fbuf, flen);
-                close(rfd);
-                rfd = -1;
-                if (nread >= 0 && (size_t)nread == flen)
-                {
-                    if (ensure_bind_mount_target(src, dst, "--secret") == 0)
-                    {
-                        /* bind_mount_memfd_secret always closes sfd */
-                        if (bind_mount_memfd_secret(sfd, fbuf, flen, dst) == 0)
-                        {
-                            used_memfd = 1;
-                            fprintf(stderr,
-                                    "oci2bin: secret %s -> %s"
-                                    " (memfd_secret)\n",
-                                    src, ctr);
-                        }
-                        sfd = -1; /* closed by bind_mount_memfd_secret */
-                    }
-                }
-                explicit_bzero(fbuf, flen + 1);
-                free(fbuf);
-            }
-        }
-        if (rfd >= 0)
-        {
-            close(rfd);
-        }
-        if (sfd >= 0)
-        {
-            close(sfd);
-        }
-        if (used_memfd)
-        {
-            return 0;
-        }
-        /* Fall through to bind-mount on any memfd failure */
-    }
-
-    /* Fallback: read-only bind-mount of the host file. */
     if (ensure_bind_mount_target(src, dst, "--secret") < 0)
     {
         return -1;
@@ -7709,7 +7942,161 @@ install_plain_secret(const char* src, const char* dst, const char* ctr)
     return 0;
 }
 
-static int install_tpm2_secret(const char* cred_name, const char* dst_path,
+/*
+* System credential stores searched for a `--secret tpm2:NAME` blob, in
+* order.  The `.encrypted` directories are systemd's own convention for
+* sealed credentials, so they win over the plain ones.  Within each
+* directory both `NAME` (systemd's convention) and `NAME.cred` are tried.
+                         */
+static const char* const CREDSTORE_DIRS[] =
+{
+    "/etc/credstore.encrypted",
+    "/run/credstore.encrypted",
+    "/var/lib/credstore.encrypted",
+    "/etc/credstore",
+    "/run/credstore",
+    "/var/lib/credstore",
+};
+
+/*
+* Build "<dir>/<cred>" or "<dir>/<cred>.cred".
+* Returns 0 on success, -1 if the result would not fit in 'out'.
+*/
+static int credstore_candidate_path(char* out, size_t outsz, const char* dir,
+                                    const char* cred, int with_suffix)
+{
+    int n = snprintf(out, outsz, "%s/%s%s", dir, cred,
+                     with_suffix ? ".cred" : "");
+    if (n < 0 || (size_t)n >= outsz)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+* A sealed credential is only as trustworthy as the file it is read from:
+* `systemd-creds decrypt` accepts host-key-only and even --with-key=null
+* (unencrypted) blobs just as happily as TPM2-sealed ones, so anyone who can
+* rewrite the file can substitute a credential of their own choosing.  There
+* is no systemd-creds flag to demand TPM2 binding at decrypt time, so guard
+* the input instead: require a regular file (an lstat that reports a symlink
+* fails this, so a link cannot redirect past the check) that is owned by root
+* (or by us) and is not group- or world-writable.
+*
+* The ownership check is not redundant with the mode check: an owner can
+* always chmod its own file, so a 0400 blob owned by some other unprivileged
+* uid is just as rewritable as a group-writable one.
+*
+* 'st' must come from lstat() or from fstat() on an O_NOFOLLOW open.
+*/
+static int credential_file_is_safe(const char* path, const struct stat* st)
+{
+    if (!S_ISREG(st->st_mode))
+    {
+        fprintf(stderr,
+                "oci2bin: --secret tpm2: %s is not a regular file\n", path);
+        return 0;
+    }
+    if (st->st_uid != 0 && st->st_uid != geteuid())
+    {
+        fprintf(stderr,
+                "oci2bin: --secret tpm2: refusing credential %s: it is owned"
+                " by uid %u, which can rewrite it\n",
+                path, (unsigned)st->st_uid);
+        /* In a rootless run the host's root-owned credential is unmapped and
+         * reports as the overflow uid, so say what is actually wrong rather
+         * than leaving the caller chasing file ownership. */
+        if (st->st_uid == (uid_t) - 1 || st->st_uid == 65534)
+        {
+            fprintf(stderr,
+                    "oci2bin: (the credential is owned by a uid not mapped"
+                    " into this user namespace — --secret tpm2 requires"
+                    " running as root)\n");
+        }
+        return 0;
+    }
+    if (st->st_mode & (S_IWGRP | S_IWOTH))
+    {
+        fprintf(stderr,
+                "oci2bin: --secret tpm2: refusing credential %s: it is"
+                " group- or world-writable (mode %04o)\n",
+                path, (unsigned)(st->st_mode & 07777));
+        return 0;
+    }
+    return 1;
+}
+
+/*
+* Locate the sealed blob for 'cred_name' in the system credential stores and
+* return an open read-only fd for it, so the file that was validated is
+* exactly the file that gets decrypted (no TOCTOU between check and use).
+* 'out_path' receives the path, for diagnostics.
+* Returns the fd on success, -1 on failure.
+*/
+static int open_tpm2_credential(const char* cred_name, char* out_path,
+                                size_t out_sz)
+{
+    size_t n_dirs = sizeof(CREDSTORE_DIRS) / sizeof(CREDSTORE_DIRS[0]);
+    for (size_t i = 0; i < n_dirs; i++)
+    {
+        for (int suffix = 0; suffix <= 1; suffix++)
+        {
+            char cand[PATH_MAX];
+            if (credstore_candidate_path(cand, sizeof(cand),
+                                         CREDSTORE_DIRS[i], cred_name,
+                                         suffix) < 0)
+            {
+                continue;
+            }
+            /* O_NONBLOCK so a FIFO (or a device node) planted under the
+             * candidate name cannot wedge the loader in open(); the fstat
+             * below rejects anything that is not a regular file, and
+             * O_NONBLOCK is a no-op for those. */
+            int fd = open(cand, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+            if (fd < 0)
+            {
+                continue;
+            }
+            struct stat st;
+            if (fstat(fd, &st) < 0)
+            {
+                fprintf(stderr, "oci2bin: --secret tpm2: fstat %s: %s\n",
+                        cand, strerror(errno));
+                close(fd);
+                return -1;
+            }
+            if (!credential_file_is_safe(cand, &st))
+            {
+                close(fd);
+                return -1;
+            }
+            if (snprintf(out_path, out_sz, "%s", cand) >= (int)out_sz)
+            {
+                close(fd);
+                return -1;
+            }
+            return fd;
+        }
+    }
+
+    fprintf(stderr,
+            "oci2bin: --secret tpm2:%s: no sealed credential found."
+            " Searched for '%s' and '%s.cred' in:\n",
+            cred_name, cred_name, cred_name);
+    for (size_t i = 0; i < n_dirs; i++)
+    {
+        fprintf(stderr, "oci2bin:   %s\n", CREDSTORE_DIRS[i]);
+    }
+    fprintf(stderr,
+            "oci2bin: seal one with: systemd-creds encrypt"
+            " --with-key=tpm2 --name=%s PLAINTEXT %s/%s\n",
+            cred_name, CREDSTORE_DIRS[0], cred_name);
+    return -1;
+}
+
+static int install_tpm2_secret(const char* cred_name, const char* staging,
+                               int slot, const char* dst_path,
                                const char* ctr)
 {
     if (ensure_regular_file_target(dst_path, "--secret tpm2", 0400) < 0)
@@ -7728,92 +8115,67 @@ static int install_tpm2_secret(const char* cred_name, const char* dst_path,
         return -1;
     }
 
+    char cred_path[PATH_MAX];
+    int  cred_fd = open_tpm2_credential(cred_name, cred_path,
+                                        sizeof(cred_path));
+    if (cred_fd < 0)
+    {
+        return -1;
+    }
+
+    /* Feed the blob on stdin ("-" as INPUT) rather than by path: the fd is
+    * already open and validated, so the decrypted bytes cannot come from a
+    * file swapped in after the check. */
     char* const argv[] =
     {
         creds_bin, "decrypt", "--name", (char*)(uintptr_t)cred_name,
         "-", "-", NULL
     };
     size_t len = 0;
-    char*  plaintext = run_cmd_capture(argv, &len);
+    char*  plaintext = run_cmd_capture_stdin(argv, cred_fd, &len);
+    close(cred_fd);
     if (!plaintext)
     {
         fprintf(stderr,
-                "oci2bin: systemd-creds decrypt failed for credential '%s'\n",
-                cred_name);
+                "oci2bin: systemd-creds decrypt failed for credential '%s'"
+                " (%s).\n"
+                "oci2bin: decryption needs the host credential key"
+                " (/var/lib/systemd/credential.secret) and the TPM2 device,"
+                " both of which are root-only — run as root.\n",
+                cred_name, cred_path);
         return -1;
     }
-
-    /* Prefer memfd_secret (Linux ≥ 5.14): plaintext never reaches the page
-     * cache or kernel crash dumps.  Create an empty regular file as the
-     * bind-mount target, overlay it with the secretmem fd, then discard. */
-    int sfd = make_memfd_secret();
-    if (sfd >= 0)
+    if (len > SECRET_MAX_BYTES)
     {
-        int tfd = open(dst_path,
-                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
-                       0400);
-        if (tfd < 0)
-        {
-            fprintf(stderr,
-                    "oci2bin: cannot create secret target %s: %s\n",
-                    dst_path, strerror(errno));
-            close(sfd);
-            explicit_bzero(plaintext, len);
-            free(plaintext);
-            return -1;
-        }
-        close(tfd);
-        /* bind_mount_memfd_secret always closes sfd */
-        int rc = bind_mount_memfd_secret(sfd, plaintext, len, dst_path);
-        explicit_bzero(plaintext, len);
-        free(plaintext);
-        if (rc == 0)
-        {
-            fprintf(stderr,
-                    "oci2bin: tpm2 secret '%s' -> %s (memfd_secret)\n",
-                    cred_name, ctr);
-        }
-        return rc;
-    }
-
-    /* Fallback: write plaintext to a regular file inside rootfs. */
-    int fd = open(dst_path,
-                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
-                  0400);
-    if (fd < 0)
-    {
-        fprintf(stderr, "oci2bin: cannot create secret file %s: %s\n",
-                dst_path, strerror(errno));
+        fprintf(stderr,
+                "oci2bin: --secret tpm2:%s: decrypted credential is %zu bytes,"
+                " over the %u-byte limit\n",
+                cred_name, len, (unsigned)SECRET_MAX_BYTES);
         explicit_bzero(plaintext, len);
         free(plaintext);
         return -1;
     }
-    int rc = 0;
-    if (write_all_fd(fd, plaintext, len) < 0)
-    {
-        fprintf(stderr, "oci2bin: write secret %s failed: %s\n",
-                dst_path, strerror(errno));
-        rc = -1;
-    }
-    close(fd);
+
+    int rc = install_staged_secret(staging, slot, plaintext, len, dst_path);
     explicit_bzero(plaintext, len);
     free(plaintext);
     if (rc == 0)
     {
-        fprintf(stderr, "oci2bin: tpm2 secret '%s' -> %s (read-only)\n",
+        fprintf(stderr,
+                "oci2bin: tpm2 secret '%s' -> %s (read-only, memory-backed)\n",
                 cred_name, ctr);
     }
     return rc;
 }
 
 /*
- * Bind-mount/install every requested --secret. A secret the user explicitly
- * requested that cannot be validated or installed is a fail-closed error —
- * see setup_volumes() for the same reasoning: a workload that expects a
- * credential at a fixed path must not silently start without it.
- * Returns 0 if every requested secret installed, -1 on the first failure
- * (caller aborts the run).
- */
+* Bind-mount/install every requested --secret. A secret the user explicitly
+* requested that cannot be validated or installed is a fail-closed error —
+* see setup_volumes() for the same reasoning: a workload that expects a
+* credential at a fixed path must not silently start without it.
+* Returns 0 if every requested secret installed, -1 on the first failure
+* (caller aborts the run).
+*/
 static int setup_secrets(const char* rootfs, struct container_opts *opts)
 {
     if (opts->n_secrets == 0)
@@ -7842,6 +8204,13 @@ static int setup_secrets(const char* rootfs, struct container_opts *opts)
         return -1;
     }
 
+    /* Staging mount for secrets that exist only in memory (TPM2).  Mounted
+     * lazily so a run with only plain-file secrets does not pay for it, and
+     * torn down before we return either way. */
+    char staging[PATH_MAX];
+    staging[0] = '\0';
+    int rc = 0;
+
     for (int i = 0; i < opts->n_secrets; i++)
     {
         const char* cred = opts->secret_cred[i]; /* non-NULL = TPM2 path */
@@ -7857,7 +8226,8 @@ static int setup_secrets(const char* rootfs, struct container_opts *opts)
                 fprintf(stderr,
                         "oci2bin: --secret container path must be absolute"
                         " and clean: %s\n", ctr);
-                return -1;
+                rc = -1;
+                goto out;
             }
         }
         else
@@ -7872,14 +8242,16 @@ static int setup_secrets(const char* rootfs, struct container_opts *opts)
             {
                 fprintf(stderr,
                         "oci2bin: --secret cannot derive basename\n");
-                return -1;
+                rc = -1;
+                goto out;
             }
             int n = snprintf(ctr_buf, sizeof(ctr_buf), "/run/secrets/%s", base);
             if (n < 0 || (size_t)n >= sizeof(ctr_buf))
             {
                 fprintf(stderr,
                         "oci2bin: --secret container path too long\n");
-                return -1;
+                rc = -1;
+                goto out;
             }
             ctr = ctr_buf;
         }
@@ -7891,15 +8263,26 @@ static int setup_secrets(const char* rootfs, struct container_opts *opts)
         {
             fprintf(stderr, "oci2bin: --secret destination path too long: %s%s\n",
                     rootfs, ctr);
-            return -1;
+            rc = -1;
+            goto out;
         }
 
         if (cred)
         {
-            /* TPM2-sealed secret: decrypt and install (memfd_secret or file) */
-            if (install_tpm2_secret(cred, dst, ctr) < 0)
+            /* TPM2-sealed secret: decrypt into the staging mount, then
+             * bind-mount it read-only at the destination. */
+            if (staging[0] == '\0' &&
+                    mount_secret_staging(rootfs, staging,
+                                         sizeof(staging)) < 0)
             {
-                return -1;
+                staging[0] = '\0';
+                rc = -1;
+                goto out;
+            }
+            if (install_tpm2_secret(cred, staging, i, dst, ctr) < 0)
+            {
+                rc = -1;
+                goto out;
             }
             continue;
         }
@@ -7910,15 +8293,22 @@ static int setup_secrets(const char* rootfs, struct container_opts *opts)
             fprintf(stderr,
                     "oci2bin: --secret host path must be absolute and clean: %s\n",
                     src);
-            return -1;
+            rc = -1;
+            goto out;
         }
 
         if (install_plain_secret(src, dst, ctr) < 0)
         {
-            return -1;
+            rc = -1;
+            goto out;
         }
     }
-    return 0;
+
+out:
+    /* The staging directory only ever held names we have already unlinked;
+     * the installed secrets survive as bind mounts on their own inodes. */
+    umount_secret_staging(staging);
+    return rc;
 }
 
 /* ── capability management ───────────────────────────────────────────────── */
@@ -11058,6 +11448,171 @@ static int make_mount_tree_private(void)
     return 0;
 }
 
+/*
+ * --ephemeral-root / --overlay-persist: mount a writable overlayfs.
+ * For --ephemeral-root:  upper/work live in a tmpdir (discarded on exit).
+ * For --overlay-persist: upper/work live in the user-specified dir (kept).
+ *
+ * Must run BEFORE any -v/--secret/--device/--ssh-agent bind mount is added
+ * to rootfs. Overlayfs resolves lowerdir=rootfs by directory-merging its
+ * tree at mount time; it does not recognize filesystems mounted inside
+ * lowerdir as submounts, so anything bind-mounted into rootfs before this
+ * mount would be invisible (shadowed by the pre-mount placeholder content)
+ * in the merged view. Bind mounts added AFTER this point land on top of
+ * the merged overlay via ordinary mount stacking, which does compose
+ * correctly. Returns 0 on success or if no overlay was requested, -1 on
+ * failure (caller aborts — both flags are explicit, so silently degrading
+ * to a writable/unmerged root would defeat the user's request).
+ */
+static int setup_overlay_root(const char* rootfs,
+                              const struct container_opts* opts)
+{
+    if (!opts->ephemeral_root && !opts->overlay_persist)
+    {
+        return 0;
+    }
+
+    char upper[PATH_MAX];
+    char work[PATH_MAX];
+    int upper_ok = 0;
+
+    if (opts->overlay_persist)
+    {
+        /* --overlay-persist DIR: use DIR/upper and DIR/work */
+        int ulen = snprintf(upper, sizeof(upper),
+                            "%s/upper", opts->overlay_persist);
+        int wlen = snprintf(work,  sizeof(work),
+                            "%s/work",  opts->overlay_persist);
+        if (ulen < 0 || (size_t)ulen >= sizeof(upper))
+        {
+            fprintf(stderr,
+                    "oci2bin: --overlay-persist: upper path"
+                    " truncated\n");
+        }
+        else if (wlen < 0 || (size_t)wlen >= sizeof(work))
+        {
+            fprintf(stderr,
+                    "oci2bin: --overlay-persist: work path"
+                    " truncated\n");
+        }
+        else
+        {
+            /* Create DIR, DIR/upper, DIR/work if needed */
+            mkdir(opts->overlay_persist, 0755);
+            mkdir(upper, 0755);
+            mkdir(work,  0755);
+            /* Verify upper and work are on the same filesystem */
+            struct stat su, sw;
+            if (stat(upper, &su) < 0 || stat(work, &sw) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --overlay-persist: stat"
+                        " failed\n");
+            }
+            else if (su.st_dev != sw.st_dev)
+            {
+                fprintf(stderr,
+                        "oci2bin: --overlay-persist:"
+                        " upper and work must be on the"
+                        " same filesystem\n");
+            }
+            else
+            {
+                upper_ok = 1;
+            }
+        }
+    }
+    else
+    {
+        /* --ephemeral-root: derive tmpdir by stripping "/rootfs" suffix */
+        char tmpdir[PATH_MAX];
+        int tmpdir_ok = 0;
+        int tlen = snprintf(tmpdir, sizeof(tmpdir), "%s", rootfs);
+        if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
+        {
+            char* slash = strrchr(tmpdir, '/');
+            if (slash && strcmp(slash, "/rootfs") == 0)
+            {
+                *slash = '\0';
+                tmpdir_ok = 1;
+            }
+            else
+            {
+                tlen = snprintf(tmpdir, sizeof(tmpdir),
+                                "%s/..", rootfs);
+                if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
+                {
+                    tmpdir_ok = 1;
+                }
+            }
+        }
+        if (tmpdir_ok)
+        {
+            int ulen = snprintf(upper, sizeof(upper),
+                                "%s/upper", tmpdir);
+            int wlen = snprintf(work,  sizeof(work),
+                                "%s/work",  tmpdir);
+            if (ulen > 0 && (size_t)ulen < sizeof(upper) &&
+                    wlen > 0 && (size_t)wlen < sizeof(work))
+            {
+                mkdir(upper, 0755);
+                mkdir(work,  0755);
+                /* mkdir() errors (e.g. EEXIST on a re-run) are expected;
+                 * verify the directories actually exist rather than
+                 * trusting the mkdir() call, matching the
+                 * --overlay-persist branch above. */
+                struct stat su, sw;
+                if (stat(upper, &su) == 0 && S_ISDIR(su.st_mode) &&
+                        stat(work, &sw) == 0 && S_ISDIR(sw.st_mode))
+                {
+                    upper_ok = 1;
+                }
+                else
+                {
+                    fprintf(stderr,
+                            "oci2bin: --ephemeral-root: could not"
+                            " create overlay upper/work dirs\n");
+                }
+            }
+        }
+    }
+
+    if (upper_ok)
+    {
+        char overlay_opts[PATH_MAX * 4];
+        int olen = snprintf(overlay_opts, sizeof(overlay_opts),
+                            "lowerdir=%s,upperdir=%s,workdir=%s",
+                            rootfs, upper, work);
+        if (olen > 0 && (size_t)olen < sizeof(overlay_opts))
+        {
+            if (mount("overlay", rootfs, "overlay", 0,
+                      overlay_opts) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: %s requested but overlayfs"
+                        " mount failed: %s\n",
+                        opts->ephemeral_root ? "--ephemeral-root"
+                        : "--overlay-persist",
+                        strerror(errno));
+                return -1;
+            }
+            return 0;
+        }
+        fprintf(stderr, "oci2bin: overlay options string truncated\n");
+        return -1;
+    }
+    /* upper_ok==0 means the upper/work setup failed (path truncated,
+     * mkdir, or cross-device). The earlier branches already printed a
+     * specific error; for an explicit flag we refuse to silently
+     * downgrade. */
+    fprintf(stderr,
+            "oci2bin: %s requested but overlay upper/work"
+            " could not be prepared\n",
+            opts->ephemeral_root ? "--ephemeral-root"
+            : "--overlay-persist");
+    return -1;
+}
+
 static int container_main(const char* rootfs, struct container_opts *opts)
 {
     debug_log("container_main.begin", "rootfs=%s", rootfs);
@@ -11117,6 +11672,64 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Establish the writable root BEFORE any bind mount is added — see
+     * setup_overlay_root() for why ordering matters here. */
+    if (setup_overlay_root(rootfs, opts) < 0)
+    {
+        return 1;
+    }
+
+    /* Auto-mount /run as tmpfs before secrets/--ssh-agent are installed
+     * beneath it, so a later duplicate mount does not shadow them. This
+     * covers both --read-only's automatic writable /run and an explicit
+     * --tmpfs /run — either would otherwise be mounted post-chroot, after
+     * setup_secrets() has already bind-mounted a secret at its default
+     * /run/secrets/<basename> location. run_tmpfs_preinstalled is checked
+     * later (post-chroot) so those code paths do not mount /run again. */
+    int run_tmpfs_preinstalled = 0;
+    {
+        int want_run_tmpfs = (opts->read_only && !opts->no_auto_tmpfs);
+        if (!want_run_tmpfs)
+        {
+            for (int ti = 0; ti < opts->n_tmpfs; ti++)
+            {
+                if (path_equals_normalized(opts->tmpfs_mounts[ti], "/run"))
+                {
+                    want_run_tmpfs = 1;
+                    break;
+                }
+            }
+        }
+        if (want_run_tmpfs)
+        {
+            char dst[PATH_MAX];
+            int n = snprintf(dst, sizeof(dst), "%s/run", rootfs);
+            if (n < 0 || (size_t)n >= sizeof(dst))
+            {
+                fprintf(stderr, "oci2bin: /run mountpoint path too long\n");
+                return 1;
+            }
+            if (mkdir_p_secure(dst, 0755, "/run tmpfs") < 0)
+            {
+                return 1;
+            }
+            if (mount("tmpfs", dst, "tmpfs",
+                      MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=0755") < 0)
+            {
+                /* Fail closed: if this mount silently degrades instead
+                 * of aborting, a post-chroot --tmpfs /run mount (which
+                 * only skips /run when run_tmpfs_preinstalled is set)
+                 * would still run and shadow secrets already bind-mounted
+                 * by setup_secrets() beneath /run — the exact bug this
+                 * pre-chroot mount exists to prevent. */
+                fprintf(stderr, "oci2bin: mount /run tmpfs: %s\n",
+                        strerror(errno));
+                return 1;
+            }
+            run_tmpfs_preinstalled = 1;
+        }
+    }
+
     /* Set up volume bind mounts BEFORE chroot (host paths still reachable).
      * Both fail closed: a requested -v/--secret that cannot be validated or
      * mounted aborts the run rather than starting the workload without it. */
@@ -11169,19 +11782,9 @@ static int container_main(const char* rootfs, struct container_opts *opts)
                 return 1;
             }
         }
-        if (opts->read_only && !opts->no_auto_tmpfs)
-        {
-            char dst[PATH_MAX];
-            int n = snprintf(dst, sizeof(dst), "%s/run", rootfs);
-            if (n < 0 || (size_t)n >= sizeof(dst) ||
-                    mkdir_p_secure(dst, 0755,
-                                   "--read-only /run") < 0)
-            {
-                fprintf(stderr,
-                        "oci2bin: cannot prepare mountpoint /run\n");
-                return 1;
-            }
-        }
+        /* /run is prepared earlier (before setup_volumes/setup_secrets)
+         * by the run_tmpfs_preinstalled block above when needed, so it
+         * does not need separate handling here. */
         for (int i = 0; i < opts->n_tmpfs; i++)
         {
             char dst[PATH_MAX];
@@ -11464,151 +12067,12 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* --ephemeral-root / --overlay-persist: mount a writable overlayfs.
-     * For --ephemeral-root:  upper/work live in a tmpdir (discarded on exit).
-     * For --overlay-persist: upper/work live in the user-specified dir (kept). */
-    if (opts->ephemeral_root || opts->overlay_persist)
-    {
-        char upper[PATH_MAX];
-        char work[PATH_MAX];
-        int upper_ok = 0;
-
-        if (opts->overlay_persist)
-        {
-            /* --overlay-persist DIR: use DIR/upper and DIR/work */
-            int ulen = snprintf(upper, sizeof(upper),
-                                "%s/upper", opts->overlay_persist);
-            int wlen = snprintf(work,  sizeof(work),
-                                "%s/work",  opts->overlay_persist);
-            if (ulen < 0 || (size_t)ulen >= sizeof(upper))
-            {
-                fprintf(stderr,
-                        "oci2bin: --overlay-persist: upper path"
-                        " truncated\n");
-            }
-            else if (wlen < 0 || (size_t)wlen >= sizeof(work))
-            {
-                fprintf(stderr,
-                        "oci2bin: --overlay-persist: work path"
-                        " truncated\n");
-            }
-            else
-            {
-                /* Create DIR, DIR/upper, DIR/work if needed */
-                mkdir(opts->overlay_persist, 0755);
-                mkdir(upper, 0755);
-                mkdir(work,  0755);
-                /* Verify upper and work are on the same filesystem */
-                struct stat su, sw;
-                if (stat(upper, &su) < 0 || stat(work, &sw) < 0)
-                {
-                    fprintf(stderr,
-                            "oci2bin: --overlay-persist: stat"
-                            " failed\n");
-                }
-                else if (su.st_dev != sw.st_dev)
-                {
-                    fprintf(stderr,
-                            "oci2bin: --overlay-persist:"
-                            " upper and work must be on the"
-                            " same filesystem\n");
-                }
-                else
-                {
-                    upper_ok = 1;
-                }
-            }
-        }
-        else
-        {
-            /* --ephemeral-root: derive tmpdir by stripping "/rootfs" suffix */
-            char tmpdir[PATH_MAX];
-            int tmpdir_ok = 0;
-            int tlen = snprintf(tmpdir, sizeof(tmpdir), "%s", rootfs);
-            if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
-            {
-                char* slash = strrchr(tmpdir, '/');
-                if (slash && strcmp(slash, "/rootfs") == 0)
-                {
-                    *slash = '\0';
-                    tmpdir_ok = 1;
-                }
-                else
-                {
-                    tlen = snprintf(tmpdir, sizeof(tmpdir),
-                                    "%s/..", rootfs);
-                    if (tlen > 0 && (size_t)tlen < sizeof(tmpdir))
-                    {
-                        tmpdir_ok = 1;
-                    }
-                }
-            }
-            if (tmpdir_ok)
-            {
-                int ulen = snprintf(upper, sizeof(upper),
-                                    "%s/upper", tmpdir);
-                int wlen = snprintf(work,  sizeof(work),
-                                    "%s/work",  tmpdir);
-                if (ulen > 0 && (size_t)ulen < sizeof(upper) &&
-                        wlen > 0 && (size_t)wlen < sizeof(work))
-                {
-                    mkdir(upper, 0755);
-                    mkdir(work,  0755);
-                    upper_ok = 1;
-                }
-            }
-        }
-
-        if (upper_ok)
-        {
-            char overlay_opts[PATH_MAX * 4];
-            int olen = snprintf(overlay_opts, sizeof(overlay_opts),
-                                "lowerdir=%s,upperdir=%s,workdir=%s",
-                                rootfs, upper, work);
-            if (olen > 0 && (size_t)olen < sizeof(overlay_opts))
-            {
-                if (mount("overlay", rootfs, "overlay", 0,
-                          overlay_opts) < 0)
-                {
-                    /* Both --ephemeral-root and --overlay-persist are
-                     * explicit flags — silently degrading to
-                     * read-write on overlayfs failure would defeat
-                     * the user's request. Fail closed. */
-                    fprintf(stderr,
-                            "oci2bin: %s requested but overlayfs"
-                            " mount failed: %s\n",
-                            opts->ephemeral_root ? "--ephemeral-root"
-                            : "--overlay-persist",
-                            strerror(errno));
-                    return 1;
-                }
-            }
-            else
-            {
-                fprintf(stderr,
-                        "oci2bin: overlay options string truncated\n");
-                return 1;
-            }
-        }
-        else
-        {
-            /* upper_ok==0 means the upper/work setup failed (path
-             * truncated, mkdir, or cross-device).  The earlier
-             * branches already printed a specific error; for an
-             * explicit flag we now refuse to silently downgrade. */
-            fprintf(stderr,
-                    "oci2bin: %s requested but overlay upper/work"
-                    " could not be prepared\n",
-                    opts->ephemeral_root ? "--ephemeral-root"
-                    : "--overlay-persist");
-            return 1;
-        }
-    }
-
     /*
      * --read-only is an actual read-only root mount. Clone the complete rootfs
      * mount tree, then change only the top bind mount to read-only; explicit
      * submounts such as -v, /dev and tmpfs retain their own mount flags.
+     * --ephemeral-root/--overlay-persist were already established earlier
+     * (before any bind mount was added to rootfs — see setup_overlay_root()).
      */
     if (opts->read_only)
     {
@@ -11648,31 +12112,10 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         perror("mount /tmp tmpfs (non-fatal)");
     }
 
-    /* When --read-only is active, also mount /run as tmpfs so containers
-     * that need a writable /run (e.g. systemd, D-Bus, ssh) still work.
-     * Skip if user passed --no-auto-tmpfs. */
-    if (opts->read_only && !opts->no_auto_tmpfs)
-    {
-        /* Only mount if not already covered by a user-supplied --tmpfs /run */
-        int run_covered = 0;
-        for (int ti = 0; ti < opts->n_tmpfs; ti++)
-        {
-            if (strcmp(opts->tmpfs_mounts[ti], "/run") == 0)
-            {
-                run_covered = 1;
-                break;
-            }
-        }
-        if (!run_covered)
-        {
-            mkdir("/run", 0755);
-            if (mount("tmpfs", "/run", "tmpfs",
-                      MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=0755") < 0)
-            {
-                perror("mount /run tmpfs (non-fatal)");
-            }
-        }
-    }
+    /* /run (--read-only's automatic writable /run, or an explicit
+     * --tmpfs /run) was already mounted pre-chroot by run_tmpfs_preinstalled
+     * above, before secrets/--ssh-agent were installed beneath it. Retrying
+     * here would remount over them again. */
 
     /* Mount devpts for TTY/job control support.  /dev is already a tmpfs
      * with host device nodes bind-mounted (done pre-chroot above). */
@@ -11692,6 +12135,13 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     for (int ti = 0; ti < opts->n_tmpfs; ti++)
     {
         const char* ctr_path = opts->tmpfs_mounts[ti];
+        /* /run was already mounted pre-chroot (run_tmpfs_preinstalled)
+         * before secrets were installed beneath it; mounting again here
+         * would shadow them. */
+        if (run_tmpfs_preinstalled && path_equals_normalized(ctr_path, "/run"))
+        {
+            continue;
+        }
         /* mkdir at the container path (we are post-chroot) */
         if (mkdir(ctr_path, 0755) < 0 && errno != EEXIST)
         {
@@ -12383,9 +12833,11 @@ static void usage(const char* prog)
             "                      Bind mount a host file read-only into the container;\n"
             "                      defaults to /run/secrets/<basename> (may be repeated)\n"
             "  --secret tpm2:CRED_NAME[:CONTAINER_PATH]\n"
-            "                      Decrypt a TPM2-sealed credential via systemd-creds\n"
-            "                      and place it in the container at CONTAINER_PATH\n"
-            "                      (or /run/secrets/CRED_NAME by default)\n"
+            "                      Decrypt a sealed credential from the system\n"
+            "                      credential stores (/etc/credstore.encrypted and\n"
+            "                      friends) via systemd-creds and place it in the\n"
+            "                      container at CONTAINER_PATH (or\n"
+            "                      /run/secrets/CRED_NAME by default); needs root\n"
             "  -e KEY=VALUE        Set an environment variable inside the container\n"
             "  -e KEY              Pass KEY from host environment (skip if unset)\n"
             "                      (may be repeated; overrides built-in defaults)\n"
@@ -13655,6 +14107,17 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 fprintf(stderr,
                         "oci2bin: --overlay-persist: path must not"
                         " contain '..'\n");
+                return -1;
+            }
+            /* The path is interpolated into the overlayfs mount option
+             * string ("lowerdir=..,upperdir=..,workdir=.."), where ',' ends
+             * an option and ':' separates lower layers. A path containing
+             * either would inject mount options of the caller's choosing. */
+            if (strchr(argv[i], ',') || strchr(argv[i], ':'))
+            {
+                fprintf(stderr,
+                        "oci2bin: --overlay-persist: path must not"
+                        " contain ',' or ':'\n");
                 return -1;
             }
             opts->read_only = 0;
@@ -15651,16 +16114,17 @@ static pid_t start_metrics_helper(const char* socket_path)
 }
 
 /* Write a formatted value to a cgroup knob under g_cgroup_dir.
- * Non-fatal: prints a warning on any failure. */
+ * Returns 0 on success, -1 on failure (path/value truncation or a failed
+ * cg_write()) — the caller decides whether a given knob is fatal. */
 __attribute__((format(printf, 2, 3)))
-static void cg_set(const char* knob, const char* fmt, ...)
+static int cg_set(const char* knob, const char* fmt, ...)
 {
     char path[PATH_MAX];
     int n = snprintf(path, sizeof(path), "%s/%s", g_cgroup_dir, knob);
     if (n < 0 || n >= (int)sizeof(path))
     {
         fprintf(stderr, "oci2bin: cgroup %s path truncated\n", knob);
-        return;
+        return -1;
     }
     char val[64];
     va_list ap;
@@ -15670,9 +16134,9 @@ static void cg_set(const char* knob, const char* fmt, ...)
     if (vn < 0 || vn >= (int)sizeof(val))
     {
         fprintf(stderr, "oci2bin: cgroup %s value out of range\n", knob);
-        return;
+        return -1;
     }
-    cg_write(path, val);
+    return cg_write(path, val);
 }
 
 static void cleanup_cgroup(void)
@@ -15719,9 +16183,20 @@ static void cleanup_oci_rootfs(void)
  * Set up a cgroup v2 leaf for this process.  Called before unshare().
  * On failure: prints a warning and returns 0 (non-fatal).
  * Returns 1 if a cgroup namespace unshare should be done, 0 otherwise.
+ *
+ * *out_limits_failed is set to 1 if any explicitly requested limit
+ * (--memory/--cpus/--pids-limit) could not actually be written, even when
+ * this function otherwise returns 1 (the directory/fd setup that drives
+ * the return value succeeding does not mean every knob write succeeded —
+ * a missing controller or an EPERM on a single cg_set() call must not be
+ * silently treated as "limits applied"). Left at 0 when every requested
+ * knob (if any) was written successfully.
  */
-static int setup_cgroup(const struct container_opts* opts)
+static int setup_cgroup(const struct container_opts* opts,
+                        int* out_limits_failed)
 {
+    *out_limits_failed = 0;
+
     if (!opts->cg_memory_bytes && !opts->cg_cpu_quota &&
             !opts->cg_pids && !opts->metrics_socket)
     {
@@ -15771,17 +16246,20 @@ static int setup_cgroup(const struct container_opts* opts)
         }
     }
 
-    if (opts->cg_memory_bytes > 0)
+    if (opts->cg_memory_bytes > 0 &&
+            cg_set("memory.max", "%lld\n", opts->cg_memory_bytes) < 0)
     {
-        cg_set("memory.max", "%lld\n", opts->cg_memory_bytes);
+        *out_limits_failed = 1;
     }
-    if (opts->cg_cpu_quota > 0)
+    if (opts->cg_cpu_quota > 0 &&
+            cg_set("cpu.max", "%ld 100000\n", opts->cg_cpu_quota) < 0)
     {
-        cg_set("cpu.max", "%ld 100000\n", opts->cg_cpu_quota);
+        *out_limits_failed = 1;
     }
-    if (opts->cg_pids > 0)
+    if (opts->cg_pids > 0 &&
+            cg_set("pids.max", "%ld\n", opts->cg_pids) < 0)
     {
-        cg_set("pids.max", "%ld\n", opts->cg_pids);
+        *out_limits_failed = 1;
     }
 
     /* Open the cgroup directory fd for use with clone3(CLONE_INTO_CGROUP).
@@ -15807,8 +16285,14 @@ static int setup_cgroup(const struct container_opts* opts)
  * clone3(CLONE_INTO_CGROUP) when available (Linux 5.7+).  Falls back
  * to plain fork() followed by writing the child's PID to cgroup.procs.
  * Returns the child PID (>0 in parent, 0 in child) or -1 on error.
+ *
+ * If the fallback cgroup.procs join fails, the child would otherwise run
+ * outside the resource-limited cgroup while everything upstream reports
+ * limits as applied. When explicit limits were requested and
+ * opts->allow_degraded is not set, the child aborts here (before exec)
+ * instead of silently running unconstrained.
  */
-static pid_t fork_into_cgroup(void)
+static pid_t fork_into_cgroup(const struct container_opts* opts)
 {
     if (g_cgroup_fd >= 0 && kernel_supports_clone3())
     {
@@ -15840,15 +16324,33 @@ static pid_t fork_into_cgroup(void)
         /* Child: write own PID to cgroup.procs (fallback path only) */
         char pid_str[16];
         int n = snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());
+        int joined = 0;
         if (n > 0 && n < (int)sizeof(pid_str))
         {
             int procs_fd = openat(g_cgroup_fd, "cgroup.procs",
                                   O_WRONLY | O_CLOEXEC);
             if (procs_fd >= 0)
             {
-                write_all_fd(procs_fd, pid_str, (size_t)n);
+                joined = write_all_fd(procs_fd, pid_str, (size_t)n) == 0;
                 close(procs_fd);
             }
+        }
+        if (!joined)
+        {
+            int limits_requested = opts->cg_memory_bytes > 0 ||
+                                   opts->cg_cpu_quota > 0 ||
+                                   opts->cg_pids > 0;
+            if (limits_requested && !opts->allow_degraded)
+            {
+                fprintf(stderr,
+                        "oci2bin: failed to join resource-limited cgroup;"
+                        " refusing to run unconstrained (pass"
+                        " --allow-degraded to run without enforcement)\n");
+                _exit(1);
+            }
+            fprintf(stderr,
+                    "oci2bin: warning: failed to join resource-limited"
+                    " cgroup; continuing unconstrained\n");
         }
     }
     return pid;
@@ -17198,10 +17700,14 @@ static void mcp_tool_run_container(long id, const char* args_json,
     int   n_vol = 0;
     if (vol_arr)
     {
-        int raw_n_vol = json_parse_string_array(vol_arr, vol_strs, MCP_VOL_MAX);
-        /* Validate each volume spec: HOST:CONTAINER — both must be absolute
-         * clean paths with no '..' components. */
-        for (int i = 0; i < raw_n_vol; i++)
+        n_vol = json_parse_string_array(vol_arr, vol_strs, MCP_VOL_MAX);
+        /* Validate each volume spec: HOST:CONTAINER[:ro|:rw] — both paths
+         * must be absolute and clean with no '..' components, and the
+         * optional suffix must be exactly "ro" or "rw". An invalid spec
+         * fails the whole request closed (matching the CLI -v fail-closed
+         * policy) instead of silently launching the container without the
+         * volume the caller explicitly requested. */
+        for (int i = 0; i < n_vol; i++)
         {
             char* colon = strchr(vol_strs[i], ':');
             int   ok    = 0;
@@ -17236,16 +17742,16 @@ static void mcp_tool_run_container(long id, const char* args_json,
                 }
                 *colon = ':'; /* restore for argv */
             }
-            if (ok)
-            {
-                vol_strs[n_vol++] = vol_strs[i];
-            }
-            else
+            if (!ok)
             {
                 fprintf(stderr,
                         "oci2bin: MCP: rejecting invalid volume spec: %s\n",
                         vol_strs[i]);
-                free(vol_strs[i]);
+                mcp_send_error(id, -32602,
+                               "run_container: invalid volume spec"
+                               " (expected HOST:CONTAINER[:ro|:rw],"
+                               " both absolute and clean)");
+                goto cleanup_env;
             }
         }
     }
@@ -18732,6 +19238,18 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    /* --secret is installed by setup_secrets() on the container path only;
+     * the VM guest gets its rootfs over virtiofs and never sees those mounts.
+     * Reject rather than boot a VM without a credential the caller asked for
+     * — same fail-closed reasoning as setup_secrets() itself. */
+    if (opts.use_vm && opts.n_secrets > 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --secret is not supported with --vm; the VM guest "
+                "cannot see host secret mounts — use container mode\n");
+        return 1;
+    }
+
     /* 4b. VM dispatch: after rootfs extraction so rootfs is available */
     if (opts.use_vm)
     {
@@ -18793,7 +19311,8 @@ int main(int argc, char* argv[])
     }
 
     /* 6a. Set up cgroup v2 resource limits (before unshare, uses host cgroupfs) */
-    int cg_did_setup = setup_cgroup(&opts);
+    int cg_limits_failed = 0;
+    int cg_did_setup = setup_cgroup(&opts, &cg_limits_failed);
     if (opts.metrics_socket && !cg_did_setup)
     {
         fprintf(stderr,
@@ -18804,10 +19323,14 @@ int main(int argc, char* argv[])
     /* Explicit resource ceilings are a security/isolation control, not a
      * cosmetic feature — silently running unconstrained when the caller
      * asked for --memory/--cpus/--pids-limit is a fail-open regression.
-     * Abort unless the caller opted into degraded mode explicitly. */
-    if (!cg_did_setup && !opts.allow_degraded &&
+     * Abort unless the caller opted into degraded mode explicitly. This
+     * covers both total cgroup-v2 unavailability (cg_did_setup==0) and a
+     * specific memory.max/cpu.max/pids.max write failing even though the
+     * cgroup directory itself was created successfully (cg_limits_failed). */
+    if (!opts.allow_degraded &&
             (opts.cg_memory_bytes > 0 || opts.cg_cpu_quota > 0 ||
-             opts.cg_pids > 0))
+             opts.cg_pids > 0) &&
+            (!cg_did_setup || cg_limits_failed))
     {
         fprintf(stderr,
                 "oci2bin: --memory/--cpus/--pids-limit requested but"
@@ -18815,7 +19338,8 @@ int main(int argc, char* argv[])
                 " (pass --allow-degraded to run without enforcement)\n");
         return 1;
     }
-    debug_log("main.cgroup", "enabled=%d dir=%s", cg_did_setup,
+    debug_log("main.cgroup", "enabled=%d limits_failed=%d dir=%s",
+              cg_did_setup, cg_limits_failed,
               g_cgroup_dir[0] ? g_cgroup_dir : "(none)");
 
     /* 7-8. Enter the user namespace and install the UID/GID maps. For the
@@ -19175,7 +19699,7 @@ int main(int argc, char* argv[])
      * Use clone3(CLONE_INTO_CGROUP) when cgroup limits are active so the
      * child lands directly in the cgroup without the parent joining it.
      * Falls back to fork() + cgroup.procs write on older kernels. */
-    pid_t child = fork_into_cgroup();
+    pid_t child = fork_into_cgroup(&opts);
     if (child < 0)
     {
         perror("fork");
