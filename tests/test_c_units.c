@@ -6190,6 +6190,24 @@ static void test_seccomp_profile_check_supported(void)
     ASSERT_INT_EQ(seccomp_profile_check_supported(with_errno), 0,
                   "seccomp: errnoRet warns but is accepted");
 
+    /* Docker's own default profile emits empty args/includes/excludes on
+     * every entry. They constrain nothing, so they must not be refused. */
+    const char* docker_shaped =
+        "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"syscalls\":["
+        "{\"names\":[\"read\",\"write\"],\"action\":\"SCMP_ACT_ALLOW\","
+        "\"args\":[],\"comment\":\"\",\"includes\":{},\"excludes\":{}}]}";
+    ASSERT_INT_EQ(seccomp_profile_check_supported(docker_shaped), 0,
+                  "seccomp: empty args/includes/excludes accepted");
+
+    /* ...but one non-empty occurrence anywhere still fails the profile. */
+    const char* mixed_args =
+        "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"syscalls\":["
+        "{\"names\":[\"read\"],\"action\":\"SCMP_ACT_ALLOW\",\"args\":[]},"
+        "{\"names\":[\"ioctl\"],\"action\":\"SCMP_ACT_ALLOW\","
+        "\"args\":[{\"index\":1,\"value\":21505}]}]}";
+    ASSERT_INT_EQ(seccomp_profile_check_supported(mixed_args), -1,
+                  "seccomp: a later non-empty \"args\" is still rejected");
+
     /* A bare substring that is not an object key must not trip the check. */
     const char* substring_only =
         "{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"comment\":\"no args here\","
@@ -6230,6 +6248,33 @@ static void test_json_has_key(void)
                   "json_has_key: ignores the word as a string value");
     ASSERT_INT_EQ(json_has_key("{\"names\":[\"read\"]}", "args"), 0,
                   "json_has_key: absent key returns 0");
+
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":[]}", "args", '['), 0,
+                  "json_has_nonempty_key: empty array does not count");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"includes\": { }}", "includes",
+                                        '{'), 0,
+                  "json_has_nonempty_key: empty object does not count");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":null}", "args", '['), 0,
+                  "json_has_nonempty_key: null does not count");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":[1]}", "args", '['), 1,
+                  "json_has_nonempty_key: non-empty array counts");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"a\":{\"args\":[]},"
+                                        "\"b\":{\"args\":[1]}}", "args",
+                                        '['), 1,
+                  "json_has_nonempty_key: keeps scanning past an empty one");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":nullx}", "args", '['), 1,
+                  "json_has_nonempty_key: malformed null is not empty");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":[]junk}", "args", '['), 1,
+                  "json_has_nonempty_key: malformed array is not empty");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":{}junk}", "args", '['), 1,
+                  "json_has_nonempty_key: malformed object is not empty");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":{}}", "args", '['), 1,
+                  "json_has_nonempty_key: wrong empty type is not empty");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"includes\":[]}", "includes",
+                                        '{'), 1,
+                  "json_has_nonempty_key: wrong object type is not empty");
+    ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":[]", "args", '['), 1,
+                  "json_has_nonempty_key: truncated object is not empty");
 }
 
 /*
@@ -6271,6 +6316,15 @@ static void test_rm_rf_dir_does_not_cross_mounts(void)
     snprintf(mnt, sizeof(mnt), "%s/data", cont);
     ASSERT_INT_EQ(mkdir(mnt, 0755), 0, "rm_rf_dir/mount: create mountpoint");
 
+    /* A second mountpoint whose name contains a space. /proc/self/mountinfo
+     * writes that as "\040", so a scanner that does not decode the octal
+     * escapes drops this mount from the protection list and deletes straight
+     * through it. */
+    char mnt_sp[320];
+    snprintf(mnt_sp, sizeof(mnt_sp), "%s/my data", cont);
+    ASSERT_INT_EQ(mkdir(mnt_sp, 0755), 0,
+                  "rm_rf_dir/mount: create mountpoint with a space");
+
     pid_t pid = fork();
     ASSERT(pid >= 0, "rm_rf_dir/mount: fork");
     if (pid == 0)
@@ -6286,6 +6340,10 @@ static void test_rm_rf_dir_does_not_cross_mounts(void)
             _exit(42);
         }
         if (mount(host, mnt, NULL, MS_BIND, NULL) < 0)
+        {
+            _exit(42);
+        }
+        if (mount(host, mnt_sp, NULL, MS_BIND, NULL) < 0)
         {
             _exit(42);
         }
@@ -6315,7 +6373,51 @@ static void test_rm_rf_dir_does_not_cross_mounts(void)
     unlink(precious);
     rmdir(host);
     rmdir(mnt);
+    rmdir(mnt_sp);
     rmdir(cont);
+}
+
+/*
+ * /proc/self/mountinfo escapes space, tab, newline and backslash as \OOO.
+ * Decoding them is what keeps a `-v /host:"/my data"` bind on the
+ * do-not-delete list.
+ */
+static void test_mountinfo_unescape(void)
+{
+    char out[PATH_MAX];
+
+    ASSERT_INT_EQ(mountinfo_unescape("/tmp/plain", out, sizeof(out)), 10,
+                  "mountinfo_unescape: plain path length");
+    ASSERT_STR_EQ(out, "/tmp/plain",
+                  "mountinfo_unescape: plain path unchanged");
+
+    ASSERT(mountinfo_unescape("/tmp/my\\040data", out, sizeof(out)) > 0,
+           "mountinfo_unescape: decodes \\040");
+    ASSERT_STR_EQ(out, "/tmp/my data",
+                  "mountinfo_unescape: \\040 becomes a space");
+
+    ASSERT(mountinfo_unescape("/tmp/a\\011b\\012c\\134d", out,
+                              sizeof(out)) > 0,
+           "mountinfo_unescape: decodes tab/newline/backslash");
+    ASSERT_STR_EQ(out, "/tmp/a\tb\nc\\d",
+                  "mountinfo_unescape: tab, newline and backslash decoded");
+
+    /* Not a valid escape: left alone rather than swallowed. */
+    ASSERT(mountinfo_unescape("/tmp/a\\9x", out, sizeof(out)) > 0,
+           "mountinfo_unescape: non-octal escape accepted");
+    ASSERT_STR_EQ(out, "/tmp/a\\9x",
+                  "mountinfo_unescape: non-octal escape left verbatim");
+
+    /* \000 would truncate the path: refuse instead. */
+    ASSERT_INT_EQ(mountinfo_unescape("/tmp/a\\000b", out, sizeof(out)), -1,
+                  "mountinfo_unescape: rejects an embedded NUL");
+
+    /* Does not fit. */
+    char small[4];
+    ASSERT_INT_EQ(mountinfo_unescape("/tmp/x", small, sizeof(small)), -1,
+                  "mountinfo_unescape: rejects overflow");
+    ASSERT_INT_EQ(mountinfo_unescape("/tmp/x", out, 0), -1,
+                  "mountinfo_unescape: rejects zero-size output");
 }
 
 /*
@@ -6369,6 +6471,43 @@ static void test_mcp_mount_root_policy(void)
     ASSERT_NOT_NULL(mcp_mount_root_for("/anything/at/all"),
                     "mcp mounts: root of '/' matches any path");
 
+    /*
+     * The resolved-path half of the check. mount(2) follows symlinks in the
+     * source, so "/srv/data/escape" -> "/etc" passes the textual test while
+     * binding /etc into the container. Only the resolved comparison catches
+     * it — and an unset (empty) resolved root must match nothing rather than
+     * everything.
+     */
+    memset(g_mcp_mount_roots, 0, sizeof(g_mcp_mount_roots));
+    g_mcp_n_mount_roots = 1;
+    snprintf(g_mcp_mount_roots[0].path, sizeof(g_mcp_mount_roots[0].path),
+             "%s", "/srv/data");
+    const struct mcp_mount_root* root = &g_mcp_mount_roots[0];
+    ASSERT_NULL(mcp_mount_root_for_real(root, "/srv/data/sub"),
+                "mcp mounts: an unresolved root matches nothing");
+
+    snprintf(g_mcp_mount_roots[0].real, sizeof(g_mcp_mount_roots[0].real),
+             "%s", "/mnt/pool/data");
+    ASSERT_NOT_NULL(mcp_mount_root_for_real(root, "/mnt/pool/data/sub"),
+                    "mcp mounts: resolved path under resolved root allowed");
+    ASSERT_NULL(mcp_mount_root_for_real(root, "/etc"),
+                "mcp mounts: symlink target outside the root is denied");
+    ASSERT_NULL(mcp_mount_root_for_real(root, "/mnt/pool/dataset"),
+                "mcp mounts: resolved sibling sharing a prefix is denied");
+
+    snprintf(g_mcp_mount_roots[1].path, sizeof(g_mcp_mount_roots[1].path),
+             "%s", "/srv/writable");
+    snprintf(g_mcp_mount_roots[1].real, sizeof(g_mcp_mount_roots[1].real),
+             "%s", "/mnt/pool/writable");
+    g_mcp_mount_roots[1].writable = 1;
+    g_mcp_n_mount_roots = 2;
+    root = mcp_mount_root_for("/srv/data/link");
+    ASSERT(root == &g_mcp_mount_roots[0],
+           "mcp mounts: lexical path selects its own root policy");
+    ASSERT_NULL(mcp_mount_root_for_real(root, "/mnt/pool/writable/target"),
+                "mcp mounts: resolved path cannot switch root policy");
+
+    memset(g_mcp_mount_roots, 0, sizeof(g_mcp_mount_roots));
     g_mcp_n_mount_roots = 0;
 }
 
@@ -6439,6 +6578,162 @@ static void test_mcp_ctr_identity_and_slots(void)
 
     memset(g_mcp_ctrs, 0, sizeof(g_mcp_ctrs));
     g_mcp_n_ctrs = 0;
+}
+
+/*
+ * read_self_metadata() parses a binary framing format out of the binary's own
+ * tail: a LE32 length, the OCI2BIN_META magic, the JSON, and optionally a
+ * trailing signature block whose length is a BE32 at the very end.
+ *
+ * Its three-way return is the whole point: 0 means "no policy block", -1 means
+ * "a block is there but its framing is inconsistent". Collapsing -1 into 0 is
+ * what would let a corrupted or doctored binary run as if it had never
+ * declared --require-signed, so each malformed shape is pinned down here.
+ */
+static void rsm_write(const char* path, const unsigned char* data, size_t n)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0)
+    {
+        write_all_fd(fd, (const char*)data, n);
+        close(fd);
+    }
+}
+
+/* Build "<pad><LE32 total><magic><json><NUL>" exactly as build_meta_block()
+ * does, optionally corrupting the length field. */
+static size_t rsm_build(unsigned char* buf, size_t pad, const char* json,
+                        long total_override)
+{
+    static const char magic[] = "OCI2BIN_META";
+    size_t mlen = sizeof(magic);            /* includes the NUL */
+    size_t jlen = strlen(json) + 1;         /* builder appends a NUL */
+    unsigned long total = (unsigned long)(4 + mlen + jlen);
+    if (total_override >= 0)
+    {
+        total = (unsigned long)total_override;
+    }
+    memset(buf, 'A', pad);
+    size_t o = pad;
+    buf[o++] = (unsigned char)(total & 0xff);
+    buf[o++] = (unsigned char)((total >> 8) & 0xff);
+    buf[o++] = (unsigned char)((total >> 16) & 0xff);
+    buf[o++] = (unsigned char)((total >> 24) & 0xff);
+    memcpy(buf + o, magic, mlen);
+    o += mlen;
+    memcpy(buf + o, json, jlen);
+    o += jlen;
+    return o;
+}
+
+/* Append the signature footer: <trailer><BE32 total-of-sig-block>. */
+static size_t rsm_append_sig(unsigned char* buf, size_t o, size_t body,
+                             unsigned long total_override)
+{
+    static const char trailer[] = "OCI2BIN_SIG_END";
+    memset(buf + o, 'S', body);
+    o += body;
+    memcpy(buf + o, trailer, sizeof(trailer));
+    o += sizeof(trailer);
+    unsigned long total = (unsigned long)(body + sizeof(trailer) + 4);
+    if (total_override != 0)
+    {
+        total = total_override;
+    }
+    buf[o++] = (unsigned char)((total >> 24) & 0xff);
+    buf[o++] = (unsigned char)((total >> 16) & 0xff);
+    buf[o++] = (unsigned char)((total >> 8) & 0xff);
+    buf[o++] = (unsigned char)(total & 0xff);
+    return o;
+}
+
+static void test_read_self_metadata(void)
+{
+    char dir_tmpl[] = "/tmp/oci2bin-meta-XXXXXX";
+    char* dir = mkdtemp(dir_tmpl);
+    ASSERT(dir != NULL, "read_self_metadata: mkdtemp");
+    if (!dir)
+    {
+        return;
+    }
+    char path[320];
+    snprintf(path, sizeof(path), "%s/bin", dir);
+
+    static unsigned char buf[8192];
+    const char* json = "{\"image\":\"x\",\"require_signed\":true}";
+    char* meta = NULL;
+    size_t n;
+
+    /* Well-formed block. */
+    n = rsm_build(buf, 512, json, -1);
+    rsm_write(path, buf, n);
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), 1,
+                  "read_self_metadata: accepts a well-formed block");
+    ASSERT_STR_EQ(meta ? meta : "", json,
+                  "read_self_metadata: returns the JSON verbatim");
+    free(meta);
+    meta = NULL;
+    ASSERT_INT_EQ(has_require_signed_marker(path), 1,
+                  "read_self_metadata: require_signed detected");
+
+    /* Same block with a signature block appended: the metadata is still
+     * found, because the signature is stripped first. */
+    n = rsm_build(buf, 512, json, -1);
+    n = rsm_append_sig(buf, n, 64, 0);
+    rsm_write(path, buf, n);
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), 1,
+                  "read_self_metadata: sees past a signature block");
+    free(meta);
+    meta = NULL;
+
+    /* Signature trailer claiming a length longer than the file. */
+    n = rsm_build(buf, 512, json, -1);
+    n = rsm_append_sig(buf, n, 64, 0xfffffffuL);
+    rsm_write(path, buf, n);
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), -1,
+                  "read_self_metadata: rejects an oversized sig length");
+    ASSERT_NULL(meta, "read_self_metadata: no output on a bad sig length");
+
+    /* Length field smaller than the header it is supposed to span: je would
+     * land at or before the JSON start. */
+    n = rsm_build(buf, 512, json, 4);
+    rsm_write(path, buf, n);
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), -1,
+                  "read_self_metadata: rejects a too-small length");
+
+    /* Length field running past the end of the file. */
+    n = rsm_build(buf, 512, json, 100000);
+    rsm_write(path, buf, n);
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), -1,
+                  "read_self_metadata: rejects a length past EOF");
+
+    /* Magic present but with fewer than 4 bytes in front of it. */
+    n = rsm_build(buf, 0, json, -1);
+    rsm_write(path, buf + 4, n - 4);   /* drop the length field entirely */
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), -1,
+                  "read_self_metadata: rejects a magic with no length field");
+
+    /* No block at all. */
+    memset(buf, 'Z', 4096);
+    rsm_write(path, buf, 4096);
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), 0,
+                  "read_self_metadata: reports absence as 0, not an error");
+    ASSERT_INT_EQ(has_require_signed_marker(path), 0,
+                  "read_self_metadata: no block means no policy");
+
+    /* The *last* block wins, matching the python verifier's rfind(). */
+    n = rsm_build(buf, 512, "{\"image\":\"first\"}", -1);
+    n = rsm_build(buf + n, 0, "{\"image\":\"second\"}", -1) + n;
+    rsm_write(path, buf, n);
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), 1,
+                  "read_self_metadata: two blocks parse");
+    ASSERT_STR_EQ(meta ? meta : "", "{\"image\":\"second\"}",
+                  "read_self_metadata: the trailing block wins");
+    free(meta);
+    meta = NULL;
+
+    unlink(path);
+    rmdir(dir);
 }
 
 static void test_credential_file_is_safe(void)
@@ -6672,6 +6967,8 @@ int main(void)
     test_credstore_candidate_path();
     test_mcp_ctr_identity_and_slots();
     test_mcp_mount_root_policy();
+    test_mountinfo_unescape();
+    test_read_self_metadata();
     test_rm_rf_dir_does_not_cross_mounts();
     test_json_has_key();
     test_seccomp_profile_check_supported();

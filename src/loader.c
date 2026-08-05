@@ -11048,18 +11048,23 @@ static char** json_parse_names_array(const char* json, const char* key,
 }
 
 /*
- * Does 'json' contain the key "<key>" used as an object key (i.e. followed by
- * a colon)?  Deliberately as simple as the rest of this parser — it exists to
- * detect constructs we must refuse, so a false positive costs a rejected
- * profile (safe) rather than a silently weakened filter (not safe).
+ * Find the value of object key "<key>" — the first non-space character after
+ * the colon — or NULL when the key does not appear as a key. Deliberately as
+ * simple as the rest of this parser: it exists to detect constructs we must
+ * refuse, so a false positive costs a rejected profile (safe) rather than a
+ * silently weakened filter (not safe).
  */
-static int json_has_key(const char* json, const char* key)
+static const char* json_find_key_value(const char* json, const char* key)
 {
-    char needle[64];
+    char needle[256];
+    if (strlen(key) > sizeof(needle) - 3)
+    {
+        return NULL;
+    }
     int n = snprintf(needle, sizeof(needle), "\"%s\"", key);
     if (n < 0 || (size_t)n >= sizeof(needle))
     {
-        return 0;
+        return NULL;
     }
     const char* p = json;
     while ((p = strstr(p, needle)) != NULL)
@@ -11071,9 +11076,86 @@ static int json_has_key(const char* json, const char* key)
         }
         if (*q == ':')
         {
-            return 1;
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')
+            {
+                q++;
+            }
+            return q;
         }
         p += n;
+    }
+    return NULL;
+}
+
+/*
+ * Does 'json' contain the key "<key>" used as an object key (i.e. followed by
+ * a colon)?
+ */
+static int json_has_key(const char* json, const char* key)
+{
+    return json_find_key_value(json, key) != NULL;
+}
+
+/* Does p point just past a complete JSON value? */
+static int json_value_has_delimiter(const char* p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    {
+        p++;
+    }
+    /* A key/value pair is inside an object, so only another member or the
+     * object's closing brace can follow it. Accepting NUL or ']' here would
+     * classify a truncated/malformed value as empty and skip a constraint. */
+    return *p == ',' || *p == '}';
+}
+
+/*
+ * Is this JSON value one that carries no information: null, or an empty
+ * container of the schema-prescribed type? A wrong-type empty container is
+ * malformed, not harmless: treating "args":{} like "args":[] would bypass the
+ * unsupported-constraint check.
+ */
+static int json_value_is_empty(const char* v, char empty_open)
+{
+    if (strncmp(v, "null", 4) == 0 &&
+            json_value_has_delimiter(v + 4))
+    {
+        return 1;
+    }
+    if (*v != empty_open)
+    {
+        return 0;
+    }
+    char close = empty_open == '[' ? ']' : '}';
+    const char* q = v + 1;
+    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')
+    {
+        q++;
+    }
+    return *q == close && json_value_has_delimiter(q + 1);
+}
+
+/*
+ * Like json_has_key(), but a key whose value is empty (null, [] or {}) does
+ * not count.
+ *
+ * Docker's own default seccomp profile carries "args": [], "includes": {} and
+ * "excludes": {} on nearly every entry — the Go marshaller emits them even
+ * when unset. Those say nothing about the filter, so refusing them would
+ * reject the most widely used profile in existence while blocking nothing.
+ */
+static int json_has_nonempty_key(const char* json, const char* key,
+                                 char empty_open)
+{
+    const char* v = json_find_key_value(json, key);
+    while (v)
+    {
+        if (!json_value_is_empty(v, empty_open))
+        {
+            return 1;
+        }
+        v = json_find_key_value(v, key);
     }
     return 0;
 }
@@ -11092,20 +11174,28 @@ static int json_has_key(const char* json, const char* key)
  * errnoRet is deliberately only a warning: it changes which errno a blocked
  * call reports, not whether the call is permitted.
  *
+ * An *empty* args/includes/excludes is not a construct — Docker emits those
+ * on every entry of its default profile — so only a non-empty one counts.
+ *
  * Returns 0 if the profile is representable, -1 otherwise.
  */
 static int seccomp_profile_check_supported(const char* json)
 {
-    static const char* const unsupported[] =
+    static const struct
     {
-        "args",     /* per-argument filters */
-        "includes", /* conditional application (arches/caps/minKernel) */
-        "excludes",
+        const char* key;
+        char empty_open;
+    } unsupported[] =
+    {
+        {"args", '['},     /* per-argument filters */
+        {"includes", '{'}, /* conditional application (arches/caps/minKernel) */
+        {"excludes", '{'},
     };
     for (size_t i = 0;
             i < sizeof(unsupported) / sizeof(unsupported[0]); i++)
     {
-        if (json_has_key(json, unsupported[i]))
+        if (json_has_nonempty_key(json, unsupported[i].key,
+                                  unsupported[i].empty_open))
         {
             fprintf(stderr,
                     "oci2bin: --seccomp-profile: profile uses \"%s\", which"
@@ -11113,7 +11203,7 @@ static int seccomp_profile_check_supported(const char* json)
                     "oci2bin: applying it would produce a filter weaker than"
                     " the profile describes, so the run is aborted rather"
                     " than silently ignoring it.\n",
-                    unsupported[i]);
+                    unsupported[i].key);
             return -1;
         }
     }
@@ -11128,7 +11218,7 @@ static int seccomp_profile_check_supported(const char* json)
 
     /* Top-level "architectures" lists the arches the profile was written for.
      * If ours is not among them the rules were never meant to apply here. */
-    if (json_has_key(json, "architectures"))
+    if (json_has_nonempty_key(json, "architectures", '['))
     {
 #ifdef __aarch64__
         const char* self_arch = "SCMP_ARCH_AARCH64";
@@ -15916,12 +16006,15 @@ static int read_self_metadata(const char* self_path, char** out)
 
     /* Last occurrence of the magic within the window. */
     char* found = NULL;
-    for (size_t off = 0; off + magic_len <= want; off++)
+    for (size_t off = 0; off + magic_len <= want; )
     {
-        if (memcmp(buf + off, meta_magic, magic_len) == 0)
+        char* hit = memmem(buf + off, want - off, meta_magic, magic_len);
+        if (!hit)
         {
-            found = buf + off;
+            break;
         }
+        found = hit;
+        off = (size_t)(hit - buf) + 1;
     }
     if (!found)
     {
@@ -16703,27 +16796,82 @@ static void cleanup_cgroup(void)
 static int s_oci_rootfs_cleaned = 0;
 
 /*
- * Lazily detach every mount at or below 'prefix' in our mount namespace,
- * deepest first, so the subsequent rm_rf_dir() has nothing left to cross.
+ * Decode the "\OOO" octal escapes /proc/self/mountinfo uses for space (\040),
+ * tab (\011), newline (\012) and backslash (\134).
  *
- * This runs in the parent, which shares the container's mount namespace
- * (main() unshares CLONE_NEWNS before forking), so the -v/--secret binds the
- * child installed are still listed here. Detaching them is what lets the
- * tmpdir be removed; rm_rf_dir()'s FTW_MOUNT is the backstop for anything
- * that could not be unmounted.
+ * Skipping this is not cosmetic: a `-v /home/me/docs:"/my data"` bind shows up
+ * as ".../rootfs/my\040data", which matches neither the prefix nor any path
+ * nftw() walks, so the mount would silently drop out of the protection list
+ * and rm_rf_dir() would delete straight through it.
+ *
+ * Returns the decoded length, or -1 when it does not fit (or the escape
+ * decodes to NUL, which the kernel never emits).
  */
+static int mountinfo_unescape(const char* src, char* dst, size_t dst_sz)
+{
+    if (!src || !dst || dst_sz == 0)
+    {
+        return -1;
+    }
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0'; i++)
+    {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '\\' && src[i + 1] >= '0' && src[i + 1] <= '3' &&
+                src[i + 2] >= '0' && src[i + 2] <= '7' &&
+                src[i + 3] >= '0' && src[i + 3] <= '7')
+        {
+            c = (unsigned char)(((src[i + 1] - '0') << 6) |
+                                ((src[i + 2] - '0') << 3) |
+                                (src[i + 3] - '0'));
+            if (c == '\0')
+            {
+                return -1;
+            }
+            i += 3;
+        }
+        if (j + 1 >= dst_sz)
+        {
+            return -1;
+        }
+        dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
+    return (int)j;
+}
+
 /*
  * Collect every mount point at or below 'prefix' from /proc/self/mountinfo,
  * in the order the kernel lists them (parents before children).
  *
- * Returns the count and stores a malloc'd array in *out (caller frees), or 0
- * with *out == NULL when there are none or the scan fails. A failure here is
- * reported as "no mounts", so callers must treat that as the unsafe case.
+ * Returns the count and stores a malloc'd array in *out (caller frees).
+ * *ok is set to 1 only when the whole mount table was read and translated
+ * successfully; on 0 the returned list is incomplete and callers that use it
+ * as a safety net must not proceed. "No mounts found" is indistinguishable
+ * from "could not look", which is exactly the confusion that gets host data
+ * deleted, so the two are reported separately.
+ *
+ * Paths are matched against the *resolved* prefix — mountinfo records the
+ * kernel's canonical path, so a symlinked TMPDIR would otherwise match
+ * nothing — and stored back under the caller's own spelling so they compare
+ * equal to the paths nftw() reports.
  */
 static size_t collect_mounts_below(const char* prefix,
-                                   char (**out)[PATH_MAX])
+                                   char (**out)[PATH_MAX], int* ok)
 {
     *out = NULL;
+    *ok  = 0;
+
+    char real_prefix[PATH_MAX];
+    if (!realpath(prefix, real_prefix))
+    {
+        if (errno == ENOENT || errno == ENOTDIR)
+        {
+            *ok = 1;    /* nothing there: nothing to protect, nothing to lose */
+        }
+        return 0;
+    }
+
     FILE* f = fopen("/proc/self/mountinfo", "r");
     if (!f)
     {
@@ -16733,10 +16881,21 @@ static size_t collect_mounts_below(const char* prefix,
     char (*points)[PATH_MAX] = NULL;
     size_t n_points = 0, cap_points = 0;
     size_t prefix_len = strlen(prefix);
+    size_t real_len   = strlen(real_prefix);
+    int    complete   = 1;
     char line[8192];
 
     while (fgets(line, sizeof(line), f))
     {
+        size_t line_len = strlen(line);
+        if (line_len == 0 || line[line_len - 1] != '\n')
+        {
+            /* A partial mountinfo record can omit field 5 or cut a mount path
+             * in half. Treat the scan as incomplete rather than silently
+             * dropping a mount from the deletion guard. */
+            complete = 0;
+            break;
+        }
         /* mountinfo field 5 is the mount point, space-separated. */
         char* p = line;
         for (int field = 0; field < 4 && p; field++)
@@ -16749,26 +16908,38 @@ static size_t collect_mounts_below(const char* prefix,
         }
         if (!p)
         {
+            complete = 0;
             continue;
         }
         char* end = strchr(p, ' ');
         if (!end)
         {
+            complete = 0;
             continue;
         }
         *end = '\0';
-        if (strncmp(p, prefix, prefix_len) != 0)
+
+        char mp[PATH_MAX];
+        if (mountinfo_unescape(p, mp, sizeof(mp)) < 0)
+        {
+            complete = 0;
+            continue;
+        }
+        if (strncmp(mp, real_prefix, real_len) != 0)
         {
             continue;
         }
         /* Match the prefix itself or a path beneath it, not "/tmp/abcd" when
          * the prefix is "/tmp/abc". */
-        if (p[prefix_len] != '\0' && p[prefix_len] != '/')
+        if (mp[real_len] != '\0' && mp[real_len] != '/')
         {
             continue;
         }
-        if (strlen(p) >= PATH_MAX)
+        /* Re-spell under the caller's prefix so rm_path_is_protected() can
+         * compare against the paths nftw() hands it. */
+        if (prefix_len + strlen(mp + real_len) >= PATH_MAX)
         {
+            complete = 0;
             continue;
         }
         if (n_points == cap_points)
@@ -16777,27 +16948,46 @@ static size_t collect_mounts_below(const char* prefix,
             void* grown = realloc(points, new_cap * sizeof(*points));
             if (!grown)
             {
+                complete = 0;
                 break;
             }
             points = grown;
             cap_points = new_cap;
         }
-        snprintf(points[n_points], PATH_MAX, "%s", p);
+        memcpy(points[n_points], prefix, prefix_len);
+        memcpy(points[n_points] + prefix_len, mp + real_len,
+               strlen(mp + real_len) + 1);
         n_points++;
+    }
+    if (ferror(f))
+    {
+        complete = 0;
     }
     fclose(f);
 
     *out = points;
+    *ok  = complete;
     return n_points;
 }
 
 /*
- * Lazily detach every mount at or below 'prefix', deepest first.
+ * Lazily detach every mount at or below 'prefix' in our mount namespace,
+ * deepest first, so the subsequent rm_rf_dir() has nothing left to cross.
+ *
+ * This runs in the parent, which shares the container's mount namespace
+ * (main() unshares CLONE_NEWNS before forking), so the -v/--secret binds the
+ * child installed are still listed here. Detaching them is what lets the
+ * tmpdir be removed; the mount-table check in rm_rf_dir() is the backstop for
+ * anything that could not be unmounted.
+ *
+ * Best effort: an incomplete scan still detaches what it did find, and
+ * rm_rf_dir() re-reads the table before deleting anything.
  */
 static void unmount_tree_below(const char* prefix)
 {
     char (*points)[PATH_MAX] = NULL;
-    size_t n_points = collect_mounts_below(prefix, &points);
+    int scan_ok = 0;
+    size_t n_points = collect_mounts_below(prefix, &points, &scan_ok);
     while (n_points > 0)
     {
         n_points--;
@@ -17004,11 +17194,6 @@ static pid_t fork_into_cgroup(const struct container_opts* opts)
 /* ── tmpdir cleanup ──────────────────────────────────────────────────────── */
 
 /*
- * Recursive deletion via nftw — no fork() required.
- * Used instead of "rm -rf" to avoid forking after CLONE_NEWPID, which would
- * fail with ENOMEM because the child PID namespace is already destroyed.
- */
-/*
  * Mount points the in-progress rm_rf_dir() must not delete through. nftw()
  * gives the callback no user-data pointer, so this is file-static; rm_rf_dir()
  * is not called concurrently.
@@ -17044,21 +17229,34 @@ static int rm_entry(const char* path, const struct stat* sb,
     }
     if (typeflag == FTW_DP)
     {
-        return rmdir(path);
+        rmdir(path);
     }
-    return unlink(path);
+    else
+    {
+        unlink(path);
+    }
+    /* Always continue: nftw() aborts the whole walk on a non-zero return, and
+     * a directory that still holds a protected mount point is *expected* to
+     * fail rmdir(). Returning the errno there would abandon the rest of the
+     * tree and leave far more behind than the one mount we must keep. */
+    return 0;
 }
 
 /*
  * Recursively delete 'path'.
  *
- * FTW_MOUNT is load-bearing, not a tidiness flag. main() unshares CLONE_NEWNS
- * *before* forking, so the parent shares the container's mount namespace and
- * still sees every bind mount setup_volumes()/setup_secrets() created inside
- * the rootfs. Without FTW_MOUNT the exit-time cleanup of the rootfs tmpdir
- * walks straight through a live `-v /host/dir:/ctr` bind and deletes the
- * user's host files. FTW_PHYS alone does not help: the mountpoint is a real
- * directory, not a symlink.
+ * Implemented with nftw() rather than "rm -rf" to avoid forking after
+ * CLONE_NEWPID, which fails with ENOMEM once the child PID namespace is gone.
+ *
+ * Not crossing a mount is load-bearing, not tidiness. main() unshares
+ * CLONE_NEWNS *before* forking, so the parent shares the container's mount
+ * namespace and still sees every bind mount setup_volumes()/setup_secrets()
+ * created inside the rootfs. An unguarded walk of the rootfs tmpdir at exit
+ * goes straight through a live `-v /host/dir:/ctr` bind and deletes the
+ * user's host files. FTW_PHYS does not help — the mountpoint is a real
+ * directory, not a symlink — and FTW_MOUNT alone does not either, because it
+ * compares st_dev and a same-filesystem bind has an identical device number.
+ * The mount table is the only reliable source, hence collect_mounts_below().
  *
  * Callers that need the tmpdir to actually disappear should detach the mounts
  * under it first (see unmount_tree_below()); anything still mounted is left
@@ -17066,11 +17264,21 @@ static int rm_entry(const char* path, const struct stat* sb,
  */
 static void rm_rf_dir(const char* path)
 {
-    /* FTW_MOUNT alone is not enough: it compares st_dev, and a bind mount of
-     * a directory from the same filesystem (the common `-v /tmp/x:/data`
-     * case) has an identical device number, so the walk descends right into
-     * it. Consult the mount table instead. */
-    s_rm_protect_n = collect_mounts_below(path, &s_rm_protect);
+    int scan_ok = 0;
+    s_rm_protect_n = collect_mounts_below(path, &s_rm_protect, &scan_ok);
+    if (!scan_ok)
+    {
+        /* Without a trustworthy mount table there is no way to tell a plain
+         * directory from a live bind mount. Leaking a tmpdir is recoverable;
+         * deleting the user's host files through a `-v` is not. */
+        fprintf(stderr,
+                "oci2bin: cannot read the mount table; leaving %s in place"
+                " rather than risk deleting through a bind mount\n", path);
+        free(s_rm_protect);
+        s_rm_protect = NULL;
+        s_rm_protect_n = 0;
+        return;
+    }
     nftw(path, rm_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT);
     free(s_rm_protect);
     s_rm_protect = NULL;
@@ -18186,6 +18394,14 @@ static int            g_mcp_n_ctrs;
 struct mcp_mount_root
 {
     char path[PATH_MAX];
+    /*
+     * The same root with every symlink resolved. mount(2) follows symlinks in
+     * the source path, so a string-only check is satisfied by
+     * "/srv/data/link" while the kernel happily binds whatever that link
+     * points at — /etc, $HOME, /. Matching the resolved forms on both sides
+     * is what makes the allowlist mean what it says.
+     */
+    char real[PATH_MAX];
     int  writable;
 };
 
@@ -18193,27 +18409,50 @@ static struct mcp_mount_root g_mcp_mount_roots[MCP_MAX_MOUNT_ROOTS];
 static int                   g_mcp_n_mount_roots;
 
 /*
- * Is 'host_path' inside an allowed root? Returns the root, or NULL.
- * Matches on path components so /srv/dataset is not treated as being under
- * an allowed /srv/data.
+ * Is 'path' the root itself or something below it? Compares whole components,
+ * so /srv/dataset is not treated as being under /srv/data. An empty root
+ * matches nothing (it would otherwise match every absolute path).
+ */
+static int mcp_path_under_root(const char* path, const char* root)
+{
+    size_t len = strlen(root);
+    if (len == 0 || root[0] != '/')
+    {
+        return 0;
+    }
+    if (strncmp(path, root, len) != 0)
+    {
+        return 0;
+    }
+    /* Exact match, or the next char starts a new component. A root of "/"
+     * matches everything below it. */
+    return path[len] == '\0' || path[len] == '/' || (len == 1);
+}
+
+/*
+ * Is 'host_path' inside an allowed root, as written? Returns the root, or
+ * NULL. This is the textual half of the check — see mcp_mount_root_for_real()
+ * for the half that survives a symlink.
  */
 static const struct mcp_mount_root* mcp_mount_root_for(const char* host_path)
 {
     for (int i = 0; i < g_mcp_n_mount_roots; i++)
     {
-        const char* root = g_mcp_mount_roots[i].path;
-        size_t len = strlen(root);
-        if (strncmp(host_path, root, len) != 0)
-        {
-            continue;
-        }
-        /* Exact match, or the next char starts a new component. A root of
-         * "/" matches everything below it. */
-        if (host_path[len] == '\0' || host_path[len] == '/' ||
-                (len == 1 && root[0] == '/'))
+        if (mcp_path_under_root(host_path, g_mcp_mount_roots[i].path))
         {
             return &g_mcp_mount_roots[i];
         }
+    }
+    return NULL;
+}
+
+/* Same question asked of fully resolved paths. */
+static const struct mcp_mount_root* mcp_mount_root_for_real(
+    const struct mcp_mount_root* root, const char* resolved)
+{
+    if (root && mcp_path_under_root(resolved, root->real))
+    {
+        return root;
     }
     return NULL;
 }
@@ -18268,6 +18507,13 @@ static int mcp_parse_request_id(const char* json, char* out, size_t out_sz)
         p++;
         while (*p && *p != '"' && *p != '\\')
         {
+            /* A raw control character is not legal inside a JSON string, so
+             * echoing one back would emit a response no client can parse.
+             * Refuse the id rather than corrupt the reply. */
+            if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f)
+            {
+                return 0;
+            }
             p++;
         }
         if (*p != '"')
@@ -18292,8 +18538,10 @@ static int mcp_parse_request_id(const char* json, char* out, size_t out_sz)
     /* Numeric: copy the digits verbatim rather than round-tripping through
      * strtol, so a value we cannot represent is still echoed correctly. */
     const char* start = p;
-    if (*p == '-' || *p == '+')
+    if (*p == '-')
     {
+        /* No leading '+': JSON does not allow it, and echoing it back would
+         * make our own response invalid. */
         p++;
     }
     if (!isdigit((unsigned char)*p))
@@ -18638,6 +18886,14 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
         {
             char* colon = strchr(vol_strs[i], ':');
             int   ok    = 0;
+            /* Room for the ":ro" the argv builder may append. Bounding it
+             * here means that rewrite cannot truncate later, and a spec that
+             * would not fit is refused rather than quietly forwarded without
+             * the read-only suffix. */
+            if (colon && strlen(vol_strs[i]) + sizeof(":ro") > PATH_MAX)
+            {
+                colon = NULL;
+            }
             if (colon)
             {
                 *colon = '\0';
@@ -18658,6 +18914,12 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
                         ctr_buf[clen] = '\0';
                         ctr_part = ctr_buf;
                     }
+                    else
+                    {
+                        /* Cannot split off the suffix, so ctr_part would still
+                         * carry ":ro" into the path validation. Refuse. */
+                        suffix_ok = 0;
+                    }
                 }
                 if (suffix_ok &&
                         path_is_absolute_and_clean(host_part) &&
@@ -18669,9 +18931,26 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
                 }
                 if (ok)
                 {
-                    /* Shape is fine; now the policy question. */
+                    /* Shape is fine; now the policy question. The host path
+                     * must be under an allowed root both as written and once
+                     * every symlink is resolved — mount(2) follows them, so
+                     * the textual check alone is satisfied by a link inside
+                     * an allowed root that points anywhere at all. */
+                    char real_host[PATH_MAX];
                     const struct mcp_mount_root* root =
                         mcp_mount_root_for(host_part);
+                    if (root && !realpath(host_part, real_host))
+                    {
+                        root = NULL; /* does not exist, or cannot be resolved */
+                    }
+                    else if (root)
+                    {
+                        /* Keep the policy of the root that matched the path as
+                         * written. A symlink from a read-only root into a
+                         * different writable root must not inherit the latter
+                         * root's write permission. */
+                        root = mcp_mount_root_for_real(root, real_host);
+                    }
                     if (!root)
                     {
                         ok = -1; /* not under any allowed root */
@@ -18751,10 +19030,18 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
         {
             int n = snprintf(vol_ro_bufs[i], sizeof(vol_ro_bufs[i]),
                              "%s:ro", spec);
-            if (n > 0 && (size_t)n < sizeof(vol_ro_bufs[i]))
+            if (n < 0 || (size_t)n >= sizeof(vol_ro_bufs[i]))
             {
-                spec = vol_ro_bufs[i];
+                /* The validation loop bounds the length so this cannot
+                 * normally happen — but falling through would forward the
+                 * spec read-write, which is the one outcome this whole block
+                 * exists to prevent. Fail the request instead. */
+                mcp_send_error(id, -32602,
+                               "run_container: volume spec too long to mount"
+                               " read-only");
+                goto cleanup_env;
             }
+            spec = vol_ro_bufs[i];
         }
         ctr_argv[ai++] = "-v";
         ctr_argv[ai++] = (char*)spec;
@@ -19953,6 +20240,16 @@ int main(int argc, char* argv[])
                 while (rl > 1 && r->path[rl - 1] == '/')
                 {
                     r->path[--rl] = '\0';
+                }
+                /* Resolve it once, up front: requests are matched against the
+                 * resolved form too, and a root that does not exist can only
+                 * be an operator mistake. */
+                if (!realpath(r->path, r->real))
+                {
+                    fprintf(stderr,
+                            "oci2bin: mcp-serve: cannot resolve mount root"
+                            " %s: %s\n", r->path, strerror(errno));
+                    return 1;
                 }
                 r->writable = writable;
                 g_mcp_n_mount_roots++;
