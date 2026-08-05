@@ -19,6 +19,16 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **MCP container tracking is pinned to process identity, not just a PID.**
+  Entries recorded only the PID, so once a tracked container exited the kernel
+  was free to reissue that number and a later `stop_container` would signal
+  whatever inherited it. Each entry now also records the process start time
+  from `/proc/<pid>/stat`, and lookups verify it — a recycled PID reports
+  "container not found" instead of acting on a stranger. Tracking slots
+  belonging to stopped containers are also reused, where previously the table
+  filled up permanently after 64 launches regardless of how many were still
+  running, and exhaustion now returns an error rather than overflowing.
+
 - **`--require-signed` no longer keys off a removable text marker.** Policy
   detection substring-searched the trailing 256 KiB of the file for the literal
   `"require_signed":true`. Anything that perturbed those bytes — one flipped

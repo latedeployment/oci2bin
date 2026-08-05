@@ -17973,6 +17973,14 @@ struct mcp_ctr
 {
     char  name[MCP_NAME_MAX];
     pid_t pid;
+    /*
+     * Process start time from /proc/<pid>/stat field 22. A PID on its own is
+     * not an identity: once a tracked container exits, the kernel is free to
+     * hand that number to something else, and every later kill()/signal
+     * against the stale entry would land on an unrelated process. The start
+     * time pins the entry to the exact process we launched.
+     */
+    unsigned long long start_time;
     char  log_path[PATH_MAX];
 };
 
@@ -18154,6 +18162,92 @@ static void mcp_send_error(long id, int code, const char* msg)
 }
 
 /* Find a tracked container by name; returns index or -1 */
+/*
+ * Read field 22 (starttime) of /proc/<pid>/stat. Returns 0 if it cannot be
+ * read, which callers treat as "not our process".
+ *
+ * The comm field (2) can contain spaces and parentheses, so parsing starts
+ * after the final ')' rather than splitting the whole line.
+ */
+static unsigned long long mcp_proc_start_time(pid_t pid)
+{
+    char path[64];
+    if (snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid)
+            >= (int)sizeof(path))
+    {
+        return 0;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return 0;
+    }
+    char buf[1024];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+    {
+        return 0;
+    }
+    buf[n] = '\0';
+
+    char* p = strrchr(buf, ')');
+    if (!p)
+    {
+        return 0;
+    }
+    p++; /* now at the space before field 3 */
+    /* Fields 3..21 are skipped; starttime is field 22. */
+    int field = 2;
+    while (*p && field < 22)
+    {
+        while (*p == ' ')
+        {
+            p++;
+        }
+        if (!*p)
+        {
+            return 0;
+        }
+        field++;
+        if (field == 22)
+        {
+            break;
+        }
+        while (*p && *p != ' ')
+        {
+            p++;
+        }
+    }
+    if (field != 22)
+    {
+        return 0;
+    }
+    return strtoull(p, NULL, 10);
+}
+
+/*
+ * Is this tracking entry still the process we launched? Guards against PID
+ * reuse: a recycled PID has a different start time.
+ */
+static int mcp_ctr_alive(const struct mcp_ctr* c)
+{
+    if (c->pid <= 0)
+    {
+        return 0;
+    }
+    if (kill(c->pid, 0) != 0)
+    {
+        return 0;
+    }
+    if (c->start_time != 0 &&
+            mcp_proc_start_time(c->pid) != c->start_time)
+    {
+        return 0; /* PID was recycled */
+    }
+    return 1;
+}
+
 static int mcp_find_ctr(const char* name)
 {
     for (int i = 0; i < g_mcp_n_ctrs; i++)
@@ -18161,8 +18255,40 @@ static int mcp_find_ctr(const char* name)
         if (g_mcp_ctrs[i].pid > 0 &&
                 strcmp(g_mcp_ctrs[i].name, name) == 0)
         {
+            if (!mcp_ctr_alive(&g_mcp_ctrs[i]))
+            {
+                /* Stale entry: free the slot instead of acting on it. */
+                g_mcp_ctrs[i].pid = -1;
+                g_mcp_ctrs[i].start_time = 0;
+                continue;
+            }
             return i;
         }
+    }
+    return -1;
+}
+
+/*
+ * Claim a tracking slot, reusing one belonging to a container that has
+ * stopped. Without this the table filled up permanently after
+ * MCP_MAX_CONTAINERS launches, however many were still running.
+ * Returns the index, or -1 when genuinely full.
+ */
+static int mcp_alloc_ctr_slot(void)
+{
+    for (int i = 0; i < g_mcp_n_ctrs; i++)
+    {
+        if (g_mcp_ctrs[i].pid <= 0 || !mcp_ctr_alive(&g_mcp_ctrs[i]))
+        {
+            memset(&g_mcp_ctrs[i], 0, sizeof(g_mcp_ctrs[i]));
+            return i;
+        }
+    }
+    if (g_mcp_n_ctrs < MCP_MAX_CONTAINERS)
+    {
+        int slot = g_mcp_n_ctrs++;
+        memset(&g_mcp_ctrs[slot], 0, sizeof(g_mcp_ctrs[slot]));
+        return slot;
     }
     return -1;
 }
@@ -18557,10 +18683,17 @@ static void mcp_tool_run_container(long id, const char* args_json,
     }
 
     /* Track the container */
-    int slot = g_mcp_n_ctrs++;
+    int slot = mcp_alloc_ctr_slot();
+    if (slot < 0)
+    {
+        mcp_send_error(id, -32603,
+                       "run_container: container tracking table is full");
+        goto cleanup_env;
+    }
     size_t name_len = strlen(name);
     memcpy(g_mcp_ctrs[slot].name, name, name_len + 1);
     g_mcp_ctrs[slot].pid = detached_pid;
+    g_mcp_ctrs[slot].start_time = mcp_proc_start_time(detached_pid);
     size_t log_path_len = strlen(log_path);
     memcpy(g_mcp_ctrs[slot].log_path, log_path, log_path_len + 1);
 
@@ -18615,9 +18748,10 @@ static void mcp_tool_list_containers(long id)
         if (reaped == c->pid)
         {
             c->pid = -1;
+            c->start_time = 0;
             continue;
         }
-        int running = (kill(c->pid, 0) == 0);
+        int running = mcp_ctr_alive(c);
 
         char name_esc[MCP_NAME_MAX * 2];
         json_escape_string(c->name, name_esc, sizeof(name_esc));
@@ -18698,6 +18832,7 @@ static void mcp_tool_stop_container(long id, const char* args_json)
         }
     }
     g_mcp_ctrs[idx].pid = -1;
+    g_mcp_ctrs[idx].start_time = 0;
 
     char result[128];
     snprintf(result, sizeof(result),

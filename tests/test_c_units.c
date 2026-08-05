@@ -3226,12 +3226,24 @@ static void test_mcp_helpers(void)
     ASSERT_INT_EQ(mcp_find_ctr("missing"), -1,
                   "mcp_helpers: find_ctr returns -1 for unknown name");
 
-    /* add a fake container */
+    /* Add a tracked container. find_ctr() now verifies the entry still
+     * refers to the process we launched, so this uses our own pid and start
+     * time rather than a made-up PID — a fake one is indistinguishable from
+     * a recycled one and is correctly reported as gone. */
     strncpy(g_mcp_ctrs[0].name, "test-ctr", MCP_NAME_MAX - 1);
-    g_mcp_ctrs[0].pid = 99999; /* fake PID */
+    g_mcp_ctrs[0].pid = getpid();
+    g_mcp_ctrs[0].start_time = mcp_proc_start_time(getpid());
     g_mcp_n_ctrs = 1;
     ASSERT_INT_EQ(mcp_find_ctr("test-ctr"), 0,
                   "mcp_helpers: find_ctr finds tracked container");
+
+    /* A pid that is not ours must not be returned. */
+    g_mcp_ctrs[0].pid = 999999;
+    g_mcp_ctrs[0].start_time = 1;
+    ASSERT_INT_EQ(mcp_find_ctr("test-ctr"), -1,
+                  "mcp_helpers: find_ctr rejects a stale/recycled pid");
+    g_mcp_ctrs[0].pid = getpid();
+    g_mcp_ctrs[0].start_time = mcp_proc_start_time(getpid());
     ASSERT_INT_EQ(mcp_find_ctr("other"), -1,
                   "mcp_helpers: find_ctr misses different name");
 
@@ -6307,6 +6319,75 @@ static void test_mcp_mount_root_policy(void)
     g_mcp_n_mount_roots = 0;
 }
 
+/*
+ * MCP container tracking must survive PID reuse and must not leak slots.
+ */
+static void test_mcp_ctr_identity_and_slots(void)
+{
+    memset(g_mcp_ctrs, 0, sizeof(g_mcp_ctrs));
+    g_mcp_n_ctrs = 0;
+
+    /* Our own start time is readable and stable. */
+    unsigned long long self = mcp_proc_start_time(getpid());
+    ASSERT(self != 0, "mcp identity: start time of self is readable");
+    ASSERT(mcp_proc_start_time(getpid()) == self,
+           "mcp identity: start time is stable across reads");
+
+    /* A pid that does not exist yields 0. */
+    ASSERT_INT_EQ((int)mcp_proc_start_time(999999), 0,
+                  "mcp identity: unknown pid has no start time");
+
+    /* An entry with the right identity is alive... */
+    int slot = mcp_alloc_ctr_slot();
+    ASSERT_INT_EQ(slot, 0, "mcp slots: first allocation is slot 0");
+    snprintf(g_mcp_ctrs[slot].name, MCP_NAME_MAX, "%s", "alpha");
+    g_mcp_ctrs[slot].pid = getpid();
+    g_mcp_ctrs[slot].start_time = self;
+    ASSERT_INT_EQ(mcp_ctr_alive(&g_mcp_ctrs[slot]), 1,
+                  "mcp identity: matching start time counts as alive");
+    ASSERT_INT_EQ(mcp_find_ctr("alpha"), 0,
+                  "mcp identity: live container is found by name");
+
+    /* ...and the same PID with a different start time is not: this is the
+     * PID-reuse case that previously let a signal hit a stranger. */
+    g_mcp_ctrs[slot].start_time = self + 1;
+    ASSERT_INT_EQ(mcp_ctr_alive(&g_mcp_ctrs[slot]), 0,
+                  "mcp identity: recycled pid is not treated as ours");
+    ASSERT_INT_EQ(mcp_find_ctr("alpha"), -1,
+                  "mcp identity: stale entry is not returned by name");
+    ASSERT_INT_EQ((int)g_mcp_ctrs[slot].pid, -1,
+                  "mcp identity: stale entry is released on lookup");
+
+    /* The released slot is reused rather than growing the table. */
+    int again = mcp_alloc_ctr_slot();
+    ASSERT_INT_EQ(again, 0, "mcp slots: stopped container's slot is reused");
+    ASSERT_INT_EQ(g_mcp_n_ctrs, 1, "mcp slots: table did not grow");
+
+    /* Exhaustion is reported rather than overflowing the array. */
+    memset(g_mcp_ctrs, 0, sizeof(g_mcp_ctrs));
+    g_mcp_n_ctrs = 0;
+    int allocated = 0;
+    for (int i = 0; i < MCP_MAX_CONTAINERS + 4; i++)
+    {
+        int sl = mcp_alloc_ctr_slot();
+        if (sl < 0)
+        {
+            break;
+        }
+        /* Mark as live so the next allocation cannot reclaim it. */
+        g_mcp_ctrs[sl].pid = getpid();
+        g_mcp_ctrs[sl].start_time = self;
+        allocated++;
+    }
+    ASSERT_INT_EQ(allocated, MCP_MAX_CONTAINERS,
+                  "mcp slots: allocation stops at the table limit");
+    ASSERT_INT_EQ(mcp_alloc_ctr_slot(), -1,
+                  "mcp slots: full table reports -1");
+
+    memset(g_mcp_ctrs, 0, sizeof(g_mcp_ctrs));
+    g_mcp_n_ctrs = 0;
+}
+
 static void test_credential_file_is_safe(void)
 {
     char tmpl[] = "/tmp/oci2bin-cred-test-XXXXXX";
@@ -6536,6 +6617,7 @@ int main(void)
     test_parse_opts_cdi();
     test_cdi_resolve();
     test_credstore_candidate_path();
+    test_mcp_ctr_identity_and_slots();
     test_mcp_mount_root_policy();
     test_rm_rf_dir_does_not_cross_mounts();
     test_json_has_key();
