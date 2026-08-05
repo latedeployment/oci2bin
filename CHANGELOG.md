@@ -15,6 +15,14 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **`oci2bin diff` compares file contents, not just sizes.** Regular files were
+  compared by length alone, so two files of identical size but different bytes
+  were reported as unchanged — the module docstring already claimed a
+  `sha256_or_none` field that was never computed. Both the OCI-layer and live
+  rootfs walkers now attach a streaming sha256 (1 MiB chunks, so large layers
+  are never held in memory), and the comparison falls back to size only when a
+  member cannot be read.
+
 - **`make lint-semgrep` works again.** It invoked whatever `semgrep` was on
   `PATH`; a system install missing its `attrs` dependency died with
   `ModuleNotFoundError`, which looks like a lint failure but is not one. The

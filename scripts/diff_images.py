@@ -28,6 +28,7 @@ stdlib only.
 """
 
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -95,6 +96,26 @@ def open_layer(layer_data):
     if layer_data[:2] == b'\x1f\x8b':
         return tarfile.open(fileobj=io.BytesIO(gzip.decompress(layer_data)), mode='r:')
     return tarfile.open(fileobj=io.BytesIO(layer_data), mode='r:')
+
+
+def sha256_stream(fileobj, chunk_size=1024 * 1024):
+    """
+    Content hash of fileobj, read in chunks so a multi-GB layer member never
+    lands in memory. Returns the hex digest, or None if the stream could not
+    be read (callers fall back to comparing sizes).
+    """
+    if fileobj is None:
+        return None
+    digest = hashlib.sha256()
+    try:
+        while True:
+            chunk = fileobj.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    except (OSError, tarfile.TarError):
+        return None
+    return digest.hexdigest()
 
 
 def build_file_dict(oci_bytes):
@@ -170,7 +191,13 @@ def build_file_dict(oci_bytes):
             elif m.isdir():
                 file_dict[path] = ('dir', None)
             elif m.isfile():
-                file_dict[path] = ('file', m.size)
+                # Hash the contents: comparing sizes alone reports two
+                # different files of equal length as unchanged.
+                try:
+                    src = layer_tf.extractfile(m)
+                except (KeyError, tarfile.TarError):
+                    src = None
+                file_dict[path] = ('file', m.size, sha256_stream(src))
 
         layer_tf.close()
 
@@ -193,8 +220,17 @@ def diff_dicts(d1, d2):
         if v1[0] != v2[0]:
             # Type changed (file → dir, etc.)
             modified.append((path, v1, v2))
-        elif v1[0] == 'file' and v1[1] != v2[1]:
-            modified.append((path, v1, v2))
+        elif v1[0] == 'file':
+            # Compare content hashes, not just sizes — two different files of
+            # the same length used to be reported as unchanged. Fall back to
+            # the size when a hash is unavailable (unreadable member).
+            h1 = v1[2] if len(v1) > 2 else None
+            h2 = v2[2] if len(v2) > 2 else None
+            if h1 is not None and h2 is not None:
+                if h1 != h2:
+                    modified.append((path, v1, v2))
+            elif v1[1] != v2[1]:
+                modified.append((path, v1, v2))
         elif v1[0] == 'link' and v1[1] != v2[1]:
             modified.append((path, v1, v2))
 
@@ -215,7 +251,7 @@ def build_file_dict_from_rootfs(rootfs_path):
     """
     Walk a live container rootfs at rootfs_path (e.g. /proc/PID/root)
     and build the same dict format as build_file_dict():
-        path -> ('file', size)
+        path -> ('file', size, sha256_or_none)
         path -> ('link', target)
         path -> ('dir', None)
     Does NOT follow symlinks outside the rootfs.
@@ -252,7 +288,13 @@ def build_file_dict_from_rootfs(rootfs_path):
                     target = ''
                 file_dict[fpath] = ('link', target)
             elif stat_module.S_ISREG(st.st_mode):
-                file_dict[fpath] = ('file', st.st_size)
+                digest = None
+                try:
+                    with open(os.path.join(dirpath, fname), 'rb') as fh:
+                        digest = sha256_stream(fh)
+                except OSError:
+                    digest = None
+                file_dict[fpath] = ('file', st.st_size, digest)
 
     return file_dict
 
