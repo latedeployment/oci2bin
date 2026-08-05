@@ -526,6 +526,19 @@ struct container_opts
 
     /* --secret HOST_FILE[:CONTAINER_PATH]  (read-only file mounts)
      * --secret tpm2:CRED_NAME[:CONTAINER_PATH]  (TPM2-sealed via systemd-creds) */
+    /*
+     * Heap strings this struct owns.
+     *
+     * devices[]/env_vars[]/vol_*[] hold a mix: plain argv pointers for the
+     * ordinary flags, and strdup()'d copies for anything synthesised by the
+     * CDI/--gpus path. Without a record of which is which, nothing can free
+     * them safely, so they were simply never freed. Harmless for a process
+     * that goes straight to exec, but it leaves a permanent leak signal that
+     * masks real ones under a sanitizer.
+     */
+    char* owned[MAX_ENV + MAX_VOLUMES * 4 + 8];
+    int   n_owned;
+
     char* secret_host[MAX_SECRETS]; /* host path OR NULL for tpm2 secrets */
     char* secret_ctr[MAX_SECRETS];  /* NULL → /run/secrets/<basename> */
     char* secret_cred[MAX_SECRETS]; /* NULL = plain file; non-NULL = tpm2 cred name */
@@ -8884,6 +8897,21 @@ static void health_resolve(const struct container_opts* opts,
 }
 
 /*
+ * Release the argv health_resolve() built. Every entry is heap-owned (either
+ * strdup()'d here or taken over from the parsed JSON array), so this is
+ * unambiguous. Safe to call twice.
+ */
+static void free_health_state(struct health_state* hs)
+{
+    for (int i = 0; i < MAX_HEALTH_ARGS && hs->argv[i]; i++)
+    {
+        free(hs->argv[i]);
+        hs->argv[i] = NULL;
+    }
+    hs->argc = 0;
+}
+
+/*
  * Run one health probe.  Returns 0 (healthy) when the probe command exits 0,
  * or 1 (unhealthy) on non-zero exit, exec failure, or timeout.  Probe stdio
  * is connected to /dev/null so the workload's own output is not polluted.
@@ -13388,6 +13416,37 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc)
 
 /* Append a CDI deviceNode to opts->devices (reuses the --device apply path).
  * host is the host node, ctr the container path. Both validated /dev/ + clean. */
+/*
+ * Record a heap string the opts struct now owns, so free_owned_opts() can
+ * release it later. Returns the pointer for convenient inline use, or NULL
+ * (after freeing) when the table is full — callers treat that as an error.
+ */
+static char* opts_own(struct container_opts* opts, char* p)
+{
+    if (!p)
+    {
+        return NULL;
+    }
+    if (opts->n_owned >= (int)(sizeof(opts->owned) / sizeof(opts->owned[0])))
+    {
+        free(p);
+        return NULL;
+    }
+    opts->owned[opts->n_owned++] = p;
+    return p;
+}
+
+/* Release every heap string recorded by opts_own(). Safe to call twice. */
+static void free_owned_opts(struct container_opts* opts)
+{
+    for (int i = 0; i < opts->n_owned; i++)
+    {
+        free(opts->owned[i]);
+        opts->owned[i] = NULL;
+    }
+    opts->n_owned = 0;
+}
+
 static int cdi_add_device(struct container_opts* opts, const char* host,
                           const char* ctr)
 {
@@ -13411,8 +13470,9 @@ static int cdi_add_device(struct container_opts* opts, const char* host,
                 ctr);
         return -1;
     }
-    opts->devices[opts->n_devices] = strdup(host);
-    opts->device_ctr[opts->n_devices] = ctr ? strdup(ctr) : NULL;
+    opts->devices[opts->n_devices] = opts_own(opts, strdup(host));
+    opts->device_ctr[opts->n_devices] =
+        ctr ? opts_own(opts, strdup(ctr)) : NULL;
     if (!opts->devices[opts->n_devices])
     {
         return -1;
@@ -13437,8 +13497,8 @@ static int cdi_add_mount(struct container_opts* opts, const char* host,
                 host ? host : "(null)", ctr ? ctr : "(null)");
         return -1;
     }
-    opts->vol_host[opts->n_vols] = strdup(host);
-    opts->vol_ctr[opts->n_vols] = strdup(ctr);
+    opts->vol_host[opts->n_vols] = opts_own(opts, strdup(host));
+    opts->vol_ctr[opts->n_vols] = opts_own(opts, strdup(ctr));
     if (!opts->vol_host[opts->n_vols] || !opts->vol_ctr[opts->n_vols])
     {
         return -1;
@@ -13459,7 +13519,7 @@ static int cdi_add_env(struct container_opts* opts, const char* kv)
         fprintf(stderr, "oci2bin: CDI: too many env vars (max %d)\n", MAX_ENV);
         return -1;
     }
-    opts->env_vars[opts->n_env] = strdup(kv);
+    opts->env_vars[opts->n_env] = opts_own(opts, strdup(kv));
     if (!opts->env_vars[opts->n_env])
     {
         return -1;
@@ -14925,7 +14985,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             char* full;
             if (strchr(spec, '=') || strchr(spec, '/'))
             {
-                full = strdup(spec);    /* already a full CDI name */
+                full = opts_own(opts, strdup(spec)); /* full CDI name */
             }
             else
             {
@@ -14937,7 +14997,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                     fprintf(stderr, "oci2bin: --gpus spec too long\n");
                     return -1;
                 }
-                full = strdup(buf);
+                full = opts_own(opts, strdup(buf));
             }
             if (!full)
             {

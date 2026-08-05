@@ -72,6 +72,7 @@ VMLINUX_OUT    = build/vmlinux
         test-integration-nginx test-integration-encrypt test-integration-live \
         test-integration-services \
         test-c test-c-aarch64 test-c-stubs test-python test-shellcheck check-version \
+        test-asan \
         test-all test-all-fuzz \
         test-vm-unit test-vm \
         lint lint-clang lint-semgrep lint-scan-build lint-shellcheck \
@@ -351,6 +352,19 @@ lint-shellcheck:
 	@echo "shellcheck: OK"
 
 test-shellcheck: lint-shellcheck
+
+# AddressSanitizer + UndefinedBehaviorSanitizer + LeakSanitizer over the C unit
+# suite. Kept as a local target (this project runs no hosted CI); the leak
+# baseline is clean, so any new report is a real regression.
+test-asan:
+	@echo "=== C unit tests under ASan/UBSan/LSan ==="
+	@mkdir -p build/asan $(TEST_TMPDIR)
+	$(CC_X86_64) -fsanitize=address,undefined -fno-omit-frame-pointer \
+	    -g -O0 -Wno-return-local-addr -Wno-unused-function \
+	    -o build/asan/test_c_units $(TESTS_DIR)/test_c_units.c
+	$(TEST_ENV) ASAN_OPTIONS=detect_leaks=1 ./build/asan/test_c_units >/dev/null
+	@echo "asan: OK (no leaks, no UB)"
+
 
 # Fail if the project version has drifted apart across pyproject, the builder,
 # the loader and the distro packaging files.

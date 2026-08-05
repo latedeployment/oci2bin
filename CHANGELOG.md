@@ -6,6 +6,10 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`make test-asan`** — runs the C unit suite under AddressSanitizer,
+  UndefinedBehaviorSanitizer and LeakSanitizer. Local only, like the rest of
+  the test surface.
+
 - **`mcp-serve --allow-mount PATH` / `--allow-mount-rw PATH`** — an explicit
   allowlist of host directories the MCP server may bind into containers. Both
   are repeatable (max 16 roots).
@@ -18,6 +22,15 @@ All notable changes to oci2bin are documented here.
   `--memory`/`--cpus`/`--pids-limit`.
 
 ### Fixed
+
+- **The sanitizer leak baseline is clean.** ASan reported 16 leaks totalling
+  140 bytes, in the CDI and health-check paths. `devices[]`, `env_vars[]` and
+  `vol_*[]` hold a mix of plain argv pointers and `strdup()`ed copies
+  synthesised by the CDI/`--gpus` code, with no record of which was which, so
+  nothing could free them safely. The struct now tracks the strings it owns
+  (`opts_own()`/`free_owned_opts()`), and `free_health_state()` releases the
+  health argv. Nothing leaked in practice — these allocations live until the
+  process execs — but a permanently dirty baseline hides real regressions.
 
 - **MCP auto-generated container names are unique.** An unnamed
   `run_container` was named `ctr-<pid>` using the *server's* pid, which is

@@ -2829,6 +2829,7 @@ make test-c                  # C unit tests (TAP, x86_64)
 make test-c-aarch64          # C unit tests cross-compiled and run under qemu (aarch64)
 make test-python             # Python unit tests (auto-discovered from tests/)
 make check-version           # assert the project version agrees across all sources
+make test-asan               # C unit tests under ASan/UBSan/LeakSanitizer
 make test-shellcheck         # shellcheck on all shell scripts
 make test-integration        # all integration tests (runtime, build, Redis, nginx, encrypt, live)
 make test-integration-redis  # Redis PING/SET/GET smoke test

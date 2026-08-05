@@ -5829,10 +5829,11 @@ static void test_parse_opts_health(void)
 static void test_health_resolve(void)
 {
     struct container_opts opts;
-    struct health_state hs;
+    struct health_state hs = {0};
 
     /* No --health, no image healthcheck → disabled. */
     memset(&opts, 0, sizeof(opts));
+    free_health_state(&hs);
     health_resolve(&opts, NULL, &hs);
     ASSERT_INT_EQ(hs.enabled, 0,
                   "health_resolve: off without --health or image HC");
@@ -5843,6 +5844,7 @@ static void test_health_resolve(void)
     const char* hc = "{\"Test\":[\"CMD-SHELL\",\"true\"],"
                      "\"Interval\":5000000000,\"Timeout\":2000000000,"
                      "\"Retries\":2}";
+    free_health_state(&hs);
     health_resolve(&opts, hc, &hs);
     ASSERT_INT_EQ(hs.enabled, 1, "health_resolve: enabled with image HC");
     ASSERT_STR_EQ(hs.argv[0], "/bin/sh", "health_resolve: CMD-SHELL argv[0]");
@@ -5855,6 +5857,7 @@ static void test_health_resolve(void)
     /* CMD form drops the "CMD" prefix. */
     memset(&opts, 0, sizeof(opts));
     opts.health_enabled = 1;
+    free_health_state(&hs);
     health_resolve(&opts, "{\"Test\":[\"CMD\",\"/bin/true\",\"-q\"]}", &hs);
     ASSERT_INT_EQ(hs.enabled, 1, "health_resolve: CMD form enabled");
     ASSERT_STR_EQ(hs.argv[0], "/bin/true", "health_resolve: CMD argv[0]");
@@ -5865,6 +5868,7 @@ static void test_health_resolve(void)
     /* Test ["NONE"] disables even with --health. */
     memset(&opts, 0, sizeof(opts));
     opts.health_enabled = 1;
+    free_health_state(&hs);
     health_resolve(&opts, "{\"Test\":[\"NONE\"]}", &hs);
     ASSERT_INT_EQ(hs.enabled, 0, "health_resolve: Test=[NONE] disables");
 
@@ -5872,6 +5876,7 @@ static void test_health_resolve(void)
     memset(&opts, 0, sizeof(opts));
     opts.health_enabled = 1;
     opts.health_disabled = 1;
+    free_health_state(&hs);
     health_resolve(&opts, hc, &hs);
     ASSERT_INT_EQ(hs.enabled, 0, "health_resolve: --no-health forces off");
 
@@ -5880,6 +5885,7 @@ static void test_health_resolve(void)
     opts.health_cmd = "myprobe";
     opts.health_interval_s = 9;
     opts.health_retries = 7;
+    free_health_state(&hs);
     health_resolve(&opts, hc, &hs);
     ASSERT_INT_EQ(hs.enabled, 1, "health_resolve: --health-cmd enables");
     ASSERT_STR_EQ(hs.argv[2], "myprobe",
@@ -5888,6 +5894,8 @@ static void test_health_resolve(void)
                   "health_resolve: --health-interval overrides image");
     ASSERT_INT_EQ(hs.retries, 7,
                   "health_resolve: --health-retries overrides image");
+
+    free_health_state(&hs);
 }
 
 /* ── test_json_toplevel_and_object_array (CDI helpers) ────────────────────── */
@@ -5941,10 +5949,11 @@ static void test_json_toplevel_and_object_array(void)
 
 static void test_parse_opts_cdi(void)
 {
-    struct container_opts opts;
+    struct container_opts opts = {0};
 
     {
         char* argv[] = {"prog", "--gpus", "all", NULL};
+        free_owned_opts(&opts);
         memset(&opts, 0, sizeof(opts));
         ASSERT_INT_EQ(parse_opts(3, argv, &opts), 0,
                       "parse_opts: --gpus all accepted");
@@ -5955,6 +5964,7 @@ static void test_parse_opts_cdi(void)
     {
         char a[] = "nvidia.com/gpu=0";
         char* argv[] = {"prog", "--gpus", a, NULL};
+        free_owned_opts(&opts);
         memset(&opts, 0, sizeof(opts));
         parse_opts(3, argv, &opts);
         ASSERT_STR_EQ(opts.cdi_devices[0], "nvidia.com/gpu=0",
@@ -5963,6 +5973,7 @@ static void test_parse_opts_cdi(void)
     {
         char a[] = "example.com/dev=zero";
         char* argv[] = {"prog", "--cdi-device", a, NULL};
+        free_owned_opts(&opts);
         memset(&opts, 0, sizeof(opts));
         ASSERT_INT_EQ(parse_opts(3, argv, &opts), 0,
                       "parse_opts: --cdi-device accepted");
@@ -5971,10 +5982,12 @@ static void test_parse_opts_cdi(void)
     }
     {
         char* argv[] = {"prog", "--cdi-device", NULL};
+        free_owned_opts(&opts);
         memset(&opts, 0, sizeof(opts));
         ASSERT_INT_EQ(parse_opts(2, argv, &opts), -1,
                       "parse_opts: --cdi-device missing arg rejected");
     }
+    free_owned_opts(&opts);
 }
 
 /* ── test_cdi_resolve ─────────────────────────────────────────────────────── */
@@ -6027,6 +6040,9 @@ static void test_cdi_resolve(void)
     memset(&opts2, 0, sizeof(opts2));
     ASSERT_INT_EQ(resolve_cdi_device("badname", &opts2), -1,
                   "cdi: name without '=' returns -1");
+
+    free_owned_opts(&opts);
+    free_owned_opts(&opts2);
 
     unsetenv("OCI2BIN_CDI_DIR");
     unlink(spec_path);
