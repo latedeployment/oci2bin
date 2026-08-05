@@ -15,6 +15,13 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **Python package license metadata uses an SPDX expression.** `pyproject.toml`
+  used the deprecated `license = { text = "MIT" }` table plus a
+  `License :: OSI Approved` classifier. It now declares `license = "MIT"`
+  (PEP 639) with the redundant classifier removed, and the build requirement
+  is `setuptools>=77` for SPDX support. Built wheels now carry
+  `Metadata-Version: 2.4` and `License-Expression: MIT`.
+
 - **The AUR package no longer skips source verification.** `PKGBUILD` used
   `sha256sums=('SKIP')`, so the downloaded release tarball was never checked.
   It now pins the real v0.17.0 checksum. The accompanying `.SRCINFO` was worse
