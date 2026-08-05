@@ -28,6 +28,16 @@ dependencies = []
 docs = [
     "mkdocs-material>=9.5",
 ]
+# Pinned so `make lint-semgrep` is reproducible. A bare `semgrep` on PATH is
+# easy to end up with in a half-installed state (a system install missing its
+# `attrs` dependency fails with ModuleNotFoundError, not a lint error), so the
+# Makefile prefers `uv run --group lint`.
+# The marker matters: the project supports Python >= 3.9 but semgrep requires
+# >= 3.10, and uv resolves dependency groups against the project's whole
+# requires-python range, so an unmarked pin makes resolution unsatisfiable.
+lint = [
+    "semgrep>=1.155,<2; python_version >= '3.10'",
+]
 
 [project.urls]
 Homepage = "https://github.com/latedeployment/oci2bin"

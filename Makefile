@@ -319,9 +319,21 @@ SEMGREP     ?= semgrep
 SEMGREP_CONFIGS = --config=p/default --config=p/owasp-top-ten \
                   --config=p/security-audit
 
+# Prefer the pinned `lint` dependency group over whatever `semgrep` happens to
+# be on PATH: a partially-installed system semgrep fails with an import error
+# rather than a lint result, which reads like a lint failure but is not one.
 lint-semgrep:
 	@echo "=== semgrep ==="
-	$(SEMGREP) $(SEMGREP_CONFIGS) --error src/loader.c
+	@if command -v uv >/dev/null 2>&1; then \
+		uv run --group lint semgrep $(SEMGREP_CONFIGS) --error src/loader.c; \
+	elif command -v $(SEMGREP) >/dev/null 2>&1; then \
+		echo "note: uv not found; using $(SEMGREP) from PATH (unpinned)"; \
+		$(SEMGREP) $(SEMGREP_CONFIGS) --error src/loader.c; \
+	else \
+		echo "lint-semgrep: no semgrep available." >&2; \
+		echo "  install uv (recommended) or: pip install 'semgrep>=1.155,<2'" >&2; \
+		exit 1; \
+	fi
 	@echo "semgrep: OK"
 
 # shellcheck: POSIX/bash static analysis for shell scripts.

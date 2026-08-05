@@ -15,6 +15,13 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **`make lint-semgrep` works again.** It invoked whatever `semgrep` was on
+  `PATH`; a system install missing its `attrs` dependency died with
+  `ModuleNotFoundError`, which looks like a lint failure but is not one. The
+  target now prefers the pinned `lint` dependency group via `uv run`, falls
+  back to `PATH` with a note, and gives an actionable message when neither is
+  available.
+
 - **Python package license metadata uses an SPDX expression.** `pyproject.toml`
   used the deprecated `license = { text = "MIT" }` table plus a
   `License :: OSI Approved` classifier. It now declares `license = "MIT"`
