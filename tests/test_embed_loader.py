@@ -1,15 +1,8 @@
 """
-test_embed_loader.py — Tests for loader embedding and persistence.
+Unit tests for loader embedding and extraction.
 
-TestEmbedLoaderLayer:   unit tests for embed_loader_as_layer (no Docker)
-TestEmbedLoaderLabels:  unit tests for embed_loader_as_labels (no Docker)
-TestEmbedLoaderDockerPersistence:
-    integration tests — verify the embedded layer/labels survive a full
-    docker load → docker save round-trip (requires Docker + alpine:latest)
-
-Run all:          python3 -m unittest tests.test_embed_loader -v
-Run unit only:    python3 -m unittest tests.test_embed_loader.TestEmbedLoaderLayer
-                  python3 -m unittest tests.test_embed_loader.TestEmbedLoaderLabels
+Docker load/save persistence coverage lives in integration_embed_loader.py so
+unittest discovery cannot pull it into the no-Docker unit suite.
 """
 
 import base64
@@ -17,10 +10,7 @@ import hashlib
 import importlib.util
 import io
 import json
-import os
-import subprocess
 import tarfile
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -83,39 +73,6 @@ def _read_manifest_and_config(tar_bytes):
         config_path = manifest[0]['Config']
         config = json.loads(tf.extractfile(config_path).read())
     return manifest, config
-
-
-def _docker_available():
-    try:
-        r = subprocess.run(['docker', 'info'], capture_output=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-# Prefer a small image that is likely to be cached locally.
-_CANDIDATE_IMAGES = [
-    'alpine:latest',
-    'busybox:latest',
-    'redis:7-alpine',
-    'caddy:2-alpine',
-    'memcached:1.6-alpine',
-]
-
-
-def _find_available_image():
-    """Return the first locally-present image from _CANDIDATE_IMAGES, or None."""
-    if not _docker_available():
-        return None
-    for img in _CANDIDATE_IMAGES:
-        r = subprocess.run(['docker', 'image', 'inspect', img],
-                           capture_output=True, timeout=10)
-        if r.returncode == 0:
-            return img
-    return None
-
-
-_AVAILABLE_IMAGE = _find_available_image()
 
 
 FAKE_LOADER = b'\x7fELF' + b'\xab' * 200   # 204-byte stub
@@ -367,171 +324,6 @@ class TestEmbedLoaderLabels(unittest.TestCase):
             config_raw = tf.extractfile(config_path).read()
         expected = hashlib.sha256(config_raw).hexdigest()
         self.assertIn(expected, config_path)
-
-
-# ── TestEmbedLoaderDockerPersistence ─────────────────────────────────────────
-
-@unittest.skipUnless(_AVAILABLE_IMAGE,
-                     'Docker not available or no suitable local image found')
-class TestEmbedLoaderDockerPersistence(unittest.TestCase):
-    """
-    Full round-trip: embed loader into a real OCI tar, docker load it under a
-    unique test tag, then docker save it back out and verify the loader
-    layer/labels survived.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        img = _AVAILABLE_IMAGE
-        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as f:
-            tmp = f.name
-        try:
-            r = subprocess.run(
-                ['docker', 'save', '-o', tmp, img],
-                capture_output=True, timeout=120,
-            )
-            if r.returncode != 0:
-                raise unittest.SkipTest(
-                    f'docker save {img} failed: {r.stderr.decode()}')
-            with open(tmp, 'rb') as f:
-                cls.base_tar = f.read()
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        cls.loader_bytes = FAKE_LOADER
-
-    def _retag(self, oci_bytes, new_tag):
-        """
-        Replace RepoTags in manifest.json with new_tag and strip index.json /
-        oci-layout so Docker falls back to legacy manifest.json-only mode.
-        Without this, containerd-backed Docker reads index.json for tag
-        resolution and ignores our manifest.json change.
-        """
-        _STRIP = {'index.json', 'oci-layout'}
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode='w:') as out_tf:
-            with tarfile.open(fileobj=io.BytesIO(oci_bytes), mode='r:*') as in_tf:
-                for m in in_tf.getmembers():
-                    if m.name in _STRIP:
-                        continue
-                    data = in_tf.extractfile(m)
-                    if m.name == 'manifest.json':
-                        mf = json.loads(data.read())
-                        mf[0]['RepoTags'] = [new_tag]
-                        raw = json.dumps(mf, separators=(',', ':')).encode()
-                        m2 = tarfile.TarInfo(name='manifest.json')
-                        m2.size = len(raw)
-                        out_tf.addfile(m2, io.BytesIO(raw))
-                    else:
-                        out_tf.addfile(m, data)
-        return buf.getvalue()
-
-    def _docker_load_and_save(self, oci_bytes, tag):
-        """
-        Load oci_bytes into Docker under `tag`, save it back out.
-        Returns saved_tar_bytes.  Cleans up the loaded image afterwards.
-        """
-        retagged = self._retag(oci_bytes, tag)
-        load_r = subprocess.run(
-            ['docker', 'load'],
-            input=retagged, capture_output=True, timeout=120,
-        )
-        self.assertEqual(load_r.returncode, 0,
-                         f'docker load failed: {load_r.stderr.decode()}')
-        try:
-            save_r = subprocess.run(
-                ['docker', 'save', tag],
-                capture_output=True, timeout=120,
-            )
-            self.assertEqual(save_r.returncode, 0,
-                             f'docker save failed: {save_r.stderr.decode()}')
-            return save_r.stdout
-        finally:
-            subprocess.run(['docker', 'rmi', '-f', tag],
-                           capture_output=True, timeout=30)
-
-    # ── layer approach ────────────────────────────────────────────────────────
-
-    def test_layer_survives_docker_load_save(self):
-        embedded = bp.embed_loader_as_layer(
-            self.base_tar, self.loader_bytes, 'x86_64')
-        saved = self._docker_load_and_save(
-            embedded, 'oci2bin-test-embed-layer:latest')
-
-        _, config = _read_manifest_and_config(saved)
-        labels = config.get('config', {}).get('Labels', {})
-        self.assertIn('oci2bin.loader.path', labels,
-                      'loader.path label missing after docker load/save')
-        self.assertEqual(labels['oci2bin.loader.arch'], 'x86_64')
-        self.assertEqual(labels['oci2bin.loader.sha256'],
-                         hashlib.sha256(self.loader_bytes).hexdigest())
-
-    def test_layer_binary_extractable_after_docker_load_save(self):
-        embedded = bp.embed_loader_as_layer(
-            self.base_tar, self.loader_bytes, 'x86_64')
-        saved = self._docker_load_and_save(
-            embedded, 'oci2bin-test-embed-layer2:latest')
-
-        labels = rc._get_labels(_read_manifest_and_config(saved)[1])
-        extracted, arch = rc.extract_loader_from_layer(saved, labels)
-        self.assertEqual(extracted, self.loader_bytes)
-        self.assertEqual(arch, 'x86_64')
-
-    def test_layer_count_preserved_after_docker_load_save(self):
-        orig_manifest = json.loads(
-            tarfile.open(fileobj=io.BytesIO(self.base_tar),
-                         mode='r:*').extractfile('manifest.json').read())
-        orig_layer_count = len(orig_manifest[0]['Layers'])
-
-        embedded = bp.embed_loader_as_layer(
-            self.base_tar, self.loader_bytes, 'x86_64')
-        saved = self._docker_load_and_save(
-            embedded, 'oci2bin-test-embed-layer3:latest')
-
-        manifest, _ = _read_manifest_and_config(saved)
-        self.assertEqual(len(manifest[0]['Layers']), orig_layer_count + 1)
-
-    # ── labels approach ───────────────────────────────────────────────────────
-
-    def test_labels_survive_docker_load_save(self):
-        embedded = bp.embed_loader_as_labels(
-            self.base_tar, self.loader_bytes, 'x86_64')
-        saved = self._docker_load_and_save(
-            embedded, 'oci2bin-test-embed-labels:latest')
-
-        _, config = _read_manifest_and_config(saved)
-        labels = config.get('config', {}).get('Labels', {})
-        self.assertIn('oci2bin.loader.chunks', labels,
-                      'loader.chunks label missing after docker load/save')
-        self.assertIn('oci2bin.loader.0', labels,
-                      'loader.0 label missing after docker load/save')
-
-    def test_labels_binary_extractable_after_docker_load_save(self):
-        embedded = bp.embed_loader_as_labels(
-            self.base_tar, self.loader_bytes, 'x86_64')
-        saved = self._docker_load_and_save(
-            embedded, 'oci2bin-test-embed-labels2:latest')
-
-        labels = rc._get_labels(_read_manifest_and_config(saved)[1])
-        extracted, arch = rc.extract_loader_from_labels(saved, labels)
-        self.assertEqual(extracted, self.loader_bytes)
-        self.assertEqual(arch, 'x86_64')
-
-    def test_labels_layer_count_unchanged_after_docker_load_save(self):
-        orig_manifest = json.loads(
-            tarfile.open(fileobj=io.BytesIO(self.base_tar),
-                         mode='r:*').extractfile('manifest.json').read())
-        orig_layer_count = len(orig_manifest[0]['Layers'])
-
-        embedded = bp.embed_loader_as_labels(
-            self.base_tar, self.loader_bytes, 'x86_64')
-        saved = self._docker_load_and_save(
-            embedded, 'oci2bin-test-embed-labels3:latest')
-
-        manifest, _ = _read_manifest_and_config(saved)
-        self.assertEqual(len(manifest[0]['Layers']), orig_layer_count)
 
 
 if __name__ == '__main__':

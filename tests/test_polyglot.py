@@ -1,11 +1,8 @@
 """
-test_polyglot.py — Structural + build integration tests for the oci2bin polyglot.
+Structural unit tests for the oci2bin polyglot.
 
-TestExistingPolyglot: runs against the pre-built oci2bin.img (no Docker needed).
-TestBuildPolyglotIntegration: builds a fresh polyglot in a tempdir (needs Docker + alpine).
-
-Run all:       python3 -m unittest tests.test_polyglot -v
-Run existing:  python3 -m unittest tests.test_polyglot.TestExistingPolyglot -v
+Docker-backed build coverage lives in integration_polyglot.py so unittest
+discovery cannot pull it into the no-Docker unit suite.
 """
 
 import importlib.util
@@ -34,27 +31,6 @@ IMG = ROOT / 'oci2bin.img'
 # loadable on 4/16/64 KiB-page kernels (the Raspberry Pi 5 kernel uses 16 KiB).
 PAGE_SIZE = 65536
 VADDR_BASE = 0x400000
-
-
-def _docker_available():
-    try:
-        r = subprocess.run(['docker', 'info'], capture_output=True, timeout=5)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def _alpine_available():
-    if not _docker_available():
-        return False
-    try:
-        r = subprocess.run(
-            ['docker', 'image', 'inspect', 'alpine:latest'],
-            capture_output=True, timeout=10,
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
 
 
 # ── TestExistingPolyglot ─────────────────────────────────────────────────────
@@ -188,50 +164,6 @@ class TestExistingPolyglot(unittest.TestCase):
 
     def test_file_is_executable(self):
         self.assertTrue(os.access(IMG, os.X_OK))
-
-
-# ── TestBuildPolyglotIntegration ─────────────────────────────────────────────
-
-@unittest.skipUnless(_alpine_available(), 'Docker + alpine:latest not available')
-class TestBuildPolyglotIntegration(unittest.TestCase):
-    def test_build_and_verify(self):
-        import platform
-        arch = platform.machine()
-        loader = ROOT / 'build' / f'loader-{arch}'
-        if not loader.exists():
-            loader = ROOT / 'build' / 'loader'
-        if not loader.exists():
-            self.skipTest('build/loader not found — run make loader first')
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output = os.path.join(tmpdir, 'test.img')
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(ROOT / 'scripts' / 'build_polyglot.py'),
-                    '--loader', str(loader),
-                    '--image', 'alpine:latest',
-                    '--output', output,
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(result.returncode, 0,
-                             f'build_polyglot.py failed:\n{result.stderr}')
-
-            with open(output, 'rb') as f:
-                data = f.read()
-
-            # ELF magic
-            self.assertEqual(data[0:4], b'\x7fELF')
-            # ustar magic
-            self.assertEqual(data[257:263], b'ustar\x00')
-            # Markers absent
-            self.assertNotIn(struct.pack('<Q', 0xDEADBEEFCAFEBABE), data)
-            self.assertNotIn(struct.pack('<Q', 0xCAFEBABEDEADBEEF), data)
-            self.assertNotIn(struct.pack('<Q', 0xAAAAAAAAAAAAAAAA), data)
-            # Executable
-            self.assertTrue(os.access(output, os.X_OK))
 
 
 # ── TestPolyglotPageAlignment ────────────────────────────────────────────────

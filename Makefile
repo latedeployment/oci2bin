@@ -437,8 +437,10 @@ test-integration: test-integration-redis test-integration-nginx test-integration
 	@echo "=== Runtime integration tests ==="
 	@mkdir -p $(TEST_TMPDIR)
 	@$(TEST_ENV) bash $(TESTS_DIR)/test_runtime.sh
-	@echo "=== Build integration tests ==="
-	$(TEST_ENV) python3 -m unittest tests.test_polyglot.TestBuildPolyglotIntegration -v
+	@echo "=== Python integration tests ==="
+	$(TEST_ENV) python3 -m unittest \
+		tests.integration_polyglot \
+		tests.integration_embed_loader -v
 
 test-integration-live:
 	@echo "=== Live build-and-run matrix (full rootless path) ==="
@@ -463,7 +465,7 @@ test-integration-nginx:
 test-integration-services:
 	@echo "=== Service matrix integration tests (container + VM) ==="
 	@mkdir -p $(TEST_TMPDIR)
-	$(TEST_ENV) python3 -m unittest tests.test_service_matrix -v
+	$(TEST_ENV) python3 -m unittest tests.integration_service_matrix -v
 
 # ── Fuzz targets (libFuzzer, requires clang) ───────────────────────────────────
 #

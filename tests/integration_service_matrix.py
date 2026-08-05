@@ -1,6 +1,10 @@
 """
-Integration-style unittest coverage for service images in container and VM mode.
-Skips automatically when Docker or VM prerequisites are unavailable.
+Integration coverage for service images in container and VM mode.
+
+This module intentionally does not match test_*.py: make test-python is the
+no-Docker unit suite. Run it through make test-integration-services instead.
+Docker and VM prerequisites are still checked so the dedicated target can skip
+cleanly on hosts that do not provide them.
 """
 
 import os

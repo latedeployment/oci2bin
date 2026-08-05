@@ -2827,11 +2827,11 @@ make test-all                # x86_64 unit tests + aarch64 C unit tests (no Dock
 make test-all-fuzz           # test-all, then the local fuzz sweep (FUZZ_SECONDS per harness)
 make test-c                  # C unit tests (TAP, x86_64)
 make test-c-aarch64          # C unit tests cross-compiled and run under qemu (aarch64)
-make test-python             # Python unit tests (auto-discovered from tests/)
+make test-python             # Python unit tests (auto-discovered as tests/test_*.py)
 make check-version           # assert the project version agrees across all sources
 make test-asan               # C unit tests under ASan/UBSan/LeakSanitizer
 make test-shellcheck         # shellcheck on all shell scripts
-make test-integration        # all integration tests (runtime, build, Redis, nginx, encrypt, live)
+make test-integration        # core integration suite (runtime, build, Redis, nginx, encrypt, live)
 make test-integration-redis  # Redis PING/SET/GET smoke test
 make test-integration-nginx  # nginx HTTP 200 smoke test
 make test-integration-live      # build real images + run them live on the full path
