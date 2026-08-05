@@ -18054,45 +18054,83 @@ static int mcp_name_valid(const char* s)
     return 1;
 }
 
-static long mcp_parse_request_id(const char* json)
+/*
+ * Copy the request's "id" into 'out' as the raw JSON token it was written as:
+ * 42 stays 42, "abc" stays "abc" (quotes included).
+ *
+ * JSON-RPC 2.0 requires the response id to equal the request id, type and
+ * all. The previous version parsed every id into a long, so a string id came
+ * back as a number and an unparseable one silently became -1 — a client
+ * correlating by id would never match the reply to its call.
+ *
+ * Returns 1 when an id is present, 0 when it is absent or null (a
+ * notification, which per spec gets no response at all).
+ */
+static int mcp_parse_request_id(const char* json, char* out, size_t out_sz)
 {
+    out[0] = '\0';
     const char* p = json_skip_to_toplevel_value(json, "id");
     if (!p)
     {
-        return -1;
+        return 0;
     }
-
-    if (*p == '"')
-    {
-        p++;
-        char buf[64];
-        size_t len = 0;
-        while (*p && *p != '"' && *p != '\\' && len + 1 < sizeof(buf))
-        {
-            buf[len++] = *p++;
-        }
-        if (*p != '"')
-        {
-            return -1;
-        }
-        buf[len] = '\0';
-        long id = -1;
-        (void)parse_id_value(buf, LONG_MAX, &id);
-        return id;
-    }
-
     while (*p && isspace((unsigned char)*p))
     {
         p++;
     }
-    errno = 0;
-    char* endp = NULL;
-    long id = strtol(p, &endp, 10);
-    if (endp == p || errno == ERANGE)
+
+    if (*p == '"')
     {
-        return -1;
+        /* Re-emit the string with its quotes, rejecting anything that would
+         * need escape handling so the echoed token stays valid JSON. */
+        const char* start = p;
+        p++;
+        while (*p && *p != '"' && *p != '\\')
+        {
+            p++;
+        }
+        if (*p != '"')
+        {
+            return 0;
+        }
+        size_t len = (size_t)(p - start) + 1;
+        if (len >= out_sz)
+        {
+            return 0;
+        }
+        memcpy(out, start, len);
+        out[len] = '\0';
+        return 1;
     }
-    return id;
+
+    if (strncmp(p, "null", 4) == 0)
+    {
+        return 0; /* notification */
+    }
+
+    /* Numeric: copy the digits verbatim rather than round-tripping through
+     * strtol, so a value we cannot represent is still echoed correctly. */
+    const char* start = p;
+    if (*p == '-' || *p == '+')
+    {
+        p++;
+    }
+    if (!isdigit((unsigned char)*p))
+    {
+        return 0;
+    }
+    while (isdigit((unsigned char)*p))
+    {
+        p++;
+    }
+    size_t len = (size_t)(p - start);
+    if (len == 0 || len >= out_sz)
+    {
+        return 0;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return 1;
 }
 
 static pid_t mcp_parse_detached_pid(const char* output)
@@ -18128,11 +18166,11 @@ static pid_t mcp_parse_detached_pid(const char* output)
 }
 
 /* Write JSON-RPC success response to stdout */
-static void mcp_send_result(long id, const char* result_json)
+static void mcp_send_result(const char* id, const char* result_json)
 {
     char hdr[128];
     int  n = snprintf(hdr, sizeof(hdr),
-                      "{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":", id);
+                      "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":", id);
     if (n > 0 && (size_t)n < sizeof(hdr))
     {
         write_all_fd(STDOUT_FILENO, hdr, (size_t)n);
@@ -18143,7 +18181,7 @@ static void mcp_send_result(long id, const char* result_json)
 }
 
 /* Write JSON-RPC error response to stdout */
-static void mcp_send_error(long id, int code, const char* msg)
+static void mcp_send_error(const char* id, int code, const char* msg)
 {
     char esc[512];
     if (json_escape_string(msg, esc, sizeof(esc)) < 0)
@@ -18152,7 +18190,7 @@ static void mcp_send_error(long id, int code, const char* msg)
     }
     char buf[1024];
     int n = snprintf(buf, sizeof(buf),
-                     "{\"jsonrpc\":\"2.0\",\"id\":%ld,"
+                     "{\"jsonrpc\":\"2.0\",\"id\":%s,"
                      "\"error\":{\"code\":%d,\"message\":\"%s\"}}\n",
                      id, code, esc);
     if (n > 0 && (size_t)n < sizeof(buf))
@@ -18294,7 +18332,7 @@ static int mcp_alloc_ctr_slot(void)
 }
 
 /* tools/call: run_container */
-static void mcp_tool_run_container(long id, const char* args_json,
+static void mcp_tool_run_container(const char* id, const char* args_json,
                                    int allow_net)
 {
     char* image = json_get_string(args_json, "image");
@@ -18726,7 +18764,7 @@ cleanup_env:
 }
 
 /* tools/call: list_containers */
-static void mcp_tool_list_containers(long id)
+static void mcp_tool_list_containers(const char* id)
 {
     char  buf[4096];
     int   pos  = 0;
@@ -18773,7 +18811,7 @@ static void mcp_tool_list_containers(long id)
 }
 
 /* tools/call: stop_container */
-static void mcp_tool_stop_container(long id, const char* args_json)
+static void mcp_tool_stop_container(const char* id, const char* args_json)
 {
     char* name = json_get_string(args_json, "name");
     if (!name)
@@ -18842,7 +18880,7 @@ static void mcp_tool_stop_container(long id, const char* args_json)
 }
 
 /* tools/call: exec_in_container */
-static void mcp_tool_exec_in_container(long id, const char* args_json)
+static void mcp_tool_exec_in_container(const char* id, const char* args_json)
 {
     char* name     = json_get_string(args_json, "name");
     char* cmd_arr  = json_get_array(args_json, "cmd");
@@ -18952,7 +18990,7 @@ static void mcp_tool_exec_in_container(long id, const char* args_json)
 }
 
 /* tools/call: inspect_image — forks the image with OCI2BIN_INSPECT=1 */
-static void mcp_tool_inspect_image(long id, const char* args_json)
+static void mcp_tool_inspect_image(const char* id, const char* args_json)
 {
     char* image = json_get_string(args_json, "image");
     if (!image || !path_is_absolute_and_clean(image))
@@ -19066,7 +19104,7 @@ static void mcp_tool_inspect_image(long id, const char* args_json)
 }
 
 /* tools/call: get_logs */
-static void mcp_tool_get_logs(long id, const char* args_json)
+static void mcp_tool_get_logs(const char* id, const char* args_json)
 {
     char* name   = json_get_string(args_json, "name");
     char* lines_s = json_get_string(args_json, "lines");
@@ -19363,14 +19401,14 @@ static int mcp_serve_main(const char* self_path, int allow_net)
         return 1;
     }
 
-    /* Signal to client that we're ready */
-    const char* init_resp =
-        "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{"
-        "\"protocolVersion\":\"2024-11-05\","
-        "\"capabilities\":{\"tools\":{}},"
-        "\"serverInfo\":{\"name\":\"oci2bin\",\"version\":\"" OCI2BIN_VERSION "\"}"
-        "}}\n";
-    write_all_fd(STDOUT_FILENO, init_resp, strlen(init_resp));
+    /*
+     * No greeting is written here. This used to emit a full
+     * {"id":0,"result":{...}} response before the client had sent anything,
+     * which JSON-RPC 2.0 has no notion of — a response must answer a request,
+     * and a client correlating replies by id sees a result for a call it
+     * never made. The handshake is answered where it belongs, in the
+     * "initialize" branch below.
+     */
 
     for (;;)
     {
@@ -19396,7 +19434,7 @@ static int mcp_serve_main(const char* self_path, int allow_net)
                 {
                     ;
                 }
-                mcp_send_error(-1, -32700, "request line too large");
+                mcp_send_error("null", -32700, "request line too large");
                 len = 0;
             }
         }
@@ -19406,20 +19444,34 @@ static int mcp_serve_main(const char* self_path, int allow_net)
             continue;
         }
 
-        /* Parse id */
-        long id = mcp_parse_request_id(line);
+        /* Parse id, preserving its original JSON type. An absent or null id
+         * marks a notification, which per JSON-RPC 2.0 gets no response. */
+        char id_buf[80];
+        int have_id = mcp_parse_request_id(line, id_buf, sizeof(id_buf));
+        const char* id = have_id ? id_buf : "null";
 
         /* Parse method */
         char* method = json_get_string(line, "method");
         if (!method)
         {
-            mcp_send_error(id, -32600, "invalid request: missing method");
+            if (have_id)
+            {
+                mcp_send_error(id, -32600, "invalid request: missing method");
+            }
+            continue;
+        }
+
+        /* A notification (no id) gets no response of any kind. */
+        if (!have_id)
+        {
+            free(method);
             continue;
         }
 
         if (strcmp(method, "initialize") == 0)
         {
-            /* Already sent init_resp above; this is the client's handshake */
+            /* The client's handshake — the only place a server
+             * capabilities response is emitted. */
             const char* resp =
                 "{\"protocolVersion\":\"2024-11-05\","
                 "\"capabilities\":{\"tools\":{}},"

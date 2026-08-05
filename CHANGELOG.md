@@ -19,6 +19,18 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **MCP JSON-RPC ids are echoed with their original type, and the unsolicited
+  greeting is gone.** Every request id was parsed into a `long`, so a string id
+  like `"abc-123"` came back as a number and an unparseable one silently became
+  `-1` — a client correlating replies by id would never match them to its
+  calls. Ids are now echoed as the exact JSON token received, and one too long
+  for the buffer is refused rather than truncated into a different id. The
+  server also used to write a full `{"id":0,"result":{...}}` response at
+  startup before the client had sent anything, which JSON-RPC 2.0 has no
+  notion of; the handshake is now answered only in response to an actual
+  `initialize` request. Notifications (absent or null id) correctly receive no
+  response at all.
+
 - **MCP container tracking is pinned to process identity, not just a PID.**
   Entries recorded only the PID, so once a tracked container exited the kernel
   was free to reissue that number and a later `stop_container` would signal

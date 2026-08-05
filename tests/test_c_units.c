@@ -3196,18 +3196,55 @@ static void test_mcp_helpers(void)
     ASSERT_INT_EQ(mcp_name_valid("bad name"), 0,
                   "mcp_helpers: space in name rejected");
 
-    ASSERT_INT_EQ(mcp_parse_request_id("{\"id\":42,\"method\":\"x\"}"), 42,
-                  "mcp_helpers: numeric JSON-RPC id accepted");
-    ASSERT_INT_EQ(mcp_parse_request_id("{\"id\":\"43\",\"method\":\"x\"}"), 43,
-                  "mcp_helpers: string JSON-RPC id accepted");
-    ASSERT_INT_EQ(mcp_parse_request_id(
-                      "{\"params\":{\"id\":99},\"method\":\"x\"}"), -1,
-                  "mcp_helpers: nested JSON-RPC id ignored");
-    ASSERT_INT_EQ(mcp_parse_request_id(
-                      "{\"id\":\"4\\\\2\",\"method\":\"x\"}"), -1,
-                  "mcp_helpers: escaped string JSON-RPC id rejected");
-    ASSERT_INT_EQ(mcp_parse_request_id("{\"method\":\"x\"}"), -1,
-                  "mcp_helpers: missing JSON-RPC id -> -1");
+    /* The id is echoed back as the exact JSON token it arrived as: JSON-RPC
+     * 2.0 requires the response id to match the request id including type. */
+    {
+        char idb[80];
+        ASSERT_INT_EQ(mcp_parse_request_id("{\"id\":42,\"method\":\"x\"}",
+                                           idb, sizeof(idb)), 1,
+                      "mcp_helpers: numeric JSON-RPC id accepted");
+        ASSERT_STR_EQ(idb, "42", "mcp_helpers: numeric id echoed as number");
+
+        ASSERT_INT_EQ(mcp_parse_request_id("{\"id\":\"43\",\"method\":\"x\"}",
+                                           idb, sizeof(idb)), 1,
+                      "mcp_helpers: string JSON-RPC id accepted");
+        ASSERT_STR_EQ(idb, "\"43\"",
+                      "mcp_helpers: string id keeps its quotes");
+
+        ASSERT_INT_EQ(mcp_parse_request_id(
+                          "{\"id\":\"abc-123\",\"method\":\"x\"}",
+                          idb, sizeof(idb)), 1,
+                      "mcp_helpers: non-numeric string id accepted");
+        ASSERT_STR_EQ(idb, "\"abc-123\"",
+                      "mcp_helpers: non-numeric string id preserved verbatim");
+
+        ASSERT_INT_EQ(mcp_parse_request_id("{\"id\":-7,\"method\":\"x\"}",
+                                           idb, sizeof(idb)), 1,
+                      "mcp_helpers: negative numeric id accepted");
+        ASSERT_STR_EQ(idb, "-7", "mcp_helpers: negative id preserved");
+
+        ASSERT_INT_EQ(mcp_parse_request_id(
+                          "{\"params\":{\"id\":99},\"method\":\"x\"}",
+                          idb, sizeof(idb)), 0,
+                      "mcp_helpers: nested JSON-RPC id ignored");
+        ASSERT_INT_EQ(mcp_parse_request_id(
+                          "{\"id\":\"4\\\\2\",\"method\":\"x\"}",
+                          idb, sizeof(idb)), 0,
+                      "mcp_helpers: escaped string JSON-RPC id rejected");
+        ASSERT_INT_EQ(mcp_parse_request_id("{\"method\":\"x\"}",
+                                           idb, sizeof(idb)), 0,
+                      "mcp_helpers: missing id is a notification");
+        ASSERT_INT_EQ(mcp_parse_request_id("{\"id\":null,\"method\":\"x\"}",
+                                           idb, sizeof(idb)), 0,
+                      "mcp_helpers: null id is a notification");
+        /* An id longer than the buffer must be refused, not truncated into a
+         * different id than the client sent. */
+        char small[8];
+        ASSERT_INT_EQ(mcp_parse_request_id(
+                          "{\"id\":\"aaaaaaaaaaaaaaaaaaaa\",\"method\":\"x\"}",
+                          small, sizeof(small)), 0,
+                      "mcp_helpers: oversized id rejected rather than truncated");
+    }
 
     ASSERT_INT_EQ((int)mcp_parse_detached_pid("1234\n"), 1234,
                   "mcp_helpers: detached PID parsed");
