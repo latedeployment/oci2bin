@@ -50,9 +50,13 @@ class TestExistingPolyglot(unittest.TestCase):
     def test_elf_class_64(self):
         self.assertEqual(self.data[4], 2)  # ELFCLASS64
 
-    def test_elf_machine_x86_64(self):
+    def test_elf_machine_supported(self):
         e_machine = struct.unpack_from('<H', self.data, 18)[0]
-        self.assertEqual(e_machine, 0x3e)
+        self.assertIn(
+            e_machine,
+            bp.SUPPORTED_MACHINES,
+            f'unsupported polyglot ELF architecture: e_machine={e_machine:#x}',
+        )
 
     def test_elf_type_exec(self):
         e_type = struct.unpack_from('<H', self.data, 16)[0]
