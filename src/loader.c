@@ -15593,7 +15593,12 @@ static int verify_pinned_digest(const char* self_path)
         "js=m+len(MAGIC)\n"
         "je=(m-4)+tot\n"
         "sys.exit(0) if je>len(data) or je<=js else None\n"
-        "meta=json.loads(data[js:je].rstrip(b'\\x00'))\n"
+        "try:\n"
+        " meta=json.loads(data[js:je].rstrip(b'\\x00'))\n"
+        "except Exception:\n"
+        " sys.stderr.write('oci2bin: embedded metadata is not valid JSON;'"
+        "  ' refusing to run\\n')\n"
+        " sys.exit(1)\n"
         "pin=meta.get('pin_digest','')\n"
         "sys.exit(0) if not pin else None\n"
         "algo,want=('sha256',pin)\n"
@@ -15636,56 +15641,203 @@ static int verify_pinned_digest(const char* self_path)
  * guards against accidental corruption; for strong anti-tamper, pin the
  * key out-of-band (see README).
  */
-/* Cheap pre-check: only binaries that actually carry the policy marker pay
- * for the python+openssl verification. Scans the trailing window of the file
- * (the OCI2BIN_META block lives at/near the end) for the compact-JSON marker.
- * Returns 1 if the marker is present, 0 if not, -1 on read error. */
-static int has_require_signed_marker(const char* self_path)
+/*
+ * Locate the embedded OCI2BIN_META JSON block and copy it out.
+ *
+ * Layout, matching what the builder writes and the python verifier reads:
+ *   [ ... payload ... ][ LE32 total ]["OCI2BIN_META\0"][ JSON ][ NUL pad ]
+ * optionally followed by a signature block whose length is a BE32 in the
+ * final 4 bytes, preceded by the "OCI2BIN_SIG_END\0" trailer.
+ *
+ * Returns 1 and sets *out (malloc'd, NUL-terminated) when a structurally
+ * valid block is found, 0 when the binary carries no metadata block at all,
+ * and -1 when a block is present but its framing is inconsistent — callers
+ * must treat -1 as untrustworthy rather than "no policy".
+ */
+static int read_self_metadata(const char* self_path, char** out)
 {
-    static const char marker[] = "\"require_signed\":true";
-    const size_t mlen = sizeof(marker) - 1;
-    const size_t window = 256 * 1024;
+    static const char meta_magic[]  = "OCI2BIN_META";
+    static const char sig_trailer[] = "OCI2BIN_SIG_END";
+    const size_t magic_len = sizeof(meta_magic); /* includes the NUL */
+    const size_t window    = 1024u * 1024u;
 
-    int fd = open(self_path, O_RDONLY);
+    *out = NULL;
+
+    int fd = open(self_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
     {
         return -1;
     }
-    off_t end = lseek(fd, 0, SEEK_END);
-    if (end < 0)
+    off_t size = lseek(fd, 0, SEEK_END);
+    if (size < 0)
     {
         close(fd);
         return -1;
     }
-    size_t want = (size_t)end < window ? (size_t)end : window;
-    if (lseek(fd, end - (off_t)want, SEEK_SET) < 0)
+
+    /* Strip a trailing signature block so the metadata search sees the same
+     * bytes the signer covered. */
+    off_t content_end = size;
+    if (size >= 20)
+    {
+        char tail[20];
+        if (lseek(fd, size - 20, SEEK_SET) < 0 ||
+                read_all_fd(fd, tail, sizeof(tail)) != (ssize_t)sizeof(tail))
+        {
+            close(fd);
+            return -1;
+        }
+        if (memcmp(tail, sig_trailer, sizeof(sig_trailer)) == 0)
+        {
+            unsigned long total =
+                ((unsigned long)(unsigned char)tail[16] << 24) |
+                ((unsigned long)(unsigned char)tail[17] << 16) |
+                ((unsigned long)(unsigned char)tail[18] << 8) |
+                ((unsigned long)(unsigned char)tail[19]);
+            if (total == 0 || (off_t)total > size)
+            {
+                close(fd);
+                return -1; /* trailer present but length is nonsense */
+            }
+            content_end = size - (off_t)total;
+        }
+    }
+
+    size_t want = (size_t)content_end < window ? (size_t)content_end : window;
+    if (want < magic_len + 4)
+    {
+        close(fd);
+        return 0;
+    }
+    off_t base = content_end - (off_t)want;
+    if (lseek(fd, base, SEEK_SET) < 0)
     {
         close(fd);
         return -1;
     }
-    char* buf = malloc(want + 1);
+    char* buf = malloc(want);
     if (!buf)
     {
         close(fd);
         return -1;
     }
-    ssize_t n = read_all_fd(fd, buf, want);
+    ssize_t got = read_all_fd(fd, buf, want);
     close(fd);
-    int found = 0;
-    if (n > 0 && (size_t)n >= mlen)
+    if (got < 0 || (size_t)got != want)
     {
-        found = memmem(buf, (size_t)n, marker, mlen) != NULL ? 1 : 0;
+        free(buf);
+        return -1;
     }
+
+    /* Last occurrence of the magic within the window. */
+    char* found = NULL;
+    for (size_t off = 0; off + magic_len <= want; off++)
+    {
+        if (memcmp(buf + off, meta_magic, magic_len) == 0)
+        {
+            found = buf + off;
+        }
+    }
+    if (!found)
+    {
+        free(buf);
+        return 0; /* no metadata block */
+    }
+
+    size_t m = (size_t)(found - buf);
+    if (m < 4)
+    {
+        free(buf);
+        return -1;
+    }
+    unsigned long tot =
+        ((unsigned long)(unsigned char)buf[m - 4]) |
+        ((unsigned long)(unsigned char)buf[m - 3] << 8) |
+        ((unsigned long)(unsigned char)buf[m - 2] << 16) |
+        ((unsigned long)(unsigned char)buf[m - 1] << 24);
+    size_t js = m + magic_len;
+    if (tot < 4 || (m - 4) + tot > want)
+    {
+        free(buf);
+        return -1;
+    }
+    size_t je = (m - 4) + tot;
+    if (je <= js)
+    {
+        free(buf);
+        return -1;
+    }
+    /* Trim the NUL padding the builder adds. */
+    while (je > js && buf[je - 1] == '\0')
+    {
+        je--;
+    }
+    size_t json_len = je - js;
+    char* json = malloc(json_len + 1);
+    if (!json)
+    {
+        free(buf);
+        return -1;
+    }
+    memcpy(json, buf + js, json_len);
+    json[json_len] = '\0';
     free(buf);
+    *out = json;
+    return 1;
+}
+
+/*
+ * Does this binary declare the --require-signed policy?
+ *
+ * Returns 1 (policy set), 0 (no policy), or -1 (metadata present but
+ * unreadable/inconsistent — the caller must refuse to run rather than
+ * treating it as "no policy").
+ *
+ * This used to substring-search the trailing 256 KiB for the literal
+ * "require_signed":true. Anything that perturbed those bytes — a single
+ * flipped character, different key ordering, added whitespace — read as "no
+ * policy" and the binary ran unverified, without ever having to produce a
+ * coherent metadata block. The check is now scoped to a structurally
+ * validated block, so defeating it requires rewriting the block itself.
+ *
+ * The underlying limitation is unchanged and unfixable from inside: the
+ * policy flag and the trust anchor both live in the artifact they protect,
+ * so this stops accidental corruption and foreign-signed swaps, not someone
+ * who can rewrite the file at will. Pin the key out-of-band for that.
+ */
+static int has_require_signed_marker(const char* self_path)
+{
+    char* meta = NULL;
+    int rc = read_self_metadata(self_path, &meta);
+    if (rc <= 0)
+    {
+        return rc; /* 0 = no block, -1 = malformed */
+    }
+    /* Scoped to the validated block, so this is a field lookup rather than a
+     * scan over arbitrary file bytes. */
+    int found = (strstr(meta, "\"require_signed\":true") != NULL) ||
+                (strstr(meta, "\"require_signed\": true") != NULL);
+    free(meta);
     return found;
 }
 
 static int enforce_require_signed(const char* self_path)
 {
     /* Fast path: skip the python+openssl verifier entirely when the binary
-     * does not declare the policy (the common case). On read error, fall
-     * through to the verifier, which fails closed. */
-    if (has_require_signed_marker(self_path) == 0)
+     * carries no policy (the common case). A metadata block we cannot make
+     * sense of is refused outright — treating "I could not read the policy"
+     * as "there is no policy" is the failure mode this check exists to
+     * prevent. */
+    int policy = has_require_signed_marker(self_path);
+    if (policy < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: embedded metadata block is unreadable or"
+                " inconsistent; refusing to run rather than assuming no"
+                " signature policy\n");
+        return 1;
+    }
+    if (policy == 0)
     {
         return 0;
     }

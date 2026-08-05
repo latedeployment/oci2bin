@@ -15,6 +15,20 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **`--require-signed` no longer keys off a removable text marker.** Policy
+  detection substring-searched the trailing 256 KiB of the file for the literal
+  `"require_signed":true`. Anything that perturbed those bytes — one flipped
+  character, reordered keys, added whitespace — read as "no policy" and the
+  binary ran unverified, without the attacker ever having to produce a coherent
+  metadata block. The loader now locates and structurally validates the
+  `OCI2BIN_META` block in C and looks the field up inside it, and a block whose
+  framing is inconsistent is refused outright instead of being treated as
+  "no policy". Malformed embedded metadata now reports a clear error rather
+  than surfacing a Python traceback. The underlying limitation is unchanged and
+  documented: the policy flag and trust anchor live in the artifact they
+  protect, so this stops corruption and foreign-signed swaps, not someone who
+  can rewrite the file at will.
+
 - **`--verify-key` works on a distributed binary.** Verification shelled out to
   `../scripts/sign_binary.py` resolved relative to the executable, so it only
   ever worked from inside a source checkout — a copied binary failed with
