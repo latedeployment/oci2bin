@@ -33,14 +33,18 @@
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
     if (size == 0)
+    {
         return 0;
+    }
 
     /* ── Part 1: parse_opts ─────────────────────────────────────────────── */
 
     /* Make a mutable copy — parse_opts mutates argv strings (e.g. -v) */
     char* buf = malloc(size + 1);
     if (!buf)
+    {
         return 0;
+    }
     memcpy(buf, data, size);
     buf[size] = '\0';
 
@@ -53,16 +57,23 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
     char* p = buf;
     char* end = buf + size;
-    while (p < end && argc < MAX_FUZZ_ARGC) {
+    while (p < end && argc < MAX_FUZZ_ARGC)
+    {
         /* skip runs of NUL */
         while (p < end && *p == '\0')
+        {
             p++;
+        }
         if (p >= end)
+        {
             break;
+        }
         argv[argc++] = p;
         /* advance to next NUL or end */
         while (p < end && *p != '\0')
+        {
             p++;
+        }
     }
     argv[argc] = NULL;
 
@@ -76,7 +87,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
     char tmppath[] = "/tmp/fuzz_envfile_XXXXXX";
     int fd = mkstemp(tmppath);
-    if (fd >= 0) {
+    if (fd >= 0)
+    {
         (void)write(fd, data, size);
         close(fd);
 
@@ -86,7 +98,9 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
         /* load_env_file malloc's each accepted line; free them */
         for (int i = 0; i < opts2.n_env; i++)
+        {
             free(opts2.env_vars[i]);
+        }
 
         unlink(tmppath);
     }

@@ -31,7 +31,8 @@
  * A fixed set of key names covers the keys used in real OCI manifests
  * and seccomp profiles.
  */
-static const char* const FUZZ_KEYS[] = {
+static const char* const FUZZ_KEYS[] =
+{
     "Config",
     "Layers",
     "Entrypoint",
@@ -56,11 +57,14 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     /* Make a NUL-terminated copy so helpers can use strstr/strchr safely */
     char* json = malloc(size + 1);
     if (!json)
+    {
         return 0;
+    }
     memcpy(json, data, size);
     json[size] = '\0';
 
-    for (int k = 0; k < N_FUZZ_KEYS; k++) {
+    for (int k = 0; k < N_FUZZ_KEYS; k++)
+    {
         const char* key = FUZZ_KEYS[k];
 
         /* json_skip_to_value — returns pointer into json, no alloc */
@@ -72,21 +76,27 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
         /* json_get_array — malloc'd result */
         char* arr = json_get_array(json, key);
-        if (arr) {
+        if (arr)
+        {
             /* json_parse_string_array on the returned array */
             char* items[256];
             int n = json_parse_string_array(arr, items, 256);
             for (int i = 0; i < n; i++)
+            {
                 free(items[i]);
+            }
             free(arr);
         }
 
         /* json_parse_names_array — malloc'd array of malloc'd strings */
         int n_names = 0;
         char** names = json_parse_names_array(json, key, &n_names);
-        if (names) {
+        if (names)
+        {
             for (int i = 0; i < n_names; i++)
+            {
                 free(names[i]);
+            }
             free(names);
         }
     }

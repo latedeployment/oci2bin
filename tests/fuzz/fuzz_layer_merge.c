@@ -141,7 +141,7 @@ static size_t take_name(struct cursor* c, char* out, size_t max_len)
  * leaf's parent dir and writes the leaf name into *leaf_out, or -1.
  */
 static int open_parent_for_create(int base_fd, const char* relpath,
-                                   char* leaf_out, size_t leaf_sz)
+                                  char* leaf_out, size_t leaf_sz)
 {
     char buf[PATH_MAX];
     snprintf(buf, sizeof(buf), "%s", relpath);

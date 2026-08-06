@@ -133,21 +133,30 @@ static void stub_reset(void)
 {
     memset(g_stub_calls, 0, sizeof(g_stub_calls));
     g_stub_n_calls        = 0;
-    g_stub_mount_retval   = 0;  g_stub_mount_errno   = 0;
+    g_stub_mount_retval   = 0;
+    g_stub_mount_errno   = 0;
     g_stub_mount_fail_after = -1;
     g_stub_umount2_retval = 0;
-    g_stub_unshare_retval = 0;  g_stub_unshare_errno = 0;
-    g_stub_chroot_retval  = 0;  g_stub_chroot_errno  = 0;
-    g_stub_prctl_retval   = 0;  g_stub_prctl_errno   = 0;
+    g_stub_unshare_retval = 0;
+    g_stub_unshare_errno = 0;
+    g_stub_chroot_retval  = 0;
+    g_stub_chroot_errno  = 0;
+    g_stub_prctl_retval   = 0;
+    g_stub_prctl_errno   = 0;
     g_stub_execvp_errno   = ENOEXEC; /* never actually exec */
-    g_stub_setuid_retval  = 0;  g_stub_setuid_errno  = 0;
-    g_stub_setgid_retval  = 0;  g_stub_setgid_errno  = 0;
-    g_stub_setgroups_retval = 0; g_stub_setgroups_errno = 0;
+    g_stub_setuid_retval  = 0;
+    g_stub_setuid_errno  = 0;
+    g_stub_setgid_retval  = 0;
+    g_stub_setgid_errno  = 0;
+    g_stub_setgroups_retval = 0;
+    g_stub_setgroups_errno = 0;
     g_stub_sethostname_retval = 0;
     g_stub_mknod_retval   = 0;
     g_stub_chown_retval   = 0;
-    g_stub_seccomp_retval = 0;  g_stub_seccomp_errno = 0;
-    g_stub_capset_retval  = 0;  g_stub_capset_errno  = 0;
+    g_stub_seccomp_retval = 0;
+    g_stub_seccomp_errno = 0;
+    g_stub_capset_retval  = 0;
+    g_stub_capset_errno  = 0;
 }
 
 /* Count recorded calls for a named stub */
@@ -196,7 +205,10 @@ static const struct stub_call_rec* stub_nth(const char* fn, int idx)
 static int stub_mount(const char* src, const char* tgt, const char* fstype,
                       unsigned long flags, const void* data)
 {
-    (void)src; (void)tgt; (void)fstype; (void)data;
+    (void)src;
+    (void)tgt;
+    (void)fstype;
+    (void)data;
     STUB_RECORD("mount", flags, 0);
     if (g_stub_mount_fail_after >= 0)
     {
@@ -269,7 +281,8 @@ static int stub_prctl(int option, ...)
 
 static int stub_execvp(const char* file, char* const argv[])
 {
-    (void)file; (void)argv;
+    (void)file;
+    (void)argv;
     STUB_RECORD("execvp", 0, 0);
     errno = g_stub_execvp_errno;
     return -1; /* never exec; caller will _exit(127) */
@@ -311,7 +324,8 @@ static int stub_setgroups(size_t size, const gid_t* list)
 
 static int stub_sethostname(const char* name, size_t len)
 {
-    (void)name; (void)len;
+    (void)name;
+    (void)len;
     STUB_RECORD("sethostname", 0, 0);
     if (g_stub_sethostname_retval < 0)
     {
@@ -323,7 +337,9 @@ static int stub_sethostname(const char* name, size_t len)
 
 static int stub_mknod(const char* path, mode_t mode, dev_t dev)
 {
-    (void)path; (void)mode; (void)dev;
+    (void)path;
+    (void)mode;
+    (void)dev;
     STUB_RECORD("mknod", mode, 0);
     if (g_stub_mknod_retval < 0)
     {
@@ -883,7 +899,9 @@ static void test_stub_load_env_file(void)
     int  fd     = mkstemp(path);
     ASSERT(fd >= 0, "load_env_file: mkstemp");
     if (fd < 0)
+    {
         return;
+    }
 
     const char* content =
         "# comment line\n"
@@ -905,7 +923,10 @@ static void test_stub_load_env_file(void)
                   "load_env_file: second var is BAZ=qux (CR stripped)");
     ASSERT_INT_EQ(strcmp(opts.env_vars[2], "EMPTY="), 0,
                   "load_env_file: third var is EMPTY=");
-    for (int i = 0; i < opts.n_env; i++) { free(opts.env_vars[i]); }
+    for (int i = 0; i < opts.n_env; i++)
+    {
+        free(opts.env_vars[i]);
+    }
 
     /* Bad line (no '='): should return -1 */
     char bad_path[] = "/tmp/oci2bin-envfile2-XXXXXX";
@@ -940,21 +961,24 @@ static void test_stub_resolve_user(void)
     gid_t gid;
 
     /* Pure numeric UID → success, gid defaults to 0 */
-    uid = 999; gid = 999;
+    uid = 999;
+    gid = 999;
     ASSERT_INT_EQ(resolve_user("1000", &uid, &gid), 0,
                   "resolve_user: numeric uid returns 0");
     ASSERT_INT_EQ((int)uid, 1000, "resolve_user: numeric uid stored");
     ASSERT_INT_EQ((int)gid, 0,    "resolve_user: numeric uid gid defaults 0");
 
     /* uid:gid → both stored */
-    uid = 999; gid = 999;
+    uid = 999;
+    gid = 999;
     ASSERT_INT_EQ(resolve_user("1000:2000", &uid, &gid), 0,
                   "resolve_user: uid:gid returns 0");
     ASSERT_INT_EQ((int)uid, 1000, "resolve_user: uid:gid uid stored");
     ASSERT_INT_EQ((int)gid, 2000, "resolve_user: uid:gid gid stored");
 
     /* uid:0 */
-    uid = 999; gid = 999;
+    uid = 999;
+    gid = 999;
     ASSERT_INT_EQ(resolve_user("0:0", &uid, &gid), 0,
                   "resolve_user: 0:0 returns 0");
     ASSERT_INT_EQ((int)uid, 0, "resolve_user: 0:0 uid=0");
@@ -1079,7 +1103,10 @@ static void test_stub_cg_write(void)
     char path[] = "/tmp/oci2bin-cg-XXXXXX";
     int  fd     = mkstemp(path);
     ASSERT(fd >= 0, "cg_write: mkstemp");
-    if (fd < 0) return;
+    if (fd < 0)
+    {
+        return;
+    }
     close(fd);
 
     /* cg_write opens for O_WRONLY — the file must exist and be writeable */
@@ -1116,7 +1143,11 @@ static void test_stub_read_text_file_at(void)
 
     int  dirfd = open(dir, O_RDONLY | O_DIRECTORY);
     ASSERT(dirfd >= 0, "read_text_file_at: open dir");
-    if (dirfd < 0) { rmdir(dir); return; }
+    if (dirfd < 0)
+    {
+        rmdir(dir);
+        return;
+    }
 
     /* Create file in dir */
     char fp[PATH_MAX];
@@ -1341,12 +1372,18 @@ static void test_stub_container_main(void)
         rmdir(p);
         snprintf(p, sizeof(p), "%s/dev/ptmx", rootfs);
         unlink(p);
-        snprintf(p, sizeof(p), "%s/dev/null",  rootfs); unlink(p);
-        snprintf(p, sizeof(p), "%s/dev/zero",  rootfs); unlink(p);
-        snprintf(p, sizeof(p), "%s/dev/random", rootfs); unlink(p);
-        snprintf(p, sizeof(p), "%s/dev/urandom", rootfs); unlink(p);
-        snprintf(p, sizeof(p), "%s/dev/tty",   rootfs); unlink(p);
-        snprintf(p, sizeof(p), "%s/dev",       rootfs); rmdir(p);
+        snprintf(p, sizeof(p), "%s/dev/null",  rootfs);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/zero",  rootfs);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/random", rootfs);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/urandom", rootfs);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/dev/tty",   rootfs);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/dev",       rootfs);
+        rmdir(p);
         rmdir(rootfs);
     }
 }

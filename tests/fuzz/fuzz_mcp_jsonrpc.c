@@ -85,7 +85,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     char* method = json_get_string(line, "method");
 
     /* 3. Exercise per-tool argument extraction for every known tool */
-    static const char* const TOOLS[] = {
+    static const char* const TOOLS[] =
+    {
         "run_container",
         "exec_in_container",
         "list_containers",

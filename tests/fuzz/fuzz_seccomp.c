@@ -47,17 +47,22 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
     /* Reject giant inputs to keep the fuzzer fast */
     if (size > 256 * 1024)
+    {
         return 0;
+    }
 
     /* Write input to a temp file */
     char tmppath[] = "/tmp/fuzz_seccomp_XXXXXX";
     int fd = mkstemp(tmppath);
     if (fd < 0)
+    {
         return 0;
+    }
 
     ssize_t written = write(fd, data, size);
     close(fd);
-    if (written != (ssize_t)size) {
+    if (written != (ssize_t)size)
+    {
         unlink(tmppath);
         return 0;
     }
