@@ -1,6 +1,21 @@
 # oci2bin
 
-**oci2bin** converts any Docker (OCI) image into a single executable file. The output runs as a rootless container on any Linux machine - without Docker, without a daemon, and without any installation on the target.
+**oci2bin** converts any Docker (OCI) image into a single executable file. The output runs as a rootless container on Linux - without Docker, without a daemon, and without any installation on the target.
+
+The result is close to a **hermetic executable**: the image layers, OCI config
+(entrypoint, cmd, env and workdir), and loader are all in one file. A normal
+run has two host requirements: a Linux kernel that allows unprivileged user
+namespaces, and `tar` to unpack the root filesystem. Optional features can add
+their own requirements; see [Dependencies](docs/reference/dependencies.md).
+
+With `oci2vm`, the file is deployed directly as a VM: copy it to a KVM host and
+run it to boot the image as a microVM. In that mode `/dev/kvm` and the selected
+VMM backend replace the user-namespace requirement.
+
+Here, “hermetic” describes how the output is packaged. It is separate from the
+`hermetic` metadata marker set by
+[`--offline-only`](#air-gap-seal----offline-only), which says that the build did
+not access a registry.
 
 The output is an [ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): simultaneously a native Linux executable and a valid `docker save` tar archive.
 

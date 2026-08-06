@@ -7,6 +7,20 @@ The output file is both:
 - a native Linux executable that starts the image as a rootless container
 - a valid tar archive that can be loaded back into Docker with `docker load`
 
+It is close to a **hermetic executable**: the image layers, OCI config and
+loader are all embedded in one file. A normal run needs two things from the
+host: a Linux kernel that allows unprivileged user namespaces, and `tar` to
+unpack the root filesystem. Optional features can add the requirements listed
+in [Dependencies](reference/dependencies.md).
+
+With `oci2vm`, this file is deployed directly as a VM: copy it to a KVM host
+and run it to boot the image as a microVM. That mode needs `/dev/kvm` and its
+selected VMM backend instead of unprivileged user namespaces.
+
+Here, “hermetic” describes how the output is packaged. It is separate from the
+`hermetic` marker that [`--offline-only`](build.md) records to describe the
+build.
+
 ```bash
 oci2bin redis:7-alpine # builds ./redis_7-alpine
 scp ./redis_7-alpine deploy@server.example.com:/opt/redis/redis_7-alpine
