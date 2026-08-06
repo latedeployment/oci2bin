@@ -1,38 +1,45 @@
 # Dependencies
 
-oci2bin keeps its hard dependencies tiny and pulls in everything else **only
-when you use the feature that needs it**. Run `oci2bin doctor` (or
-`oci2bin doctor --json`) on any host to see what is present and get the exact
-install command for what is missing.
+oci2bin keeps its hard dependencies small and resolves other helpers **only
+when a selected feature needs them**.
 
 There are two separate environments:
 
 - **Build host** — the machine that runs `oci2bin` to *produce* a binary.
 - **Target host** — the machine that *runs* the produced `./mybinary`.
 
-## Graceful degradation
+Use the matching check for each environment:
 
-A missing dependency never blocks an unrelated run. The rule is:
+```bash
+oci2bin doctor             # build host
+oci2bin doctor --json      # build host, machine-readable
+./mybinary --doctor        # target host, using the deployed artifact
+```
 
-- **Always-applied hardening degrades silently.** The default seccomp filter,
-  Landlock sandbox, cgroup v2 limits, the full rootless UID/GID range
-  (`newuidmap`/`newgidmap`), `ramfs`-backed secret staging, and `--notify`
-  delivery all *warn and continue* (or fall back) when the kernel feature or
-  helper is absent. A plain `./mybinary` needs only `tar` plus unprivileged
-  user namespaces. (`--strict` is the opt-in that turns these degradations into
-  hard failures.)
+## Failure And Fallback Rules
+
+A missing dependency does not block an unrelated run. The exact behavior
+depends on the feature:
+
+- **Baseline protections can fall back.** A normal namespace run needs `tar`
+  and unprivileged user namespaces. The default seccomp and Landlock
+  protections warn or fall back when unavailable; `--strict` turns supported
+  hardening degradations into failures. Missing `newuidmap`/`newgidmap` falls
+  back to a single-ID mapping.
 - **A dependency is required only when its feature is in play.** `age` only when
   the payload is encrypted; `zstd` only when it is compressed; `slirp4netns`/
   `pasta` only for `--net slirp`/`pasta`; `nft` only for `--allow-egress`;
   `systemd-creds` only for `--secret tpm2:`; `rekor-cli` only for `--rekor`; and
-  so on. If you do not use the feature, the tool is never looked for.
-- **Explicitly requested things fail loudly rather than silently wrong.** When
-  you *do* ask for a feature whose dependency is missing, oci2bin aborts with a
-  clear message instead of running degraded — `--vm` without a VM backend,
-  `--gpus`/`--cdi-device` without a CDI spec, `--allow-egress` without `nft`
-  (fail-closed), a `--seccomp-profile` that won't load, or an encrypted/
-  compressed payload without `age`/`zstd`. These are the only "strict"
-  requirements, and each is tied to something you opted into.
+  so on. If you do not use the feature, the tool is not invoked. The one
+  lightweight exception is startup auto-detection of an installed libkrun
+  backend.
+- **Explicit controls normally fail closed.** Examples include an unavailable
+  VM backend, a missing CDI device, an egress allowlist without `nft`, an
+  invalid volume or secret, a custom seccomp profile that cannot load, and an
+  encrypted or compressed payload without its helper. Requested cgroup limits
+  also abort if they cannot be applied unless `--allow-degraded` is given.
+- **Best-effort features say so explicitly.** Notifications are skipped when
+  `curl` is unavailable. They are observability, not an enforcement boundary.
 
 ## Target host (runtime)
 
@@ -43,7 +50,7 @@ small. Each dependency below is needed **only** for the feature in its row.
 | --- | --- | --- |
 | `tar` (with gzip support) | **Always** — rootfs extraction | Hard (the only universal runtime dep). GNU tar >= 1.32 is used with `--keep-directory-symlink`; on older or non-GNU tar the loader drops that flag and replaces symlinked directories with real ones instead of following them |
 | `age` | Encrypted payloads (`--encrypt` / `--passphrase`) | Required if the image is encrypted |
-| `zstd` | Compressed payloads (`--compress-binary`) | Required if the payload is compressed |
+| `zstd` | zstd-compressed layers (`--squash --compress zstd`) or whole payloads (`--compress-binary zstd`) | Required if either form is used |
 | `slirp4netns` | `--net slirp`, `-p PORT` | Required for that mode |
 | `pasta` | `--net pasta` | Required for that mode |
 | `nft` (nftables) | `--allow-egress` (fail-closed) | Required for that mode |
@@ -66,17 +73,19 @@ small. Each dependency below is needed **only** for the feature in its row.
 A namespace-mode binary needs the kernel to allow **unprivileged user
 namespaces**. Most distros enable them by default. Two gotchas:
 
-- **Ubuntu 23.10+ / Debian-derived kernels** ship
-  `kernel.apparmor_restrict_unprivileged_userns=1`. The user namespace is still
+- **Ubuntu 23.10+** enables
+  `kernel.apparmor_restrict_unprivileged_userns=1` by default; other
+  AppArmor-configured systems can enable it too. The user namespace is still
   created, but AppArmor strips its capabilities, so the follow-up
   `unshare(NEWNS|NEWPID|NEWUTS)` fails with `EPERM` ("Operation not permitted").
-  The loader detects this and points you at the fix; relax it with
-  `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via
-  `/etc/sysctl.d/`), or run under a microVM with `--vm`.
+  Prefer a targeted AppArmor profile granting `userns,` for an artifact at a
+  stable path. Globally setting the sysctl to `0` is a broader security
+  tradeoff. VM mode avoids the namespace requirement.
 - **Hardened kernels** may set `kernel.unprivileged_userns_clone=0`; enable it
   with `sudo sysctl -w kernel.unprivileged_userns_clone=1`.
 
-`oci2bin doctor` reports both knobs under **unprivileged user namespaces**.
+`oci2bin doctor` reports both knobs on the build host; `./artifact --doctor`
+checks the target host.
 
 ### The libkrun note (read this if you build VM binaries)
 
@@ -101,13 +110,13 @@ cloud-hypervisor backend. See
 | `gcc` + static libc (`glibc-static` or `musl-gcc`) | Compiling the loader (first build only; then cached) | Hard |
 | `python3` (stdlib only) | The builder itself | Hard |
 | `docker`, `podman`, or `skopeo` | Pull backend for `oci2bin IMAGE` (auto-detected docker → podman → skopeo; force with `--pull-with`) | Optional - not needed with `--oci-dir`, `from-chroot`, or `build-dockerfile FROM scratch`/OCI dir |
-| `zstd` | `--compress`, `--compress-binary` | Required for those flags |
+| `zstd` | `--squash --compress zstd`, `--compress-binary zstd` | Required for those flags |
 | `age` | `--encrypt`, `--passphrase` | Required for those flags |
 | `cosign` | `--verify-cosign`, `--require-cosign` | Required for those flags |
 | `rekor-cli` | `oci2bin sign --rekor` | Required for that flag |
 | `openssl` | `sign`, `verify`, `--require-signed` | Required for signing. Resolved from `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` only, not `$PATH` |
 | aarch64 cross-toolchain + sysroot | `--arch aarch64` / `--arch all` | Required for cross builds |
-| `pkg-config` + `libkrun`/`libkrun-dev` | Building the libkrun VM loader | Required for that loader |
+| discoverable `libkrun` (`pkg-config` or `ldconfig`) | Automatically selecting the libkrun-capable loader | Optional; `--libkrun` can force that loader without headers or build-time linking, but `libkrun.so.1` is still required when VM mode actually runs |
 | `skopeo` / `crane` / `buildah` | Producing OCI layouts for `--oci-dir`; `skopeo` also works as a direct daemonless pull backend (`--pull-with skopeo`) | Optional, your choice of tool |
 
 ## Check a host

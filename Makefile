@@ -1,26 +1,35 @@
 CC_CLANG  ?= clang
 # The host's own arch builds with plain gcc; the other arch uses a cross
-# compiler + sysroot. Both directions are supported: x86_64 host -> aarch64,
-# and aarch64 host -> x86_64.
+# compiler. Fedora's cross compiler needs its separately packaged sysroot;
+# Debian/Ubuntu cross compilers already know their default sysroot. Both
+# directions are supported: x86_64 host -> aarch64 and aarch64 host -> x86_64.
 ifeq ($(shell uname -m),aarch64)
 # aarch64 host: native aarch64, cross-compile to x86_64.
 CC_AARCH64       = gcc
 CFLAGS_AARCH64   =
 CC_X86_64        = x86_64-linux-gnu-gcc
-# Sysroot for the x86_64 cross-compiler — Fedora package: sysroot-x86_64-fc43-glibc
-X86_64_SYSROOT  ?= /usr/x86_64-redhat-linux/sys-root/fc43
+# Use the newest installed Fedora sysroot, or the compiler's built-in default.
+X86_64_SYSROOT  ?= $(lastword $(sort $(wildcard /usr/x86_64-redhat-linux/sys-root/fc*)))
+ifneq ($(strip $(X86_64_SYSROOT)),)
 CFLAGS_X86_64    = --sysroot=$(X86_64_SYSROOT) -isystem $(X86_64_SYSROOT)/usr/include
+else
+CFLAGS_X86_64    =
+endif
 else
 # x86_64 (or other) host: native x86_64, cross-compile to aarch64.
 CC_X86_64        = gcc
 CFLAGS_X86_64    =
 CC_AARCH64       = aarch64-linux-gnu-gcc
-# Sysroot for the aarch64 cross-compiler — Fedora package: sysroot-aarch64-fc43-glibc
-AARCH64_SYSROOT ?= /usr/aarch64-redhat-linux/sys-root/fc43
+# Use the newest installed Fedora sysroot, or the compiler's built-in default.
+AARCH64_SYSROOT ?= $(lastword $(sort $(wildcard /usr/aarch64-redhat-linux/sys-root/fc*)))
+ifneq ($(strip $(AARCH64_SYSROOT)),)
 # The glibc-only sysroot ships no static libatomic.a, but Fedora's gcc spec
 # unconditionally requests -latomic (as-needed) for aarch64 static links, so ld
 # fails just locating the file. Our code uses no atomics; suppress the request.
 CFLAGS_AARCH64   = --sysroot=$(AARCH64_SYSROOT) -isystem $(AARCH64_SYSROOT)/usr/include -fno-link-libatomic
+else
+CFLAGS_AARCH64   =
+endif
 endif
 CC         = gcc
 CFLAGS     = -static -O2 -s -Wall -Wextra

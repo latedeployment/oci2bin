@@ -33,7 +33,7 @@ The file has an executable loader and an image archive in the same byte stream.
 +--------------------------------------------------+
 | ELF executable loader                            |
 +--------------------------------------------------+
-| tar-compatible OCI image payload                 |
+| OCI image payload (plain tar, compressed, or age)|
 +--------------------------------------------------+
 | metadata: image name, labels, digest, policies   |
 +--------------------------------------------------+
@@ -68,13 +68,16 @@ The practical layout is:
 
 ```text
 tar entry 1 header: contains the ELF header bytes
-tar entry 1 data:   padding plus the statically linked loader
+tar entry 1 data:   padding plus the loader (normally statically linked)
 tar entries 2+:     OCI image archive entries
 tar EOF:            two zero blocks
 metadata:           oci2bin metadata outside the tar stream
 ```
 
-Docker sees the OCI image archive entries. Runtime execution starts the loader.
+Docker sees the OCI image archive entries only in the default plain-payload
+form. Runtime execution starts the loader. Encryption protects the OCI payload,
+but the ELF loader and outer routing/policy metadata remain readable so the
+kernel and loader can locate it.
 
 ## OCI Image Payload
 
@@ -182,7 +185,7 @@ labels. Runtime options override them:
 
 ## Reconstructable Images
 
-A normal polyglot is self-contained for running, but the loader is not
+A normal polyglot is mostly self-contained for running, but the loader is not
 automatically part of the image if the image is pushed elsewhere. The
 reconstruction features store the loader inside the image itself:
 
@@ -205,14 +208,16 @@ oci2vm app:latest
 ./oci2vm_app_latest
 ```
 
-The binary can embed VM assets such as a kernel and initramfs. Backend selection
-can use libkrun or the static loader path, depending on build options and host
-support.
+The binary can embed VM assets such as a kernel and initramfs. The VMM backend
+is libkrun or cloud-hypervisor. A libkrun loader opens `libkrun.so.1` lazily;
+the default static loader invokes cloud-hypervisor when VM mode is requested.
+In both cases the generated file is deployed directly: copy it to the KVM host
+and execute it to start the microVM.
 
 ## Why The File Can Still Be Useful As An Image
 
-The `docker load` property makes `oci2bin` artifacts easy to inspect and move
-between workflows:
+For default plain-payload artifacts, the `docker load` property makes them easy
+to inspect and move between workflows:
 
 ```bash
 docker load < app.bin

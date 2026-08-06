@@ -3,6 +3,26 @@
 This page explains the security controls available in `oci2bin` and how to use
 them together.
 
+## Security Boundaries
+
+Namespace mode reduces a workload's access to the host, but shares the host
+kernel and is not the same boundary as a VM. VM mode uses KVM and a VMM for a
+stronger kernel boundary. In either mode, treat the embedded image and its
+entrypoint as code: rootless execution limits host privilege, but does not make
+untrusted code harmless.
+
+The controls solve different problems:
+
+- signing, digest pinning, Cosign, and attestations establish integrity,
+  identity, or provenance
+- age encryption protects the embedded image payload at rest
+- namespaces, seccomp, Landlock, capabilities, mounts, and cgroups limit a
+  running workload
+- VM mode isolates the workload behind a guest kernel
+
+Use the controls together according to the threat model; none substitutes for
+all the others.
+
 ## Rootless By Default
 
 The generated binary runs without a daemon and without host root privileges.
@@ -10,10 +30,16 @@ The generated binary runs without a daemon and without host root privileges.
 Inside the container, the process may see UID 0. On the host, the process runs
 as the invoking user. User namespaces provide that mapping.
 
-Check the host:
+Check the build host:
 
 ```bash
 oci2bin doctor
+```
+
+Check a deployment host with the artifact:
+
+```bash
+./app.bin --doctor
 ```
 
 For better UID/GID compatibility, install `newuidmap` and `newgidmap` and
@@ -54,8 +80,13 @@ Use userspace networking instead of host networking:
 Restrict egress:
 
 ```bash
-./app.bin --allow-egress 10.10.0.0/16:443 --allow-egress 198.51.100.10:443
+./app.bin --net slirp \
+  --allow-egress 10.10.0.0/16:443 \
+  --allow-egress 198.51.100.10:443
 ```
+
+Egress filtering is supported with `--net slirp` and `--net pasta`, and needs
+`nft`. The run fails closed if the allowlist cannot be installed.
 
 ## Read-Only Rootfs
 
@@ -117,10 +148,16 @@ When supported by the kernel, Landlock can restrict filesystem access from the
 container process. Use it for defense in depth together with read-only rootfs,
 explicit mounts, and secrets.
 
-Check support:
+Check support on the build host:
 
 ```bash
 oci2bin doctor
+```
+
+Check the deployment host with the artifact itself:
+
+```bash
+./app.bin --doctor
 ```
 
 ## AppArmor And SELinux
@@ -178,6 +215,52 @@ OCI2BIN_PASSWORD_FILE=/etc/oci2bin/pass.txt ./app.bin
 
 Encryption protects the embedded image payload at rest. It does not replace
 runtime isolation.
+
+### What is encrypted
+
+Encryption is the last payload transformation. It covers the OCI image config
+and all layers, including any files added at build time, after optional
+compression. It does not cover the ELF loader or the small outer metadata the
+loader needs to find and start the payload. The outer file must retain a
+plaintext ELF header to remain directly executable.
+
+Recipient mode passes `--recipient` and `--recipients-file` values to the
+installed `age` CLI. This includes native age and SSH recipient types supported
+by that age version. Both options are repeatable. An identity file can hold
+multiple private identities; the loader tries `OCI2BIN_IDENTITY` first, then
+`~/.config/oci2bin/identity`, `~/.ssh/id_ed25519`, and `~/.ssh/id_rsa`.
+
+Passphrase mode reads `OCI2BIN_PASSWORD_FILE` first, then
+`OCI2BIN_PASSWORD`, and finally prompts on a terminal. Do not put a production
+passphrase directly in a shell command or environment when a protected file or
+secret manager can supply it.
+
+### Runtime plaintext and compatibility
+
+The loader decrypts to a temporary tar in its private extraction directory,
+then prepares the rootfs and removes the directory during normal cleanup.
+Temporary storage is not guaranteed to be memory-backed. If the host has
+enough memory, use:
+
+```bash
+OCI2BIN_TMPDIR=/dev/shm \
+OCI2BIN_IDENTITY=/run/secrets/oci2bin.identity \
+./app.bin
+```
+
+The extraction filesystem must permit execution because the workload runs from
+the prepared rootfs. If `/dev/shm` is mounted `noexec`, use a dedicated tmpfs
+with an appropriate mount policy instead.
+
+An encrypted artifact cannot be passed directly to `docker load`, inspected as
+a plain OCI archive, reconstructed, or label-filtered without decrypting the
+payload. Encryption also uses fresh randomness, so two encrypted builds are
+not byte-identical even with `--reproducible`.
+
+Encryption provides confidentiality only. It does not authenticate who built
+or published the artifact. Pair it with an enforced signature or provenance
+policy where authenticity matters, and keep runtime decryption material
+separate from the artifact.
 
 ## Signing And Verification
 
@@ -237,11 +320,15 @@ oci2bin sign --key priv.pem --attest slsa.json --in app.bin
 Verify upstream image signatures before building:
 
 ```bash
-oci2bin --verify-cosign app:latest app.bin
+oci2bin --require-cosign --cosign-key cosign.pub app:latest app.bin
 ```
 
-Verify source-image signatures through attestation when your policy requires a
-link between the generated binary and the source image identity.
+`--require-cosign` aborts if verification fails or `cosign` is unavailable.
+The weaker `--verify-cosign` form warns and continues, which is suitable for
+advisory validation but not for enforcing source trust. When policy also
+requires an attested link to the source image, pass the verified image,
+key path, and result to `oci2bin sign --attest auto` with its
+`--cosign-image-ref`, `--cosign-key-path`, and `--cosign-result` options.
 
 ## Digest Pinning
 
@@ -287,7 +374,10 @@ Offline mode:
 oci2bin --offline-only --oci-dir ./layout app:latest app.bin
 ```
 
-Use these when auditability and byte-for-byte rebuilds matter.
+Use these when auditability and byte-for-byte rebuilds matter. Reproducibility
+applies only to inputs and metadata that `oci2bin` controls; recipient or
+passphrase encryption deliberately uses fresh age randomness and therefore
+does not produce byte-identical artifacts.
 
 ## VM Isolation
 

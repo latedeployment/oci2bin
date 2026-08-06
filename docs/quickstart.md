@@ -16,13 +16,14 @@ make
 Install to your path:
 
 ```bash
-make install
+sudo make install
 ```
 
-Use a different install prefix:
+Or install for only the current user:
 
 ```bash
 make install PREFIX="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 You can also run `./oci2bin` directly from the repository root.
@@ -36,7 +37,7 @@ oci2bin doctor
 The doctor command checks the build and runtime pieces `oci2bin` can use:
 
 - compiler and static libc support
-- Docker or Podman availability
+- Docker, Podman, or Skopeo availability
 - unprivileged user namespaces
 - `newuidmap` and `newgidmap`
 - seccomp, Landlock, and cgroup v2
@@ -102,9 +103,10 @@ Mount secrets read-only:
 ./myapp --secret /etc/myapp/db_password:/run/secrets/db_password
 ```
 
-## Load The Binary Back Into Docker
+## Load The Default Binary Back Into Docker
 
-The output file is also a Docker-compatible saved-image tar archive:
+An unencrypted, whole-payload-uncompressed output is also a Docker-compatible
+saved-image tar archive:
 
 ```bash
 docker load < redis_7-alpine
@@ -112,6 +114,9 @@ docker load < redis_7-alpine
 
 This is useful when a binary moves through a system as a single executable but
 later needs to be inspected or re-imported as a normal image.
+
+`--encrypt`, `--passphrase`, and `--compress-binary zstd` make the embedded
+payload opaque, so those artifacts are not directly accepted by `docker load`.
 
 ## Build From An OCI Layout
 
@@ -147,4 +152,3 @@ oci2bin run alpine:latest -- /bin/echo hello
 ```
 
 This builds a temporary binary, executes it, and removes the temporary file.
-

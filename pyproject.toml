@@ -9,7 +9,7 @@ environments = ["sys_platform == 'linux'"]
 [project]
 name = "oci2bin"
 version = "0.18.0"
-description = "Convert OCI/Docker images into self-contained ELF executables"
+description = "Convert OCI/Docker images into mostly self-contained Linux executables"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -20,8 +20,9 @@ classifiers = [
     "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
-# No Python runtime dependencies — stdlib only.
-# Runtime system requirements: gcc, docker (documented in README).
+# No Python package dependencies: the builder uses only the standard library.
+# Compilers, image pull backends, and target helpers are feature-dependent
+# system requirements documented in the dependency reference.
 dependencies = []
 
 [dependency-groups]

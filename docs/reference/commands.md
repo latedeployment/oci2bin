@@ -17,9 +17,10 @@ Common build options:
 --no-cache
 --layer IMAGE
 --strip
---strip-prefix PREFIX
+--strip-prefix PREFIX        # root-relative; no leading slash
 --strip-auto
 --squash
+--compress gzip|zstd         # squashed-layer codec; requires --squash
 --add-file HOST:CONTAINER
 --add-dir HOST:CONTAINER
 --oci-dir DIR
@@ -51,6 +52,17 @@ Common build options:
 --libkrun
 --no-libkrun
 ```
+
+`--verify-cosign` warns and continues if verification fails or `cosign` is
+missing. Use `--require-cosign` when source verification is an enforced build
+policy. A later `sign --attest auto` command needs explicit
+`--cosign-image-ref`, `--cosign-key-path`, and `--cosign-result` arguments to
+record that build-time result.
+
+Age recipient and passphrase modes encrypt the embedded OCI payload, not the
+executable loader. They are mutually exclusive, remove direct `docker load`
+compatibility, and prevent byte-identical encrypted rebuilds because age uses
+fresh randomness.
 
 ## Generated Binary
 

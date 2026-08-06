@@ -49,9 +49,10 @@ workload layers:
 - Artifacts can be signed, verified at runtime, or built with a mandatory
   embedded signature policy. Digest pinning, source-image Cosign verification,
   Rekor entries, and provenance attestations extend the chain of trust.
-- Embedded images can be encrypted with age recipients or a passphrase.
-  Runtime secrets are mounted read-only; TPM2-sealed secrets are staged in
-  memory rather than disk-backed storage.
+- Embedded image payloads can be encrypted with age recipients or a
+  passphrase; the executable loader and routing metadata remain readable so
+  Linux can start the file. Runtime secrets are mounted read-only; TPM2-sealed
+  secrets are staged in memory rather than disk-backed storage.
 - Untrusted image layers are extracted defensively: set-ID bits and file
   capabilities are removed, extended attributes are allowlisted, and symlink
   traversal protections are applied.

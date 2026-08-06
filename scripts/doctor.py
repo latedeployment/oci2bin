@@ -621,10 +621,11 @@ _PKGS = {
 _CROSS_PKGS = {
     "aarch64": {"apt": ["gcc-aarch64-linux-gnu"],
                 "dnf": ["gcc-aarch64-linux-gnu",
-                        "sysroot-aarch64-fc-glibc"],
+                        "sysroot-aarch64-fc{fedora}-glibc"],
                 "pacman": ["aarch64-linux-gnu-gcc"], "zypper": []},
     "x86_64":  {"apt": ["gcc-x86-64-linux-gnu"],
-                "dnf": ["gcc-x86_64-linux-gnu", "sysroot-x86_64-fc-glibc"],
+                "dnf": ["gcc-x86_64-linux-gnu",
+                        "sysroot-x86_64-fc{fedora}-glibc"],
                 "pacman": [], "zypper": []},
 }
 
@@ -644,7 +645,23 @@ def _packages(result, pkgmgr):
     name = result["name"]
     if name.startswith("cross-compiler"):
         arch = "x86_64" if "x86_64" in name else "aarch64"
-        return _CROSS_PKGS.get(arch, {}).get(pkgmgr, []), None
+        pkgs = list(_CROSS_PKGS.get(arch, {}).get(pkgmgr, []))
+        if pkgmgr == "dnf":
+            try:
+                with open("/etc/os-release", encoding="utf-8") as f:
+                    fields = dict(
+                        line.rstrip().split("=", 1)
+                        for line in f
+                        if "=" in line
+                    )
+                release = fields.get("VERSION_ID", "").strip("\"'")
+            except OSError:
+                release = ""
+            if release:
+                pkgs = [p.format(fedora=release) for p in pkgs]
+            else:
+                pkgs = [p.replace("{fedora}", "NN") for p in pkgs]
+        return pkgs, None
     pkgs = _PKGS.get(name, {}).get(pkgmgr, [])
     return pkgs, _MANUAL.get(name)
 
@@ -674,10 +691,13 @@ def _install_summary(results, pkgmgr, install_cmd, pretty):
         lines.append("  install manually: " + "; ".join(manual))
     if not pkgs and not manual:
         lines.append("  nothing to install — all checks OK or kernel-only.")
-    # Fedora sysroot packages embed the release (fcNN); flag the substitution.
+    # Fedora sysroot package names embed the release. A missing VERSION_ID is
+    # unusual, but make the placeholder explicit instead of printing a bogus
+    # package name.
     if pkgmgr == "dnf" and any("sysroot-" in x for x in pkgs):
-        lines.append("  (replace 'fc' in sysroot-* with your Fedora release, "
-                     "e.g. sysroot-aarch64-fc43-glibc)")
+        if any("fcNN-" in x for x in pkgs):
+            lines.append("  (replace NN in the sysroot package name with the "
+                         "Fedora release)")
     return lines
 
 

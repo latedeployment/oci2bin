@@ -18,12 +18,12 @@ under the terms of the MIT License.
 
 @dircategory Containers
 @direntry
-* oci2bin: (oci2bin).   Convert OCI images to self-contained executables.
+* oci2bin: (oci2bin).   Convert OCI images to mostly self-contained executables.
 @end direntry
 
 @titlepage
 @title oci2bin Manual
-@subtitle Convert Docker/OCI images into self-contained rootless container executables
+@subtitle Convert Docker/OCI images into mostly self-contained rootless executables
 @subtitle Version 0.18.0
 @author The oci2bin project
 @page
@@ -63,12 +63,12 @@ under the terms of the MIT License.
 @cindex overview
 @cindex polyglot binary
 
-@command{oci2bin} converts any Docker or OCI image into a single,
-self-contained ELF64 executable.  The output requires only @command{tar}
-on the target machine—no Docker daemon, no container runtime, no
-installation.
+@command{oci2bin} converts a Docker or OCI image into one mostly
+self-contained Linux executable.  Normal namespace mode requires
+@command{tar} and unprivileged user namespaces on the target machine—no
+Docker daemon, container runtime, or oci2bin installation.
 
-The output file is also a valid POSIX tar archive accepted by
+By default, the output file is also a valid POSIX tar archive accepted by
 @command{docker load}, making it a polyglot binary (@pxref{How It
 Works}).
 
@@ -82,10 +82,15 @@ Containers run rootlessly using Linux user namespaces.  The process
 appears as UID@tie{}0 inside the container; on the host it runs as the
 invoking user with no elevated privileges.
 
+When invoked as @command{oci2vm}, the generated artifact runs in VM mode by
+default. Deploy it directly by copying the executable to a KVM host and running
+it. This mode needs @file{/dev/kvm} and a supported VMM backend.
+
 @quotation Note
-This manual covers the core workflow.  The complete and authoritative
-reference is the project @file{README} and the documentation site under
-@file{docs/}, which always track the current feature set (including the
+This manual covers the core workflow.  The complete reference is the project
+@file{README} and
+@uref{https://latedeployment.github.io/oci2bin/, the documentation site}
+(including the
 @option{--restart}, @option{--health}, @option{--gpus}/@option{--cdi-device},
 @option{--profile}, and @option{--compress-binary} options, Rekor signing, and
 the @command{oci2bin up}/@command{down}/@command{stack} declarative-stack
@@ -121,10 +126,11 @@ Inject files/directories as a build-time layer.
 Overlay additional image layers (last image's config wins).
 @item --strip / --strip-prefix P / --strip-auto
 Remove docs/locales/caches; auto-detect package-manager caches.
+Custom prefixes are root-relative and must not begin with @file{/}.
 @item --squash
 Merge all layers into one squashed layer.
-@item --compress none|gzip|zstd
-Per-layer compression codec.
+@item --compress gzip|zstd
+Compression codec for the squashed layer; requires @option{--squash}.
 @item --compress-binary zstd
 Recompress the whole payload as one zstd frame (opaque to docker load).
 @item --entrypoint VALUE / --cmd VALUE
@@ -134,7 +140,9 @@ Add image-config labels (matchable by ps/list --filter).
 @item --cache / --no-cache
 Output-binary cache; per-layer cache toggle.
 @item --reproducible / --offline-only
-Byte-identical output; air-gap seal (no registry fetch, hermetic marker).
+Normalize oci2bin-controlled metadata for byte-identical output from identical
+inputs; air-gap seal (no registry fetch, hermetic marker). Age encryption uses
+fresh randomness and is not byte-reproducible.
 @item --pin-digest auto|ALGO:auto|ALGO:HEX
 Embed a digest the loader re-checks at run time.
 @item --self-update-url URL
@@ -148,13 +156,24 @@ Persist the loader in the image so @code{reconstruct} can rebuild it.
 @table @code
 @item --verify-cosign / --require-cosign / --cosign-key K
 Verify the source image's cosign signature before building.
+@option{--verify-cosign} warns and continues on failure;
+@option{--require-cosign} aborts.
 @item --require-signed PUB
 Embed a self-enforcing signature policy (refuse to run unsigned).
 @item --encrypt --recipient PUB / --recipients-file F
-Encrypt the payload to age recipients (opaque at rest).
+Encrypt the OCI payload to recipients supported by the installed age version,
+including native age and supported SSH recipient types. Options are repeatable.
 @item --passphrase [--password-file F]
 Symmetric (scrypt) encryption.
 @end table
+
+Encryption covers the OCI config and layers, not the ELF loader or outer
+routing metadata needed to execute the file. Encrypted artifacts are opaque to
+direct @command{docker load}. The runtime writes a decrypted temporary tar
+inside its extraction directory; use @env{OCI2BIN_TMPDIR=/dev/shm} for
+memory-backed temporary storage when sufficient RAM is available and that
+mount permits execution. A @code{noexec} tmpfs cannot run the extracted
+workload. Encryption provides confidentiality, not publisher authentication.
 
 (See also the @code{sign}, @code{verify}, and @code{attest} subcommands, with
 @option{--rekor} for a transparency-log entry and @option{--attest} for SLSA/
@@ -240,7 +259,9 @@ Run inside a hardware-isolated microVM (libkrun or cloud-hypervisor).
 git clone https://github.com/latedeployment/oci2bin
 cd oci2bin
 make          # compile the loader into build/
-make install  # install to /usr/local (override with PREFIX=~/.local)
+sudo make install  # install system-wide to /usr/local
+make install PREFIX="$HOME/.local"  # install for the current user
+export PATH="$HOME/.local/bin:$PATH"
 @end example
 
 After installation @command{oci2bin} is on your @env{PATH}.  To use it
@@ -297,13 +318,16 @@ Build for a foreign architecture with @option{--arch}:
 
 @example
 # Install cross-compiler (Fedora)
-sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
+sudo dnf install gcc-aarch64-linux-gnu \
+  "sysroot-aarch64-fc$(rpm -E %fedora)-glibc"
 
 oci2bin --arch aarch64 alpine:latest
 @end example
 
-The sysroot defaults to @file{/usr/aarch64-redhat-linux/sys-root/fc43}.
-Override with the @env{AARCH64_SYSROOT} environment variable.
+On Fedora, the newest installed
+@file{/usr/aarch64-redhat-linux/sys-root/fc*} sysroot is selected. Otherwise
+the cross compiler's built-in default is used. Override discovery with the
+@env{AARCH64_SYSROOT} environment variable.
 
 Supported values for @option{--arch}: @code{x86_64}, @code{aarch64}.
 
@@ -945,7 +969,7 @@ field.  When executed, the kernel processes the ELF; when passed to
 [0-63]       ELF64 header  (embedded in the tar filename field)
 [64-511]     Remaining tar header fields (ustar magic at byte 257)
 [512-4095]   NUL padding   (page-aligns the loader for mmap)
-[4096-~75K]  Loader binary (statically linked, gcc -static -O2 -s)
+[4096-~75K]  Loader binary (normally static; libkrun variant uses libc)
 [~75K-end]   OCI image tar (manifest.json, config, layer tarballs)
 @end example
 
@@ -1009,12 +1033,16 @@ Temporary directories are created with @code{mkdtemp} (mode
 Any value enables verbose runtime diagnostics (same as @option{--debug}).
 @item OCI2BIN_TMPDIR
 Directory for the runtime extraction tmpdir; tried before @env{TMPDIR}.
-Point at a tmpfs for speed and to keep the rootfs off disk.
+Point at a tmpfs for speed and to keep the rootfs and any decrypted payload tar
+off disk; the mount must permit execution of the extracted workload.
 @item TMPDIR
 Fallback extraction directory (then @file{/tmp}, then @file{/var/tmp}).
 @item OCI2BIN_IDENTITY
 Path to the age identity (or SSH private key) used to decrypt an
 @option{--encrypt} recipient image.
+The file may contain multiple identities. If unset, the loader tries
+@file{~/.config/oci2bin/identity}, @file{~/.ssh/id_ed25519}, then
+@file{~/.ssh/id_rsa}.
 @item OCI2BIN_PASSWORD / OCI2BIN_PASSWORD_FILE
 Passphrase (or a file whose first line is the passphrase) for a
 @option{--passphrase} image.
@@ -1039,7 +1067,8 @@ automatically by @command{make install} to
 @file{@var{PREFIX}/share/oci2bin}.
 @item AARCH64_SYSROOT / X86_64_SYSROOT
 Override the sysroot used by the aarch64 / x86_64 cross-compiler.
-aarch64 default: @file{/usr/aarch64-redhat-linux/sys-root/fc43}.
+By default, the newest installed Fedora @file{fc*} sysroot is selected;
+otherwise the compiler's built-in default is used.
 @item SOURCE_DATE_EPOCH
 Fixed timestamp for @option{--reproducible} / @option{--offline-only}
 builds.

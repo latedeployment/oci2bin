@@ -28,6 +28,7 @@ This page is a checklist of the feature surface documented by the site.
 | Custom strip prefix | `--strip-prefix PREFIX` |
 | Package-manager cache detection | `--strip-auto` |
 | Squash layers | `--squash` |
+| Squashed-layer compression | `--squash --compress gzip\|zstd` |
 | Override entrypoint at build | `--entrypoint '["redis-server"]'` |
 | Override default command at build | `--cmd '["--port","6380"]'` |
 | zstd-compress payload | `--compress-binary zstd` |
@@ -170,6 +171,11 @@ This page is a checklist of the feature surface documented by the site.
 | Memory-backed secret staging (ramfs, never swapped) | automatic for `--secret tpm2:` |
 | Show embedded attestation | `oci2bin attest-show --in app.bin` |
 | Verify recorded source-image attestation | `oci2bin attest verify --in app.bin [--recheck]` |
+
+Age encryption covers the embedded OCI payload, not the ELF loader or outer
+metadata required to start the executable. It removes direct `docker load`
+compatibility and uses randomized encryption, so encrypted builds are not
+byte-for-byte reproducible.
 
 ## VM Mode
 

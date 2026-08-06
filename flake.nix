@@ -1,5 +1,5 @@
 {
-  description = "Convert OCI/Docker images into self-contained ELF executables";
+  description = "Convert OCI/Docker images into mostly self-contained Linux executables";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -39,7 +39,7 @@
         '';
 
         meta = with pkgs.lib; {
-          description = "Convert OCI/Docker images into self-contained ELF executables";
+          description = "Convert OCI/Docker images into mostly self-contained Linux executables";
           license = licenses.mit;
           platforms = [ "x86_64-linux" ];
           mainProgram = "oci2bin";

@@ -2,24 +2,28 @@
 
 `oci2bin` converts an OCI or Docker image into one executable Linux file.
 
-The output file is both:
+By default, the output file is both:
 
 - a native Linux executable that starts the image as a rootless container
 - a valid tar archive that can be loaded back into Docker with `docker load`
 
-It is close to a **hermetic executable**: the image layers, OCI config and
-loader are all embedded in one file. A normal run needs two things from the
-host: a Linux kernel that allows unprivileged user namespaces, and `tar` to
-unpack the root filesystem. Optional features can add the requirements listed
-in [Dependencies](reference/dependencies.md).
+It is close to a **hermetic executable**: the image layers, OCI config, and
+loader are embedded in one file. A normal run still needs two things from the
+host: a Linux kernel that allows unprivileged user namespaces and `tar` to
+unpack the root filesystem. Optional features add the requirements listed in
+[Dependencies](reference/dependencies.md).
+
+Encryption and whole-payload zstd compression deliberately trade away the
+plain-tar half of the format. Those artifacts still execute, but cannot be
+passed directly to `docker load`.
 
 With `oci2vm`, this file is deployed directly as a VM: copy it to a KVM host
 and run it to boot the image as a microVM. That mode needs `/dev/kvm` and its
 selected VMM backend instead of unprivileged user namespaces.
 
 Here, “hermetic” describes how the output is packaged. It is separate from the
-`hermetic` marker that [`--offline-only`](build.md) records to describe the
-build.
+`hermetic` marker that
+[`--offline-only`](build.md#air-gap-builds) records to describe the build.
 
 ```bash
 oci2bin redis:7-alpine # builds ./redis_7-alpine
@@ -40,7 +44,7 @@ Docker or OCI image
 oci2bin builds one file
         |
         +-- ./myapp runs the image rootlessly
-        +-- docker load < myapp imports the image again
+        +-- docker load < myapp imports a default artifact again
 ```
 
 Use it when you want container packaging without requiring a container runtime
@@ -93,7 +97,7 @@ extra host support:
 Run this on a target host to see what is available:
 
 ```bash
-oci2bin doctor
+./artifact --doctor
 ```
 
 ## Where To Go Next
@@ -108,10 +112,13 @@ oci2bin doctor
   resources, process management, and state
 - [Security](security.md): rootless isolation, seccomp, capabilities,
   signatures, secrets, and limits
+- [Operations](operations.md): systemd, lifecycle commands, stacks, backups,
+  logs, and observability
+- [Command Reference](reference/commands.md): build options, runtime options,
+  and subcommands
 - [Feature Inventory](reference/features.md): the complete feature checklist
 - [Dependencies](reference/dependencies.md): build-host and target-host
   requirements per feature (and the libkrun caveat)
 - [Environment Variables](reference/environment.md): every `OCI2BIN_*` and
   related variable, for run time and build time
 - [How It Works](internals/how-it-works.md): loader flow and polyglot layout
-

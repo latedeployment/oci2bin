@@ -13,10 +13,12 @@ that it creates an unprivileged **user namespace** and then mount/PID/UTS
 namespaces inside it. The host kernel must allow this. Most distros do by
 default; two gotchas commonly bite:
 
-### Ubuntu 23.10+ / Debian-derived: AppArmor restriction
+### Ubuntu 23.10+ and AppArmor-restricted hosts
 
-These ship `kernel.apparmor_restrict_unprivileged_userns=1`. The user namespace
-is still created, but AppArmor strips its capabilities, so the follow-up
+Ubuntu 23.10 and later enable
+`kernel.apparmor_restrict_unprivileged_userns=1` by default. Other systems can
+enable the same AppArmor restriction. The user namespace is still created, but
+AppArmor strips its capabilities, so the follow-up
 `unshare(NEWNS|NEWPID|NEWUTS)` fails and you see:
 
 ```
@@ -26,14 +28,14 @@ unshare(NEWNS|NEWPID|NEWUTS): Operation not permitted
 The binary detects this and prints the fix. You have three options:
 
 ```bash
-# 1. Relax the knob globally (simplest; needs root once):
+# 1. Relax the knob globally (broad security tradeoff; needs root once):
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 echo 'kernel.apparmor_restrict_unprivileged_userns=0' | \
     sudo tee /etc/sysctl.d/60-oci2bin-userns.conf      # persist across reboots
 
 # 2. Or author an AppArmor profile that grants `userns,` to the binary
 #    (Ubuntu's intended per-application mechanism — see `man apparmor.d`).
-#    Practical when the binary lives at a stable path.
+#    Prefer this when the binary lives at a stable path.
 
 # 3. Or sidestep host namespaces entirely with a microVM (needs KVM):
 ./app.bin --vm
@@ -242,8 +244,14 @@ Add hosts entries:
 Default-deny egress allowlist:
 
 ```bash
-./app.bin --allow-egress 10.0.0.0/24:443 --allow-egress api.example.com:443
+./app.bin --net slirp \
+  --allow-egress 10.0.0.0/24:443 \
+  --allow-egress api.example.com:443
 ```
+
+Egress allowlists require `--net slirp` or `--net pasta` and the host `nft`
+command. If validation or rule installation fails, the workload does not
+start.
 
 ## Namespace Sharing
 
@@ -539,8 +547,12 @@ Persist VM state:
 Prometheus metrics over a Unix socket:
 
 ```bash
-./app.bin --metrics-socket /run/oci2bin/app.metrics.sock
+mkdir -p "$XDG_RUNTIME_DIR/oci2bin"
+./app.bin --metrics-socket "$XDG_RUNTIME_DIR/oci2bin/app.metrics.sock"
 ```
+
+`XDG_RUNTIME_DIR` must be set to a user-owned runtime directory. The loader
+does not create missing parent directories.
 
 Notifications:
 
@@ -566,8 +578,12 @@ The config file uses `key=value` entries for runtime options.
 Write audit logs:
 
 ```bash
-./app.bin --audit-log /var/log/oci2bin/app.audit
+mkdir -p "$HOME/.local/state/oci2bin"
+./app.bin --audit-log "$HOME/.local/state/oci2bin/app.audit"
 ```
+
+Choose a path writable by the invoking user; rootless runs normally cannot
+create files under `/var/log`.
 
 Apply a clock offset with a time namespace:
 

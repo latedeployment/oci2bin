@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# oci2bin — package a Docker image as a self-contained ELF+tar polyglot
+# oci2bin — package a Docker image as a mostly self-contained ELF+tar polyglot
 #
 # Usage:
 #   oci2bin [--arch ARCH] <image[:tag]> [output]
@@ -25,8 +25,10 @@
 #   oci2bin diff <binary1> <binary2>
 #   oci2bin reconstruct <image-or-file> [--output PATH] [--no-strip]
 #
-# The output file runs as a rootless container AND can be imported with
-# docker load. It accepts the same runtime flags as the embedded loader:
+# By default the output runs as a rootless container and can also be imported
+# with docker load. Encryption and whole-payload compression intentionally
+# remove direct docker-load compatibility. The executable accepts the same
+# runtime flags as the embedded loader:
 #
 #   ./output [OPTIONS] [-- CMD [ARGS...]]
 #   ./output [OPTIONS] CMD [ARGS...]
@@ -42,9 +44,12 @@
 #   --layer IMAGE         Merge additional image layers on top of the base image
 #                         (may be repeated; layers are applied in order)
 #   --strip               Remove docs/man/locale/cache from the image before packaging
-#   --strip-prefix PREFIX Strip a custom path prefix instead of the built-in defaults
-#                         (may be repeated; each use implies --strip)
+#   --strip-prefix PREFIX Strip a custom root-relative path prefix (no leading
+#                         slash) instead of the built-in defaults; repeatable
+#                         and each use implies --strip
 #   --strip-auto          Auto-detect package managers and add their cache paths to --strip
+#   --squash              Merge image layers into one layer
+#   --compress gzip|zstd  Compress the squashed layer (requires --squash)
 #   --add-file HOST:CONTAINER
 #                         Inject a host file into the image at build time (repeatable)
 #   --add-dir  HOST:CONTAINER
@@ -72,7 +77,9 @@
 #                         'ps'/'list --filter label=KEY=VAL' and shown by inspect
 #   --encrypt             Encrypt the embedded OCI image with age (opaque at
 #                         rest); requires --recipient/--recipients-file
-#   --recipient AGE_PUB   age recipient (age1.../ssh-ed25519 ...), repeatable
+#   --recipient AGE_PUB   Recipient understood by the installed age version
+#                         (including native age and supported SSH recipients);
+#                         repeatable
 #   --recipients-file F   File of age recipients, one per line (repeatable)
 #                         Runtime: set OCI2BIN_IDENTITY to the age identity file
 #   --passphrase          Encrypt with an age passphrase (symmetric, scrypt)
@@ -1856,7 +1863,7 @@ if [[ "${1:-}" == "pod" ]]; then
 fi
 
 # ── from-chroot subcommand ────────────────────────────────────────────────
-# Build a self-contained binary directly from a chroot directory — no Docker
+# Build a mostly self-contained binary directly from a chroot — no Docker
 # required.  The chroot is packed into a single OCI layer and piped through
 # the standard build pipeline.
 #
@@ -1935,7 +1942,7 @@ if [[ "${1:-}" == "from-chroot" ]]; then
 fi
 
 # ── build-dockerfile subcommand ───────────────────────────────────────────
-# Build a self-contained binary from a Dockerfile without a Docker daemon.
+# Build a mostly self-contained binary from a Dockerfile without a daemon.
 # Supported: FROM scratch/<oci-dir>/<docker-image>, COPY, ADD, RUN, ENV,
 #            ENTRYPOINT, CMD, WORKDIR, LABEL, USER, EXPOSE, ARG.
 #
@@ -2273,6 +2280,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -n "$COMPRESS_FORMAT" && "$DO_SQUASH" -ne 1 ]]; then
+    echo "oci2bin: --compress requires --squash" >&2
+    exit 1
+fi
+
 if [[ $# -lt 1 ]]; then
     usage
 fi
@@ -2459,19 +2471,34 @@ WRAPPER_EOF
     exit 0
 fi
 
+find_fedora_sysroot() {
+    local target="$1" candidate latest=""
+    for candidate in "/usr/${target}-redhat-linux/sys-root"/fc*; do
+        [[ -d "$candidate" ]] || continue
+        latest="$candidate"
+    done
+    printf '%s' "$latest"
+}
+
 if [[ "$TARGET_ARCH" == "$HOST_ARCH" ]]; then
     CC_CROSS="gcc"
     CFLAGS_CROSS=""
 elif [[ "$TARGET_ARCH" == "aarch64" && "$HOST_ARCH" == "x86_64" ]]; then
     CC_CROSS="aarch64-linux-gnu-gcc"
-    AARCH64_SYSROOT="${AARCH64_SYSROOT:-/usr/aarch64-redhat-linux/sys-root/fc43}"
-    # The glibc-only sysroot ships no static libatomic.a but Fedora's gcc spec
-    # requests -latomic for aarch64 static links; our code uses no atomics.
-    CFLAGS_CROSS="--sysroot=$AARCH64_SYSROOT -isystem $AARCH64_SYSROOT/usr/include -fno-link-libatomic"
+    AARCH64_SYSROOT="${AARCH64_SYSROOT:-$(find_fedora_sysroot aarch64)}"
+    CFLAGS_CROSS=""
+    if [[ -n "$AARCH64_SYSROOT" ]]; then
+        # The Fedora glibc-only sysroot has no static libatomic.a, but Fedora's
+        # gcc spec requests -latomic; the loader itself uses no atomics.
+        CFLAGS_CROSS="--sysroot=$AARCH64_SYSROOT -isystem $AARCH64_SYSROOT/usr/include -fno-link-libatomic"
+    fi
 elif [[ "$TARGET_ARCH" == "x86_64" && "$HOST_ARCH" == "aarch64" ]]; then
     CC_CROSS="x86_64-linux-gnu-gcc"
-    X86_64_SYSROOT="${X86_64_SYSROOT:-/usr/x86_64-redhat-linux/sys-root/fc43}"
-    CFLAGS_CROSS="--sysroot=$X86_64_SYSROOT -isystem $X86_64_SYSROOT/usr/include"
+    X86_64_SYSROOT="${X86_64_SYSROOT:-$(find_fedora_sysroot x86_64)}"
+    CFLAGS_CROSS=""
+    if [[ -n "$X86_64_SYSROOT" ]]; then
+        CFLAGS_CROSS="--sysroot=$X86_64_SYSROOT -isystem $X86_64_SYSROOT/usr/include"
+    fi
 else
     echo "oci2bin: cross-compilation from $HOST_ARCH to $TARGET_ARCH is not supported" >&2
     exit 1
@@ -2479,7 +2506,6 @@ fi
 
 # ── dependency checks ─────────────────────────────────────────────────────
 
-need "$CC_CROSS"
 need python3
 # NB: no unconditional `need docker` here — the image pull backend (docker /
 # podman / skopeo) is resolved and required only on the path that actually
@@ -2492,6 +2518,7 @@ SRC="$OCI2BIN_HOME/src/loader.c"
 if [[ "$USE_LIBKRUN" -eq 1 ]]; then
     LOADER="$OCI2BIN_HOME/build/loader-libkrun-$TARGET_ARCH"
     if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
+        need "$CC_CROSS"
         echo "oci2bin: building loader with libkrun for $TARGET_ARCH..."
         mkdir -p "$OCI2BIN_HOME/build"
         $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC" -ldl
@@ -2499,6 +2526,7 @@ if [[ "$USE_LIBKRUN" -eq 1 ]]; then
 else
     LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
     if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
+        need "$CC_CROSS"
         echo "oci2bin: building loader for $TARGET_ARCH..."
         mkdir -p "$OCI2BIN_HOME/build"
         $CC_CROSS $CFLAGS_CROSS -static -O2 -s ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC"
@@ -2743,9 +2771,9 @@ if [[ "$VERIFY_COSIGN" -eq 1 ]]; then
         fi
     fi
 fi
-# Export the cosign verification outcome so a subsequent
-# `oci2bin sign --attest auto` invocation can record it in the
-# embedded SLSA provenance without the user re-typing the metadata.
+# Export the cosign verification outcome for any downstream helper spawned by
+# this build process. A separate `oci2bin sign --attest auto` process cannot
+# inherit it and must receive the matching --cosign-* arguments explicitly.
 export OCI2BIN_COSIGN_RESULT="$COSIGN_RESULT"
 [[ "$VERIFY_COSIGN" -eq 1 ]] && export OCI2BIN_COSIGN_REF="$IMAGE"
 [[ -n "${COSIGN_KEY:-}" ]] && export OCI2BIN_COSIGN_KEY="$COSIGN_KEY"

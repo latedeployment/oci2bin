@@ -4,7 +4,7 @@
 .TH OCI2BIN 1 "2026-08-06" "oci2bin 0.18.0" "User Commands"
 .
 .SH NAME
-oci2bin \- convert Docker/OCI images into self-contained rootless container executables
+oci2bin \- convert Docker/OCI images into mostly self-contained rootless container executables
 .
 .SH SYNOPSIS
 .SS Building
@@ -55,25 +55,38 @@ oci2bin \- convert Docker/OCI images into self-contained rootless container exec
 .
 .SH DESCRIPTION
 .B oci2bin
-converts any Docker or OCI image into a single, self-contained ELF64 executable.
-The output file is also a valid POSIX tar archive accepted by
+converts a Docker or OCI image into one mostly self-contained Linux executable.
+By default, the output file is also a valid POSIX tar archive accepted by
 .BR "docker load" ,
 making it a polyglot binary.
 .PP
-The generated binary requires only
+In normal namespace mode the generated binary requires
 .BR tar (1)
-on the target machine \(em no Docker daemon, no runtime, no installation.
+and unprivileged user namespaces on the target machine \(em no Docker daemon,
+container runtime, or oci2bin installation.
 It runs the container rootlessly using Linux user namespaces.
+Encryption and whole-payload zstd compression remove direct
+.B docker load
+compatibility and add their matching runtime helper.
 .PP
 The container process appears as UID\~0 inside the container; on the host it runs
 as the invoking user with no elevated privileges.
 .PP
+When invoked as
+.B oci2vm
+the generated artifact runs in VM mode by default. It is deployed directly:
+copy the executable to a KVM host and run it to start the image in a microVM.
+That mode needs
+.I /dev/kvm
+and a supported VMM backend.
+.PP
 This man page summarizes the most common options and subcommands. The complete
-and authoritative reference is the project
+reference is the project
 .B README
-and the documentation site under
-.IR docs/ ,
-which always track the current feature set.
+and documentation site:
+.UR https://latedeployment.github.io/oci2bin/
+online documentation
+.UE
 .
 .SH BUILD OPTIONS
 These options are passed to the
@@ -91,9 +104,10 @@ or
 When building for a foreign architecture from x86_64, the
 .B aarch64\-linux\-gnu\-gcc
 cross-compiler is required.
-The sysroot defaults to
-.IR /usr/aarch64\-redhat\-linux/sys\-root/fc43 ;
-override with the
+On Fedora, the newest installed
+.I /usr/aarch64\-redhat\-linux/sys\-root/fc*
+sysroot is selected. Otherwise the cross compiler's built-in default is used.
+Override discovery with the
 .B AARCH64_SYSROOT
 environment variable.
 .
@@ -128,6 +142,17 @@ Affected paths:
 .IR var/cache/apt/ ,
 .IR var/lib/apt/lists/ ,
 .IR tmp/ .
+.
+.TP
+.BI \-\-strip\-prefix " PREFIX"
+Remove an additional root-relative image path prefix.
+.I PREFIX
+must not begin with
+.B /
+or contain
+.BR .. ;
+may be repeated and implies
+.BR \-\-strip .
 .
 .TP
 .BI \-\-add\-file " HOST:CONTAINER"
@@ -200,18 +225,32 @@ at run time; the payload is then opaque to
 .
 .TP
 .B \-\-encrypt \fR[\fB\-\-recipient \fIPUB\fR]\fR, \fB\-\-passphrase
-Encrypt the embedded image with
+Encrypt the embedded OCI payload with
 .BR age .
+Recipient and recipients-file options are repeatable and accept values
+supported by the installed age version, including native age and supported SSH
+recipients.
 At run time supply the identity via
 .B OCI2BIN_IDENTITY
 or the passphrase via
 .BR OCI2BIN_PASSWORD [ _FILE ].
+The ELF loader and outer routing metadata remain plaintext so the file can be
+executed. Encrypted artifacts are not directly loadable by
+.BR "docker load" .
+Decryption writes a temporary tar inside the extraction directory; set
+.B OCI2BIN_TMPDIR=/dev/shm
+to use tmpfs when sufficient memory is available and that mount permits
+execution. A
+.B noexec
+tmpfs cannot run the extracted workload.
 .
 .TP
 .B \-\-reproducible \fR/\fB \-\-offline\-only
-Produce byte-identical output across builds;
+Normalize oci2bin-controlled timestamps and archive metadata for
+byte-identical output from identical inputs;
 .B \-\-offline\-only
 additionally refuses any registry fetch and records a hermetic marker.
+Age encryption uses fresh randomness and is therefore not byte-reproducible.
 .
 .TP
 .B \-\-verify\-cosign \fR/\fB \-\-require\-cosign
@@ -813,13 +852,15 @@ form of
 and
 .BR \-\-ipc .
 This enables sidecar patterns and inter-container IPC without a shared daemon.
-.PP
-.B What is shared:
-.TS
-l l .
-\fB\-\-net container:\fIPID\fR	Network interfaces, routing table, port bindings
-\fB\-\-ipc container:\fIPID\fR	SysV semaphores, message queues, shmget/shmat memory
-.TE
+.SS What is shared
+.TP
+.BI "\-\-net container:" PID
+Network interfaces, routing table, and port bindings.
+.TP
+.BI "\-\-ipc container:" PID
+System V semaphores, message queues, and
+.BR shmget (2)/shmat(2)
+memory.
 .PP
 POSIX shared memory
 .RB ( shm_open ,
@@ -851,7 +892,8 @@ Set to any value to print verbose runtime diagnostics (same as
 .B OCI2BIN_TMPDIR
 Directory for the runtime extraction tmpdir; tried before
 .BR TMPDIR .
-Point at a tmpfs for speed and to keep the rootfs off disk.
+Point at a tmpfs for speed and to keep the rootfs and any decrypted payload tar
+off disk; the mount must permit execution of the extracted workload.
 .TP
 .B TMPDIR
 Fallback extraction directory (then
@@ -861,6 +903,11 @@ Fallback extraction directory (then
 Path to the age identity (or SSH private key) used to decrypt an
 .B \-\-encrypt
 recipient image.
+The file may contain multiple identities. If unset, the loader tries
+.IR ~/.config/oci2bin/identity ,
+.IR ~/.ssh/id_ed25519 ,
+then
+.IR ~/.ssh/id_rsa .
 .TP
 .B OCI2BIN_PASSWORD \fR/\fB OCI2BIN_PASSWORD_FILE
 Passphrase (or a file whose first line is the passphrase) for a
@@ -881,8 +928,9 @@ is given.
 .TP
 .B AARCH64_SYSROOT \fR/\fB X86_64_SYSROOT
 Override the sysroot used by the aarch64 / x86_64 cross-compiler.
-aarch64 default:
-.IR /usr/aarch64\-redhat\-linux/sys\-root/fc43 .
+By default, the newest installed Fedora
+.I fc*
+sysroot is selected; otherwise the compiler's built-in default is used.
 .TP
 .B SOURCE_DATE_EPOCH
 Fixed timestamp for

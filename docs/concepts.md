@@ -2,7 +2,7 @@
 
 ## The Output File
 
-An `oci2bin` output file is an ELF+TAR polyglot.
+The default `oci2bin` output file is an ELF+TAR polyglot.
 
 That means the same bytes are accepted by two different readers:
 
@@ -10,7 +10,7 @@ That means the same bytes are accepted by two different readers:
 - `docker load` sees a saved-image tar archive
 
 The executable part is a small loader. The tar part contains the OCI image
-payload and metadata.
+payload and metadata when whole-payload encryption or compression is not used.
 
 ```text
 +-------------------------------+
@@ -111,7 +111,7 @@ embedded VM assets.
 
 ## The Docker Compatibility Tradeoff
 
-Most `oci2bin` binaries can be loaded with:
+Default unencrypted and whole-payload-uncompressed binaries can be loaded with:
 
 ```bash
 docker load < myapp

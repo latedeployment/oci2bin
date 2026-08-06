@@ -17,6 +17,9 @@ scp ./my-nginx deploy@server.example.com:/opt/nginx/my-nginx
 ssh deploy@server.example.com '/opt/nginx/my-nginx -p 8080:80 --net slirp'
 ```
 
+Because this artifact uses `--compress-binary zstd`, install `zstd` on the
+server before running it. It is not directly loadable with `docker load`.
+
 Make a systemd unit:
 
 ```bash
@@ -43,7 +46,7 @@ oci2bin ghcr.io/example/rss:latest rss
   -p 8080:8080
 ```
 
-Use `--size` to apply a resource profile, `--overlay-persist` to keep writable
+Use `--size` to apply a resource preset, `--overlay-persist` to keep writable
 rootfs changes, and `-v` for explicit host data.
 
 ## Run A Locked-Down Utility
@@ -165,7 +168,13 @@ oci2bin --passphrase --password-file ./pass.txt myapp:latest myapp.bin
 OCI2BIN_PASSWORD_FILE=/etc/oci2bin/pass.txt ./myapp.bin
 ```
 
-Encryption makes the embedded OCI payload opaque at rest.
+Encryption makes the embedded OCI payload opaque at rest while leaving the ELF
+loader and the minimal outer metadata plaintext so the file remains directly
+executable. The decrypted tar uses the runtime extraction directory; set
+`OCI2BIN_TMPDIR=/dev/shm` when memory-backed temporary storage is required and
+that mount permits execution, or use a dedicated executable tmpfs.
+See [Security → Encrypted Payloads](security.md#encrypted-payloads) for identity
+fallbacks, compatibility limits, signing, and reproducibility implications.
 
 ## Debug A Container Entrypoint
 
@@ -281,3 +290,7 @@ oci2bin mcp-serve
 Use it when an AI agent should inspect, build, or manage `oci2bin` artifacts
 through a structured tool interface instead of shelling out manually.
 
+The MCP server denies networking and host mounts by default. Enable host
+networking explicitly with `--allow-net`; allow only required host paths with
+`--allow-mount` (read-only) or `--allow-mount-rw`. Treat those flags as trust
+boundaries for the calling agent.

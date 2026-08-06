@@ -1,5 +1,5 @@
 site_name: oci2bin
-site_description: Convert OCI and Docker images into self-contained Linux executables.
+site_description: Convert OCI and Docker images into mostly self-contained Linux executables.
 site_url: https://latedeployment.github.io/oci2bin/
 repo_url: https://github.com/latedeployment/oci2bin
 repo_name: latedeployment/oci2bin

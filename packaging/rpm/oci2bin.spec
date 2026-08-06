@@ -1,7 +1,7 @@
 Name:           oci2bin
 Version:        0.18.0
 Release:        1%{?dist}
-Summary:        Convert OCI/Docker images into self-contained ELF executables
+Summary:        Convert OCI/Docker images into mostly self-contained Linux executables
 
 License:        MIT
 URL:            https://github.com/latedeployment/oci2bin
@@ -10,12 +10,16 @@ Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz
 ExclusiveArch:  x86_64 aarch64
 
 BuildRequires:  gcc glibc-static texinfo
-Requires:       python3 docker
+Requires:       python3
+Suggests:       docker
+Suggests:       podman
+Suggests:       skopeo
 
 %description
-oci2bin converts any Docker (OCI) image into a single executable file
-that runs as a rootless container on any Linux machine without Docker,
-without a daemon, and without any installation on the target.
+oci2bin packages a Docker or OCI image as one mostly self-contained Linux
+executable. The artifact runs as a rootless container without Docker, a daemon,
+or oci2bin on the target. A normal target needs unprivileged user namespaces
+and tar; optional features add feature-specific dependencies.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -44,7 +48,7 @@ make install PREFIX=%{buildroot}/usr
 %changelog
 * Thu Aug 06 2026 latedeployment - 0.18.0-1
 - Update to v0.18.0
-* Fri Apr 18 2026 latedeployment - 0.9.0-1
+* Sat Apr 18 2026 latedeployment - 0.9.0-1
 - Update to v0.9.0; install all helper scripts
 * Tue Mar 10 2026 latedeployment - 0.1.0-1
 - Initial package

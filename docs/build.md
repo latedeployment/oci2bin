@@ -172,8 +172,9 @@ scp ./myapp deploy@remote-host.example.com:/opt/app/myapp
 ssh deploy@remote-host.example.com /opt/app/myapp
 ```
 
-The result is a self-contained executable artifact. The target host does not
-need the Dockerfile builder or Docker.
+The result is a mostly self-contained executable artifact. The target host
+does not need the Dockerfile builder or Docker, but it still needs the normal
+[runtime dependencies](reference/dependencies.md#target-host-runtime).
 
 ## Override Entrypoint Or Command
 
@@ -209,14 +210,18 @@ toolchain for the non-native target:
 
 ```bash
 # x86_64 host -> aarch64
-sudo dnf install gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc   # Fedora
+sudo dnf install gcc-aarch64-linux-gnu \
+  "sysroot-aarch64-fc$(rpm -E %fedora)-glibc"                       # Fedora
 sudo apt install gcc-aarch64-linux-gnu                              # Debian/Ubuntu
 # aarch64 host -> x86_64
-sudo dnf install gcc-x86_64-linux-gnu sysroot-x86_64-fc43-glibc     # Fedora
+sudo dnf install gcc-x86_64-linux-gnu \
+  "sysroot-x86_64-fc$(rpm -E %fedora)-glibc"                        # Fedora
 sudo apt install gcc-x86-64-linux-gnu                               # Debian/Ubuntu (note: x86-64 hyphen)
 ```
 
-`oci2bin doctor` prints the right command for your distro. Override the sysroot
+On Fedora, `oci2bin` selects the newest installed `fc*` sysroot. On
+Debian/Ubuntu it uses the cross compiler's built-in default. `oci2bin doctor`
+prints the right install command for the current distro. Override discovery
 with the matching variable:
 
 ```bash
@@ -283,11 +288,14 @@ Add custom strip prefixes:
 ```bash
 oci2bin \
   --strip \
-  --strip-prefix /usr/share/zoneinfo \
-  --strip-prefix /opt/vendor/cache \
+  --strip-prefix usr/share/zoneinfo \
+  --strip-prefix opt/vendor/cache \
   app:latest \
   app.bin
 ```
+
+Prefixes are relative to the image root: do not start them with `/`, and do not
+use `..`.
 
 Auto-detect package manager cache paths:
 
@@ -299,10 +307,14 @@ oci2bin --strip-auto app:latest app.bin
 
 ```bash
 oci2bin --squash app:latest app.bin
+oci2bin --squash --compress zstd app:latest app.bin
 ```
 
 Squashing rewrites the image payload as fewer layers. Use it when artifact
-shape matters more than preserving upstream layer boundaries.
+shape matters more than preserving upstream layer boundaries. `--compress
+gzip|zstd` selects the codec for the squashed layer and is valid only with
+`--squash`; this is distinct from `--compress-binary`, which wraps the entire
+embedded payload.
 
 ## Compress The Binary
 
@@ -331,11 +343,15 @@ Labels are shown by inspection commands and can be used by list and ps filters.
 ## Verify Source Images With Cosign
 
 ```bash
-oci2bin --verify-cosign app:latest app.bin
+oci2bin --require-cosign --cosign-key cosign.pub app:latest app.bin
 ```
 
-Use source-image verification when the build should reject unsigned or
-incorrectly signed upstream images.
+Use `--require-cosign` when the build must reject an unsigned or incorrectly
+signed upstream image, or when `cosign` being absent must abort the build.
+`--verify-cosign` performs the same check but warns and continues on failure;
+it is an advisory check, not an enforcement boundary. To record the result in
+a later `--attest auto` signature, pass `--cosign-image-ref`,
+`--cosign-key-path`, and `--cosign-result` to `oci2bin sign` explicitly.
 
 ## Encrypt The Embedded Image
 
@@ -366,6 +382,13 @@ Runtime:
 OCI2BIN_IDENTITY=/etc/oci2bin/identity.txt ./app.bin
 ```
 
+`--recipient` is repeatable and passes each value to the installed `age`
+program. Native age recipients and SSH recipients supported by that version of
+age can therefore be used. A recipients file may contain several public
+recipients; the runtime identity file may likewise contain multiple private
+identities. If `OCI2BIN_IDENTITY` is unset, the loader tries
+`~/.config/oci2bin/identity`, `~/.ssh/id_ed25519`, then `~/.ssh/id_rsa`.
+
 Passphrase mode:
 
 ```bash
@@ -375,6 +398,26 @@ OCI2BIN_PASSWORD_FILE=/etc/oci2bin/pass.txt ./app.bin
 
 If no password environment variable or password file is set, the runtime can
 prompt on the terminal.
+
+Recipient and passphrase modes are mutually exclusive. In either mode,
+encryption covers the embedded OCI payload—image configuration and layers
+after any requested compression—not the ELF loader or the small outer metadata
+needed to locate and start it. A completely age-encrypted file could not remain
+directly executable because the Linux kernel must read a plaintext ELF header.
+
+At runtime the loader asks `age` to decrypt into a temporary tar inside its
+private extraction directory, uses it to prepare the rootfs, and removes that
+directory during normal cleanup. This is not automatically memory-backed. On a
+host with enough RAM, set `OCI2BIN_TMPDIR=/dev/shm` to keep both the decrypted
+tar and extracted rootfs on tmpfs. The selected mount must permit execution of
+the extracted workload; many hardened systems mount `/dev/shm` with `noexec`,
+in which case use a dedicated executable tmpfs instead.
+
+Encryption provides payload confidentiality, not publisher authentication.
+Combine it with `--require-signed`, digest pinning, or an external signature
+policy when authenticity matters. Encrypted artifacts are intentionally opaque
+to direct `docker load`, normal inspection, reconstruction, and label filtering
+unless the payload is separately decrypted with the matching material.
 
 ## Self-Enforcing Signature Policy
 
@@ -401,6 +444,8 @@ oci2bin --reproducible --pin-digest auto app:latest app.bin
 
 `--reproducible` normalizes timestamps and tar metadata controlled by
 `oci2bin`. `--pin-digest` embeds a canonical digest that is checked at runtime.
+Recipient and passphrase encryption use fresh age randomness, so encrypted
+builds are not byte-for-byte reproducible even when `--reproducible` is set.
 
 Use a stronger hash:
 

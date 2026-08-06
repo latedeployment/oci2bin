@@ -239,6 +239,16 @@ class TestCliFeatures(unittest.TestCase):
         self.assertNotIn("unknown build option before IMAGE", result.stderr)
         self.assertIn("--oci-dir: directory not found", result.stderr)
 
+    def test_layer_compression_requires_squash(self):
+        result = subprocess.run(
+            [str(OCI2BIN), "--compress", "gzip", "alpine:latest"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--compress requires --squash", result.stderr)
+
     def test_stop_refuses_mismatched_process_identity(self):
         home = self.tmpdir / "home-stop"
         ctr_dir = home / ".cache" / "oci2bin" / "containers"

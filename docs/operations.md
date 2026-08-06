@@ -311,11 +311,15 @@ oci2bin reconstruct redis:7-alpine --label-prefix myorg.loader
 ## Doctor And Troubleshooting
 
 ```bash
-oci2bin doctor
-oci2bin doctor --json
+oci2bin doctor          # build host
+oci2bin doctor --json   # build host, machine-readable
+./app.bin --doctor      # deployment host
 ```
 
-Use doctor output first when a host behaves differently from the build machine.
+The CLI doctor checks the machine that builds artifacts. The artifact doctor
+checks the machine on which that exact file will run, without extracting it or
+creating namespaces. Use the latter when a deployment host behaves differently
+from the build machine.
 
 Common checks:
 
