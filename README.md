@@ -588,6 +588,13 @@ mismatched, or `openssl` is unavailable, the binary **fails closed** and
 refuses to run. The check is self-contained, so it works for a binary copied
 anywhere (it needs only `python3` + `openssl`, both already used by the runtime).
 
+Both helpers are resolved by absolute path — `/usr/bin/python3`, and `openssl`
+from `/usr/bin`, `/bin`, `/usr/sbin` or `/sbin` — never through `$PATH`. An
+`openssl` that exists only somewhere else on `$PATH` is treated as missing and
+refused, because a stub earlier in `$PATH` would otherwise be able to report
+success for any payload without touching the binary at all. The same applies to
+`--verify-key` and to `oci2bin sign` / `verify`.
+
 **Trust-anchor caveat.** The public key is embedded in the very binary it
 protects, so a determined attacker who rewrites the payload can also swap the
 key and re-sign. `--require-signed` therefore guarantees *"this binary will not
@@ -3023,6 +3030,8 @@ When subordinate-ID remapping is unavailable, oci2bin falls back to a single-ID 
 - Layer and config paths from the OCI manifest are validated against path traversal
 - Volume container paths must be absolute and must not contain `..`
 - Tar extraction uses `--no-same-permissions --no-same-owner` to prevent setuid bit restoration
+- Extended attributes from layers are allowlisted to `user.*` and `trusted.overlay.*` when merging into the rootfs. `security.capability` is dropped: a file capability set grants the same privilege as a setuid bit, so copying it verbatim would walk around the set-ID strip above
+- `--keep-directory-symlink` is passed only to GNU tar ≥ 1.32, which refuses to traverse a symlink it created earlier in the same run. On older or non-GNU tar the flag is dropped and symlinked directories are replaced with real ones
 - Temporary directories are created with `mkdtemp` (mode `0700`)
 
 ---
@@ -3060,6 +3069,8 @@ Remember that the other end of an MCP session is typically a model. Grant the na
 **Inspect support:**
 
 Any oci2bin binary supports `OCI2BIN_INSPECT=1` in its environment: it prints a JSON object with `entrypoint`, `cmd`, and `env` from the embedded OCI config to stdout, then exits. The `inspect_image` MCP tool uses this mechanism.
+
+Inspection extracts the embedded layout, so it is subject to the same launch policy as a normal run: on a binary built with `--require-signed` or `--pin-digest`, `OCI2BIN_INSPECT=1` refuses before extracting unless the check passes. The same applies to `mcp-serve`.
 
 **Example (connect from Claude Desktop):**
 

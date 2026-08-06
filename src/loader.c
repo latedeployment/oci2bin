@@ -3318,6 +3318,40 @@ static int ensure_directory_in_root(int rootfs_fd, const char* relpath)
     return rc;
 }
 
+/*
+ * Which xattrs may cross from a staged layer file into the rootfs.
+ *
+ * apply_fd_metadata() strips set-ID bits because a crafted layer must not be
+ * able to plant a setuid binary. `security.capability` grants the same thing
+ * in a different encoding — a file capability set is exactly "run this with
+ * privilege I did not have" — so copying the security.* namespace verbatim
+ * reopened the hole the mode strip closes. It is only settable with
+ * CAP_SETFCAP, so this bites when oci2bin runs privileged or as root inside a
+ * user namespace, which is precisely when it matters.
+ *
+ * Allowlist rather than deny security.*: SELinux/SMACK labels from an
+ * untrusted image are equally not ours to reapply, and a new privileged
+ * namespace should default to "not copied" rather than silently pass through.
+ */
+static int layer_xattr_is_allowed(const char* name)
+{
+    static const char* prefixes[] =
+    {
+        "user.",             /* image-supplied metadata, unprivileged */
+        "trusted.overlay.",  /* opaque-dir / redirect markers between layers */
+    };
+
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+    {
+        size_t plen = strlen(prefixes[i]);
+        if (strncmp(name, prefixes[i], plen) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int copy_fd_xattrs(int src_fd, int dst_fd)
 {
     ssize_t names_len = flistxattr(src_fd, NULL, 0);
@@ -3363,6 +3397,12 @@ static int copy_fd_xattrs(int src_fd, int dst_fd)
             rc = -1;
             break;
         }
+        if (!layer_xattr_is_allowed(name))
+        {
+            debug_log("xattr.drop", "name=%s", name);
+            name += name_len + 1;
+            continue;
+        }
         ssize_t value_len = fgetxattr(src_fd, name, NULL, 0);
         if (value_len < 0 ||
                 (size_t)value_len > MAX_LAYER_XATTR_BYTES - total_bytes)
@@ -3383,8 +3423,21 @@ static int copy_fd_xattrs(int src_fd, int dst_fd)
         }
         ssize_t value_got = fgetxattr(src_fd, name, value,
                                       (size_t)value_len);
-        if (value_got != value_len ||
-                fsetxattr(dst_fd, name, value, (size_t)value_len, 0) < 0)
+        if (value_got != value_len)
+        {
+            free(value);
+            rc = -1;
+            break;
+        }
+        /* A destination that will not take the attribute is not a reason to
+         * abort the whole layer merge and leave the image unrunnable: the
+         * target filesystem may not support xattrs at all, or may refuse the
+         * namespace to an unprivileged caller. Dropping an allowlisted,
+         * non-privilege-bearing attribute is the safe outcome; anything else
+         * still fails. */
+        if (fsetxattr(dst_fd, name, value, (size_t)value_len, 0) < 0 &&
+                errno != ENOTSUP && errno != EOPNOTSUPP && errno != EPERM &&
+                errno != EACCES)
         {
             free(value);
             rc = -1;
@@ -3971,6 +4024,84 @@ static int safe_merge_walk(struct layer_merge_ctx* ctx, int cur_dir_fd,
 }
 
 /*
+ * May we pass --keep-directory-symlink to tar?
+ *
+ * The flag asks tar to extract into a symlinked directory instead of
+ * replacing the symlink with a real one, which is what preserves merged-/usr
+ * layouts. It is only safe because GNU tar >= 1.32 refuses to traverse a
+ * symlink it created earlier in the same run: without that, a layer holding
+ * "foo -> /etc" followed by "foo/passwd" writes straight through to the host.
+ *
+ * That is a load-bearing assumption about a host binary, so check it instead
+ * of assuming it. When we cannot confirm a tar that implements the
+ * protection, the flag is dropped and tar falls back to replacing the symlink
+ * with a real directory — more conservative, and safe on every version.
+ */
+/* Split out so the version gate can be tested without a tar on the host. */
+static int tar_version_output_is_safe(const char* version_output)
+{
+    static const char marker[] = "(GNU tar) ";
+
+    if (!version_output)
+    {
+        return 0;
+    }
+    const char* p = strstr(version_output, marker);
+    if (!p)
+    {
+        return 0; /* not GNU tar, or an unrecognizable banner */
+    }
+    p += sizeof(marker) - 1;
+    if (*p < '0' || *p > '9')
+    {
+        return 0;
+    }
+    int         major = atoi(p);
+    const char* dot   = strchr(p, '.');
+    int         minor = (dot && dot[1] >= '0' && dot[1] <= '9')
+                        ? atoi(dot + 1) : 0;
+    return (major > 1 || (major == 1 && minor >= 32)) ? 1 : 0;
+}
+
+static int tar_keeps_directory_symlink_safely(void)
+{
+    static int cached = -1;
+
+    if (cached >= 0)
+    {
+        return cached;
+    }
+
+    char*  ver_argv[] = { "tar", "--version", NULL };
+    size_t out_len    = 0;
+    char*  out        = run_cmd_capture(ver_argv, &out_len);
+    /* run_cmd_capture() returns a length-counted buffer that is *not*
+     * NUL-terminated, so the string scan below would run off the end of the
+     * allocation. Copy it into a terminated buffer first. */
+    char*  ver        = NULL;
+    if (out)
+    {
+        ver = malloc(out_len + 1);
+        if (ver)
+        {
+            memcpy(ver, out, out_len);
+            ver[out_len] = '\0';
+        }
+        free(out);
+    }
+    cached = tar_version_output_is_safe(ver);
+    free(ver);
+
+    if (!cached)
+    {
+        fprintf(stderr,
+                "oci2bin: tar does not identify as GNU tar >= 1.32; "
+                "extracting without --keep-directory-symlink\n");
+    }
+    return cached;
+}
+
+/*
  * safe_extract_layer: extract `tar_path` to a fresh staging directory
  * under `tmpdir_parent`, then merge the result into `rootfs_fd` using
  * symlink-safe primitives. Removes the staging directory before
@@ -3999,13 +4130,24 @@ static int safe_extract_layer_path(int rootfs_fd, const char* tar_path,
         perror("oci2bin: mkdir stage");
         return -1;
     }
-    char* tar_argv[] =
+    char* tar_argv[14];
+    int   a        = 0;
+    tar_argv[a++] = "tar";
+    tar_argv[a++] = "xf";
+    tar_argv[a++] = (char*)tar_path;
+    tar_argv[a++] = "-C";
+    tar_argv[a++] = stage;
+    tar_argv[a++] = "--no-same-permissions";
+    tar_argv[a++] = "--no-same-owner";
+    tar_argv[a++] = "--xattrs";
+    tar_argv[a++] = "--xattrs-include=*";
+    tar_argv[a++] = "--acls";
+    tar_argv[a++] = "--delay-directory-restore";
+    if (tar_keeps_directory_symlink_safely())
     {
-        "tar", "xf", (char*)tar_path, "-C", stage,
-        "--no-same-permissions", "--no-same-owner",
-        "--xattrs", "--xattrs-include=*", "--acls",
-        "--delay-directory-restore", "--keep-directory-symlink", NULL
-    };
+        tar_argv[a++] = "--keep-directory-symlink";
+    }
+    tar_argv[a] = NULL;
     int tar_rc = run_cmd_umask(tar_argv, 0);
     int merge_rc = -1;
     if (tar_rc == 0)
@@ -5992,12 +6134,20 @@ static int extract_embedded_oci_layout(const char* self_path,
                 "oci2bin: OCI tar contains unsafe entry names; refusing\n");
         return -1;
     }
-    char* tar_argv[] =
+    char* tar_argv[9];
+    int   a       = 0;
+    tar_argv[a++] = "tar";
+    tar_argv[a++] = "xf";
+    tar_argv[a++] = (char*)tar_input;
+    tar_argv[a++] = "-C";
+    tar_argv[a++] = oci_dir_out;
+    tar_argv[a++] = "--no-same-permissions";
+    tar_argv[a++] = "--no-same-owner";
+    if (tar_keeps_directory_symlink_safely())
     {
-        "tar", "xf", (char*)tar_input, "-C", oci_dir_out,
-        "--no-same-permissions", "--no-same-owner",
-        "--keep-directory-symlink", NULL
-    };
+        tar_argv[a++] = "--keep-directory-symlink";
+    }
+    tar_argv[a] = NULL;
     if (run_cmd(tar_argv) != 0)
     {
         fprintf(stderr, "oci2bin: failed to extract OCI tar\n");
@@ -15774,12 +15924,25 @@ static int verify_signature(const char* self_path, const char* key_path)
         return -1;
     }
 
+    /* Resolve openssl ourselves instead of letting subprocess search PATH:
+     * an attacker-writable early PATH entry could otherwise supply a stub
+     * that exits 0, and every signature check in this binary would report
+     * success on an arbitrary payload. */
+    char openssl_bin[PATH_MAX];
+    if (find_helper_binary("openssl", openssl_bin, sizeof(openssl_bin)) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --verify-key: openssl not found in /usr/bin, /bin,"
+                " /usr/sbin or /sbin; cannot verify\n");
+        return -1;
+    }
+
     static const char script[] =
         "import os,struct,subprocess,sys,tempfile\n"
         "SIGMAGIC=b'OCI2BIN_SIG\\x00'\n"
         "TRAILER=b'OCI2BIN_SIG_END\\x00'\n"
         "ALGOS={1:'sha256',3:'sha512'}\n"
-        "path,keyfile=sys.argv[1],sys.argv[2]\n"
+        "path,keyfile,osslbin=sys.argv[1],sys.argv[2],sys.argv[3]\n"
         "data=open(path,'rb').read()\n"
         "block_start=None\n"
         "sig=None\n"
@@ -15804,17 +15967,17 @@ static int verify_signature(const char* self_path, const char* key_path)
         "with tempfile.TemporaryDirectory(prefix='oci2bin-vk-') as td:\n"
         " sf=os.path.join(td,'sig.der');open(sf,'wb').write(sig)\n"
         " try:\n"
-        "  r=subprocess.run(['openssl','dgst','-'+algo,'-verify',keyfile,"
+        "  r=subprocess.run([osslbin,'dgst','-'+algo,'-verify',keyfile,"
         "'-signature',sf],input=content,stdout=subprocess.DEVNULL,"
         "stderr=subprocess.DEVNULL)\n"
-        " except FileNotFoundError:\n"
-        "  sys.stderr.write('oci2bin: --verify-key: openssl not found; "
+        " except OSError:\n"
+        "  sys.stderr.write('oci2bin: --verify-key: cannot run openssl; "
         "cannot verify\\n');sys.exit(1)\n"
         " if r.returncode!=0:\n"
         "  sys.exit(1)\n"
         "sys.exit(0)\n";
 
-    if (run_python_helper(script, self_path, key_path, NULL, NULL) != 0)
+    if (run_python_helper(script, self_path, key_path, openssl_bin, NULL) != 0)
     {
         fprintf(stderr,
                 "oci2bin: signature verification failed — "
@@ -15852,22 +16015,36 @@ static int run_python_helper(const char* script, const char* arg1,
 
 static int verify_pinned_digest(const char* self_path)
 {
+    /* The script strips a trailing signature block only when it really is
+     * one: a bare trailer plus a crafted length would otherwise cut the
+     * metadata out of `data` and skip the pin check entirely. Same test the
+     * --require-signed verifier and read_self_metadata() apply.
+     *
+     * Keep comments out of the string-literal sequence below — the test
+     * suite extracts these scripts by matching adjacent literals, and a
+     * comment between them silently ends the match. */
     static const char script[] =
         "import hashlib,json,re,struct,sys\n"
         "MAGIC=b'OCI2BIN_META\\x00'\n"
+        "SIGMAGIC=b'OCI2BIN_SIG\\x00'\n"
         "TRAILER=b'OCI2BIN_SIG_END\\x00'\n"
         "SUPPORTED={'sha256':64,'sha512':128}\n"
         "path=sys.argv[1]\n"
         "data=open(path,'rb').read()\n"
         "if len(data)>=20 and data[-20:-4]==TRAILER:\n"
         " t=struct.unpack('>I',data[-4:])[0]\n"
-        " data=data[:-t] if 0<t<=len(data) else data\n"
+        " bs=len(data)-t\n"
+        " if 0<t<=len(data) and data[bs:bs+len(SIGMAGIC)]==SIGMAGIC:\n"
+        "  data=data[:bs]\n"
         "m=data.rfind(MAGIC)\n"
         "sys.exit(0) if m<4 else None\n"
         "tot=struct.unpack_from('<I',data,m-4)[0]\n"
         "js=m+len(MAGIC)\n"
         "je=(m-4)+tot\n"
-        "sys.exit(0) if je>len(data) or je<=js else None\n"
+        "if je>len(data) or je<=js:\n"
+        " sys.stderr.write('oci2bin: embedded metadata block framing is'"
+        "  ' inconsistent; refusing to run\\n')\n"
+        " sys.exit(1)\n"
         "try:\n"
         " meta=json.loads(data[js:je].rstrip(b'\\x00'))\n"
         "except Exception:\n"
@@ -15932,9 +16109,16 @@ static int verify_pinned_digest(const char* self_path)
 static int read_self_metadata(const char* self_path, char** out)
 {
     static const char meta_magic[]  = "OCI2BIN_META";
+    static const char sig_magic[]   = "OCI2BIN_SIG";
     static const char sig_trailer[] = "OCI2BIN_SIG_END";
     const size_t magic_len = sizeof(meta_magic); /* includes the NUL */
-    const size_t window    = 1024u * 1024u;
+    /* Backward-scan chunk size, not a search bound — see the loop below. */
+    const size_t window = 1024u * 1024u;
+    /* The block holds a small JSON object (image ref, version, a PEM key).
+     * Cap it before malloc so a crafted length cannot request an absurd
+     * allocation; over the cap we return -1, which callers treat as "refuse",
+     * so being stricter than python here can only fail closed. */
+    const size_t META_MAX_BYTES = 1024u * 1024u;
 
     *out = NULL;
 
@@ -15974,92 +16158,140 @@ static int read_self_metadata(const char* self_path, char** out)
                 close(fd);
                 return -1; /* trailer present but length is nonsense */
             }
-            content_end = size - (off_t)total;
+            /* The python verifiers only treat the tail as a signature block
+             * when OCI2BIN_SIG is actually at its start. Without the same
+             * check here, 20 appended bytes (trailer + a length that reaches
+             * back past the metadata) make C see truncated content with no
+             * OCI2BIN_META in it — "no policy" — while python still finds the
+             * block and its require_signed flag. That differential is a
+             * policy bypass, so the two must agree on where content ends. */
+            off_t bs = size - (off_t)total;
+            char  sm[sizeof(sig_magic)];
+            if (bs + (off_t)sizeof(sm) <= size)
+            {
+                if (lseek(fd, bs, SEEK_SET) < 0 ||
+                        read_all_fd(fd, sm, sizeof(sm)) != (ssize_t)sizeof(sm))
+                {
+                    close(fd);
+                    return -1;
+                }
+                if (memcmp(sm, sig_magic, sizeof(sm)) == 0)
+                {
+                    content_end = bs;
+                }
+            }
         }
     }
 
-    size_t want = (size_t)content_end < window ? (size_t)content_end : window;
-    if (want < magic_len + 4)
+    if ((size_t)content_end < magic_len + 4)
     {
         close(fd);
         return 0;
     }
-    off_t base = content_end - (off_t)want;
-    if (lseek(fd, base, SEEK_SET) < 0)
-    {
-        close(fd);
-        return -1;
-    }
-    char* buf = malloc(want);
+
+    /*
+     * Find the last OCI2BIN_META over the whole content, scanning backwards a
+     * chunk at a time. The python verifier does an unbounded rfind(), so a
+     * bounded search here is a parser differential, not an optimization: pad
+     * past the bound and C reports "no metadata" — hence "no policy" — while
+     * python still finds the block. The two must agree on the same bytes.
+     *
+     * Chunks overlap by magic_len-1 so a block straddling a boundary is still
+     * found. The builder always appends this near the end, so a well-formed
+     * binary is satisfied by the first chunk and pays exactly what the old
+     * fixed window cost; only a binary that hides the block scans further.
+     */
+    off_t  mabs      = -1;
+    size_t overlap   = magic_len - 1;
+    off_t  chunk_end = content_end;
+    char*  buf       = malloc(window);
     if (!buf)
     {
         close(fd);
         return -1;
     }
-    ssize_t got = read_all_fd(fd, buf, want);
-    close(fd);
-    if (got < 0 || (size_t)got != want)
+    while (chunk_end >= (off_t)(magic_len) && mabs < 0)
     {
-        free(buf);
-        return -1;
-    }
-
-    /* Last occurrence of the magic within the window. */
-    char* found = NULL;
-    for (size_t off = 0; off + magic_len <= want; )
-    {
-        char* hit = memmem(buf + off, want - off, meta_magic, magic_len);
-        if (!hit)
+        size_t want = (size_t)chunk_end < window ? (size_t)chunk_end : window;
+        off_t  base = chunk_end - (off_t)want;
+        if (lseek(fd, base, SEEK_SET) < 0 ||
+                read_all_fd(fd, buf, want) != (ssize_t)want)
+        {
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        for (size_t off = 0; off + magic_len <= want; )
+        {
+            char* hit = memmem(buf + off, want - off, meta_magic, magic_len);
+            if (!hit)
+            {
+                break;
+            }
+            mabs = base + (off_t)(hit - buf);
+            off  = (size_t)(hit - buf) + 1;
+        }
+        if (base == 0)
         {
             break;
         }
-        found = hit;
-        off = (size_t)(hit - buf) + 1;
+        chunk_end = base + (off_t)overlap;
     }
-    if (!found)
+    free(buf);
+
+    if (mabs < 0)
     {
-        free(buf);
+        close(fd);
         return 0; /* no metadata block */
     }
+    if (mabs < 4)
+    {
+        close(fd);
+        return -1;
+    }
 
-    size_t m = (size_t)(found - buf);
-    if (m < 4)
+    /* Framing: [ LE32 total ]["OCI2BIN_META\0"][ JSON ][ NUL pad ], where
+     * total spans from the length field itself to the end of the padding. */
+    unsigned char lenbuf[4];
+    if (lseek(fd, mabs - 4, SEEK_SET) < 0 ||
+            read_all_fd(fd, (char*)lenbuf, 4) != 4)
     {
-        free(buf);
+        close(fd);
         return -1;
     }
-    unsigned long tot =
-        ((unsigned long)(unsigned char)buf[m - 4]) |
-        ((unsigned long)(unsigned char)buf[m - 3] << 8) |
-        ((unsigned long)(unsigned char)buf[m - 2] << 16) |
-        ((unsigned long)(unsigned char)buf[m - 1] << 24);
-    size_t js = m + magic_len;
-    if (tot < 4 || (m - 4) + tot > want)
+    unsigned long tot = ((unsigned long)lenbuf[0]) |
+                        ((unsigned long)lenbuf[1] << 8) |
+                        ((unsigned long)lenbuf[2] << 16) |
+                        ((unsigned long)lenbuf[3] << 24);
+    off_t js = mabs + (off_t)magic_len;
+    off_t je = (mabs - 4) + (off_t)tot;
+    if (tot < 4 || tot > META_MAX_BYTES || je > content_end || je <= js)
     {
-        free(buf);
+        close(fd);
         return -1;
     }
-    size_t je = (m - 4) + tot;
-    if (je <= js)
-    {
-        free(buf);
-        return -1;
-    }
-    /* Trim the NUL padding the builder adds. */
-    while (je > js && buf[je - 1] == '\0')
-    {
-        je--;
-    }
-    size_t json_len = je - js;
-    char* json = malloc(json_len + 1);
+
+    size_t json_len = (size_t)(je - js);
+    char*  json     = malloc(json_len + 1);
     if (!json)
     {
-        free(buf);
+        close(fd);
         return -1;
     }
-    memcpy(json, buf + js, json_len);
+    if (lseek(fd, js, SEEK_SET) < 0 ||
+            read_all_fd(fd, json, json_len) != (ssize_t)json_len)
+    {
+        free(json);
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    /* Trim the NUL padding the builder adds. */
+    while (json_len > 0 && json[json_len - 1] == '\0')
+    {
+        json_len--;
+    }
     json[json_len] = '\0';
-    free(buf);
     *out = json;
     return 1;
 }
@@ -16120,6 +16352,23 @@ static int enforce_require_signed(const char* self_path)
         return 0;
     }
 
+    /* Same reasoning as verify_signature(): the verifier must not be
+     * selectable through PATH, or the policy is enforced by whatever
+     * 'openssl' the caller's environment happens to point at. */
+    char openssl_bin[PATH_MAX];
+    if (find_helper_binary("openssl", openssl_bin, sizeof(openssl_bin)) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --require-signed: openssl not found in /usr/bin,"
+                " /bin, /usr/sbin or /sbin; refusing to run\n");
+        return 1;
+    }
+
+    /* The script below only runs once the C side has already found a
+     * require_signed policy in the metadata block, so every way of failing to
+     * re-derive that policy here means the two parsers disagree about the same
+     * bytes. That is exactly the condition this check exists to catch, so all
+     * of those paths refuse rather than falling back to "there is no policy". */
     static const char script[] =
         "import json,os,struct,subprocess,sys,tempfile\n"
         "MAGIC=b'OCI2BIN_META\\x00'\n"
@@ -16143,18 +16392,22 @@ static int enforce_require_signed(const char* self_path)
         "   off+=32\n"
         "   siglen=struct.unpack('>H',data[off:off+2])[0];off+=2\n"
         "   sig=data[off:off+siglen]\n"
+        "def refuse(why):\n"
+        " sys.stderr.write('oci2bin: --require-signed: '+why+'; refusing to "
+        "run\\n');sys.exit(1)\n"
         "content=data[:block_start] if block_start is not None else data\n"
         "m=content.rfind(MAGIC)\n"
-        "sys.exit(0) if m<4 else None\n"
+        "refuse('embedded metadata block not found') if m<4 else None\n"
         "tot2=struct.unpack_from('<I',content,m-4)[0]\n"
         "js=m+len(MAGIC);je=(m-4)+tot2\n"
-        "sys.exit(0) if je>len(content) or je<=js else None\n"
+        "refuse('embedded metadata block framing is inconsistent')"
+        " if je>len(content) or je<=js else None\n"
         "try:\n"
         " meta=json.loads(content[js:je].rstrip(b'\\x00'))\n"
         "except Exception:\n"
-        " sys.exit(0)\n"
+        " refuse('embedded metadata is not valid JSON')\n"
         "if not meta.get('require_signed'):\n"
-        " sys.exit(0)\n"
+        " refuse('metadata parsers disagree about the signature policy')\n"
         "pub=meta.get('verify_pubkey','')\n"
         "if not pub or sig is None:\n"
         " sys.stderr.write('oci2bin: --require-signed: no valid signature "
@@ -16163,17 +16416,58 @@ static int enforce_require_signed(const char* self_path)
         " pf=os.path.join(td,'pub.pem');open(pf,'w').write(pub)\n"
         " sf=os.path.join(td,'sig.der');open(sf,'wb').write(sig)\n"
         " try:\n"
-        "  r=subprocess.run(['openssl','dgst','-'+algo,'-verify',pf,"
+        "  r=subprocess.run([sys.argv[2],'dgst','-'+algo,'-verify',pf,"
         "'-signature',sf],input=content,stdout=subprocess.DEVNULL,"
         "stderr=subprocess.DEVNULL)\n"
-        " except FileNotFoundError:\n"
-        "  sys.stderr.write('oci2bin: --require-signed: openssl not found; "
+        " except OSError:\n"
+        "  sys.stderr.write('oci2bin: --require-signed: cannot run openssl; "
         "cannot verify; refusing to run\\n');sys.exit(1)\n"
         " if r.returncode!=0:\n"
         "  sys.stderr.write('oci2bin: --require-signed: signature "
         "verification failed; refusing to run\\n');sys.exit(1)\n"
         "sys.exit(0)\n";
-    return run_python_helper(script, self_path, NULL, NULL, NULL);
+    return run_python_helper(script, self_path, openssl_bin, NULL, NULL);
+}
+
+/*
+ * Every gate that must pass before this binary acts on its embedded payload:
+ * the polyglot markers, the pinned-digest check, and the --require-signed
+ * policy.
+ *
+ * Bundled into one call because these ran at step 3 of main()'s dispatcher,
+ * *after* OCI2BIN_INSPECT and mcp-serve had already been dispatched — both of
+ * which extract and act on untrusted layer data, so an environment variable
+ * alone was enough to launch a require_signed binary with the policy never
+ * consulted. Any new entry point that touches the payload calls this first;
+ * ordering inside a dispatcher is not a safe place to keep a trust decision.
+ *
+ * `opts` may be NULL on paths that run before option parsing — notify_event()
+ * already no-ops on NULL, so those paths simply get no notification.
+ */
+static int enforce_launch_policy(const char* self_path,
+                                 const struct container_opts* opts)
+{
+    if (OCI_PATCHED != 1)
+    {
+        fprintf(stderr,
+                "oci2bin: OCI data markers not patched!\n"
+                "This binary must be built with the polyglot builder.\n");
+        return 1;
+    }
+
+    if (verify_pinned_digest(self_path) != 0)
+    {
+        return 1;
+    }
+
+    if (enforce_require_signed(self_path) != 0)
+    {
+        notify_event(opts, "sig_mismatch",
+                     "\"key\":\"require-signed policy\"");
+        return 1;
+    }
+
+    return 0;
 }
 
 static int run_self_update(const char* self_path, const char* key_path,
@@ -20183,15 +20477,26 @@ int main(int argc, char* argv[])
     self_path[len] = '\0';
     debug_log("main.self", "path=%s", self_path);
 
-    /* 1a. OCI2BIN_INSPECT=1: print image metadata as JSON and exit */
+    /* 1a. OCI2BIN_INSPECT=1: print image metadata as JSON and exit.
+     * Extracts the embedded layout, so the launch policy gates it — an env
+     * var must not be a way around --require-signed. */
     if (getenv("OCI2BIN_INSPECT"))
     {
+        if (enforce_launch_policy(self_path, NULL) != 0)
+        {
+            return 1;
+        }
         return inspect_image_main(self_path);
     }
 
-    /* 1b. "mcp-serve" subcommand: start JSON-RPC 2.0 MCP server */
+    /* 1b. "mcp-serve" subcommand: start JSON-RPC 2.0 MCP server. Gated for
+     * the same reason: it extracts and runs the payload on request. */
     if (argc >= 2 && strcmp(argv[1], "mcp-serve") == 0)
     {
+        if (enforce_launch_policy(self_path, NULL) != 0)
+        {
+            return 1;
+        }
         int allow_net = 0;
         for (int i = 2; i < argc; i++)
         {
@@ -20356,16 +20661,17 @@ int main(int argc, char* argv[])
     debug_log("main.oci_blob", "offset=0x%lx size=0x%lx",
               OCI_DATA_OFFSET, OCI_DATA_SIZE);
 
-    /* 3. Sanity check the markers */
-    if (OCI_PATCHED != 1)
+    /* 3. Marker sanity, pinned digest, and the self-enforcing signature
+     * policy (--require-signed) — all before any extraction. Same gate the
+     * inspect and mcp-serve entry points run above. */
+    if (enforce_launch_policy(self_path, &opts) != 0)
     {
-        fprintf(stderr,
-                "oci2bin: OCI data markers not patched!\n"
-                "This binary must be built with the polyglot builder.\n");
         return 1;
     }
 
-    /* 3a. Verify binary signature before any extraction */
+    /* 3a. Verify the binary against an operator-supplied key. Runs after the
+     * embedded policy so a binary that refuses to launch stays refused
+     * regardless of which key the caller passes. */
     if (opts.verify_key)
     {
         if (verify_signature(self_path, opts.verify_key) < 0)
@@ -20374,20 +20680,6 @@ int main(int argc, char* argv[])
                          "\"key\":\"verify-key supplied\"");
             return 1;
         }
-    }
-
-    if (verify_pinned_digest(self_path) != 0)
-    {
-        return 1;
-    }
-
-    /* 3b. Self-enforcing signature policy (--require-signed): refuse to run
-     * unless a valid signature from the embedded trusted key is present. */
-    if (enforce_require_signed(self_path) != 0)
-    {
-        notify_event(&opts, "sig_mismatch",
-                     "\"key\":\"require-signed policy\"");
-        return 1;
     }
 
     if (opts.check_update || opts.self_update)

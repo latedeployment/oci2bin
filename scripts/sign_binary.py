@@ -102,6 +102,24 @@ DEFAULT_SIGNATURE_HASH = "sha512"
 # Total trailing bytes: TRAILER(16) + totallen(4) = 20
 FOOTER_SIZE = len(TRAILER) + 4
 
+# openssl is the trust decision in every signing and verification path here,
+# so it is resolved from a fixed list of system directories rather than PATH.
+# A stub named `openssl` in an attacker-writable early PATH entry would
+# otherwise make every verify() return success on an arbitrary payload.
+_OPENSSL_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+
+def _openssl() -> str:
+    """Return an absolute path to openssl, or exit if it is not installed."""
+    for directory in _OPENSSL_DIRS:
+        candidate = os.path.join(directory, "openssl")
+        if os.access(candidate, os.X_OK):
+            return candidate
+    print("sign_binary: openssl not found in "
+          + ", ".join(_OPENSSL_DIRS)
+          + "; cannot sign or verify", file=sys.stderr)
+    sys.exit(1)
+
 
 def _read_file_limited(path: str, max_bytes: int) -> bytes:
     with open(path, "rb") as f:
@@ -188,14 +206,14 @@ def _compute_keyid(pubkey_pem: bytes) -> bytes:
         tmpname = f.name
     try:
         result = subprocess.run(
-            ["openssl", "ec", "-pubin", "-in", tmpname,
+            [_openssl(), "ec", "-pubin", "-in", tmpname,
              "-outform", "DER"],
             capture_output=True,
         )
         if result.returncode != 0:
             # Try as a private key and extract the public key
             result2 = subprocess.run(
-                ["openssl", "ec", "-in", tmpname,
+                [_openssl(), "ec", "-in", tmpname,
                  "-pubout", "-outform", "DER"],
                 capture_output=True,
             )
@@ -219,7 +237,7 @@ def _read_pubkey_der_from_privkey(privkey_pem: bytes) -> bytes:
         tmpname = f.name
     try:
         result = subprocess.run(
-            ["openssl", "ec", "-in", tmpname, "-pubout", "-outform", "DER"],
+            [_openssl(), "ec", "-in", tmpname, "-pubout", "-outform", "DER"],
             capture_output=True,
         )
         if result.returncode != 0:
@@ -515,7 +533,7 @@ def _rekor_upload(out_path: str, signed_content: bytes, key_path: str,
                                          suffix=".pub") as pf:
             tmp_pub = pf.name
         pub = subprocess.run(
-            ["openssl", "pkey", "-in", key_path, "-pubout", "-out", tmp_pub],
+            [_openssl(), "pkey", "-in", key_path, "-pubout", "-out", tmp_pub],
             capture_output=True)
         if pub.returncode != 0:
             print("sign_binary: --rekor: could not derive public key: "
@@ -986,7 +1004,7 @@ def _sign_hash_with_key(key_path: str, digest: bytes, algorithm: str) -> bytes:
         sig_path = sigf.name
     try:
         result = subprocess.run(
-            ["openssl", "pkeyutl", "-sign",
+            [_openssl(), "pkeyutl", "-sign",
              "-inkey", key_path,
              "-in", hash_path,
              "-out", sig_path,
@@ -1022,7 +1040,7 @@ def _verify_hash_with_key(key_path: str, digest: bytes, sig_bytes: bytes,
         sig_path = sf.name
     try:
         result = subprocess.run(
-            ["openssl", "pkeyutl", "-verify",
+            [_openssl(), "pkeyutl", "-verify",
              "-pubin", "-inkey", key_tmp,
              "-in", hash_path,
              "-sigfile", sig_path,

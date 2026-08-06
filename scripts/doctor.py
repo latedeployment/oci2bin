@@ -330,13 +330,32 @@ def _check_kvm_libkrun():
         "; ".join(notes))
 
 
+def _find_openssl():
+    """Resolve openssl the way the loader and sign_binary.py do.
+
+    Both refuse to take `openssl` from PATH — it is the trust decision in
+    every verification path — so doctor must report on the same fixed
+    directories rather than on shutil.which().
+    """
+    for directory in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        candidate = os.path.join(directory, "openssl")
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _check_openssl_cosign():
     parts = []
     status = OK
     fix = ""
-    if _which("openssl") is None:
+    if _find_openssl() is None:
         status = DEGRADED
-        parts.append("openssl missing — signing flows unavailable")
+        if _which("openssl") is not None:
+            parts.append("openssl found only via PATH — signature "
+                         "verification requires it in /usr/bin, /bin, "
+                         "/usr/sbin or /sbin")
+        else:
+            parts.append("openssl missing — signing flows unavailable")
         fix = "apt install openssl"
     else:
         parts.append("openssl")
@@ -464,6 +483,29 @@ def _check_cross_toolchain():
     return _result(name, OK, cc)
 
 
+def _tar_version_note():
+    """Flag a tar that cannot safely take --keep-directory-symlink.
+
+    The loader passes that flag only to GNU tar >= 1.32, which refuses to
+    traverse a symlink it created earlier in the same run. Older or non-GNU
+    tar still works — the loader drops the flag — but a symlinked directory
+    in a layer is then replaced by a real one rather than followed, so it is
+    worth surfacing.
+    """
+    rc, out, _ = _run(["tar", "--version"])
+    if rc != 0 or "(GNU tar) " not in out:
+        return " (not GNU tar — --keep-directory-symlink disabled)"
+    version = out.split("(GNU tar) ", 1)[1].split()[0]
+    parts = version.split(".")
+    try:
+        major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return " (unparseable version — --keep-directory-symlink disabled)"
+    if (major, minor) < (1, 32):
+        return f" {version} (< 1.32 — --keep-directory-symlink disabled)"
+    return f" {version}"
+
+
 def _check_tar_gzip_zstd():
     parts = []
     status = OK
@@ -473,6 +515,8 @@ def _check_tar_gzip_zstd():
             status = MISSING
             fix = f"apt install {needed}"
             parts.append(f"{needed} missing")
+        elif needed == "tar":
+            parts.append(f"tar{_tar_version_note()}")
         else:
             parts.append(needed)
     if _which("zstd") is None:

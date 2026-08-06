@@ -207,6 +207,12 @@ oci2bin sign --key priv.pem --in app.bin
 ./app.bin
 ```
 
+All of these run the ECDSA check through `openssl`, which is resolved by
+absolute path from `/usr/bin`, `/bin`, `/usr/sbin` or `/sbin` — never through
+`$PATH`. An `openssl` reachable only via `$PATH` is treated as missing and the
+check fails closed, so a stub planted in an attacker-writable `$PATH` entry
+cannot make verification report success.
+
 Detached file signing:
 
 ```bash
@@ -250,6 +256,24 @@ Use a specific algorithm:
 ```bash
 oci2bin --pin-digest sha512:auto app:latest app.bin
 ```
+
+## Untrusted Layer Content
+
+Layer contents come from the image and are treated as attacker-controlled.
+
+Extraction passes `--no-same-permissions --no-same-owner` so a crafted layer
+cannot restore set-ID bits, and the merge step strips them again. Extended
+attributes are allowlisted to `user.*` and `trusted.overlay.*`;
+`security.capability` in particular is dropped, because a file capability set
+grants the same privilege as a setuid bit and would otherwise walk straight
+around the set-ID strip. This matters when oci2bin runs with `CAP_SETFCAP` —
+privileged, or as root inside a user namespace.
+
+`--keep-directory-symlink` is passed only to GNU tar 1.32 or newer, which
+refuses to traverse a symlink it created earlier in the same run. On an older
+or non-GNU tar the loader drops the flag and prints a notice; extraction then
+replaces a symlinked directory with a real one instead of following it.
+`oci2bin doctor` reports the host's tar version.
 
 ## Reproducible And Offline Builds
 

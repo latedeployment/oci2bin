@@ -41,7 +41,7 @@ small. Each dependency below is needed **only** for the feature in its row.
 
 | Dependency | Needed for | Hard / optional |
 | --- | --- | --- |
-| `tar` (with gzip support) | **Always** — rootfs extraction | Hard (the only universal runtime dep) |
+| `tar` (with gzip support) | **Always** — rootfs extraction | Hard (the only universal runtime dep). GNU tar >= 1.32 is used with `--keep-directory-symlink`; on older or non-GNU tar the loader drops that flag and replaces symlinked directories with real ones instead of following them |
 | `age` | Encrypted payloads (`--encrypt` / `--passphrase`) | Required if the image is encrypted |
 | `zstd` | Compressed payloads (`--compress-binary`) | Required if the payload is compressed |
 | `slirp4netns` | `--net slirp`, `-p PORT` | Required for that mode |
@@ -52,7 +52,7 @@ small. Each dependency below is needed **only** for the feature in its row.
 | `sqlite3` | `freeze` / `thaw` (DB-consistent snapshots) | Required for that subcommand |
 | `systemd-creds` | `--secret tpm2:NAME` | Required for TPM2 secrets (root only; also needs a credential in `/etc/credstore.encrypted` or another system credential store) |
 | `gdb` | `--gdb` | Required for that mode |
-| `openssl` + `python3` | `--verify-key`, `--require-signed`, `--pin-digest` runtime checks | Required if the binary enforces a signature/digest |
+| `openssl` + `python3` | `--verify-key`, `--require-signed`, `--pin-digest` runtime checks | Required if the binary enforces a signature/digest. Both are resolved by absolute path (`/usr/bin/python3`; `openssl` from `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and never through `$PATH` — an `openssl` installed elsewhere counts as missing and the check fails closed |
 | `curl` | `--notify` | Optional — notifications are silently skipped if absent |
 | `rekor-cli` | `oci2bin verify --rekor` (inclusion check) | Required for that check |
 | `/dev/kvm` | `--vm` (either backend) | Hard for VM mode |
@@ -105,7 +105,7 @@ cloud-hypervisor backend. See
 | `age` | `--encrypt`, `--passphrase` | Required for those flags |
 | `cosign` | `--verify-cosign`, `--require-cosign` | Required for those flags |
 | `rekor-cli` | `oci2bin sign --rekor` | Required for that flag |
-| `openssl` | `sign`, `verify`, `--require-signed` | Required for signing |
+| `openssl` | `sign`, `verify`, `--require-signed` | Required for signing. Resolved from `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin` only, not `$PATH` |
 | aarch64 cross-toolchain + sysroot | `--arch aarch64` / `--arch all` | Required for cross builds |
 | `pkg-config` + `libkrun`/`libkrun-dev` | Building the libkrun VM loader | Required for that loader |
 | `skopeo` / `crane` / `buildah` | Producing OCI layouts for `--oci-dir`; `skopeo` also works as a direct daemonless pull backend (`--pull-with skopeo`) | Optional, your choice of tool |

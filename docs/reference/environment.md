@@ -41,6 +41,10 @@ recursion guard, the container engine the wrapper resolved — `docker` or
 assuming `docker`, and passing the build-time cosign result into
 `sign --attest auto`). You normally do not set these.
 
+Setting `OCI2BIN_INSPECT=1` yourself is supported (see the README), but it is
+not a way around a binary's launch policy: it extracts the embedded layout, so
+`--require-signed` and `--pin-digest` are enforced before it does anything.
+
 ## Examples
 
 ```bash

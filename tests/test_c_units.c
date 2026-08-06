@@ -277,7 +277,7 @@ static void test_parse_opts(void)
         ASSERT_INT_EQ(r, 0, "parse_opts: -v :ro returns 0");
         ASSERT_STR_EQ(opts.vol_host[0], "/host", "parse_opts: -v :ro host split");
         ASSERT_STR_EQ(opts.vol_ctr[0],  "/ctr",  "parse_opts: -v :ro ctr split"
-                      " (suffix stripped)");
+                                        " (suffix stripped)");
         ASSERT_INT_EQ(opts.vol_ro[0], 1, "parse_opts: -v :ro sets vol_ro=1");
     }
 
@@ -1402,7 +1402,8 @@ static void test_parse_opts_misc_flags(void)
     {
         char arg[] = "/var/overlay";
         char* argv[] = {"prog", "--read-only", "--overlay-persist", arg,
-                        NULL};
+                        NULL
+                       };
         memset(&opts, 0, sizeof(opts));
         int r = parse_opts(4, argv, &opts);
         ASSERT_INT_EQ(r, 0,
@@ -1415,7 +1416,8 @@ static void test_parse_opts_misc_flags(void)
     {
         char arg[] = "/var/overlay";
         char* argv[] = {"prog", "--overlay-persist", arg, "--read-only",
-                        NULL};
+                        NULL
+                       };
         memset(&opts, 0, sizeof(opts));
         int r = parse_opts(4, argv, &opts);
         ASSERT_INT_EQ(r, 0,
@@ -1427,7 +1429,8 @@ static void test_parse_opts_misc_flags(void)
     }
     {
         char* argv[] = {"prog", "--profile", "prod", "--ephemeral-root",
-                        NULL};
+                        NULL
+                       };
         memset(&opts, 0, sizeof(opts));
         int r = parse_opts(4, argv, &opts);
         ASSERT_INT_EQ(r, 0,
@@ -6261,7 +6264,7 @@ static void test_json_has_key(void)
     ASSERT_INT_EQ(json_has_nonempty_key("{\"a\":{\"args\":[]},"
                                         "\"b\":{\"args\":[1]}}", "args",
                                         '['), 1,
-                  "json_has_nonempty_key: keeps scanning past an empty one");
+                                        "json_has_nonempty_key: keeps scanning past an empty one");
     ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":nullx}", "args", '['), 1,
                   "json_has_nonempty_key: malformed null is not empty");
     ASSERT_INT_EQ(json_has_nonempty_key("{\"args\":[]junk}", "args", '['), 1,
@@ -6626,12 +6629,20 @@ static size_t rsm_build(unsigned char* buf, size_t pad, const char* json,
     return o;
 }
 
-/* Append the signature footer: <trailer><BE32 total-of-sig-block>. */
+/* Append a signature block: <OCI2BIN_SIG\0><body><trailer><BE32 total>.
+ * The OCI2BIN_SIG magic at the block start is load-bearing — it is what
+ * distinguishes a real signature block from 20 appended bytes that merely
+ * look like one. */
 static size_t rsm_append_sig(unsigned char* buf, size_t o, size_t body,
                              unsigned long total_override)
 {
-    static const char trailer[] = "OCI2BIN_SIG_END";
+    static const char sigmagic[] = "OCI2BIN_SIG";
+    static const char trailer[]  = "OCI2BIN_SIG_END";
     memset(buf + o, 'S', body);
+    if (body >= sizeof(sigmagic))
+    {
+        memcpy(buf + o, sigmagic, sizeof(sigmagic));
+    }
     o += body;
     memcpy(buf + o, trailer, sizeof(trailer));
     o += sizeof(trailer);
@@ -6732,8 +6743,206 @@ static void test_read_self_metadata(void)
     free(meta);
     meta = NULL;
 
+    /* The search must not be bounded to a window near the end of the file.
+     * More than 1 MiB between the block and the signature footer used to push
+     * OCI2BIN_META outside a fixed 1 MiB window, so this reported "no
+     * metadata" — hence "no policy" — while the python verifier's unbounded
+     * rfind() still found the block and its require_signed flag. A parser
+     * differential here is a --require-signed bypass. */
+    {
+        const size_t   gap = 2u * 1024u * 1024u;
+        size_t         cap = gap + 8192u;
+        unsigned char* big = malloc(cap);
+        ASSERT_NOT_NULL(big, "read_self_metadata: alloc padded buffer");
+        if (big)
+        {
+            size_t bn = rsm_build(big, 512, json, -1);
+            memset(big + bn, 'P', gap);
+            bn += gap;
+            bn = rsm_append_sig(big, bn, 64, 0);
+            rsm_write(path, big, bn);
+            ASSERT_INT_EQ(read_self_metadata(path, &meta), 1,
+                          "read_self_metadata: finds a block >1 MiB from the"
+                          " end");
+            ASSERT_STR_EQ(meta ? meta : "", json,
+                          "read_self_metadata: distant block parses the same");
+            free(meta);
+            meta = NULL;
+            ASSERT_INT_EQ(has_require_signed_marker(path), 1,
+                          "read_self_metadata: policy survives >1 MiB of"
+                          " padding");
+            free(big);
+        }
+    }
+
+    /* A signature *footer* with no OCI2BIN_SIG block behind it must not move
+     * content_end. Otherwise 20 appended bytes — the trailer plus a length
+     * reaching back past the metadata — hide OCI2BIN_META from C ("no
+     * policy") while the python verifiers, which require the magic at the
+     * block start, still find it and its require_signed flag. */
+    n = rsm_build(buf, 512, json, -1);
+    {
+        static const char trailer[] = "OCI2BIN_SIG_END";
+        memcpy(buf + n, trailer, sizeof(trailer));
+        size_t        o     = n + sizeof(trailer);
+        /* Claim the whole tail back to before the metadata block. */
+        unsigned long total = (unsigned long)(o + 4 - 256);
+        buf[o++] = (unsigned char)((total >> 24) & 0xff);
+        buf[o++] = (unsigned char)((total >> 16) & 0xff);
+        buf[o++] = (unsigned char)((total >> 8) & 0xff);
+        buf[o++] = (unsigned char)(total & 0xff);
+        rsm_write(path, buf, o);
+    }
+    ASSERT_INT_EQ(read_self_metadata(path, &meta), 1,
+                  "read_self_metadata: a bare trailer is not a signature"
+                  " block");
+    free(meta);
+    meta = NULL;
+    ASSERT_INT_EQ(has_require_signed_marker(path), 1,
+                  "read_self_metadata: a bare trailer cannot strip the"
+                  " policy");
+
     unlink(path);
     rmdir(dir);
+}
+
+/*
+ * Layer xattrs are attacker-controlled. apply_fd_metadata() strips set-ID bits
+ * so a crafted layer cannot plant a setuid binary, but copy_fd_xattrs() used
+ * to copy every xattr verbatim — including security.capability, which grants
+ * the same privilege in a different encoding and so walked straight around the
+ * mode strip. The allowlist is the security decision, so it is pinned here
+ * name by name; security.capability cannot be set without CAP_SETFCAP, which
+ * is why this tests the predicate rather than a round trip.
+ */
+static void test_layer_xattr_allowlist(void)
+{
+    ASSERT_INT_EQ(layer_xattr_is_allowed("security.capability"), 0,
+                  "xattr allowlist: security.capability is dropped");
+    ASSERT_INT_EQ(layer_xattr_is_allowed("security.selinux"), 0,
+                  "xattr allowlist: security.selinux is dropped");
+    ASSERT_INT_EQ(layer_xattr_is_allowed("security.evm"), 0,
+                  "xattr allowlist: security.evm is dropped");
+    ASSERT_INT_EQ(layer_xattr_is_allowed("system.posix_acl_access"), 0,
+                  "xattr allowlist: system.* is dropped");
+    ASSERT_INT_EQ(layer_xattr_is_allowed("trusted.foo"), 0,
+                  "xattr allowlist: trusted.* outside overlay is dropped");
+    ASSERT_INT_EQ(layer_xattr_is_allowed("user.mime_type"), 1,
+                  "xattr allowlist: user.* is kept");
+    ASSERT_INT_EQ(layer_xattr_is_allowed("trusted.overlay.opaque"), 1,
+                  "xattr allowlist: overlay markers are kept");
+
+    /* Prefix confusion: the match is on "user." / "trusted.overlay.", so a
+     * name that merely starts with those letters must not slip through. */
+    ASSERT_INT_EQ(layer_xattr_is_allowed("username"), 0,
+                  "xattr allowlist: 'username' is not the user. namespace");
+    ASSERT_INT_EQ(layer_xattr_is_allowed("user"), 0,
+                  "xattr allowlist: bare 'user' is not the user. namespace");
+    ASSERT_INT_EQ(layer_xattr_is_allowed("trusted.overlayfs.x"), 0,
+                  "xattr allowlist: 'trusted.overlayfs' is not overlay.");
+    ASSERT_INT_EQ(layer_xattr_is_allowed(""), 0,
+                  "xattr allowlist: empty name is dropped");
+}
+
+/*
+ * copy_fd_xattrs() must still carry the allowlisted namespace across, and must
+ * not abort the whole layer merge when the destination will not take an
+ * attribute — that turned an unsettable xattr into an unrunnable image.
+ */
+static void test_copy_fd_xattrs(void)
+{
+    char tmpl[] = "/tmp/oci2bin-xattr-XXXXXX";
+    char* dir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(dir, "copy_fd_xattrs: mkdtemp");
+    if (!dir)
+    {
+        return;
+    }
+    char src_path[320], dst_path[320];
+    snprintf(src_path, sizeof(src_path), "%s/src", dir);
+    snprintf(dst_path, sizeof(dst_path), "%s/dst", dir);
+
+    int src_fd = open(src_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int dst_fd = open(dst_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    ASSERT(src_fd >= 0 && dst_fd >= 0, "copy_fd_xattrs: create temp files");
+    if (src_fd < 0 || dst_fd < 0)
+    {
+        goto out;
+    }
+
+    if (fsetxattr(src_fd, "user.oci2bin_test", "v", 1, 0) < 0)
+    {
+        /* Filesystems without user-xattr support (older tmpfs) cannot
+         * exercise this; the allowlist test above still covers the decision. */
+        printf("ok %d - copy_fd_xattrs: skipped, no user xattr support\n",
+               ++tap_test_num);
+        goto out;
+    }
+
+    ASSERT_INT_EQ(copy_fd_xattrs(src_fd, dst_fd), 0,
+                  "copy_fd_xattrs: succeeds on an allowlisted xattr");
+    char val[8] = {0};
+    ASSERT_INT_EQ((int)fgetxattr(dst_fd, "user.oci2bin_test", val,
+                                 sizeof(val)), 1,
+                  "copy_fd_xattrs: user.* reaches the destination");
+
+    /* A destination that rejects the attribute must not fail the merge. */
+    int null_fd = open("/dev/null", O_WRONLY);
+    if (null_fd >= 0)
+    {
+        ASSERT_INT_EQ(copy_fd_xattrs(src_fd, null_fd), 0,
+                      "copy_fd_xattrs: an unsettable xattr is dropped, not"
+                      " fatal");
+        close(null_fd);
+    }
+
+out:
+    if (src_fd >= 0)
+    {
+        close(src_fd);
+    }
+    if (dst_fd >= 0)
+    {
+        close(dst_fd);
+    }
+    unlink(src_path);
+    unlink(dst_path);
+    rmdir(dir);
+}
+
+/*
+ * --keep-directory-symlink tells tar to extract into a symlinked directory.
+ * That is only safe on GNU tar >= 1.32, which refuses to traverse a symlink
+ * it created earlier in the same run; on older tar a layer holding
+ * "foo -> /etc" then "foo/passwd" writes through to the host. The gate must
+ * therefore fail closed on anything it cannot positively identify.
+ */
+static void test_tar_version_gate(void)
+{
+    ASSERT_INT_EQ(tar_version_output_is_safe("tar (GNU tar) 1.35\n"), 1,
+                  "tar gate: 1.35 is safe");
+    ASSERT_INT_EQ(tar_version_output_is_safe("tar (GNU tar) 1.32\n"), 1,
+                  "tar gate: 1.32 is the boundary and is safe");
+    ASSERT_INT_EQ(tar_version_output_is_safe("tar (GNU tar) 2.0\n"), 1,
+                  "tar gate: a future major is safe");
+    ASSERT_INT_EQ(tar_version_output_is_safe("tar (GNU tar) 1.31\n"), 0,
+                  "tar gate: 1.31 is not safe");
+    ASSERT_INT_EQ(tar_version_output_is_safe("tar (GNU tar) 1.30\n"), 0,
+                  "tar gate: 1.30 is not safe");
+    ASSERT_INT_EQ(tar_version_output_is_safe("tar (GNU tar) 1.9\n"), 0,
+                  "tar gate: 1.9 sorts below 1.32, not above");
+    ASSERT_INT_EQ(tar_version_output_is_safe("bsdtar 3.7.2\n"), 0,
+                  "tar gate: bsdtar is not GNU tar");
+    ASSERT_INT_EQ(tar_version_output_is_safe("busybox tar\n"), 0,
+                  "tar gate: busybox tar is not GNU tar");
+    ASSERT_INT_EQ(tar_version_output_is_safe(""), 0,
+                  "tar gate: empty output fails closed");
+    ASSERT_INT_EQ(tar_version_output_is_safe(NULL), 0,
+                  "tar gate: NULL (capture failed) fails closed");
+    ASSERT_INT_EQ(tar_version_output_is_safe("tar (GNU tar) x.y\n"), 0,
+                  "tar gate: unparseable version fails closed");
+    ASSERT_INT_EQ(tar_version_output_is_safe("tar (GNU tar) 1\n"), 0,
+                  "tar gate: missing minor is treated as .0");
 }
 
 static void test_credential_file_is_safe(void)
@@ -6969,6 +7178,9 @@ int main(void)
     test_mcp_mount_root_policy();
     test_mountinfo_unescape();
     test_read_self_metadata();
+    test_layer_xattr_allowlist();
+    test_tar_version_gate();
+    test_copy_fd_xattrs();
     test_rm_rf_dir_does_not_cross_mounts();
     test_json_has_key();
     test_seccomp_profile_check_supported();

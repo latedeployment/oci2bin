@@ -4,6 +4,65 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **File capabilities from image layers are no longer copied into the rootfs.**
+  The merge step stripped set-ID bits but copied every extended attribute
+  verbatim, so a layer carrying `security.capability` on a binary reinstated
+  exactly the privilege the set-ID strip removes. Layer xattrs are now
+  allowlisted to `user.*` and `trusted.overlay.*`. Reachable when oci2bin runs
+  with `CAP_SETFCAP` — privileged, or as root inside a user namespace.
+
+- **The `--require-signed` verifier no longer fails open on a malformed
+  metadata block.** Missing magic, inconsistent framing and unparseable JSON
+  each returned "no policy" and ran the binary unverified, undoing the
+  fail-closed intent of the C-side check that invokes it. All of them now
+  refuse. The same framing check in the `--pin-digest` verifier was fail-open
+  too and now refuses.
+
+- **The metadata block is found wherever it is, not only in the last 1 MiB.**
+  The C parser searched a fixed window while the python verifier used an
+  unbounded `rfind()`, so more than 1 MiB of padding between the metadata and
+  signature blocks made C report "no policy" while python still saw one — a
+  `--require-signed` bypass. The C side now scans the whole content backwards
+  in chunks; a well-formed binary costs the same as before.
+
+- **`--keep-directory-symlink` is now gated on the tar version.** It was passed
+  unconditionally, but it is only safe on GNU tar >= 1.32, which refuses to
+  traverse a symlink it created earlier in the same run; on older tar a layer
+  holding `foo -> /etc` followed by `foo/passwd` could write outside the
+  staging directory. The loader now checks `tar --version` and drops the flag
+  when it cannot confirm a safe tar. `oci2bin doctor` reports the version.
+
+- **`OCI2BIN_INSPECT=1` and `mcp-serve` no longer bypass `--require-signed`.**
+  Both were dispatched by `main()` before the signature and pinned-digest
+  checks ran, so on a binary carrying a `require_signed` policy an environment
+  variable alone was enough to extract and act on untrusted layer data with the
+  policy never consulted. The marker check, `--pin-digest` verification and the
+  `--require-signed` policy are now one gate that every entry point touching
+  the embedded payload runs first. `--help`, `--version` and `--doctor` read no
+  payload and are deliberately still ungated, so an unverifiable binary stays
+  diagnosable.
+
+- **`openssl` is no longer resolved through `$PATH`.** Every signature check —
+  `--verify-key`, the `--require-signed` launch policy, `oci2bin sign` /
+  `verify` / `sign-file` / `verify-file`, and self-update — invoked a bare
+  `openssl`, so a stub named `openssl` in an attacker-writable `$PATH` entry
+  made all of them report success on an arbitrary payload without modifying
+  the binary. It is now resolved by absolute path from `/usr/bin`, `/bin`,
+  `/usr/sbin` or `/sbin`; an `openssl` reachable only via `$PATH` counts as
+  missing and the check fails closed. `oci2bin doctor` reports the same
+  distinction.
+
+### Fixed
+
+- **A layer merge no longer aborts on an xattr the destination will not
+  take.** `copy_fd_xattrs` treated any `fsetxattr` failure as fatal, so a
+  target filesystem without xattr support (or one refusing the namespace to an
+  unprivileged caller) made the whole image unrunnable. `ENOTSUP`,
+  `EOPNOTSUPP`, `EPERM` and `EACCES` now drop the attribute and continue;
+  other errors still fail.
+
 ## [0.18.0] - 2026-08-06
 
 ### Added
