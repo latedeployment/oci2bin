@@ -30,7 +30,7 @@ jobs:
           python-version: "3.x"
       - uses: astral-sh/setup-uv@v8.1.0
       - run: uv run --locked --group docs mkdocs build --strict
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
@@ -42,4 +42,4 @@ jobs:
     needs: build
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
