@@ -1,37 +1,31 @@
 # oci2bin
 
-**oci2bin** converts any Docker (OCI) image into a single executable file. The output runs as a rootless container on Linux - without Docker, without a daemon, and without any installation on the target.
-
-The output is an [ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): simultaneously a native Linux executable and a valid `docker save` tar archive.
-
-The result is close to a **hermetic executable**: the image layers, OCI config
-(entrypoint, cmd, env and workdir), and loader are all in one file. A normal
-run has two host requirements: a Linux kernel that allows unprivileged user
-namespaces, and `tar` to unpack the root filesystem. Optional features can add
-their own requirements; see [Dependencies](docs/reference/dependencies.md).
-
-With `oci2vm`, the file is deployed directly as a VM: copy it to a KVM host and
-run it to boot the image as a microVM. In that mode `/dev/kvm` and the selected
-VMM backend replace the user-namespace requirement.
-
-Here, “hermetic” describes how the output is packaged. It is separate from the
-`hermetic` metadata marker set by
-[`--offline-only`](#air-gap-seal----offline-only), which says that the build did
-not access a registry.
-
-See below [How it works](#how-it-works).
+**oci2bin** packages an OCI or Docker image as a single executable file. Copy it
+to a Linux host and run it without installing Docker or starting a daemon.
 
 ```bash
 oci2bin alpine:latest    # produces ./alpine_latest
-./alpine_latest          # runs the container
+./alpine_latest          # runs the image
 ```
+
+The result is mostly hermetic: it contains the image layers, OCI configuration
+and loader. A normal rootless run only needs a Linux kernel with unprivileged
+user namespaces and `tar`. Optional features can add
+[other requirements](docs/reference/dependencies.md).
+
+With `oci2vm`, the file is deployed directly as a microVM. Copy it to a KVM
+host and run it; VM mode requires `/dev/kvm` and a supported VMM backend.
+
+The file is also an
+[ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): a native
+Linux executable and a valid `docker save` archive.
 
 ## Useful features
 
 | Feature | Example |
 |---------|---------|
 | Pack any image into a single binary | `oci2bin redis:7-alpine` |
-| Run anywhere — no Docker, no daemon | `scp ./redis_7-alpine user@remote:/opt/redis/ && ssh user@remote /opt/redis/redis_7-alpine` |
+| Copy and run on Linux — no Docker, no daemon | `scp ./redis_7-alpine user@remote:/opt/redis/ && ssh user@remote /opt/redis/redis_7-alpine` |
 | Build from a chroot directory | `oci2bin from-chroot ./rootfs -o myapp.bin` |
 | Build from a Dockerfile | `oci2bin build-dockerfile -o myapp.bin` |
 | Daemonless pull (no Docker) | `oci2bin --pull-with skopeo redis:7-alpine` |
@@ -712,6 +706,9 @@ adds three guarantees on top of `--reproducible`:
   records `"hermetic":"yes"`, `"network_used":"no"`, and `"build_epoch":0`.
   `oci2bin inspect` and `oci2bin explain` surface this so downstream
   auditors can see the binary was produced in air-gap mode.
+
+This metadata marker describes how the file was built. It is separate from the
+mostly hermetic packaging described at the top of this README.
 
 ```bash
 # Pre-stage the image (only thing that talks to the network)
