@@ -7,7 +7,9 @@ string. Drives `oci2bin mcp-serve` over stdin/stdout.
 import json
 import os
 import pathlib
+import struct
 import subprocess
+import tempfile
 import unittest
 
 
@@ -17,21 +19,35 @@ _LOADER = _ROOT / "build" / "loader-x86_64"
 
 def _send_one(req: dict) -> dict:
     """Spawn mcp-serve, send a single JSON-RPC line, read all lines,
-    and return the first reply whose id matches the request. The server
-    emits an unsolicited init/server-info line before processing the
-    first request, so a plain head -1 wouldn't suffice."""
+    and return the first reply whose id matches the request."""
     line = (json.dumps(req) + "\n").encode()
-    p = subprocess.Popen(
-        [str(_LOADER), "mcp-serve"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        out, _ = p.communicate(line, timeout=10)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        raise
+    # A raw loader has not gone through build_polyglot yet, so its policy gate
+    # deliberately refuses every payload entry point. This test does not touch
+    # the payload; patch the gate marker in a private copy to exercise only the
+    # MCP parser under test.
+    marker = struct.pack("<Q", 0xAAAAAAAAAAAAAAAA)
+    loader = _LOADER.read_bytes()
+    if marker in loader:
+        loader = loader.replace(marker, struct.pack("<Q", 1))
+    meta_magic = b"OCI2BIN_META\x00"
+    meta_json = b"{}"
+    meta_size = 4 + len(meta_magic) + len(meta_json) + 1
+    loader += struct.pack("<I", meta_size) + meta_magic + meta_json + b"\x00"
+    with tempfile.TemporaryDirectory() as td:
+        executable = pathlib.Path(td) / "loader"
+        executable.write_bytes(loader)
+        executable.chmod(0o755)
+        p = subprocess.Popen(
+            [str(executable), "mcp-serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            out, err = p.communicate(line, timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            raise
     target_id = req.get("id")
     seen = []
     for raw in out.splitlines():
@@ -50,7 +66,8 @@ def _send_one(req: dict) -> dict:
     if seen:
         return seen[-1]
     raise AssertionError(
-        f"empty mcp-serve output; rc={p.returncode}")
+        f"empty mcp-serve output; rc={p.returncode}; "
+        f"stderr={err.decode(errors='replace').strip()!r}")
 
 
 @unittest.skipUnless(_LOADER.exists(),

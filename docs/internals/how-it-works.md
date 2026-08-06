@@ -35,6 +35,8 @@ The file has an executable loader and an image archive in the same byte stream.
 +--------------------------------------------------+
 | OCI image payload (plain tar, compressed, or age)|
 +--------------------------------------------------+
+| optional SquashFS rootfs / VM blobs              |
++--------------------------------------------------+
 | metadata: image name, labels, digest, policies   |
 +--------------------------------------------------+
 ```
@@ -79,6 +81,12 @@ form. Runtime execution starts the loader. Encryption protects the OCI payload,
 but the ELF loader and outer routing/policy metadata remain readable so the
 kernel and loader can locate it.
 
+With `--rootfs-format squashfs`, the plain OCI tar is followed by an aligned
+SquashFS payload whose offset and size are patched into dedicated loader
+markers. It follows the OCI tar's end-of-archive blocks, so tar readers ignore
+it and `docker load` continues to see the original image. Carrying both forms
+costs artifact size but preserves the project's OCI round trip.
+
 ## OCI Image Payload
 
 The embedded image payload follows the shape produced by `docker save` and OCI
@@ -116,8 +124,11 @@ process.
 
 ## Root Filesystem Preparation
 
-The loader prepares a root filesystem from the embedded image layers. Runtime
-options then modify that filesystem view:
+Normally the loader prepares a root filesystem from the embedded image layers.
+With `--lazy`, it instead mounts the embedded SquashFS directly through
+`squashfuse` and places a `fuse-overlayfs` writable view above it. The overlay
+uses a temporary upper/work directory by default or `--overlay-persist DIR`
+when state should survive. Runtime options then modify the resulting view:
 
 - `-v` adds bind mounts
 - `--secret` adds read-only secret files
@@ -213,6 +224,15 @@ is libkrun or cloud-hypervisor. A libkrun loader opens `libkrun.so.1` lazily;
 the default static loader invokes cloud-hypervisor when VM mode is requested.
 In both cases the generated file is deployed directly: copy it to the KVM host
 and execute it to start the microVM.
+
+For a libkrun VM, `--net userspace` uses libkrun's implicit
+virtio-vsock/Transparent Socket Impersonation path. The guest does not need a
+virtual NIC or DHCP setup: socket operations are proxied by the VMM in the
+calling user's host network context. oci2bin always passes an explicit port
+map, including an empty one, so guest listeners are not exposed by default;
+`-p HOST:GUEST` adds selected TCP mappings. `--net none` disables the implicit
+vsock device. Cloud-hypervisor networking is not wired to this path and rejects
+userspace-network and port-publication requests.
 
 ## Why The File Can Still Be Useful As An Image
 

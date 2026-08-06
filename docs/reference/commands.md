@@ -20,6 +20,7 @@ Common build options:
 --strip-prefix PREFIX        # root-relative; no leading slash
 --strip-auto
 --squash
+--rootfs-format tar|squashfs
 --compress gzip|zstd         # squashed-layer codec; requires --squash
 --add-file HOST:CONTAINER
 --add-dir HOST:CONTAINER
@@ -64,6 +65,12 @@ executable loader. They are mutually exclusive, remove direct `docker load`
 compatibility, and prevent byte-identical encrypted rebuilds because age uses
 fresh randomness.
 
+`--rootfs-format squashfs` retains the OCI tar and appends a mountable rootfs
+for `--lazy`. It needs `mksquashfs` at build time and `squashfuse`,
+`fuse-overlayfs`, `/dev/fuse`, and `user_allow_other` enabled in
+`/etc/fuse.conf` at runtime. It cannot be combined with age encryption because
+the second rootfs would disclose the plaintext image.
+
 ## Generated Binary
 
 ```bash
@@ -79,7 +86,7 @@ Common runtime options:
 --secret HOST_FILE[:CONTAINER_PATH]
 --entrypoint PATH
 --workdir PATH
---net host|none|slirp|pasta|container:PID
+--net host|none|userspace|slirp|pasta|container:PID
 --ipc host|container:PID
 -p HOST_PORT:CONTAINER_PORT
 --add-host HOST:IP
@@ -149,11 +156,19 @@ Common runtime options:
 --doctor              # report this host's runtime readiness, then exit
 ```
 
+`--net userspace` and VM-mode `-p` use libkrun's rootless TSI networking.
+Outbound networking is available without a TAP device; inbound listeners stay
+closed unless published with `-p`. Use `--vm --net none` to disable TSI.
+Cloud-hypervisor currently accepts only `--net none` and rejects `-p`.
+
 ## Subcommands
 
 ```bash
 oci2bin exec PID -- CMD
 oci2bin inspect BINARY [--json | -o json | --format TEMPLATE]
+oci2bin benchmark BINARY [--modes extract,lazy,vm] [--runs N]
+                        [--warmups N] [--timeout SEC] [--json] [-o FILE]
+                        [-- CMD...]
 oci2bin explain BINARY
 oci2bin list [--json] [--filter label=KEY[=VAL]]
 oci2bin prune [--dry-run]

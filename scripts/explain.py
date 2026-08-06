@@ -179,7 +179,8 @@ def main():
         print()
         print("Build metadata:")
         if meta:
-            for k in ("image", "digest", "timestamp", "version"):
+            for k in ("image", "digest", "timestamp", "version",
+                      "rootfs_format", "payload_encoding"):
                 if k in meta:
                     print(f"  {k:<12}{meta[k]}")
             if meta.get("hermetic") == "yes":

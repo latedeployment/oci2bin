@@ -612,6 +612,99 @@ static void test_parse_opts(void)
     }
 }
 
+static void test_validate_network_opts(void)
+{
+    struct container_opts opts;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.n_portfwd = 1;
+    normalize_network_opts(&opts);
+    ASSERT_STR_EQ(opts.net, "slirp",
+                  "network opts: container -p implies slirp");
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_vm = 1;
+    opts.n_portfwd = 1;
+    normalize_network_opts(&opts);
+    ASSERT_STR_EQ(opts.net, "userspace",
+                  "network opts: VM -p implies userspace");
+
+    memset(&opts, 0, sizeof(opts));
+    opts.net = "userspace";
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: userspace requires VM mode");
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_vm = 1;
+    opts.net = "userspace";
+    ASSERT_INT_EQ(validate_network_opts(&opts), 0,
+                  "network opts: userspace is valid in VM mode");
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_vm = 1;
+    opts.net_join_pid = 123;
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: VM cannot join a container netns");
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_vm = 1;
+    opts.net = "pasta";
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: VM rejects container helper modes");
+
+    memset(&opts, 0, sizeof(opts));
+    opts.net = "none";
+    opts.n_portfwd = 1;
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: none rejects port publication");
+
+    memset(&opts, 0, sizeof(opts));
+    opts.use_vm = 1;
+    opts.n_egress = 1;
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: VM rejects host nft allowlist");
+}
+
+static void test_validate_lazy_rootfs_payload(void)
+{
+    char path[] = "/tmp/oci2bin-squashfs-test-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT(fd >= 0, "lazy rootfs validation: mkstemp");
+    if (fd < 0)
+    {
+        return;
+    }
+
+    unsigned char image[16 + 96];
+    memset(image, 0, sizeof(image));
+    memcpy(image + 16, "hsqs", 4);
+    image[16 + 40] = 96; /* little-endian bytes_used */
+    ASSERT_INT_EQ(write_all_fd(fd, image, sizeof(image)), 0,
+                  "lazy rootfs validation: write fixture");
+    close(fd);
+
+    unsigned long saved_offset = ROOTFS_DATA_OFFSET;
+    unsigned long saved_size = ROOTFS_DATA_SIZE;
+    unsigned long saved_patched = ROOTFS_DATA_PATCHED;
+    ROOTFS_DATA_OFFSET = 16;
+    ROOTFS_DATA_SIZE = 96;
+    ROOTFS_DATA_PATCHED = 1;
+
+    ASSERT_INT_EQ(validate_lazy_rootfs_payload(path), 0,
+                  "lazy rootfs validation: accepts bounded SquashFS");
+    ROOTFS_DATA_SIZE = 95;
+    ASSERT_INT_EQ(validate_lazy_rootfs_payload(path), -1,
+                  "lazy rootfs validation: rejects short payload");
+    ROOTFS_DATA_SIZE = 4096;
+    ASSERT_INT_EQ(validate_lazy_rootfs_payload(path), -1,
+                  "lazy rootfs validation: rejects range beyond artifact");
+
+    ROOTFS_DATA_OFFSET = saved_offset;
+    ROOTFS_DATA_SIZE = saved_size;
+    ROOTFS_DATA_PATCHED = saved_patched;
+    unlink(path);
+}
+
 /* ── test_build_exec_args ─────────────────────────────────────────────── */
 
 static void test_build_exec_args(void)
@@ -1538,6 +1631,17 @@ static void test_parse_opts_misc_flags(void)
         ASSERT_INT_EQ(r, 0, "parse_opts: --net none returns 0");
         ASSERT_STR_EQ(opts.net, "none",
                       "parse_opts: --net none sets net=none");
+    }
+
+    /* --net userspace (libkrun VM networking) */
+    {
+        char arg[] = "userspace";
+        char* argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --net userspace returns 0");
+        ASSERT_STR_EQ(opts.net, "userspace",
+                      "parse_opts: --net userspace sets net=userspace");
     }
 
     /* --net slirp:8080:80 port forward */
@@ -2619,6 +2723,32 @@ static void test_runtime_doctor_helpers(void)
     char* a3[] = { "app", "--", "--doctor", NULL };
     ASSERT_INT_EQ(argv_has_doctor_flag(3, a3), 0,
                   "doctor: --doctor after -- is not intercepted");
+
+    char fuse_conf[] = "/tmp/oci2bin-fuse-conf-XXXXXX";
+    fd = mkstemp(fuse_conf);
+    ASSERT(fd >= 0, "doctor: mkstemp fuse.conf succeeds");
+    if (fd >= 0)
+    {
+        const char* disabled = "# user_allow_other\nmount_max = 10\n";
+        ASSERT_INT_EQ(write_all_fd(fd, disabled, strlen(disabled)), 0,
+                      "doctor: write disabled fuse.conf");
+        close(fd);
+        ASSERT_INT_EQ(fuse_conf_has_user_allow_other(fuse_conf), 0,
+                      "doctor: commented FUSE allow_other stays disabled");
+
+        fd = open(fuse_conf, O_WRONLY | O_TRUNC);
+        ASSERT(fd >= 0, "doctor: reopen fuse.conf");
+        if (fd >= 0)
+        {
+            const char* enabled = "  user_allow_other # rootless lazy mode\n";
+            ASSERT_INT_EQ(write_all_fd(fd, enabled, strlen(enabled)), 0,
+                          "doctor: write enabled fuse.conf");
+            close(fd);
+            ASSERT_INT_EQ(fuse_conf_has_user_allow_other(fuse_conf), 1,
+                          "doctor: parses FUSE user_allow_other");
+        }
+        unlink(fuse_conf);
+    }
 }
 
 /* ── test_copy_n_bytes ────────────────────────────────────────────────────── */
@@ -7108,6 +7238,8 @@ int main(void)
     test_path_join_suffix();
     test_parse_id_value();
     test_parse_opts();
+    test_validate_network_opts();
+    test_validate_lazy_rootfs_payload();
     test_parse_opts_path_validation();
     test_parse_opts_name();
     test_parse_opts_limits();

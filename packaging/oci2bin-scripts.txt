@@ -1,6 +1,7 @@
 # Runtime Python helpers installed under share/oci2bin/scripts and bundled in
 # wheels under oci2bin_pkg/scripts. Paths are repository-root relative.
 scripts/add_files.py
+scripts/benchmark.py
 scripts/build_polyglot.py
 scripts/diff_fs.py
 scripts/diff_images.py

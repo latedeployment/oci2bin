@@ -29,6 +29,8 @@ depends on the feature:
 - **A dependency is required only when its feature is in play.** `age` only when
   the payload is encrypted; `zstd` only when it is compressed; `slirp4netns`/
   `pasta` only for `--net slirp`/`pasta`; `nft` only for `--allow-egress`;
+  `squashfuse`, `fuse-overlayfs`, `/dev/fuse`, and FUSE `user_allow_other`
+  only for an artifact's `--lazy` path;
   `systemd-creds` only for `--secret tpm2:`; `rekor-cli` only for `--rekor`; and
   so on. If you do not use the feature, the tool is not invoked. The one
   lightweight exception is startup auto-detection of an installed libkrun
@@ -48,10 +50,11 @@ small. Each dependency below is needed **only** for the feature in its row.
 
 | Dependency | Needed for | Hard / optional |
 | --- | --- | --- |
-| `tar` (with gzip support) | **Always** — rootfs extraction | Hard (the only universal runtime dep). GNU tar >= 1.32 is used with `--keep-directory-symlink`; on older or non-GNU tar the loader drops that flag and replaces symlinked directories with real ones instead of following them |
+| `tar` (with gzip support) | Normal OCI rootfs extraction | Hard for the default path. A SquashFS artifact run with `--lazy` mounts instead. GNU tar >= 1.32 is used with `--keep-directory-symlink`; on older or non-GNU tar the loader drops that flag and replaces symlinked directories with real ones instead of following them |
+| `squashfuse` + `fuse-overlayfs` + `/dev/fuse` + `user_allow_other` in `/etc/fuse.conf` | `--lazy` on a `--rootfs-format squashfs` artifact | Required for that mode; `allow_other` lets the mapped image UID enter the rootless FUSE mounts, while the private temporary mount tree prevents unrelated host users from traversing them |
 | `age` | Encrypted payloads (`--encrypt` / `--passphrase`) | Required if the image is encrypted |
 | `zstd` | zstd-compressed layers (`--squash --compress zstd`) or whole payloads (`--compress-binary zstd`) | Required if either form is used |
-| `slirp4netns` | `--net slirp`, `-p PORT` | Required for that mode |
+| `slirp4netns` | Container-mode `--net slirp`, `-p PORT` | Required for that mode; VM-mode `-p` uses libkrun instead |
 | `pasta` | `--net pasta` | Required for that mode |
 | `nft` (nftables) | `--allow-egress` (fail-closed) | Required for that mode |
 | `newuidmap` / `newgidmap` + `/etc/subuid`,`/etc/subgid` | Full rootless UID/GID range | Optional — falls back to single-ID mapping |
@@ -65,7 +68,7 @@ small. Each dependency below is needed **only** for the feature in its row.
 | `/dev/kvm` | `--vm` (either backend) | Hard for VM mode |
 | `cloud-hypervisor` + embedded kernel | `--vm` via cloud-hypervisor | Required for that backend |
 | `virtiofsd` | `-v` volume mounts under cloud-hypervisor `--vm` | Required for that case |
-| `libkrun.so.1` | `--vm` on a libkrun-built binary | Lazy — `dlopen`'d only when `--vm` runs; **see the note below** |
+| `libkrun.so.1` | `--vm` on a libkrun-built binary, including `--net userspace` and VM `-p` | Lazy — `dlopen`'d only when `--vm` runs; **see the note below** |
 | `qemu-<arch>-static` | running a foreign-arch fat-binary without binfmt | Optional fallback |
 
 ### Unprivileged user namespaces (read this if a plain run says "Operation not permitted")
@@ -111,6 +114,7 @@ cloud-hypervisor backend. See
 | `python3` (stdlib only) | The builder itself | Hard |
 | `docker`, `podman`, or `skopeo` | Pull backend for `oci2bin IMAGE` (auto-detected docker → podman → skopeo; force with `--pull-with`) | Optional - not needed with `--oci-dir`, `from-chroot`, or `build-dockerfile FROM scratch`/OCI dir |
 | `zstd` | `--squash --compress zstd`, `--compress-binary zstd` | Required for those flags |
+| `mksquashfs` (`squashfs-tools`) | `--rootfs-format squashfs` | Required for that build mode |
 | `age` | `--encrypt`, `--passphrase` | Required for those flags |
 | `cosign` | `--verify-cosign`, `--require-cosign` | Required for those flags |
 | `rekor-cli` | `oci2bin sign --rekor` | Required for that flag |

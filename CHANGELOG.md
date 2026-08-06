@@ -4,6 +4,27 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Repeatable startup benchmarks.** `oci2bin benchmark BINARY` compares
+  normal extraction, SquashFS lazy mounting, and libkrun VM launches. It
+  reports first-run and steady-state latency, p95, peak RSS, artifact/host
+  metadata, and launch success rate; JSON output retains every sample.
+
+- **Mountable SquashFS root filesystems.** Build with
+  `--rootfs-format squashfs` to retain the Docker-loadable OCI tar and append
+  a normalized SquashFS rootfs. At runtime, `--lazy` mounts it directly with
+  `squashfuse` and adds a writable `fuse-overlayfs` view, avoiding per-launch
+  layer extraction. Persistent overlays and reproducible builds are supported;
+  age encryption is rejected because a second plaintext rootfs would defeat
+  it.
+
+- **Rootless libkrun VM networking.** `--vm --net userspace` uses libkrun's
+  TSI/vsock path for outbound TCP, UDP, and DNS without TAP setup. Inbound
+  listeners are closed by default and `-p HOST:GUEST` publishes only selected
+  TCP ports. `--vm --net none` disables the implicit vsock device.
+  Cloud-hypervisor rejects these options until it has an equivalent path.
+
 ### Security
 
 - **File capabilities from image layers are no longer copied into the rootfs.**
@@ -55,6 +76,19 @@ All notable changes to oci2bin are documented here.
   distinction.
 
 ### Fixed
+
+- **Lazy SquashFS roots are accessible to non-root image users.** Both FUSE
+  mounts now use `allow_other`, with an explicit `/etc/fuse.conf`
+  `user_allow_other` preflight. Runtime doctor reports `/dev/fuse` and this
+  setting instead of claiming lazy mode is ready when execution would fail
+  with `EACCES`.
+
+- **Inspect reads the retained OCI tar in SquashFS artifacts correctly.** An
+  adjacent loader value could be mistaken for the OCI size, truncating the
+  tar before `manifest.json`. Candidate spans are now validated as complete
+  docker-save archives. Signature presence also checks a real trailing,
+  length-delimited block instead of matching verifier strings compiled into
+  every loader.
 
 - **A layer merge no longer aborts on an xattr the destination will not
   take.** `copy_fd_xattrs` treated any `fsetxattr` failure as fatal, so a

@@ -248,6 +248,25 @@ class TestMarkerPatching(unittest.TestCase):
         self.assertIn(struct.pack('<Q', 0x4000), patched)
         self.assertIn(struct.pack('<Q', 0x8000), patched)
 
+    def test_squashfs_rootfs_markers_patched(self):
+        fake_data = (
+            build_polyglot.OFFSET_MARKER +
+            build_polyglot.SIZE_MARKER +
+            build_polyglot.PATCHED_MARKER +
+            build_polyglot.ROOTFS_OFFSET_MARKER +
+            build_polyglot.ROOTFS_SIZE_MARKER +
+            build_polyglot.ROOTFS_PATCHED_MARKER
+        )
+        patched = build_polyglot.patch_markers(
+            fake_data, oci_offset=0x4000, oci_size=0x8000,
+            rootfs_offset=0x100000, rootfs_size=0x20000,
+        )
+        self.assertNotIn(build_polyglot.ROOTFS_OFFSET_MARKER, patched)
+        self.assertNotIn(build_polyglot.ROOTFS_SIZE_MARKER, patched)
+        self.assertNotIn(build_polyglot.ROOTFS_PATCHED_MARKER, patched)
+        self.assertIn(struct.pack('<Q', 0x100000), patched)
+        self.assertIn(struct.pack('<Q', 0x20000), patched)
+
 
 if __name__ == '__main__':
     unittest.main()

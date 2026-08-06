@@ -88,6 +88,19 @@ Restrict egress:
 Egress filtering is supported with `--net slirp` and `--net pasta`, and needs
 `nft`. The run fails closed if the allowlist cannot be installed.
 
+In libkrun VM mode, use its rootless userspace network or disable it:
+
+```bash
+./app.bin --vm --net userspace -p 8080:80
+./app.bin --vm --net none
+```
+
+oci2bin passes an empty libkrun port map unless `-p` is present, preventing the
+library's implicit “expose all guest listeners” behavior. TSI proxies guest
+sockets in the VMM process's host network context; it is connectivity, not a
+network security boundary. VM egress allowlists are not implemented, and
+`--allow-egress` continues to fail with `--vm`.
+
 ## Read-Only Rootfs
 
 ```bash
@@ -234,6 +247,12 @@ Passphrase mode reads `OCI2BIN_PASSWORD_FILE` first, then
 `OCI2BIN_PASSWORD`, and finally prompts on a terminal. Do not put a production
 passphrase directly in a shell command or environment when a protected file or
 secret manager can supply it.
+
+`--rootfs-format squashfs` is deliberately incompatible with age encryption.
+That mode appends an independently mountable root filesystem; leaving it
+plaintext would bypass encryption, while encrypting it would prevent direct
+mounting. The builder rejects the combination rather than providing partial
+protection.
 
 ### Runtime plaintext and compatibility
 

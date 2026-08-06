@@ -115,6 +115,61 @@ class ReadOciDataTest(unittest.TestCase):
             f.flush()
             self.assertEqual(mod.read_oci_data(f.name), blob)
 
+    def test_read_oci_data_rejects_truncated_adjacent_size(self):
+        mod = self._mod()
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w") as tf:
+            leading = b"x" * 4096
+            leading_info = tarfile.TarInfo("blobs/layer")
+            leading_info.size = len(leading)
+            tf.addfile(leading_info, io.BytesIO(leading))
+            manifest = b"{}"
+            manifest_info = tarfile.TarInfo("manifest.json")
+            manifest_info.size = len(manifest)
+            tf.addfile(manifest_info, io.BytesIO(manifest))
+        blob = out.getvalue()
+        oci_offset = 4096
+        loader = bytearray(512)
+        # Matches the compiled loader layout that exposed this regression:
+        # true size, offset, then an unrelated but superficially plausible
+        # small integer.
+        loader[120:128] = struct.pack("<Q", len(blob))
+        loader[128:136] = struct.pack("<Q", oci_offset)
+        loader[136:144] = struct.pack("<Q", 2048)
+        data = bytes(loader) + b"\0" * (oci_offset - len(loader)) + blob
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(data)
+            f.flush()
+            self.assertEqual(mod.read_oci_data(f.name), blob)
+
+
+class SignaturePresenceTest(unittest.TestCase):
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "inspect_image", _SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_loader_strings_are_not_a_signature(self):
+        mod = self._mod()
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b"prefix" + mod.SIG_MAGIC + b"middle" + mod.SIG_TRAILER)
+            f.flush()
+            self.assertFalse(mod.has_signature(f.name))
+
+    def test_trailing_length_delimited_signature_is_detected(self):
+        mod = self._mod()
+        body = mod.SIG_MAGIC + b"\x01" + b"k" * 32
+        body += struct.pack(">H", 3) + b"sig"
+        total_size = len(body) + len(mod.SIG_TRAILER) + 4
+        block = body + mod.SIG_TRAILER + struct.pack(">I", total_size)
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b"artifact" + block)
+            f.flush()
+            self.assertTrue(mod.has_signature(f.name))
+
 
 class RenderFormatTest(unittest.TestCase):
     def _mod(self):

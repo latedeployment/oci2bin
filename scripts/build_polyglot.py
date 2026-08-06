@@ -24,6 +24,7 @@ import datetime
 import getpass
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -248,11 +249,15 @@ KERNEL_PATCHED_MARKER    = struct.pack('<Q', 0x5A5A5A5A5A5A5A5A)
 INITRAMFS_OFFSET_MARKER  = struct.pack('<Q', 0xC0FFEE00C0FFEE00)
 INITRAMFS_SIZE_MARKER    = struct.pack('<Q', 0xFACEB00CFACEB00C)
 INITRAMFS_PATCHED_MARKER = struct.pack('<Q', 0x6B6B6B6B6B6B6B6B)
+ROOTFS_OFFSET_MARKER     = struct.pack('<Q', 0x51554153484F4646)
+ROOTFS_SIZE_MARKER       = struct.pack('<Q', 0x5351554153485349)
+ROOTFS_PATCHED_MARKER    = struct.pack('<Q', 0x5254465350415443)
 
 
 def patch_markers(data, oci_offset, oci_size,
                   kernel_offset=None, kernel_size=None,
-                  initramfs_offset=None, initramfs_size=None):
+                  initramfs_offset=None, initramfs_size=None,
+                  rootfs_offset=None, rootfs_size=None):
     """
     Find and replace the OCI_DATA_OFFSET and OCI_DATA_SIZE markers in the
     loader binary.  Optionally also patch KERNEL and INITRAMFS markers when
@@ -284,6 +289,19 @@ def patch_markers(data, oci_offset, oci_size,
         print(f"  Patched INITRAMFS offset=0x{initramfs_offset:x} size=0x{initramfs_size:x} ({n}x marker)", file=sys.stderr)
         if n != 1:
             print(f"WARNING: expected 1 INITRAMFS_OFFSET marker, found {n}", file=sys.stderr)
+    if rootfs_offset is not None:
+        n = patched.count(ROOTFS_OFFSET_MARKER)
+        patched = patched.replace(ROOTFS_OFFSET_MARKER,
+                                  struct.pack('<Q', rootfs_offset))
+        patched = patched.replace(ROOTFS_SIZE_MARKER,
+                                  struct.pack('<Q', rootfs_size))
+        patched = patched.replace(ROOTFS_PATCHED_MARKER,
+                                  struct.pack('<Q', 1))
+        print(f"  Patched ROOTFS offset=0x{rootfs_offset:x} "
+              f"size=0x{rootfs_size:x} ({n}x marker)", file=sys.stderr)
+        if n != 1:
+            print(f"WARNING: expected 1 ROOTFS_OFFSET marker, found {n}",
+                  file=sys.stderr)
 
     return patched
 
@@ -634,7 +652,8 @@ REPRODUCIBLE_TIMESTAMP = '1970-01-01T00:00:00Z'
 
 def build_meta_block(image_name, digest=None, self_update_url=None,
                      pin_digest=None, reproducible=False,
-                     offline_only=False, require_signed_pubkey=None):
+                     offline_only=False, require_signed_pubkey=None,
+                     rootfs_format='tar', payload_encoding='tar'):
     """
     Build the OCI2BIN_META block appended to the end of the output binary.
     Format: uint32_le(total_size) + META_MAGIC + json_bytes + b'\\x00'
@@ -655,6 +674,8 @@ def build_meta_block(image_name, digest=None, self_update_url=None,
         'image':     image_name,
         'timestamp': timestamp,
         'version':   OCI2BIN_VERSION,
+        'rootfs_format': rootfs_format,
+        'payload_encoding': payload_encoding,
     }
     if digest:
         meta['digest'] = digest
@@ -1281,6 +1302,119 @@ def resolve_build_passphrase(password_file):
     return p1.encode('utf-8')
 
 
+def _load_dockerfile_rootfs_extractor():
+    """Load the existing hardened docker-save layer merger by file path."""
+    helper_path = os.path.join(os.path.dirname(__file__), 'dockerfile_build.py')
+    spec = importlib.util.spec_from_file_location(
+        '_oci2bin_dockerfile_build', helper_path)
+    if not spec or not spec.loader:
+        raise RuntimeError(f'cannot load rootfs extractor: {helper_path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._extract_docker_save_to_rootfs
+
+
+def _resolve_image_user(rootfs, user):
+    """Resolve OCI user[:group] names before passwd/group IDs are remapped."""
+    if not user:
+        return user
+
+    user_part, sep, group_part = user.partition(':')
+    uid = user_part if user_part.isdigit() else None
+    default_gid = None
+    passwd_path = os.path.join(rootfs, 'etc', 'passwd')
+    if uid is None:
+        try:
+            with open(passwd_path, encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    fields = line.rstrip('\n').split(':')
+                    if len(fields) >= 4 and fields[0] == user_part:
+                        int(fields[2])
+                        int(fields[3])
+                        uid = fields[2]
+                        default_gid = fields[3]
+                        break
+        except (OSError, ValueError):
+            return user
+    if uid is None:
+        return user
+
+    if not sep:
+        return f'{uid}:{default_gid}' if default_gid is not None else uid
+    if group_part.isdigit():
+        return f'{uid}:{group_part}'
+
+    group_path = os.path.join(rootfs, 'etc', 'group')
+    try:
+        with open(group_path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                fields = line.rstrip('\n').split(':')
+                if len(fields) >= 3 and fields[0] == group_part:
+                    int(fields[2])
+                    return f'{uid}:{fields[2]}'
+    except (OSError, ValueError):
+        pass
+    return user
+
+
+def _write_runtime_config(rootfs, image_config):
+    """Embed the config consumed by both the namespace and VM runtimes."""
+    config = image_config.get('config') or {}
+    user = _resolve_image_user(rootfs, config.get('User'))
+    runtime_config = {
+        'Cmd': config.get('Cmd'),
+        'Entrypoint': config.get('Entrypoint'),
+        'Env': config.get('Env'),
+        'WorkingDir': config.get('WorkingDir'),
+        'User': user,
+        'Healthcheck': config.get('Healthcheck'),
+    }
+    config_path = os.path.join(rootfs, '.oci2bin_config')
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(runtime_config, f, separators=(',', ':'))
+    os.chmod(config_path, 0o644)
+
+
+def build_squashfs_payload(oci_data, reproducible=False):
+    """Materialize an OCI rootfs and return a SquashFS image containing it."""
+    mksquashfs = shutil.which('mksquashfs')
+    if not mksquashfs:
+        raise SystemExit(
+            "build_polyglot: --rootfs-format squashfs requires "
+            "'mksquashfs' on the build host")
+
+    with tempfile.TemporaryDirectory(prefix='oci2bin-squashfs.') as tmpdir:
+        tar_path = os.path.join(tmpdir, 'image.tar')
+        rootfs = os.path.join(tmpdir, 'rootfs')
+        output = os.path.join(tmpdir, 'rootfs.squashfs')
+        os.mkdir(rootfs, 0o755)
+        with open(tar_path, 'wb') as f:
+            f.write(oci_data)
+
+        extract_rootfs = _load_dockerfile_rootfs_extractor()
+        image_config = extract_rootfs(tar_path, rootfs)
+        _write_runtime_config(rootfs, image_config)
+
+        argv = [
+            mksquashfs, rootfs, output,
+            '-noappend', '-all-root', '-no-progress', '-processors', '1',
+        ]
+        if reproducible:
+            argv.extend(['-mkfs-time', '0', '-all-time', '0'])
+        result = subprocess.run(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            detail = result.stderr.decode(errors='replace').strip()
+            raise SystemExit(
+                'build_polyglot: mksquashfs failed'
+                + (f': {detail}' if detail else ''))
+        with open(output, 'rb') as f:
+            payload = f.read()
+        print(f'  Built SquashFS rootfs ({len(payload)} bytes)',
+              file=sys.stderr)
+        return payload
+
+
 def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    digest=None, image_name_for_meta=None,
                    kernel_path=None, initramfs_path=None,
@@ -1294,7 +1428,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    encrypt_recipients=None, encrypt_recipients_files=None,
                    encrypt_passphrase=False, password_file=None,
                    require_signed_pubkey=None, compress_binary=None,
-                   set_entrypoint=None, set_cmd=None):
+                   set_entrypoint=None, set_cmd=None,
+                   rootfs_format='tar'):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -1380,6 +1515,17 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     if reproducible:
         oci_data = repack_oci_tar_reproducible(oci_data)
 
+    rootfs_data = b''
+    if rootfs_format == 'squashfs':
+        if (encrypt_passphrase or encrypt_recipients or
+                encrypt_recipients_files):
+            raise SystemExit(
+                'build_polyglot: --rootfs-format squashfs cannot be combined '
+                'with age encryption: the separately mountable rootfs would '
+                'expose the plaintext image')
+        rootfs_data = build_squashfs_payload(
+            oci_data, reproducible=reproducible)
+
     # 2b'. Compress the OCI payload with zstd (--compress-binary). Runs before
     # encryption so the ciphertext wraps the compressed bytes; the loader
     # decrypts then inflates. zstd frames carry no timestamp, so this is
@@ -1460,24 +1606,27 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
             initramfs_data = f.read()
         print(f"  Initramfs: {initramfs_path} ({len(initramfs_data) // 1024} KB)", file=sys.stderr)
 
-    # Pre-compute VM blob offsets (after OCI tar, aligned to 4096)
+    # Pre-compute optional payload offsets after the OCI tar. SquashFS comes
+    # first so VM blobs keep their existing relative order.
     PAGE_ALIGN = 4096
+    rootfs_file_offset = None
     kernel_file_offset = None
     initramfs_file_offset = None
 
+    payload_end = oci_data_file_offset + oci_size
+    if rootfs_data:
+        pad = (PAGE_ALIGN - (payload_end % PAGE_ALIGN)) % PAGE_ALIGN
+        rootfs_file_offset = payload_end + pad
+        payload_end = rootfs_file_offset + len(rootfs_data)
+
     if kernel_data:
-        # offset after OCI tar, aligned to PAGE_ALIGN
-        base = oci_data_file_offset + oci_size
-        pad = (PAGE_ALIGN - (base % PAGE_ALIGN)) % PAGE_ALIGN
-        kernel_file_offset = base + pad
+        pad = (PAGE_ALIGN - (payload_end % PAGE_ALIGN)) % PAGE_ALIGN
+        kernel_file_offset = payload_end + pad
+        payload_end = kernel_file_offset + len(kernel_data)
 
     if initramfs_data:
-        if kernel_file_offset is not None:
-            base = kernel_file_offset + len(kernel_data)
-        else:
-            base = oci_data_file_offset + oci_size
-        pad = (PAGE_ALIGN - (base % PAGE_ALIGN)) % PAGE_ALIGN
-        initramfs_file_offset = base + pad
+        pad = (PAGE_ALIGN - (payload_end % PAGE_ALIGN)) % PAGE_ALIGN
+        initramfs_file_offset = payload_end + pad
 
     # 4. Patch the OCI offset/size markers in the loader binary
     patched_loader = patch_markers(
@@ -1486,6 +1635,8 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
         kernel_size=len(kernel_data) if kernel_data else None,
         initramfs_offset=initramfs_file_offset,
         initramfs_size=len(initramfs_data) if initramfs_data else None,
+        rootfs_offset=rootfs_file_offset,
+        rootfs_size=len(rootfs_data) if rootfs_data else None,
     )
 
     # 5. Patch program headers in the loader binary.
@@ -1569,6 +1720,17 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     # docker load sees these as top-level entries: manifest.json, config, layers.
     polyglot += oci_data
 
+    # Optional directly mountable rootfs. It sits after the OCI tar EOF and is
+    # invisible to docker load; the loader reaches it through patched offsets.
+    if rootfs_data:
+        pad = (PAGE_ALIGN - (len(polyglot) % PAGE_ALIGN)) % PAGE_ALIGN
+        polyglot += b'\x00' * pad
+        if len(polyglot) != rootfs_file_offset:
+            raise SystemExit(
+                f"build_polyglot: rootfs offset mismatch: "
+                f"{len(polyglot)} != {rootfs_file_offset}")
+        polyglot += rootfs_data
+
     # Append kernel blob (page-aligned) if provided
     if kernel_data:
         pad = (PAGE_ALIGN - (len(polyglot) % PAGE_ALIGN)) % PAGE_ALIGN
@@ -1596,7 +1758,14 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                                   pin_digest=pin_digest,
                                   reproducible=reproducible,
                                   offline_only=offline_only,
-                                  require_signed_pubkey=require_signed_pubkey)
+                                  require_signed_pubkey=require_signed_pubkey,
+                                  rootfs_format=rootfs_format,
+                                  payload_encoding=(
+                                      'age-passphrase' if encrypt_passphrase
+                                      else 'age' if (encrypt_recipients or
+                                                     encrypt_recipients_files)
+                                      else 'zstd' if compress_binary == 'zstd'
+                                      else 'tar'))
     with open(output_path, 'wb') as f:
         f.write(polyglot)
         f.write(meta_block)
@@ -1612,6 +1781,11 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     print(f"  Loader at file offset: 0x{PAGE_SIZE:x} ({PAGE_SIZE})")
     print(f"  OCI data offset: 0x{oci_data_file_offset:x} ({oci_data_file_offset})")
     print(f"  OCI data size: {oci_size} bytes ({oci_size / 1024 / 1024:.1f} MB)")
+    if rootfs_data:
+        print(f"  SquashFS offset: 0x{rootfs_file_offset:x} "
+              f"({rootfs_file_offset})")
+        print(f"  SquashFS size:   {len(rootfs_data)} bytes "
+              f"({len(rootfs_data) / 1024 / 1024:.1f} MB)")
     if kernel_data:
         print(f"  Kernel offset:  0x{kernel_file_offset:x} ({kernel_file_offset})")
         print(f"  Kernel size:    {len(kernel_data)} bytes ({len(kernel_data) / 1024 / 1024:.1f} MB)")
@@ -1732,6 +1906,12 @@ def main():
                              'Like --encrypt, the payload is no longer a tar, '
                              'so the binary is opaque to docker load / '
                              'reconstruct. Compatible with --reproducible.')
+    parser.add_argument('--rootfs-format', choices=['tar', 'squashfs'],
+                        default='tar',
+                        help='Runtime rootfs representation. tar keeps the '
+                             'normal layer-extraction path (default); '
+                             'squashfs appends a directly mountable rootfs for '
+                             '`--lazy` and requires mksquashfs at build time.')
     parser.add_argument('--reproducible', action='store_true', default=False,
                         help='Produce a byte-identical output across runs of '
                              'the same input: re-emit the OCI tar with sorted '
@@ -1862,6 +2042,7 @@ def main():
                    password_file=args.password_file,
                    require_signed_pubkey=require_signed_pubkey,
                    compress_binary=args.compress_binary,
+                   rootfs_format=args.rootfs_format,
                    set_entrypoint=(parse_exec_value(args.set_entrypoint)
                                    if args.set_entrypoint is not None
                                    else None),

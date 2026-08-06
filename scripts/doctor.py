@@ -296,6 +296,22 @@ def _check_slirp_or_pasta():
         "dnf install slirp4netns passt")
 
 
+def _check_squashfs():
+    tools = ("mksquashfs", "squashfuse", "fuse-overlayfs")
+    present = [tool for tool in tools if _which(tool)]
+    missing = [tool for tool in tools if not _which(tool)]
+    if not missing:
+        return _result(
+            "SquashFS lazy rootfs", OK,
+            "mksquashfs (build), squashfuse + fuse-overlayfs (runtime)")
+    return _result(
+        "SquashFS lazy rootfs", DEGRADED,
+        "present: " + (", ".join(present) or "none")
+        + "; missing (optional): " + ", ".join(missing),
+        "apt install squashfs-tools squashfuse fuse-overlayfs / "
+        "dnf install squashfs-tools squashfuse fuse-overlayfs")
+
+
 def _check_kvm_libkrun():
     notes = []
     if os.path.exists("/dev/kvm"):
@@ -541,6 +557,7 @@ CHECKS = [
     _check_cgroup_v2,
     _check_userns_unprivileged,
     _check_slirp_or_pasta,
+    _check_squashfs,
     _check_nftables,
     _check_kvm_libkrun,
     _check_openssl_cosign,
@@ -594,6 +611,11 @@ _PKGS = {
                             "dnf": ["slirp4netns", "passt"],
                             "pacman": ["slirp4netns", "passt"],
                             "zypper": ["slirp4netns", "passt"]},
+    "SquashFS lazy rootfs": {
+        "apt": ["squashfs-tools", "squashfuse", "fuse-overlayfs"],
+        "dnf": ["squashfs-tools", "squashfuse", "fuse-overlayfs"],
+        "pacman": ["squashfs-tools", "squashfuse", "fuse-overlayfs"],
+        "zypper": ["squashfs", "squashfuse", "fuse-overlayfs"]},
     "nftables (--allow-egress)": {"apt": ["nftables"], "dnf": ["nftables"],
                                   "pacman": ["nftables"], "zypper": ["nftables"]},
     "age (image encryption)": {"apt": ["age"], "dnf": ["age"],

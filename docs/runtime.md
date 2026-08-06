@@ -306,15 +306,24 @@ Persist overlay state:
 ./app.bin --overlay-persist /srv/app/state
 ```
 
-Lazy rootfs extraction probe:
+Mount an embedded SquashFS rootfs without extracting OCI layers:
 
 ```bash
+oci2bin --rootfs-format squashfs app:latest app.bin
 ./app.bin --lazy
 ```
 
-The lazy extraction path is a `userfaultfd` capability probe only: it does not
-yet enable on-demand paging and always falls back to full extraction. Reserved
-for future use; treat as experimental.
+`--lazy` requires an artifact built with `--rootfs-format squashfs`, plus
+`squashfuse`, `fuse-overlayfs`, an accessible `/dev/fuse`, and
+`user_allow_other` enabled in `/etc/fuse.conf` on the target. The SquashFS
+payload is the read-only lower filesystem; the loader creates a writable
+temporary FUSE overlay by default. `--read-only` remounts the resulting view
+read-only, and `--overlay-persist DIR` puts the overlay upper/work directories
+in `DIR`.
+
+The mode fails closed when the payload is absent or corrupt, a FUSE helper
+cannot start, `/dev/fuse` is unavailable, or a mount does not become ready.
+Concurrent runs use separate temporary mount trees.
 
 ## Runtime Profiles
 
@@ -535,6 +544,23 @@ Set VM resources:
 ```bash
 ./app.bin --vm --memory 1g --cpus 2 /bin/sh
 ```
+
+Use rootless libkrun networking:
+
+```bash
+./app.bin --vm --net userspace
+./app.bin --vm -p 8080:80
+./app.bin --vm --net none
+```
+
+libkrun uses its in-process TSI/vsock backend, so outbound TCP, UDP, and DNS do
+not need a guest NIC, TAP device, or root privileges. Passing an explicit empty
+port map keeps inbound listeners closed by default; each `-p HOST:GUEST` adds
+one TCP mapping. `--net none` disables libkrun's implicit vsock/TSI device.
+
+This path requires a libkrun-built artifact and a recent `libkrun.so.1`.
+Cloud-hypervisor currently supports `--net none` only; it rejects
+`--net userspace`, slirp/pasta network flags, and `-p`.
 
 Persist VM state:
 

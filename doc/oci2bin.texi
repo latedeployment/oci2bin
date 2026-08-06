@@ -129,6 +129,10 @@ Remove docs/locales/caches; auto-detect package-manager caches.
 Custom prefixes are root-relative and must not begin with @file{/}.
 @item --squash
 Merge all layers into one squashed layer.
+@item --rootfs-format tar|squashfs
+Keep the normal extracted-layer rootfs, or append a mountable SquashFS rootfs
+for runtime @option{--lazy}. SquashFS retains the OCI tar, so the artifact
+contains both representations.
 @item --compress gzip|zstd
 Compression codec for the squashed layer; requires @option{--squash}.
 @item --compress-binary zstd
@@ -184,8 +188,9 @@ in-toto provenance.)
 @table @code
 @item --entrypoint / --workdir / -e K=V / --env-file F
 Override entrypoint, workdir, environment.
-@item -v H:C / --tmpfs P / --read-only / --overlay-persist DIR
-Bind mounts, tmpfs, read-only rootfs, persistent overlay upper layer.
+@item -v H:C / --tmpfs P / --read-only / --overlay-persist DIR / --lazy
+Bind mounts, tmpfs, read-only rootfs, persistent overlay upper layer, or mount
+an embedded SquashFS rootfs without extracting OCI layers.
 @item --secret H[:C] / --secret tpm2:NAME / --ssh-agent
 File secrets (read-only bind mounts), sealed systemd credentials, SSH-agent
 forwarding.  @code{tpm2:NAME} reads the sealed blob from the system credential
@@ -193,7 +198,7 @@ stores (@file{/etc/credstore.encrypted} and friends), needs root and
 @command{systemd-creds}, and is rejected together with @option{--vm}.
 @item --device /dev/H[:C] / --gpus all|N|CDI / --cdi-device KIND=DEV / --no-host-dev
 Expose device nodes, GPUs/CDI devices, or skip the host /dev nodes.
-@item --net host|none|slirp|pasta|container:PID / -p H:C / --allow-egress H:P
+@item --net host|none|userspace|slirp|pasta|container:PID / -p H:C / --allow-egress H:P
 Network modes, published ports, default-deny egress allowlist.
 @item --dns IP / --dns-search D / --add-host H:IP / --ipc container:PID
 Custom DNS, /etc/hosts entries, shared IPC namespace.
@@ -229,6 +234,9 @@ seccomp, Landlock, cgroup v2, tar, /dev/kvm) and exit; read-only, exits non-zero
 if blocked. Complements the build-host @command{oci2bin doctor}.
 @item --vm [--vmm VMM] [--memory/--cpus]
 Run inside a hardware-isolated microVM (libkrun or cloud-hypervisor).
+With libkrun, @option{--net userspace} provides rootless outbound TSI
+networking and @option{-p H:G} publishes selected TCP ports; inbound ports are
+closed by default. @option{--net none} disables TSI.
 @end table
 
 @c ─────────────────────────────────────────────────────────────────────────────
@@ -756,6 +764,12 @@ container exits.
 Share the host network stack (default).
 @item --net none
 Create an isolated network namespace with only a loopback interface.
+In libkrun VM mode this disables the implicit TSI/vsock device.
+@item --net userspace
+Use libkrun's rootless TSI/vsock network in VM mode. Outbound TCP, UDP, and DNS
+need no TAP device or privileged setup. Guest listeners remain closed unless
+published with @option{-p @var{HOST}:@var{GUEST}}. Cloud-hypervisor does not
+yet support this mode.
 @item --net container:@var{PID}
 Join the network namespace of process @var{PID}.
 @end table
@@ -775,6 +789,18 @@ the root read-only aborts the run.
 @opindex --ephemeral-root
 @option{--ephemeral-root} instead provides a writable temporary overlay.
 Its upper layer is discarded on exit.
+
+@opindex --lazy
+An artifact built with @option{--rootfs-format squashfs} can use
+@option{--lazy} to mount the appended rootfs directly with
+@command{squashfuse}. @command{fuse-overlayfs} supplies a temporary writable
+view, or a persistent one with @option{--overlay-persist}. This avoids
+extracting every OCI layer at each launch. It requires @file{/dev/fuse} and
+both helpers on the target, with @code{user_allow_other} enabled in
+@file{/etc/fuse.conf} so the mapped image UID can access the mounts. A missing
+payload or failed mount aborts the run.
+Age encryption is incompatible with this build mode because the extra rootfs
+would be a plaintext copy.
 
 @example
 ./my-app --read-only
@@ -893,6 +919,11 @@ Besides building, the @command{oci2bin} CLI provides these subcommands.
 @item oci2bin inspect BINARY [--json | --format TMPL]
 Show embedded image metadata (name, arch, layers, entrypoint, cmd, env,
 workdir, digest, build time); secret-shaped env values are redacted.
+@item oci2bin benchmark BINARY [--modes LIST] [--runs N] [--] [CMD ...]
+Measure first and repeated startup latency, p95 latency, peak RSS, and launch
+success rate for extraction, SquashFS lazy-mount, and libkrun VM modes.
+Unavailable FUSE or KVM modes are reported as skipped; @option{--json} retains
+the raw samples and host metadata.
 @item oci2bin explain BINARY [--json]
 Inspect plus a host-capability check of what the binary needs to run.
 @item oci2bin doctor [--json]
@@ -971,6 +1002,7 @@ field.  When executed, the kernel processes the ELF; when passed to
 [512-4095]   NUL padding   (page-aligns the loader for mmap)
 [4096-~75K]  Loader binary (normally static; libkrun variant uses libc)
 [~75K-end]   OCI image tar (manifest.json, config, layer tarballs)
+[optional]   aligned SquashFS rootfs and VM blobs
 @end example
 
 @section Runtime Sequence
@@ -981,7 +1013,8 @@ Open @file{/proc/self/exe} and read the embedded OCI tar from the
 patched offset.
 @item
 Extract image layers into a temporary rootfs under @file{/tmp} using
-@command{tar --no-same-permissions --no-same-owner}.
+@command{tar --no-same-permissions --no-same-owner}; with @option{--lazy},
+mount the embedded SquashFS and its writable FUSE overlay instead.
 @item
 Patch @file{/etc/passwd} and @file{/etc/group} for single-UID namespace
 compatibility (all UIDs/GIDs set to@tie{}0, except 65534).

@@ -94,7 +94,7 @@ This page is a checklist of the feature surface documented by the site.
 | Ephemeral writable root | `--ephemeral-root` |
 | Disable auto tmpfs | `--no-auto-tmpfs` |
 | Persistent overlay state | `--overlay-persist DIR` |
-| Lazy rootfs extraction probe | `--lazy` |
+| Mountable SquashFS rootfs | build with `--rootfs-format squashfs`, run with `--lazy` |
 | Device mount | `--device /dev/HOST[:CONTAINER]` |
 | Skip host /dev nodes | `--no-host-dev` |
 | GPU selection | `--gpus all` |
@@ -106,6 +106,7 @@ This page is a checklist of the feature surface documented by the site.
 | --- | --- |
 | Host network | `--net host` |
 | No network | `--net none` |
+| Rootless libkrun VM network | `--vm --net userspace` |
 | slirp4netns | `--net slirp` |
 | pasta | `--net pasta` |
 | Publish port | `-p HOST:CONTAINER` |
@@ -188,6 +189,7 @@ byte-for-byte reproducible.
 | Embed initramfs | `--initramfs PATH` |
 | Force libkrun loader | `--libkrun` |
 | Force static loader | `--no-libkrun` |
+| VM TCP port publication | `--vm -p HOST:GUEST` (libkrun) |
 | Custom VM defaults | VM-specific build/runtime options |
 
 ## Reconstruction And Registry Round Trip

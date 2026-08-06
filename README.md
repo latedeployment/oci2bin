@@ -29,8 +29,9 @@ Linux executable and a valid `docker save` archive.
 | Artifact trust | Signing, mandatory runtime signature policy, digest pinning, source-image Cosign verification, Rekor, and SLSA/in-toto attestations |
 | Secrets and encryption | Read-only runtime secrets, TPM2-sealed credentials, and age or passphrase encryption for the embedded image |
 | Flexible builds | Docker, Podman, Skopeo, OCI layouts, chroots, and a daemonless Dockerfile builder |
+| Fast-start filesystem | Optional SquashFS rootfs mounts on demand with a disposable writable overlay, while the default OCI tar path remains unchanged |
 | Production runtime | Health checks, restart policies, systemd units, pods, declarative stacks, logs, metrics, notifications, and audit logs |
-| Architectures and hardware | x86_64 and aarch64 builds, multi-architecture bundles, GPU/CDI devices, and direct microVM deployment |
+| Architectures and hardware | x86_64 and aarch64 builds, multi-architecture bundles, GPU/CDI devices, direct microVM deployment, and rootless libkrun VM networking |
 | OCI interoperability | Load the executable into Docker, push its image payload, or preserve and reconstruct the loader through a registry round trip |
 
 ## Related projects
@@ -103,10 +104,13 @@ for threat boundaries, requirements, and complete hardening examples.
 | Build for another architecture | `oci2bin --arch aarch64 alpine:latest` |
 | Build a multi-architecture bundle | `oci2bin --arch all alpine:latest` |
 | Keep writable state between runs | `./myapp.bin --overlay-persist /srv/myapp/state` |
+| Avoid extracting layers at startup | `oci2bin --rootfs-format squashfs app:latest app.bin && ./app.bin --lazy` |
+| Publish a port from a rootless VM | `./app.bin --vm --net userspace -p 8080:80` |
 | Run with health and restart policies | `./myapp.bin --health-cmd /healthcheck --restart on-failure:5` |
 | Run a pod or declarative stack | `oci2bin up -f stack.yaml -d` |
 | Generate a systemd unit | `oci2bin systemd ./myapp.bin` |
 | Inspect or compare artifacts | `oci2bin inspect ./myapp.bin` / `oci2bin diff old.bin new.bin` |
+| Compare extraction, lazy, and VM startup | `oci2bin benchmark ./myapp.bin --modes extract,lazy,vm` |
 | Generate an SBOM | `oci2bin sbom ./myapp.bin` |
 | Use GPUs or CDI devices | `./myapp.bin --gpus all` |
 | Reload the default artifact into Docker | `docker load < myapp.bin` |
@@ -128,6 +132,7 @@ The complete documentation is available at
 | [Run binaries](https://latedeployment.github.io/oci2bin/runtime/) | Environment, mounts, networking, resources, state, and process management |
 | [Security](https://latedeployment.github.io/oci2bin/security/) | Rootless isolation, seccomp, Landlock, signatures, and secrets |
 | [Operations](https://latedeployment.github.io/oci2bin/operations/) | systemd, stacks, lifecycle commands, logs, and backups |
+| [Benchmarks](https://latedeployment.github.io/oci2bin/benchmarks/) | Startup latency, peak RSS, reliability, and mode comparisons |
 | [Command reference](https://latedeployment.github.io/oci2bin/reference/commands/) | Build flags, runtime flags, and subcommands |
 | [Feature inventory](https://latedeployment.github.io/oci2bin/reference/features/) | Complete feature checklist |
 | [Dependencies](https://latedeployment.github.io/oci2bin/reference/dependencies/) | Build-host and target-host requirements |
@@ -168,6 +173,10 @@ VM mode instead requires `/dev/kvm` and either libkrun or cloud-hypervisor with
 the appropriate VM assets. Features such as encrypted payloads, zstd
 compression, userspace networking, and enforced signature checks add their own
 dependencies.
+
+SquashFS lazy mode requires `mksquashfs` on the build host and `squashfuse`
+plus `fuse-overlayfs`, `/dev/fuse`, and `user_allow_other` enabled in
+`/etc/fuse.conf` on the target.
 
 Use the artifact's built-in readiness check on the machine where it will run:
 
@@ -268,6 +277,26 @@ oci2vm redis:7-alpine
 ./oci2vm_redis_7-alpine
 ```
 
+Give a libkrun VM rootless outbound networking and publish only selected
+inbound TCP ports:
+
+```bash
+./oci2vm_redis_7-alpine --net userspace -p 6379:6379
+```
+
+Build an optional directly mountable rootfs and skip OCI layer extraction on
+each start:
+
+```bash
+oci2bin --rootfs-format squashfs app:latest app.bin
+./app.bin --lazy
+```
+
+This artifact retains the OCI tar for inspection and `docker load`, so it is
+larger than a tar-only or SquashFS-only design. Age encryption cannot be
+combined with this mode because the independently mountable filesystem would
+otherwise expose the plaintext image.
+
 Build for another CPU architecture:
 
 ```bash
@@ -308,6 +337,9 @@ Detailed examples live in the
   kernel and `tar`.
 - Encrypted (`--encrypt` or `--passphrase`) and whole-payload zstd-compressed
   (`--compress-binary`) artifacts are intentionally opaque to `docker load`.
+- `--rootfs-format squashfs` appends a second rootfs representation for
+  `--lazy`; it retains the OCI tar and therefore remains Docker-loadable, at
+  the cost of a larger artifact.
 - Feature-specific helpers are resolved only when the corresponding feature is
   used.
 - `--offline-only` describes how an artifact was built; it is separate from the

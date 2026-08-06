@@ -74,6 +74,7 @@ class PackagingManifestTest(unittest.TestCase):
             env = os.environ.copy()
             env["OCI2BIN_HOME"] = str(share)
             commands = [
+                (["benchmark", "--help"], "benchmark"),
                 (["doctor", "--help"], "doctor"),
                 (["explain", "--help"], "explain"),
                 (["diff-fs", "--help"], "diff-fs"),

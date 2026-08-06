@@ -32,6 +32,7 @@ META_MAGIC = b'OCI2BIN_META\x00'
 # OCI2BIN_SIG block magic + trailer (Feature: signing)
 SIG_MAGIC   = b'OCI2BIN_SIG\x00'
 SIG_TRAILER = b'OCI2BIN_SIG_END\x00'
+SIG_FOOTER_SIZE = len(SIG_TRAILER) + 4
 
 # age ciphertext header (Feature: --encrypt). An encrypted payload is opaque,
 # so inspect reports it as such instead of trying to parse it as a tar.
@@ -53,7 +54,22 @@ def has_signature(binary_path):
             data = f.read()
     except OSError:
         return False
-    return SIG_TRAILER in data and SIG_MAGIC in data
+    # Both strings also occur in the loader's signature-verification code.
+    # A real signature is a length-delimited block at the very end of the
+    # artifact; scanning for the strings alone therefore reports every normal
+    # binary as signed.
+    if len(data) < SIG_FOOTER_SIZE:
+        return False
+    trailer_at = len(data) - SIG_FOOTER_SIZE
+    if data[trailer_at:trailer_at + len(SIG_TRAILER)] != SIG_TRAILER:
+        return False
+    total_size = struct.unpack_from('>I', data, len(data) - 4)[0]
+    if total_size < len(SIG_MAGIC) + 1 + 32 + 2 + SIG_FOOTER_SIZE:
+        return False
+    if total_size > len(data):
+        return False
+    block_at = len(data) - total_size
+    return data[block_at:block_at + len(SIG_MAGIC)] == SIG_MAGIC
 
 
 def has_sbom(binary_path):
@@ -158,7 +174,21 @@ def read_oci_data(binary_path):
         if candidate_offset + candidate_size > file_size:
             return False
         tar_region = data[candidate_offset:candidate_offset + 512]
-        return len(tar_region) >= 262 and tar_region[257:262] == b'ustar'
+        if len(tar_region) < 262 or tar_region[257:262] != b'ustar':
+            return False
+        # Adjacent loader globals can make both the true OCI size and an
+        # unrelated small integer look plausible.  Confirm that the candidate
+        # is a complete docker-save tar instead of accepting the first ustar
+        # header (which may be only a truncated first member).
+        try:
+            with tarfile.open(
+                    fileobj=io.BytesIO(
+                        data[candidate_offset:candidate_offset + candidate_size]),
+                    mode='r:*') as tf:
+                tf.getmember('manifest.json')
+        except (KeyError, tarfile.TarError, EOFError):
+            return False
+        return True
 
     # Scan uint64 values in the loader region looking for a plausible offset.
     # Older loader layouts may place offset,size next to each other; current
@@ -437,6 +467,8 @@ def main():
         meta['signature_present'] = has_signature(binary_path)
         meta['sbom_present'] = has_sbom(binary_path)
         meta['encrypted'] = oci_is_encrypted(oci_bytes)
+        meta['docker_load_compatible'] = (
+            meta.get('payload_encoding', 'tar') == 'tar')
         print(json.dumps(meta))
         return
 
@@ -449,13 +481,17 @@ def main():
         print(f"Image:        {meta.get('image', '(encrypted)')}")
         print("Payload:      encrypted (age) — config/layers not readable "
               "without the matching identity")
+        print(f"Rootfs:       {meta.get('rootfs_format', 'tar')}")
+        print("Docker load:  not compatible (encrypted OCI payload)")
         print(f"Signature:    "
               f"{'present' if has_signature(binary_path) else 'absent'}")
         if meta:
             print()
             print("Build metadata:")
             for label, key in (("Image", "image"), ("Digest", "digest"),
-                               ("Built", "timestamp"), ("oci2bin", "version")):
+                               ("Built", "timestamp"), ("oci2bin", "version"),
+                               ("Rootfs", "rootfs_format"),
+                               ("Encoding", "payload_encoding")):
                 if key in meta:
                     print(f"  {label + ':':10} {meta[key]}")
         return
@@ -522,6 +558,13 @@ def main():
     # Display OCI2BIN_META block if present
     meta = read_meta_block(binary_path)
     if meta:
+        rootfs_format = meta.get('rootfs_format', 'tar')
+        payload_encoding = meta.get('payload_encoding', 'tar')
+        print(f"Rootfs:       {rootfs_format}")
+        print("Docker load:  "
+              + ("compatible (OCI tar retained)"
+                 if payload_encoding == 'tar'
+                 else f"not compatible ({payload_encoding} OCI payload)"))
         print()
         print("Build metadata:")
         if 'image' in meta:

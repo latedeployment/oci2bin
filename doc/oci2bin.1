@@ -204,6 +204,15 @@ Merge all image layers into a single squashed layer before packaging
 to pick the layer codec).
 .
 .TP
+.BI \-\-rootfs\-format " tar|squashfs"
+Use normal OCI layer extraction at run time (the default), or retain the OCI
+tar and append a directly mountable SquashFS rootfs for
+.BR \-\-lazy .
+The SquashFS mode requires
+.BR mksquashfs (1)
+at build time and cannot be combined with age encryption.
+.
+.TP
 .BI \-\-entrypoint " VALUE" \fR, \fB\-\-cmd " VALUE"
 Override the embedded image Entrypoint/Cmd at build time.
 .I VALUE
@@ -337,6 +346,27 @@ is active.
 May be repeated.
 .
 .TP
+.B \-\-lazy
+Mount the SquashFS rootfs appended by build-time
+.B \-\-rootfs\-format squashfs
+instead of extracting OCI layers.
+Requires
+.BR squashfuse (1),
+.BR fuse\-overlayfs (1),
+an accessible
+.IR /dev/fuse ,
+and
+.B user_allow_other
+enabled in
+.IR /etc/fuse.conf
+on the target.
+The lower filesystem is read-only; a temporary writable overlay is used by
+default, or
+.B \-\-overlay\-persist
+can retain its upper layer.
+A missing payload or failed mount aborts the run.
+.
+.TP
 .BI \-\-device " /dev/HOST\fR[:\fICONTAINER\fR]"
 Expose a host device node inside the container.
 .I HOST
@@ -464,6 +494,15 @@ Share the host network stack (default).
 .TP
 .B \-\-net none
 Create an isolated network namespace with only a loopback interface.
+In libkrun VM mode, disable the implicit TSI/vsock device.
+.
+.TP
+.B \-\-net userspace
+Use libkrun's rootless TSI/vsock networking in VM mode.
+Outbound TCP, UDP, and DNS require no TAP device or privileged network setup.
+Inbound listeners remain closed unless published with
+.BR \-p .
+Cloud-hypervisor does not yet support this mode.
 .
 .TP
 .B \-\-net slirp \fR/\fB \-\-net pasta
@@ -474,8 +513,10 @@ or
 .
 .TP
 .BI \-p " HOST:CTR"
-Publish a port (implies
+Publish a port. In container mode this implies
 .BR "\-\-net slirp" ).
+In libkrun VM mode it maps the selected host TCP port to the guest; guest
+listeners are otherwise closed.
 May be repeated.
 .
 .TP
@@ -710,6 +751,12 @@ via
 .BR \-\-vmm ).
 Requires
 .IR /dev/kvm .
+The libkrun backend supports rootless
+.B \-\-net userspace
+and
+.BR \-p ;
+cloud-hypervisor currently accepts only
+.BR \-\-net none .
 .
 .SH SUBCOMMANDS
 .TP
@@ -718,6 +765,19 @@ Display OCI metadata embedded in
 .IR BINARY :
 image name, architecture, layer count, entrypoint, command, environment,
 working directory, build digest, and build timestamp.
+.
+.TP
+.B oci2bin benchmark \fIBINARY\fR \fR[\fB\-\-modes \fILIST\fR] \fR[\fB\-\-runs \fIN\fR] \fR[\fB\-\-\fR \fICMD\fR ...]
+Measure first and repeated startup latency, p95 latency, peak resident memory,
+and launch success rate. Modes are
+.BR extract ,
+.BR lazy ,
+and
+.BR vm .
+Unavailable FUSE or KVM modes are reported as skipped.
+Use
+.B \-\-json
+for raw samples and host metadata.
 .
 .TP
 .B oci2bin list \fR[\fB\-\-json\fR]

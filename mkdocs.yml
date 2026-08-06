@@ -22,6 +22,7 @@ nav:
   - Run Binaries: runtime.md
   - Security: security.md
   - Operations: operations.md
+  - Benchmarks: benchmarks.md
   - Feature Inventory: reference/features.md
   - Command Reference: reference/commands.md
   - Dependencies: reference/dependencies.md

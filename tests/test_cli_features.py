@@ -229,6 +229,7 @@ class TestCliFeatures(unittest.TestCase):
             [str(OCI2BIN), "run",
              "--pull-with", "skopeo",
              "--reproducible",
+             "--rootfs-format", "tar",
              "--oci-dir", str(missing_oci),
              "alpine:latest", "--", "/bin/true"],
             capture_output=True,
@@ -248,6 +249,29 @@ class TestCliFeatures(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--compress requires --squash", result.stderr)
+
+    def test_squashfs_rootfs_rejects_encryption_before_build(self):
+        result = subprocess.run(
+            [str(OCI2BIN), "--rootfs-format", "squashfs",
+             "--encrypt", "--recipient", "age1example",
+             "alpine:latest"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be combined with age encryption", result.stderr)
+        self.assertIn("would expose the plaintext image", result.stderr)
+
+    def test_rootfs_format_rejects_unknown_value(self):
+        result = subprocess.run(
+            [str(OCI2BIN), "--rootfs-format", "ext4", "alpine:latest"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported format 'ext4'", result.stderr)
 
     def test_stop_refuses_mismatched_process_identity(self):
         home = self.tmpdir / "home-stop"

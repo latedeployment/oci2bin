@@ -31,6 +31,19 @@ class TestBuildMetaBlock(unittest.TestCase):
         self.assertEqual(meta['self_update_url'],
                          'https://example.com/demo.json')
         self.assertEqual(meta['pin_digest'], 'b' * 64)
+        self.assertEqual(meta['rootfs_format'], 'tar')
+        self.assertEqual(meta['payload_encoding'], 'tar')
+
+    def test_records_rootfs_format_and_payload_encoding(self):
+        block = bp.build_meta_block(
+            'demo:latest',
+            rootfs_format='squashfs',
+            payload_encoding='zstd',
+        )
+        payload = block[4 + len(bp.META_MAGIC):-1]
+        meta = json.loads(payload)
+        self.assertEqual(meta['rootfs_format'], 'squashfs')
+        self.assertEqual(meta['payload_encoding'], 'zstd')
 
     def test_patch_auto_pin_digest_replaces_placeholder(self):
         block = bp.build_meta_block('demo:latest', pin_digest='auto')

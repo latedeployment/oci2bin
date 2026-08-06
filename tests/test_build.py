@@ -367,5 +367,74 @@ class TestLayerCache(unittest.TestCase):
             self.assertFalse(Path(bp.get_layer_cache_root()).exists())
 
 
+class TestSquashFSRootfs(unittest.TestCase):
+    def test_runtime_config_resolves_named_user(self):
+        with tempfile.TemporaryDirectory() as td:
+            etc = Path(td) / 'etc'
+            etc.mkdir()
+            (etc / 'passwd').write_text(
+                'app:x:1001:1002:App:/home/app:/bin/sh\n',
+                encoding='utf-8')
+            (etc / 'group').write_text(
+                'workers:x:2002:\n',
+                encoding='utf-8')
+            bp._write_runtime_config(td, {
+                'config': {
+                    'Entrypoint': ['/bin/app'],
+                    'Cmd': ['serve'],
+                    'Env': ['MODE=prod'],
+                    'WorkingDir': '/srv',
+                    'User': 'app',
+                    'Healthcheck': {'Test': ['CMD', '/bin/check']},
+                },
+            })
+            cfg = json.loads(
+                (Path(td) / '.oci2bin_config').read_text(encoding='utf-8'))
+            self.assertEqual(cfg['User'], '1001:1002')
+            self.assertEqual(cfg['Entrypoint'], ['/bin/app'])
+            self.assertEqual(cfg['Healthcheck']['Test'],
+                             ['CMD', '/bin/check'])
+
+            self.assertEqual(
+                bp._resolve_image_user(td, 'app:workers'), '1001:2002')
+            self.assertEqual(
+                bp._resolve_image_user(td, '1001:workers'), '1001:2002')
+            self.assertEqual(
+                bp._resolve_image_user(td, 'app:3003'), '1001:3003')
+            self.assertEqual(
+                bp._resolve_image_user(td, '1001:3003'), '1001:3003')
+
+    def test_build_squashfs_invokes_hardened_extractor_and_mksquashfs(self):
+        image_cfg = {'config': {'Cmd': ['/bin/true'], 'User': '0'}}
+
+        def fake_extract(_tar_path, rootfs):
+            (Path(rootfs) / 'payload').write_text('ok', encoding='utf-8')
+            return image_cfg
+
+        def fake_run(argv, **_kwargs):
+            Path(argv[2]).write_bytes(b'hsqs-fake')
+            return mock.Mock(returncode=0, stderr=b'')
+
+        with mock.patch.object(bp.shutil, 'which',
+                               return_value='/usr/bin/mksquashfs'), \
+                mock.patch.object(bp, '_load_dockerfile_rootfs_extractor',
+                                  return_value=fake_extract), \
+                mock.patch.object(bp.subprocess, 'run',
+                                  side_effect=fake_run) as run:
+            result = bp.build_squashfs_payload(b'fake-oci',
+                                               reproducible=True)
+
+        self.assertEqual(result, b'hsqs-fake')
+        argv = run.call_args.args[0]
+        self.assertIn('-all-root', argv)
+        self.assertIn('-mkfs-time', argv)
+        self.assertIn('-all-time', argv)
+
+    def test_build_squashfs_requires_mksquashfs(self):
+        with mock.patch.object(bp.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(SystemExit, 'requires.*mksquashfs'):
+                bp.build_squashfs_payload(b'fake-oci')
+
+
 if __name__ == '__main__':
     unittest.main()

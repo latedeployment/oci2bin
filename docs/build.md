@@ -316,6 +316,43 @@ gzip|zstd` selects the codec for the squashed layer and is valid only with
 `--squash`; this is distinct from `--compress-binary`, which wraps the entire
 embedded payload.
 
+## Mountable SquashFS Rootfs
+
+Build an artifact with a second, directly mountable root filesystem:
+
+```bash
+oci2bin --rootfs-format squashfs app:latest app.bin
+./app.bin --lazy
+```
+
+The builder applies the OCI layers once, writes the runtime image config into
+the normalized rootfs, and runs `mksquashfs`. At runtime, `squashfuse` mounts
+that payload directly from the executable and `fuse-overlayfs` supplies the
+normal writable view. This avoids extracting every layer for every launch.
+
+`tar` remains the default format. The SquashFS option appends the mountable
+rootfs while retaining the original OCI payload, so the artifact remains
+inspectable and directly accepted by `docker load`; the tradeoff is that it
+carries both representations and is larger.
+
+Use persistent state with the same runtime flag:
+
+```bash
+./app.bin --lazy --overlay-persist /srv/app/state
+```
+
+Build requirements and constraints:
+
+- `mksquashfs` is required on the build host.
+- `squashfuse`, `fuse-overlayfs`, `/dev/fuse`, and `user_allow_other` enabled
+  in `/etc/fuse.conf` are required on the runtime host.
+- `--reproducible` gives `mksquashfs` fixed filesystem and file timestamps.
+- age encryption cannot be combined with SquashFS mode. The separately
+  mountable filesystem would otherwise be a plaintext copy of the encrypted
+  OCI payload, so the builder rejects the combination.
+- Whole-OCI zstd compression remains allowed; `--lazy` mounts the SquashFS
+  copy, while ordinary extraction needs `zstd`.
+
 ## Compress The Binary
 
 ```bash
@@ -534,6 +571,19 @@ Backend selection:
 oci2bin --libkrun alpine:latest vm.bin
 oci2bin --no-libkrun alpine:latest static-loader.bin
 ```
+
+The libkrun backend also provides rootless VM userspace networking:
+
+```bash
+./vm.bin --vm --net userspace
+./vm.bin --vm -p 8080:80
+./vm.bin --vm --net none
+```
+
+No TAP device or privileged host network setup is required. Inbound ports are
+closed unless explicitly published. This networking path is currently
+libkrun-only; cloud-hypervisor rejects `--net userspace` and `-p` instead of
+silently booting without the requested connectivity.
 
 > **libkrun is a lazy runtime dependency, not a load-time one.** If `libkrun`
 > is installed on the build host, oci2bin selects the libkrun loader by default.

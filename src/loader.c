@@ -190,6 +190,10 @@ static volatile unsigned long KERNEL_DATA_PATCHED   = 0x5A5A5A5A5A5A5A5AUL;
 static volatile unsigned long INITRAMFS_DATA_OFFSET = 0xC0FFEE00C0FFEE00UL;
 static volatile unsigned long INITRAMFS_DATA_SIZE   = 0xFACEB00CFACEB00CUL;
 static volatile unsigned long INITRAMFS_DATA_PATCHED = 0x6B6B6B6B6B6B6B6BUL;
+/* Optional SquashFS rootfs payload used by --lazy. */
+static volatile unsigned long ROOTFS_DATA_OFFSET    = 0x51554153484F4646UL;
+static volatile unsigned long ROOTFS_DATA_SIZE      = 0x5351554153485349UL;
+static volatile unsigned long ROOTFS_DATA_PATCHED   = 0x5254465350415443UL;
 
 /* Max layers / volumes / exec args we support */
 #define MAX_LAYERS   128
@@ -399,7 +403,8 @@ static int kernel_supports_mseal(void)
     return kernel_feature_supported(KERNEL_FEATURE_MSEAL);
 }
 
-static int kernel_supports_uffd(void)
+/* Retained for kernel feature diagnostics/tests; --lazy now uses SquashFS. */
+static int __attribute__((unused)) kernel_supports_uffd(void)
 {
     return kernel_feature_supported(KERNEL_FEATURE_UFFD);
 }
@@ -550,14 +555,15 @@ struct container_opts
     /* --workdir /path  (overrides OCI WorkingDir) */
     char* workdir;
 
-    /* --net host|none|container:<PID>|slirp|pasta|slirp:H:C
+    /* --net host|none|userspace|container:<PID>|slirp|pasta|slirp:H:C
      * NULL/"host" = host network; "none" = isolated; container:<PID> = join
      * "slirp" = userspace TCP/UDP via slirp4netns
      * "pasta" = userspace TCP/UDP via pasta
+     * "userspace" = rootless libkrun TSI networking in --vm mode
      * "slirp:HOST_PORT:CTR_PORT" = slirp with port forward */
     char* net;
     pid_t net_join_pid; /* >0: join this PID's network namespace */
-    /* port-forwards for slirp mode: "HOST_PORT:CTR_PORT" strings */
+    /* port-forwards: "HOST_PORT:CTR_PORT" strings */
     char* net_portfwd[16];
     int   n_portfwd;
 
@@ -723,7 +729,7 @@ struct container_opts
     /* --no-userns-remap  (force single-ID user namespace fallback) */
     int no_userns_remap;
 
-    /* --lazy  (experimental: attempt userfaultfd-based on-demand rootfs paging) */
+    /* --lazy  (mount the embedded SquashFS rootfs instead of extracting layers) */
     int lazy;
 
     /* Landlock LSM filesystem sandbox.
@@ -5614,6 +5620,335 @@ static pid_t spawn_daemon(char* const argv[])
 
 /* File-level static so the returned pointer is never to stack memory. */
 static char s_oci_rootfs[PATH_MAX];
+static pid_t s_lazy_squash_pid = -1;
+static pid_t s_lazy_overlay_pid = -1;
+
+/* Defined with the cleanup helpers below. */
+static int mountinfo_unescape(const char* src, char* dst, size_t dst_sz);
+
+/*
+ * Return 1 once path appears as an exact mount point in /proc/self/mountinfo.
+ * Temporary paths may contain whitespace, hence the kernel escape decoding.
+ */
+static int path_is_mountpoint(const char* path)
+{
+    FILE* f = fopen("/proc/self/mountinfo", "r");
+    if (!f)
+    {
+        return 0;
+    }
+    char line[8192];
+    int found = 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        char* p = line;
+        for (int field = 0; field < 4 && p; field++)
+        {
+            p = strchr(p, ' ');
+            if (p)
+            {
+                p++;
+            }
+        }
+        if (!p)
+        {
+            continue;
+        }
+        char* end = strchr(p, ' ');
+        if (!end)
+        {
+            continue;
+        }
+        *end = '\0';
+        char decoded[PATH_MAX];
+        if (mountinfo_unescape(p, decoded, sizeof(decoded)) >= 0 &&
+                strcmp(decoded, path) == 0)
+        {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/*
+ * Wait up to five seconds for a FUSE helper to publish its mount. If the
+ * helper exits first, reap it and clear the PID so cleanup cannot signal a
+ * subsequently reused process ID.
+ */
+static int wait_for_fuse_mount(const char* path, pid_t* helper_pid,
+                               const char* helper_name)
+{
+    struct timespec pause = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 };
+    for (int attempt = 0; attempt < 250; attempt++)
+    {
+        if (path_is_mountpoint(path))
+        {
+            return 0;
+        }
+        int status = 0;
+        pid_t done = waitpid(*helper_pid, &status, WNOHANG);
+        if (done == *helper_pid)
+        {
+            *helper_pid = -1;
+            fprintf(stderr,
+                    "oci2bin: --lazy: %s exited before mounting %s"
+                    " (is it installed and is /dev/fuse usable?)\n",
+                    helper_name, path);
+            return -1;
+        }
+        nanosleep(&pause, NULL);
+    }
+    fprintf(stderr, "oci2bin: --lazy: timed out waiting for %s to mount %s\n",
+            helper_name, path);
+    return -1;
+}
+
+static void stop_lazy_helper(pid_t* helper_pid)
+{
+    if (*helper_pid <= 0)
+    {
+        return;
+    }
+    int status = 0;
+    pid_t done = waitpid(*helper_pid, &status, WNOHANG);
+    if (done == 0)
+    {
+        kill(*helper_pid, SIGTERM);
+    }
+    *helper_pid = -1;
+}
+
+static void discard_failed_lazy_mount(const char* tmpdir)
+{
+    stop_lazy_helper(&s_lazy_overlay_pid);
+    stop_lazy_helper(&s_lazy_squash_pid);
+    /* Give libfuse's auto_unmount handler a moment to detach. rm_rf_dir()
+     * independently refuses to cross a remaining mount, so a slow detach
+     * can leak a temp directory but can never delete through the mount. */
+    struct timespec pause = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 };
+    nanosleep(&pause, NULL);
+    rm_rf_dir(tmpdir);
+    s_oci_rootfs[0] = '\0';
+}
+
+static int validate_lazy_rootfs_payload(const char* self_path)
+{
+    if (ROOTFS_DATA_PATCHED != 1 || ROOTFS_DATA_SIZE < 96)
+    {
+        fprintf(stderr,
+                "oci2bin: --lazy requires an embedded SquashFS rootfs;"
+                " rebuild with --rootfs-format squashfs\n");
+        return -1;
+    }
+
+    int fd = open(self_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        perror("oci2bin: --lazy open executable");
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < 0 ||
+            ROOTFS_DATA_OFFSET > (unsigned long)st.st_size ||
+            ROOTFS_DATA_SIZE >
+            (unsigned long)st.st_size - ROOTFS_DATA_OFFSET)
+    {
+        fprintf(stderr,
+                "oci2bin: --lazy: embedded SquashFS range is outside the "
+                "artifact\n");
+        close(fd);
+        return -1;
+    }
+
+    unsigned char sb[48];
+    ssize_t n = pread(fd, sb, sizeof(sb), (off_t)ROOTFS_DATA_OFFSET);
+    close(fd);
+    if (n != (ssize_t)sizeof(sb) || memcmp(sb, "hsqs", 4) != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --lazy: embedded rootfs has no SquashFS "
+                "superblock\n");
+        return -1;
+    }
+
+    /* squashfs_super_block.bytes_used is little-endian at byte 40. */
+    uint64_t bytes_used = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        bytes_used |= (uint64_t)sb[40 + i] << (i * 8);
+    }
+    if (bytes_used < 96 || bytes_used > ROOTFS_DATA_SIZE)
+    {
+        fprintf(stderr,
+                "oci2bin: --lazy: SquashFS superblock exceeds its embedded "
+                "range\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* A lazy root is mounted before the container changes to the image UID.
+ * libfuse otherwise permits only the host user that created the mount, so
+ * the mapped image UID receives EACCES even though the file modes allow
+ * execution. Root may request allow_other directly; an unprivileged mount
+ * needs the standard /etc/fuse.conf opt-in. */
+static int fuse_conf_has_user_allow_other(const char* path)
+{
+    FILE* f = fopen(path, "r");
+    if (!f)
+    {
+        return 0;
+    }
+    char line[256];
+    int found = 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        char* p = line;
+        while (*p == ' ' || *p == '\t')
+        {
+            p++;
+        }
+        if (*p == '#' || *p == '\0' || *p == '\n')
+        {
+            continue;
+        }
+        static const char option[] = "user_allow_other";
+        size_t option_len = sizeof(option) - 1;
+        if (strncmp(p, option, option_len) == 0 &&
+                (p[option_len] == '\0' || p[option_len] == '\n' ||
+                 p[option_len] == '\r' || p[option_len] == ' ' ||
+                 p[option_len] == '\t' || p[option_len] == '#'))
+        {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static int fuse_allow_other_available(void)
+{
+    return geteuid() == 0 ||
+           fuse_conf_has_user_allow_other("/etc/fuse.conf");
+}
+
+/*
+ * Mount the embedded SquashFS as a lower filesystem and place a temporary
+ * fuse-overlayfs upper layer over it. This preserves the normal writable-root
+ * behavior while avoiding OCI layer extraction at every launch.
+ */
+static char* mount_lazy_rootfs(const char* self_path,
+                               const struct container_opts* opts)
+{
+    if (validate_lazy_rootfs_payload(self_path) < 0)
+    {
+        return NULL;
+    }
+    if (!fuse_allow_other_available())
+    {
+        fprintf(stderr,
+                "oci2bin: --lazy requires user_allow_other in /etc/fuse.conf"
+                " so the image UID can access the rootless FUSE mounts\n");
+        return NULL;
+    }
+
+    char tmpdir[PATH_MAX];
+    if (make_runtime_tmpdir(tmpdir, sizeof(tmpdir), "oci2bin.") < 0)
+    {
+        perror("mkdtemp");
+        return NULL;
+    }
+    if (strchr(tmpdir, ',') || strchr(tmpdir, ':'))
+    {
+        fprintf(stderr,
+                "oci2bin: --lazy: temporary path must not contain ',' or ':'"
+                " (set OCI2BIN_TMPDIR to a simple path)\n");
+        rm_rf_dir(tmpdir);
+        return NULL;
+    }
+
+    char lower[PATH_MAX], upper[PATH_MAX], work[PATH_MAX];
+    if (path_join_suffix(s_oci_rootfs, sizeof(s_oci_rootfs),
+                         tmpdir, "/rootfs") < 0 ||
+            path_join_suffix(lower, sizeof(lower), tmpdir, "/lower") < 0)
+    {
+        fprintf(stderr, "oci2bin: --lazy: runtime path too long\n");
+        discard_failed_lazy_mount(tmpdir);
+        return NULL;
+    }
+    const char* overlay_base = opts->overlay_persist ?
+                               opts->overlay_persist : tmpdir;
+    if (path_join_suffix(upper, sizeof(upper), overlay_base, "/upper") < 0 ||
+            path_join_suffix(work, sizeof(work), overlay_base, "/work") < 0)
+    {
+        fprintf(stderr, "oci2bin: --lazy: overlay path too long\n");
+        discard_failed_lazy_mount(tmpdir);
+        return NULL;
+    }
+    if ((opts->overlay_persist &&
+            mkdir(opts->overlay_persist, 0755) < 0 && errno != EEXIST) ||
+            (mkdir(s_oci_rootfs, 0755) < 0 && errno != EEXIST) ||
+            (mkdir(lower, 0755) < 0 && errno != EEXIST) ||
+            (mkdir(upper, 0755) < 0 && errno != EEXIST) ||
+            (mkdir(work, 0755) < 0 && errno != EEXIST))
+    {
+        perror("oci2bin: --lazy mkdir");
+        discard_failed_lazy_mount(tmpdir);
+        return NULL;
+    }
+
+    char squash_opts[128];
+    int n = snprintf(squash_opts, sizeof(squash_opts),
+                     "offset=%lu,allow_other", ROOTFS_DATA_OFFSET);
+    if (n < 0 || (size_t)n >= sizeof(squash_opts))
+    {
+        fprintf(stderr, "oci2bin: --lazy: SquashFS options truncated\n");
+        discard_failed_lazy_mount(tmpdir);
+        return NULL;
+    }
+    char* squash_argv[] = {
+        "squashfuse", "-f", "-o", squash_opts,
+        (char*)self_path, lower, NULL
+    };
+    s_lazy_squash_pid = spawn_daemon(squash_argv);
+    if (s_lazy_squash_pid < 0 ||
+            wait_for_fuse_mount(lower, &s_lazy_squash_pid,
+                                "squashfuse") < 0)
+    {
+        discard_failed_lazy_mount(tmpdir);
+        return NULL;
+    }
+
+    char overlay_opts[PATH_MAX * 3 + 96];
+    n = snprintf(overlay_opts, sizeof(overlay_opts),
+                 "lowerdir=%s,upperdir=%s,workdir=%s,allow_other,auto_unmount",
+                 lower, upper, work);
+    if (n < 0 || (size_t)n >= sizeof(overlay_opts))
+    {
+        fprintf(stderr, "oci2bin: --lazy: overlay options truncated\n");
+        discard_failed_lazy_mount(tmpdir);
+        return NULL;
+    }
+    char* overlay_argv[] = {
+        "fuse-overlayfs", "-f", "-o", overlay_opts,
+        s_oci_rootfs, NULL
+    };
+    s_lazy_overlay_pid = spawn_daemon(overlay_argv);
+    if (s_lazy_overlay_pid < 0 ||
+            wait_for_fuse_mount(s_oci_rootfs, &s_lazy_overlay_pid,
+                                "fuse-overlayfs") < 0)
+    {
+        discard_failed_lazy_mount(tmpdir);
+        return NULL;
+    }
+
+    debug_log("extract.lazy", "rootfs=%s offset=0x%lx size=0x%lx",
+              s_oci_rootfs, ROOTFS_DATA_OFFSET, ROOTFS_DATA_SIZE);
+    return s_oci_rootfs;
+}
 
 /* age ciphertext header sentinels (see https://age-encryption.org/v1).
  * A binary age file begins with the literal "age-encryption.org/v1\n";
@@ -12012,6 +12347,12 @@ static int make_mount_tree_private(void)
 static int setup_overlay_root(const char* rootfs,
                               const struct container_opts* opts)
 {
+    /* mount_lazy_rootfs() already installed the requested temporary or
+     * persistent FUSE overlay before namespace/VM dispatch. */
+    if (opts->lazy)
+    {
+        return 0;
+    }
     if (!opts->ephemeral_root && !opts->overlay_persist)
     {
         return 0;
@@ -13329,6 +13670,32 @@ static int run_runtime_doctor(void)
         issues++;
     }
 
+    if (ROOTFS_DATA_PATCHED == 1)
+    {
+        int have_squashfuse =
+            find_helper_binary("squashfuse", helper, sizeof(helper)) == 0;
+        doctor_row("squashfuse (--lazy)", have_squashfuse ? "OK" : "MISSING",
+                   have_squashfuse ? "present (lazy SquashFS mount)"
+                   : "required by this artifact's --lazy mode");
+        int have_fuse_overlay =
+            find_helper_binary("fuse-overlayfs", helper, sizeof(helper)) == 0;
+        doctor_row("fuse-overlayfs (--lazy)",
+                   have_fuse_overlay ? "OK" : "MISSING",
+                   have_fuse_overlay ? "present (writable lazy root)"
+                   : "required by this artifact's --lazy mode");
+        int have_fuse_device = access("/dev/fuse", R_OK | W_OK) == 0;
+        doctor_row("/dev/fuse (--lazy)",
+                   have_fuse_device ? "OK" : "MISSING",
+                   have_fuse_device ? "accessible (FUSE mounts available)"
+                   : "absent/inaccessible — --lazy unavailable");
+        int have_allow_other = fuse_allow_other_available();
+        doctor_row("FUSE allow_other (--lazy)",
+                   have_allow_other ? "OK" : "MISSING",
+                   have_allow_other
+                   ? "enabled for image UID access"
+                   : "enable user_allow_other in /etc/fuse.conf");
+    }
+
     /* /dev/kvm — only needed for --vm; namespace mode works without it. */
     int have_kvm = access("/dev/kvm", R_OK | W_OK) == 0;
     doctor_row("/dev/kvm (--vm only)", have_kvm ? "OK" : "DEGRADED",
@@ -13376,8 +13743,9 @@ static void usage(const char* prog)
             "                      optional :ro remounts it read-only, :rw is the\n"
             "                      default (may be repeated)\n"
             "  -p HOST_PORT:CTR_PORT\n"
-            "                      Publish a container port to the host via slirp\n"
-            "                      (may be repeated; implies --net slirp)\n"
+            "                      Publish a container or VM port to the host\n"
+            "                      (slirp in container mode, libkrun userspace\n"
+            "                      networking in VM mode; may be repeated)\n"
             "  --secret HOST_FILE[:CONTAINER_PATH]\n"
             "                      Bind mount a host file read-only into the container;\n"
             "                      defaults to /run/secrets/<basename> (may be repeated)\n"
@@ -13392,8 +13760,9 @@ static void usage(const char* prog)
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
             "  --workdir PATH      Set the working directory inside the container\n"
-            "  --net host|none|slirp|pasta|slirp:H:C|container:<PID>\n"
+            "  --net host|none|userspace|slirp|pasta|slirp:H:C|container:<PID>\n"
             "                      Network: host (default), none (isolated),\n"
+            "                      userspace (rootless libkrun --vm network),\n"
             "                      slirp (userspace via slirp4netns),\n"
             "                      pasta (userspace via pasta),\n"
             "                      slirp:HOST_PORT:CTR_PORT (with port"
@@ -13459,9 +13828,10 @@ static void usage(const char* prog)
             "  --user UID[:GID]    Run as this numeric UID (and optional GID)\n"
             "  --no-userns-remap   Disable subordinate UID/GID remapping and use\n"
             "                      the single-ID user namespace fallback\n"
-            "  --lazy              [EXPERIMENTAL] Attempt userfaultfd-based on-demand\n"
-            "                      rootfs paging (Linux 4.3+); falls back to full\n"
-            "                      extraction if unsupported\n"
+            "  --lazy              Mount an embedded SquashFS rootfs on demand;\n"
+            "                      requires an artifact built with\n"
+            "                      --rootfs-format squashfs plus squashfuse and\n"
+            "                      fuse-overlayfs on the runtime host\n"
             "  --hostname NAME     Set the hostname inside the container\n"
             "  --cap-drop CAP      Drop a capability (or 'all' to drop all)\n"
             "  --cap-add CAP       Add an ambient capability (use after --cap-drop all)\n"
@@ -14201,7 +14571,8 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         }
         else if (strcmp(argv[i], "-p") == 0)
         {
-            /* -p HOST_PORT:CTR_PORT — shorthand for --net slirp:HOST:CTR */
+            /* -p HOST_PORT:CTR_PORT. The implied network is selected after
+             * all options are parsed: slirp for containers, TSI for VMs. */
             if (i + 1 >= argc)
             {
                 fprintf(stderr,
@@ -14224,11 +14595,6 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                 return -1;
             }
             opts->net_portfwd[opts->n_portfwd++] = spec;
-            /* Auto-enable slirp networking if not already set */
-            if (!opts->net || strcmp(opts->net, "host") == 0)
-            {
-                opts->net = "slirp";
-            }
         }
         else if (strcmp(argv[i], "--allow-egress") == 0)
         {
@@ -14599,6 +14965,10 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             {
                 opts->net = argv[i]; /* "pasta" */
             }
+            else if (strcmp(argv[i], "userspace") == 0)
+            {
+                opts->net = argv[i]; /* libkrun VM networking */
+            }
             else if (strcmp(argv[i], "slirp") == 0)
             {
                 opts->net = argv[i]; /* "slirp" */
@@ -14628,7 +14998,7 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             else
             {
                 fprintf(stderr,
-                        "oci2bin: --net must be host, none, slirp,"
+                        "oci2bin: --net must be host, none, userspace, slirp,"
                         " pasta, slirp:H:C, or container:<PID>\n");
                 return -1;
             }
@@ -17304,6 +17674,11 @@ static void cleanup_oci_rootfs(void)
     {
         *last_slash = '\0';
         unmount_tree_below(s_oci_rootfs);
+        /* FUSE mounts normally disappear via auto_unmount. Terminate the
+         * daemons as a backstop, rescan, and only then remove the tree. */
+        stop_lazy_helper(&s_lazy_overlay_pid);
+        stop_lazy_helper(&s_lazy_squash_pid);
+        unmount_tree_below(s_oci_rootfs);
         rm_rf_dir(s_oci_rootfs);
     }
 }
@@ -17836,6 +18211,8 @@ typedef int32_t (*krun_set_mapped_volumes_fn)(uint32_t, const char* const[]);
 typedef int32_t (*krun_set_workdir_fn)(uint32_t, const char*);
 typedef int32_t (*krun_set_exec_fn)(uint32_t, const char*,
                                     const char* const[], const char* const[]);
+typedef int32_t (*krun_set_port_map_fn)(uint32_t, const char* const[]);
+typedef int32_t (*krun_disable_implicit_vsock_fn)(uint32_t);
 typedef int32_t (*krun_start_enter_fn)(uint32_t);
 
 static struct
@@ -17847,6 +18224,8 @@ static struct
     krun_set_mapped_volumes_fn set_mapped_volumes;
     krun_set_workdir_fn        set_workdir;
     krun_set_exec_fn           set_exec;
+    krun_set_port_map_fn       set_port_map;
+    krun_disable_implicit_vsock_fn disable_implicit_vsock;
     krun_start_enter_fn        start_enter;
 } g_krun;
 
@@ -17886,6 +18265,11 @@ static int libkrun_load(void)
         (krun_set_workdir_fn)dlsym(g_krun.handle, "krun_set_workdir");
     g_krun.set_exec =
         (krun_set_exec_fn)dlsym(g_krun.handle, "krun_set_exec");
+    g_krun.set_port_map =
+        (krun_set_port_map_fn)dlsym(g_krun.handle, "krun_set_port_map");
+    g_krun.disable_implicit_vsock =
+        (krun_disable_implicit_vsock_fn)dlsym(
+            g_krun.handle, "krun_disable_implicit_vsock");
     g_krun.start_enter =
         (krun_start_enter_fn)dlsym(g_krun.handle, "krun_start_enter");
     if (!g_krun.create_ctx || !g_krun.set_vm_config || !g_krun.set_root
@@ -17973,6 +18357,53 @@ static int run_as_vm_libkrun(const char* rootfs, const char* tmpdir,
     {
         fprintf(stderr, "oci2bin: krun_set_vm_config failed\n");
         goto cleanup;
+    }
+
+    /*
+     * libkrun provides rootless networking through its implicit TSI/vsock
+     * backend. A NULL port map exposes every listening guest port, so always
+     * pass an explicit array: empty means closed by default; -p entries are
+     * the only inbound listeners exposed to the host.
+     */
+    if (opts->net && strcmp(opts->net, "none") == 0)
+    {
+        if (!g_krun.disable_implicit_vsock)
+        {
+            fprintf(stderr,
+                    "oci2bin: --vm --net none requires a newer libkrun with "
+                    "krun_disable_implicit_vsock\n");
+            goto cleanup;
+        }
+        if (g_krun.disable_implicit_vsock((uint32_t)ctx) != 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: krun_disable_implicit_vsock failed\n");
+            goto cleanup;
+        }
+        debug_log("vm.libkrun.network", "mode=none forwards=0");
+    }
+    else
+    {
+        if (!g_krun.set_port_map)
+        {
+            fprintf(stderr,
+                    "oci2bin: rootless VM networking requires a newer "
+                    "libkrun with krun_set_port_map\n");
+            goto cleanup;
+        }
+        const char* port_map[17];
+        for (int pi = 0; pi < opts->n_portfwd; pi++)
+        {
+            port_map[pi] = opts->net_portfwd[pi];
+        }
+        port_map[opts->n_portfwd] = NULL;
+        if (g_krun.set_port_map((uint32_t)ctx, port_map) != 0)
+        {
+            fprintf(stderr, "oci2bin: krun_set_port_map failed\n");
+            goto cleanup;
+        }
+        debug_log("vm.libkrun.network", "mode=userspace forwards=%d",
+                  opts->n_portfwd);
     }
 
     /* Ensure VM guest has a usable /etc/resolv.conf (not 127.0.0.53) */
@@ -18433,6 +18864,21 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
                         struct container_opts* opts)
 {
     debug_log("vm.ch.begin", "rootfs=%s tmpdir=%s", rootfs, tmpdir);
+    if (opts->n_portfwd > 0 ||
+            (opts->net && strcmp(opts->net, "none") != 0))
+    {
+        fprintf(stderr,
+                "oci2bin: cloud-hypervisor userspace networking and -p are "
+                "not available yet; use a libkrun-built artifact or "
+                "--net none\n");
+        return 1;
+    }
+    if (opts->net_join_pid > 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --net container:PID is not supported with --vm\n");
+        return 1;
+    }
     install_resolv_conf(rootfs);
 
     if (KERNEL_DATA_PATCHED != 1)
@@ -20444,6 +20890,58 @@ static int mcp_serve_main(const char* self_path, int allow_net)
     }
 }
 
+static void normalize_network_opts(struct container_opts* opts)
+{
+    if (opts->n_portfwd > 0 &&
+            (!opts->net || strcmp(opts->net, "host") == 0))
+    {
+        opts->net = opts->use_vm ? "userspace" : "slirp";
+    }
+}
+
+static int validate_network_opts(const struct container_opts* opts)
+{
+    if (opts->use_vm && opts->n_egress > 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --allow-egress is not supported with --vm; use "
+                "container mode with --net slirp or --net pasta\n");
+        return -1;
+    }
+    if (!opts->use_vm && opts->net &&
+            strcmp(opts->net, "userspace") == 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --net userspace is a libkrun VM mode; add --vm "
+                "or use --net slirp/--net pasta in container mode\n");
+        return -1;
+    }
+    if (opts->use_vm && opts->net_join_pid > 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --net container:PID is not supported with --vm\n");
+        return -1;
+    }
+    if (opts->use_vm && opts->net &&
+            strcmp(opts->net, "host") != 0 &&
+            strcmp(opts->net, "none") != 0 &&
+            strcmp(opts->net, "userspace") != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --vm supports --net userspace or --net none; "
+                "slirp/pasta are container network modes\n");
+        return -1;
+    }
+    if (opts->net && strcmp(opts->net, "none") == 0 &&
+            opts->n_portfwd > 0)
+    {
+        fprintf(stderr,
+                "oci2bin: -p cannot be combined with --net none\n");
+        return -1;
+    }
+    return 0;
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char* argv[])
@@ -20619,6 +21117,7 @@ int main(int argc, char* argv[])
     {
         return 1;
     }
+    normalize_network_opts(&opts);
     if (opts.debug)
     {
         g_debug = 1;
@@ -20704,41 +21203,24 @@ int main(int argc, char* argv[])
         return update_rc;
     }
 
+    /* Reject incompatible network combinations before preparing a rootfs or
+     * forking a detached supervisor. */
+    if (validate_network_opts(&opts) < 0)
+    {
+        return 1;
+    }
+
     /* Emit audit start event now that opts are fully resolved */
     audit_emit_start_event(self_path, &opts);
     notify_event(&opts, "container_start", NULL);
 
-    /* 4. Extract OCI image into rootfs */
-#ifdef __NR_userfaultfd
-    if (opts.lazy)
-    {
-        if (kernel_supports_uffd())
-        {
-            fprintf(stderr,
-                    "oci2bin: --lazy: userfaultfd available (Linux ≥4.3);"
-                    " lazy rootfs paging is experimental — falling back to"
-                    " full extraction\n");
-        }
-        else
-        {
-            fprintf(stderr,
-                    "oci2bin: --lazy: userfaultfd not supported by this"
-                    " kernel — falling back to full extraction\n");
-        }
-    }
-#else
-    if (opts.lazy)
-    {
-        fprintf(stderr,
-                "oci2bin: --lazy: built without userfaultfd support"
-                " (#ifdef __NR_userfaultfd not set) — falling back to"
-                " full extraction\n");
-    }
-#endif
-    char* rootfs = extract_oci_rootfs(self_path);
+    /* 4. Prepare the rootfs. SquashFS artifacts can skip layer extraction;
+     * ordinary artifacts retain the existing OCI merge path. */
+    char* rootfs = opts.lazy ? mount_lazy_rootfs(self_path, &opts)
+                   : extract_oci_rootfs(self_path);
     if (!rootfs)
     {
-        fprintf(stderr, "oci2bin: failed to extract OCI rootfs\n");
+        fprintf(stderr, "oci2bin: failed to prepare rootfs\n");
         return 1;
     }
     /* Ensure the tmpdir is removed on every exit path — explicit returns
@@ -20873,14 +21355,6 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
-    }
-
-    if (opts.use_vm && opts.n_egress > 0)
-    {
-        fprintf(stderr,
-                "oci2bin: --allow-egress is not supported with --vm; use "
-                "container mode with --net slirp or --net pasta\n");
-        return 1;
     }
 
     /* --secret is installed by setup_secrets() on the container path only;

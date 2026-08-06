@@ -89,8 +89,12 @@ extra host support:
 
 - `--net slirp` needs `slirp4netns`
 - `--net pasta` needs `pasta`
+- `--lazy` needs an artifact built with `--rootfs-format squashfs`,
+  `squashfuse`, `fuse-overlayfs`, `/dev/fuse`, and `user_allow_other` enabled
+  in `/etc/fuse.conf`
 - cgroup resource limits need cgroup v2
-- `--vm` needs a VM backend such as libkrun or cloud-hypervisor support
+- `--vm` needs `/dev/kvm` and a VM backend such as libkrun or
+  cloud-hypervisor; rootless userspace VM networking is currently libkrun-only
 - encrypted payloads need the matching `age` identity or passphrase at runtime
 - compressed payloads need `zstd` at runtime
 
@@ -110,6 +114,7 @@ Run this on a target host to see what is available:
   reproducibility, VM mode
 - [Run Binaries](runtime.md): runtime flags for mounts, env, networking,
   resources, process management, and state
+- [Benchmarks](benchmarks.md): compare extraction, lazy-mount, and VM startup
 - [Security](security.md): rootless isolation, seccomp, capabilities,
   signatures, secrets, and limits
 - [Operations](operations.md): systemd, lifecycle commands, stacks, backups,
