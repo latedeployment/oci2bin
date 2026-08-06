@@ -20,6 +20,86 @@ By default, the file is also an
 [ELF+TAR polyglot](https://en.wikipedia.org/wiki/Polyglot_(computing)): a native
 Linux executable and a valid `docker save` archive.
 
+## Highlights
+
+| Area | What oci2bin provides |
+|---|---|
+| Portable deployment | Copy one mostly self-contained file and run it without installing Docker, a daemon, or oci2bin on the target |
+| Rootless isolation | User, mount, network, IPC, cgroup, and time namespaces with seccomp, Landlock, capabilities, and resource controls |
+| Artifact trust | Signing, mandatory runtime signature policy, digest pinning, source-image Cosign verification, Rekor, and SLSA/in-toto attestations |
+| Secrets and encryption | Read-only runtime secrets, TPM2-sealed credentials, and age or passphrase encryption for the embedded image |
+| Flexible builds | Docker, Podman, Skopeo, OCI layouts, chroots, and a daemonless Dockerfile builder |
+| Production runtime | Health checks, restart policies, systemd units, pods, declarative stacks, logs, metrics, notifications, and audit logs |
+| Architectures and hardware | x86_64 and aarch64 builds, multi-architecture bundles, GPU/CDI devices, and direct microVM deployment |
+| OCI interoperability | Load the executable into Docker, push its image payload, or preserve and reconstruct the loader through a registry round trip |
+
+## Security highlights
+
+Security controls are available at the artifact, extraction, isolation, and
+workload layers:
+
+- Execution is rootless and daemonless by default. The container's root user
+  maps to an unprivileged host user.
+- A default seccomp filter and Landlock filesystem sandbox reduce the runtime
+  surface when the host supports them. Custom and generated seccomp profiles,
+  AppArmor profiles, and SELinux labels are also supported.
+- Read-only roots, tmpfs mounts, capability controls, network isolation,
+  default-deny egress allowlists, cgroup v2 limits, and `--strict` provide a
+  fail-closed hardening path.
+- Artifacts can be signed, verified at runtime, or built with a mandatory
+  embedded signature policy. Digest pinning, source-image Cosign verification,
+  Rekor entries, and provenance attestations extend the chain of trust.
+- Embedded images can be encrypted with age recipients or a passphrase.
+  Runtime secrets are mounted read-only; TPM2-sealed secrets are staged in
+  memory rather than disk-backed storage.
+- Untrusted image layers are extracted defensively: set-ID bits and file
+  capabilities are removed, extended attributes are allowlisted, and symlink
+  traversal protections are applied.
+- For a stronger isolation boundary, `oci2vm` deploys and runs the workload
+  directly as a microVM.
+
+A locked-down namespace-mode run can be expressed directly:
+
+```bash
+./myapp.bin \
+  --read-only \
+  --tmpfs /tmp \
+  --net none \
+  --cap-drop all \
+  --memory 512m \
+  --pids-limit 128 \
+  --strict
+```
+
+See the [security guide](https://latedeployment.github.io/oci2bin/security/)
+for threat boundaries, requirements, and complete hardening examples.
+
+## Selected features
+
+| Feature | Example |
+|---|---|
+| Package an image as one executable | `oci2bin redis:7-alpine` |
+| Copy and run without Docker | `scp ./redis_7-alpine host:/opt/redis/ && ssh host /opt/redis/redis_7-alpine` |
+| Deploy directly as a microVM | `oci2vm alpine:latest` |
+| Build from a Dockerfile without Docker | `oci2bin build-dockerfile -o myapp.bin` |
+| Build from a chroot | `oci2bin from-chroot ./rootfs -o myapp.bin` |
+| Pull without a daemon | `oci2bin --pull-with skopeo redis:7-alpine` |
+| Build reproducibly with digest pinning | `oci2bin --reproducible --pin-digest auto app:latest app.bin` |
+| Build fully offline from an OCI layout | `oci2bin --offline-only --oci-dir ./layout app:latest app.bin` |
+| Build for another architecture | `oci2bin --arch aarch64 alpine:latest` |
+| Build a multi-architecture bundle | `oci2bin --arch all alpine:latest` |
+| Keep writable state between runs | `./myapp.bin --overlay-persist /srv/myapp/state` |
+| Run with health and restart policies | `./myapp.bin --health-cmd /healthcheck --restart on-failure:5` |
+| Run a pod or declarative stack | `oci2bin up -f stack.yaml -d` |
+| Generate a systemd unit | `oci2bin systemd ./myapp.bin` |
+| Inspect or compare artifacts | `oci2bin inspect ./myapp.bin` / `oci2bin diff old.bin new.bin` |
+| Generate an SBOM | `oci2bin sbom ./myapp.bin` |
+| Use GPUs or CDI devices | `./myapp.bin --gpus all` |
+| Reload the default artifact into Docker | `docker load < myapp.bin` |
+
+The [feature inventory](https://latedeployment.github.io/oci2bin/reference/features/)
+contains the complete build, runtime, security, VM, and operations surface.
+
 ## Documentation
 
 The complete documentation is available at
@@ -38,29 +118,6 @@ The complete documentation is available at
 | [Feature inventory](https://latedeployment.github.io/oci2bin/reference/features/) | Complete feature checklist |
 | [Dependencies](https://latedeployment.github.io/oci2bin/reference/dependencies/) | Build-host and target-host requirements |
 | [How it works](https://latedeployment.github.io/oci2bin/internals/how-it-works/) | Loader flow and polyglot layout |
-
-## Useful features
-
-| Feature | Example |
-|---|---|
-| Package an image as one executable | `oci2bin redis:7-alpine` |
-| Copy and run without Docker | `scp ./redis_7-alpine host:/opt/redis/ && ssh host /opt/redis/redis_7-alpine` |
-| Deploy directly as a microVM | `oci2vm alpine:latest` |
-| Build from a Dockerfile | `oci2bin build-dockerfile -o myapp.bin` |
-| Build from a chroot directory | `oci2bin from-chroot ./rootfs -o myapp.bin` |
-| Pull without a daemon | `oci2bin --pull-with skopeo redis:7-alpine` |
-| Mount host directories | `./myapp -v /srv/data:/data` |
-| Build for another architecture | `oci2bin --arch aarch64 alpine:latest` |
-| Build a multi-architecture bundle | `oci2bin --arch all alpine:latest` |
-| Sign and verify an artifact | `oci2bin sign --key private.pem --in myapp.bin` |
-| Inject runtime secrets | `./myapp --secret /etc/myapp/key:/run/secrets/key` |
-| Run a multi-binary stack | `oci2bin up -f stack.yaml` |
-| Reload the default artifact into Docker | `docker load < myapp.bin` |
-
-See the
-[feature inventory](https://latedeployment.github.io/oci2bin/reference/features/)
-for health checks, restart policies, compression, GPUs, SBOMs, notifications,
-runtime hardening, and other specialized capabilities.
 
 ## Requirements
 
