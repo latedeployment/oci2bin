@@ -33,6 +33,19 @@ Linux executable and a valid `docker save` archive.
 | Architectures and hardware | x86_64 and aarch64 builds, multi-architecture bundles, GPU/CDI devices, and direct microVM deployment |
 | OCI interoperability | Load the executable into Docker, push its image payload, or preserve and reconstruct the loader through a registry round trip |
 
+## Related projects
+
+Several projects also package containers as executables, but make different
+format and runtime tradeoffs:
+
+| Project | Approach | How oci2bin differs |
+|---|---|---|
+| [dockerc](https://github.com/NilsIrl/dockerc) | A focused, standalone rootless container executable built around `crun`, SquashFS, and FUSE | The default oci2bin artifact remains a Docker-loadable OCI image archive and emphasizes embedded trust policy, artifact inspection and reconstruction, offline workflows, and an optional VM path |
+| [Bottlefire](https://bottlefire.dev/) / [bake](https://github.com/losfair/bake) | A Firecracker microVM executable that bundles the VM runtime assets | oci2bin uses rootless namespaces by default and can instead deploy through a supported VM backend; it prioritizes OCI round trips and one policy-bearing artifact across both modes |
+
+The projects overlap around portable container artifacts while exploring
+different executable formats, runtime components, and isolation boundaries.
+
 ## Security highlights
 
 Security controls are available at the artifact, extraction, isolation, and
