@@ -1,5 +1,5 @@
 Name:           oci2bin
-Version:        0.18.0
+Version:        0.19.0
 Release:        1%{?dist}
 Summary:        Convert OCI/Docker images into mostly self-contained Linux executables
 
@@ -46,6 +46,8 @@ make install PREFIX=%{buildroot}/usr
 %{_infodir}/oci2bin.info*
 
 %changelog
+* Sat Aug 15 2026 latedeployment - 0.19.0-1
+- Update to v0.19.0
 * Thu Aug 06 2026 latedeployment - 0.18.0-1
 - Update to v0.18.0
 * Sat Apr 18 2026 latedeployment - 0.9.0-1

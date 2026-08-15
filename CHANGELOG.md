@@ -4,6 +4,8 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-08-15
+
 ### Added
 
 - **Repeatable startup benchmarks.** `oci2bin benchmark BINARY` compares

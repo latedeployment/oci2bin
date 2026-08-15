@@ -74,7 +74,7 @@
  * One of several places the version lives; `make check-version` asserts they
  * all agree, so update them together.
  */
-#define OCI2BIN_VERSION "0.18.0"
+#define OCI2BIN_VERSION "0.19.0"
 
 #ifndef __NR_mseal
 #if defined(__x86_64__) || defined(__aarch64__)
@@ -5909,7 +5909,8 @@ static char* mount_lazy_rootfs(const char* self_path,
         discard_failed_lazy_mount(tmpdir);
         return NULL;
     }
-    char* squash_argv[] = {
+    char* squash_argv[] =
+    {
         "squashfuse", "-f", "-o", squash_opts,
         (char*)self_path, lower, NULL
     };
@@ -5932,7 +5933,8 @@ static char* mount_lazy_rootfs(const char* self_path,
         discard_failed_lazy_mount(tmpdir);
         return NULL;
     }
-    char* overlay_argv[] = {
+    char* overlay_argv[] =
+    {
         "fuse-overlayfs", "-f", "-o", overlay_opts,
         s_oci_rootfs, NULL
     };

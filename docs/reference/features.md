@@ -221,6 +221,7 @@ byte-for-byte reproducible.
 | Stop container | `oci2bin stop NAME` |
 | Logs | `oci2bin logs NAME` |
 | Live stats | `oci2bin top` |
+| Startup benchmarks | `oci2bin benchmark app.bin --modes extract,lazy,vm` |
 | Generate systemd unit | `oci2bin systemd app.bin` |
 | Generate SBOM | `oci2bin sbom app.bin` |
 | Push image payload | `oci2bin push app.bin REF` |
