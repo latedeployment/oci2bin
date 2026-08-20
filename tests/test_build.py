@@ -320,7 +320,22 @@ class TestLayerCache(unittest.TestCase):
                 tf.addfile(info, io.BytesIO(data))
         return buf.getvalue()
 
-    def test_warm_layer_cache_populates_and_hits(self):
+    def _make_mismatched_oci_tar(self):
+        """A tar whose layer bytes do not hash to the declared diff_id."""
+        honest = self._make_oci_tar([('layer0/layer.tar', b'layer-zero')])
+        tampered = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(honest), mode='r:*') as src, \
+                tarfile.open(fileobj=tampered, mode='w:') as out:
+            for member in src.getmembers():
+                data = src.extractfile(member).read()
+                if member.name == 'layer0/layer.tar':
+                    data = b'tampered!!'
+                info = tarfile.TarInfo(member.name)
+                info.size = len(data)
+                out.addfile(info, io.BytesIO(data))
+        return tampered.getvalue()
+
+    def test_verify_layer_digests_populates_and_hits(self):
         layers = [
             ('layer0/layer.tar', b'layer-zero'),
             ('layer1/layer.tar', b'layer-one'),
@@ -329,18 +344,18 @@ class TestLayerCache(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
-            stats = bp.warm_layer_cache(oci_data, use_cache=True)
-            self.assertEqual(stats, {'hits': 0, 'misses': 2})
+            stats = bp.verify_layer_digests(oci_data, use_cache=True)
+            self.assertEqual(stats, {'hits': 0, 'misses': 2, 'verified': 2})
 
             cache_root = Path(bp.get_layer_cache_root())
             for _, data in layers:
                 digest = hashlib.sha256(data).hexdigest()
                 self.assertEqual((cache_root / f'{digest}.tar').read_bytes(), data)
 
-            stats = bp.warm_layer_cache(oci_data, use_cache=True)
-            self.assertEqual(stats, {'hits': 2, 'misses': 0})
+            stats = bp.verify_layer_digests(oci_data, use_cache=True)
+            self.assertEqual(stats, {'hits': 2, 'misses': 0, 'verified': 2})
 
-    def test_warm_layer_cache_refreshes_corrupt_entry(self):
+    def test_verify_layer_digests_refreshes_corrupt_entry(self):
         layers = [('layer0/layer.tar', b'layer-zero')]
         oci_data = self._make_oci_tar(layers)
         digest = hashlib.sha256(layers[0][1]).hexdigest()
@@ -351,20 +366,58 @@ class TestLayerCache(unittest.TestCase):
             cache_root.mkdir(parents=True, exist_ok=True)
             (cache_root / f'{digest}.tar').write_bytes(b'corrupt')
 
-            stats = bp.warm_layer_cache(oci_data, use_cache=True)
-            self.assertEqual(stats, {'hits': 0, 'misses': 1})
+            stats = bp.verify_layer_digests(oci_data, use_cache=True)
+            self.assertEqual(stats, {'hits': 0, 'misses': 1, 'verified': 1})
             self.assertEqual((cache_root / f'{digest}.tar').read_bytes(),
                              layers[0][1])
 
-    def test_warm_layer_cache_no_cache_bypass(self):
+    def test_verify_layer_digests_no_cache_still_verifies(self):
         layers = [('layer0/layer.tar', b'layer-zero')]
         oci_data = self._make_oci_tar(layers)
 
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
-            stats = bp.warm_layer_cache(oci_data, use_cache=False)
-            self.assertEqual(stats, {'hits': 0, 'misses': 0})
+            stats = bp.verify_layer_digests(oci_data, use_cache=False)
+            # --no-cache disables the cache, not the integrity check.
+            self.assertEqual(stats, {'hits': 0, 'misses': 0, 'verified': 1})
             self.assertFalse(Path(bp.get_layer_cache_root()).exists())
+
+    def test_verify_layer_digests_rejects_mismatch(self):
+        """A layer whose bytes do not match its diff_id aborts the build."""
+        oci_data = self._make_mismatched_oci_tar()
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
+            with self.assertRaises(SystemExit) as cm:
+                bp.verify_layer_digests(oci_data, use_cache=True)
+            self.assertEqual(cm.exception.code, 1)
+
+    def test_verify_layer_digests_mismatch_not_masked_by_cache_hit(self):
+        """
+        The cache is keyed by the *claimed* diff_id, so a warm cache entry says
+        nothing about the tar being built. A hit must not skip verification.
+        """
+        honest = self._make_oci_tar([('layer0/layer.tar', b'layer-zero')])
+        tampered = self._make_mismatched_oci_tar()
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
+            # Warm the cache with the honest layer so the digest is a hit.
+            bp.verify_layer_digests(honest, use_cache=True)
+            digest = hashlib.sha256(b'layer-zero').hexdigest()
+            self.assertTrue(
+                (Path(bp.get_layer_cache_root()) / f'{digest}.tar').exists())
+
+            with self.assertRaises(SystemExit) as cm:
+                bp.verify_layer_digests(tampered, use_cache=True)
+            self.assertEqual(cm.exception.code, 1)
+
+    def test_verify_layer_digests_mismatch_not_masked_by_no_cache(self):
+        oci_data = self._make_mismatched_oci_tar()
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
+            with self.assertRaises(SystemExit) as cm:
+                bp.verify_layer_digests(oci_data, use_cache=False)
+            self.assertEqual(cm.exception.code, 1)
 
 
 class TestSquashFSRootfs(unittest.TestCase):

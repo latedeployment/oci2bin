@@ -497,37 +497,58 @@ def _write_cached_layer(cache_root, digest_hex, data):
     os.replace(tmp_path, cache_path)
 
 
-def warm_layer_cache(oci_data, use_cache=True):
+def verify_layer_digests(oci_data, use_cache=True):
     """
-    Populate and reuse the layer tar cache for an OCI/docker-save tar.
+    Verify every layer in an OCI/docker-save tar against the diff_id the image
+    config declares for it, and populate the layer tar cache as a side effect.
 
     Layers are keyed by config.rootfs.diff_ids (sha256 of the uncompressed
-    layer tar bytes). On a cache hit we skip extracting that layer from the
-    input tar. On a miss we extract, verify the digest, and store it.
+    layer tar bytes).
+
+    Verification is not optional. This is the build's only check that the
+    manifest describes the bytes actually being embedded, so it runs for every
+    layer on every build:
+
+      - A cache hit must not skip it. The cache is keyed by the *claimed*
+        diff_id, so a hit only proves some layer hashing to D is on disk; it
+        says nothing about the layer inside this tar. Skipping the check on a
+        hit let a tar claiming an already-cached diff_id embed different bytes
+        unverified.
+      - `use_cache` must not skip it. That flag comes from --no-cache, which
+        is documented as a cache control; silently turning off integrity
+        checking is not something a performance flag may do.
+
+    `use_cache` therefore only controls whether verified layers are also
+    stored under the cache root.
     """
-    if not use_cache:
-        return {'hits': 0, 'misses': 0}
+    unverifiable = {'hits': 0, 'misses': 0, 'verified': 0}
+
+    def cannot_verify(reason):
+        print(f'  warning: cannot verify layer digests ({reason}); '
+              'the build will embed the layers as-is', file=sys.stderr)
+        return unverifiable
 
     try:
         manifest, _, config, _ = _parse_oci_manifest_and_config(oci_data)
-    except (KeyError, json.JSONDecodeError, tarfile.TarError):
-        return {'hits': 0, 'misses': 0}
+    except (KeyError, json.JSONDecodeError, tarfile.TarError) as exc:
+        return cannot_verify(f'unreadable manifest or config: {exc}')
 
     if not manifest:
-        return {'hits': 0, 'misses': 0}
+        return cannot_verify('no manifest entries')
 
     layers = manifest[0].get('Layers', [])
     diff_ids = config.get('rootfs', {}).get('diff_ids', [])
     if not isinstance(layers, list) or not isinstance(diff_ids, list):
-        return {'hits': 0, 'misses': 0}
+        return cannot_verify('Layers or rootfs.diff_ids is not a list')
     if len(layers) != len(diff_ids):
-        return {'hits': 0, 'misses': 0}
+        return cannot_verify(
+            f'{len(layers)} layer(s) but {len(diff_ids)} diff_id(s)')
 
     layer_digests = {}
     for layer_name, diff_id in zip(layers, diff_ids):
         digest_hex = _parse_sha256_hex(diff_id)
         if digest_hex is None:
-            return {'hits': 0, 'misses': 0}
+            return cannot_verify(f'unparseable diff_id {diff_id!r}')
         layer_digests[layer_name] = digest_hex
 
     cache_root = get_layer_cache_root()
@@ -536,11 +557,6 @@ def warm_layer_cache(oci_data, use_cache=True):
 
     with tarfile.open(fileobj=io.BytesIO(oci_data), mode='r:*') as tf:
         for layer_name, digest_hex in layer_digests.items():
-            cached = _read_cached_layer(cache_root, digest_hex)
-            if cached is not None:
-                hits += 1
-                continue
-
             try:
                 member = tf.getmember(layer_name)
             except KeyError:
@@ -568,13 +584,18 @@ def warm_layer_cache(oci_data, use_cache=True):
                 )
                 sys.exit(1)
 
+            if not use_cache:
+                continue
+            if _read_cached_layer(cache_root, digest_hex) is not None:
+                hits += 1
+                continue
             _write_cached_layer(cache_root, digest_hex, layer_data)
             misses += 1
 
     if hits or misses:
         print(f'  Layer cache: {hits} hit(s), {misses} miss(es)',
               file=sys.stderr)
-    return {'hits': hits, 'misses': misses}
+    return {'hits': hits, 'misses': misses, 'verified': len(layer_digests)}
 
 
 META_MAGIC = b'OCI2BIN_META\x00'
@@ -1477,7 +1498,7 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
             with open(oci_tar_path, 'rb') as f:
                 oci_data = f.read()
 
-    warm_layer_cache(oci_data, use_cache=use_layer_cache)
+    verify_layer_digests(oci_data, use_cache=use_layer_cache)
 
     # 2a. Optionally embed loader binary into the OCI image for reconstruction
     arch_name = SUPPORTED_MACHINES[loader['e_machine']]
@@ -1819,7 +1840,8 @@ def main():
                         help='Path to a pre-saved OCI tar (skips docker save)')
     parser.add_argument('--no-cache', action='store_true', default=False,
                         help='Disable the per-layer OCI tar cache '
-                             f'under {get_layer_cache_root()!r}')
+                             f'under {get_layer_cache_root()!r}. Layer '
+                             'diff_id verification still runs.')
     parser.add_argument('--image-name', default=None,
                         help='Image name/tag to embed in metadata block '
                              '(defaults to --image value)')

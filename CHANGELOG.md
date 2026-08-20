@@ -6,6 +6,17 @@ All notable changes to oci2bin are documented here.
 
 ### Security
 
+- **Layer digests are now verified on every build.** The check that each layer
+  hashes to the `diff_id` its image config declares lived inside the layer
+  cache warm-up and was skipped in two ways: a cache hit returned early, and
+  `--no-cache` returned before the loop ran at all. Because the cache is keyed
+  by the *claimed* diff_id, a hit only proved that some layer with that digest
+  was on disk — a tar declaring an already-cached diff_id could embed entirely
+  different bytes unverified, and `--no-cache`, documented purely as a cache
+  control, silently turned off the build's only integrity check. Verification
+  is now unconditional; `--no-cache` only controls whether verified layers are
+  stored.
+
 - **Seccomp filters are no longer bypassable through the x86-64 x32 ABI.**
   Both the built-in filter and `--seccomp-profile` gated on
   `seccomp_data.arch`, which x32 shares with the native ABI, and then compared

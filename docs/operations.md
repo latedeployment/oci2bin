@@ -56,6 +56,10 @@ Disable the per-layer cache for one build:
 oci2bin --no-cache redis:7-alpine
 ```
 
+`--no-cache` controls caching only. Every layer is still hashed and checked
+against the `diff_id` the image config declares for it, on every build, and a
+mismatch aborts the build.
+
 ## Detached Containers
 
 Start a named container:

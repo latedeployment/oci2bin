@@ -142,7 +142,8 @@ Override the embedded Entrypoint/Cmd (JSON array or shell-split).
 @item --label K=V
 Add image-config labels (matchable by ps/list --filter).
 @item --cache / --no-cache
-Output-binary cache; per-layer cache toggle.
+Output-binary cache; per-layer cache toggle. Caching only --- layer diff_id
+verification runs on every build regardless.
 @item --reproducible / --offline-only
 Normalize oci2bin-controlled metadata for byte-identical output from identical
 inputs; air-gap seal (no registry fetch, hermetic marker). Age encryption uses

@@ -41,7 +41,8 @@
 #                         compiler (aarch64-linux-gnu-gcc) to be in PATH.
 #   --cache               Cache the output binary; skip rebuild if already built
 #   --no-cache            Disable the per-layer OCI tar cache used while
-#                         assembling the image into a polyglot
+#                         assembling the image into a polyglot. Each layer is
+#                         still verified against its declared diff_id.
 #   --layer IMAGE         Merge additional image layers on top of the base image
 #                         (may be repeated; layers are applied in order)
 #   --strip               Remove docs/man/locale/cache from the image before packaging
