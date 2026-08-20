@@ -6,6 +6,19 @@ All notable changes to oci2bin are documented here.
 
 ### Security
 
+- **`--seccomp-deny-write` now actually enforces, and fails closed when it
+  cannot.** The flag issued its own `MS_BIND|MS_REMOUNT|MS_RDONLY` remount,
+  which cannot succeed inside a user namespace on a mount propagated in from
+  the host: those carry locked flags the remount does not reproduce, so the
+  kernel returns EPERM. Both the bind and the remount then merely warned and
+  moved on to the next path, leaving the workload free to write to a path the
+  caller had explicitly asked to be unwritable — in practice the flag was a
+  no-op with a warning on any kernel that locks mount flags. It now shares
+  `recursive_remount_rdonly()` with `-v ...:ro`, which uses `mount_setattr(2)`
+  to *add* the read-only (and nosuid) attribute without disturbing the rest,
+  and either failure aborts the run, matching `-v`, `--secret`,
+  `--allow-egress` and `--seccomp-profile`.
+
 - **Layer digests are now verified on every build.** The check that each layer
   hashes to the `diff_id` its image config declares lived inside the layer
   cache warm-up and was skipped in two ways: a cache hit returned early, and

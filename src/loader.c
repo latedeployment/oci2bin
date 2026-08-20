@@ -109,6 +109,10 @@ struct mount_attr
 };
 #endif
 
+#ifndef MOUNT_ATTR_NOSUID
+#define MOUNT_ATTR_NOSUID 0x00000002
+#endif
+
 /* Landlock LSM (Linux 5.13+).  Probed at runtime; the syscall numbers are
  * the same on x86_64 and aarch64 (444/445/446).  Provide fallback definitions
  * so the loader builds against older kernel headers. */
@@ -8105,7 +8109,8 @@ done:
  * for the ordering.
  */
 /*
- * Recursively remount everything mounted at 'path' read-only.
+ * Recursively remount everything mounted at 'path' read-only.  'add_nosuid'
+ * additionally sets nosuid on the subtree.
  *
  * The classic mount(NULL, path, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY, NULL)
  * only changes the flags of the single mount at 'path' — any submount
@@ -8116,15 +8121,20 @@ done:
  * own mount flags" contract), but wrong for `-v ...:ro`, where the user
  * asked for the whole tree they mounted to be read-only.
  *
- * Uses mount_setattr(2) with AT_RECURSIVE|MOUNT_ATTR_RDONLY (Linux 5.12+)
- * to remount the entire subtree in one atomic call. Falls back to the
- * non-recursive remount only when the kernel predates mount_setattr(2)
- * (ENOSYS) — any other failure (e.g. EPERM) is returned as-is rather than
- * silently accepting a weaker guarantee.
+ * Uses mount_setattr(2) with AT_RECURSIVE (Linux 5.12+) to remount the
+ * entire subtree in one atomic call.  mount_setattr only *adds* the
+ * attributes in attr_set and leaves the rest of the mount's flags alone,
+ * which matters inside a user namespace: a mount propagated in from the host
+ * carries locked flags (nodev/noexec/noatime), and the MS_REMOUNT path fails
+ * with EPERM unless the caller reproduces every one of them.  That is why
+ * --seccomp-deny-write shares this helper rather than issuing its own
+ * remount.  Falls back to the non-recursive remount only when the kernel
+ * predates mount_setattr(2) (ENOSYS) — any other failure (e.g. EPERM) is
+ * returned as-is rather than silently accepting a weaker guarantee.
  *
  * Returns 0 on success, -1 on failure (errno set).
  */
-static int recursive_remount_rdonly(const char* path)
+static int recursive_remount_rdonly(const char* path, int add_nosuid)
 {
 #ifdef __NR_mount_setattr
     int fd = open(path, O_PATH | O_CLOEXEC);
@@ -8139,6 +8149,10 @@ static int recursive_remount_rdonly(const char* path)
     struct mount_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.attr_set = MOUNT_ATTR_RDONLY;
+    if (add_nosuid)
+    {
+        attr.attr_set |= MOUNT_ATTR_NOSUID;
+    }
     long rc = syscall(__NR_mount_setattr, fd, "",
                       AT_EMPTY_PATH | AT_RECURSIVE,
                       &attr, sizeof(attr));
@@ -8155,7 +8169,9 @@ static int recursive_remount_rdonly(const char* path)
     }
     /* ENOSYS: kernel predates mount_setattr(2); fall back below. */
 #endif
-    return mount(NULL, path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL);
+    return mount(NULL, path, NULL,
+                 MS_BIND | MS_REMOUNT | MS_RDONLY |
+                 (add_nosuid ? MS_NOSUID : 0UL), NULL);
 }
 
 /*
@@ -8214,7 +8230,7 @@ static int setup_volumes(const char* rootfs, struct container_opts *opts)
             /* Recursive: a `:ro` request covers the whole tree the user
              * mounted, including any submount nested inside the host
              * source directory — not just the top mount. */
-            if (recursive_remount_rdonly(dst) < 0)
+            if (recursive_remount_rdonly(dst, 0) < 0)
             {
                 fprintf(stderr,
                         "oci2bin: -v read-only remount %s failed: %s\n",
@@ -13175,26 +13191,39 @@ static int container_main(const char* rootfs, struct container_opts *opts)
      * remount read-only so the workload — which seccomp BPF cannot filter
      * by path string — physically cannot write to it inside the container.
      * Done after chroot so the paths are container-relative.  Must precede
-     * Landlock so the read-only remount is captured in the inode pinning. */
+     * Landlock so the read-only remount is captured in the inode pinning.
+     *
+     * Fails closed, like every other explicitly requested control (-v,
+     * --secret, --allow-egress, --seccomp-profile): these used to warn and
+     * skip, which started the workload with the path still writable while the
+     * caller had asked for exactly the opposite. A path that cannot be made
+     * read-only aborts the run. */
     for (int i = 0; i < opts->n_deny_write; i++)
     {
         const char* p = opts->deny_write[i];
         if (mount(p, p, NULL, MS_BIND, NULL) < 0)
         {
             fprintf(stderr,
-                    "oci2bin: --seccomp-deny-write: bind %s: %s (skipping)\n",
+                    "oci2bin: --seccomp-deny-write: bind %s: %s;"
+                    " refusing to run with it still writable\n",
                     p, strerror(errno));
-            continue;
+            return 1;
         }
-        if (mount(NULL, p, NULL,
-                  MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID, NULL) < 0)
+        if (recursive_remount_rdonly(p, 1) < 0)
         {
             fprintf(stderr,
-                    "oci2bin: --seccomp-deny-write: remount-RO %s: %s\n",
+                    "oci2bin: --seccomp-deny-write: remount-RO %s: %s;"
+                    " refusing to run with it still writable\n",
                     p, strerror(errno));
-            /* Best-effort detach so we don't leave a writable bind in place. */
-            (void)umount2(p, MNT_DETACH);
-            continue;
+            /* Detach so the failed attempt does not leave a writable bind
+             * behind for whatever cleanup runs after us. */
+            if (umount2(p, MNT_DETACH) < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: warning: could not detach %s: %s\n",
+                        p, strerror(errno));
+            }
+            return 1;
         }
         if (g_debug)
         {
@@ -13833,8 +13862,10 @@ static void usage(const char* prog)
             "  --seccomp-deny-write PATH\n"
             "                      Bind-mount remount-RO PATH inside the container\n"
             "                      so the workload cannot write to it (repeatable).\n"
-            "                      Pair with --gen-seccomp's oci2binWritablePaths\n"
-            "                      output to lock down observed write targets.\n"
+            "                      Aborts the run if PATH cannot be made\n"
+            "                      read-only. Pair with --gen-seccomp's\n"
+            "                      oci2binWritablePaths output to lock down\n"
+            "                      observed write targets.\n"
             "  --gdb               Launch gdb inside the container with the image\n"
             "                      entrypoint as the debuggee (host gdb bind-mounted\n"
             "                      in if not present). Disables seccomp to allow\n"
