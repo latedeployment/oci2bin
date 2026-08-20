@@ -693,16 +693,17 @@ struct container_opts
     char* vmm;      /* "cloud-hypervisor" | path; NULL = default */
 
     /* --strict  (fail closed across the board)
-     * When set, every security-relevant degradation that today emits
-     * a warn-and-continue diagnostic instead aborts the run with a
+     * When set, every security-relevant degradation that would otherwise
+     * emit a warn-and-continue diagnostic instead aborts the run with a
      * non-zero exit code:
-     *   - default seccomp install failure
-     *   - PR_SET_NO_NEW_PRIVS failure
-     *   - explicit --landlock unsupported by kernel
+     *   - default seccomp install failure (incl. PR_SET_NO_NEW_PRIVS)
+     *   - Landlock unsupported by the kernel, or supported but not
+     *     enforceable (ruleset creation, rule add, or restrict_self failing)
      *   - cap drop/add the kernel rejects
      *   - any other place that consults opts->strict
-     * Explicit-flag failures (e.g. --read-only, --seccomp-profile)
-     * are already fatal whether or not --strict is set. */
+     * Explicit-flag failures (e.g. --read-only, --landlock,
+     * --seccomp-profile, --seccomp-deny-write) are already fatal whether or
+     * not --strict is set. */
     int strict;
 
     /* PTY relay: set by run_container() before fork, used by container_main() */
@@ -9103,10 +9104,18 @@ static int cap_name_to_num(const char* name)
 /*
  * Apply capability bounding set drops and ambient cap raises.
  * Called after chroot/chdir and before seccomp.
+ *
+ * Returns 0 if every requested drop and add took effect, -1 if the kernel
+ * rejected any of them.  --strict turns that into an aborted run: a
+ * PR_CAPBSET_DROP the kernel refuses means the workload keeps a capability the
+ * caller asked to remove, which is exactly the "security-relevant
+ * degradation" --strict exists to refuse.  Without --strict the failures stay
+ * warn-and-continue, as before.
  */
-static void apply_capabilities(const struct container_opts* opts)
+static int apply_capabilities(const struct container_opts* opts)
 {
     int cap;
+    int failed = 0;
 
     if (opts->cap_drop_all)
     {
@@ -9137,8 +9146,9 @@ static void apply_capabilities(const struct container_opts* opts)
             data[1].inheritable = (uint32_t)(opts->cap_add_mask >> 32);
             if (syscall(SYS_capset, &hdr, data) < 0)
             {
-                fprintf(stderr, "oci2bin: capset for --cap-add: %s (non-fatal)\n",
+                fprintf(stderr, "oci2bin: capset for --cap-add: %s\n",
                         strerror(errno));
+                failed = 1;
             }
             /* Step 2: raise ambient caps (bounding set still intact here) */
             for (cap = 0; cap <= 40; cap++)
@@ -9151,8 +9161,9 @@ static void apply_capabilities(const struct container_opts* opts)
                           (unsigned long)cap, 0, 0) < 0)
                 {
                     fprintf(stderr,
-                            "oci2bin: PR_CAP_AMBIENT_RAISE %d: %s (non-fatal)\n",
+                            "oci2bin: PR_CAP_AMBIENT_RAISE %d: %s\n",
                             cap, strerror(errno));
+                    failed = 1;
                 }
             }
         }
@@ -9168,8 +9179,9 @@ static void apply_capabilities(const struct container_opts* opts)
                 if (errno != EINVAL) /* EINVAL = cap doesn't exist on this kernel */
                 {
                     fprintf(stderr,
-                            "oci2bin: PR_CAPBSET_DROP %d: %s (non-fatal)\n",
+                            "oci2bin: PR_CAPBSET_DROP %d: %s\n",
                             cap, strerror(errno));
+                    failed = 1;
                 }
             }
         }
@@ -9186,13 +9198,15 @@ static void apply_capabilities(const struct container_opts* opts)
             if (prctl(PR_CAPBSET_DROP, (unsigned long)cap, 0, 0, 0) < 0)
             {
                 fprintf(stderr,
-                        "oci2bin: PR_CAPBSET_DROP %d: %s (non-fatal)\n",
+                        "oci2bin: PR_CAPBSET_DROP %d: %s\n",
                         cap, strerror(errno));
+                failed = 1;
             }
         }
     }
 
     audit_emit_cap_set_event(opts);
+    return failed ? -1 : 0;
 }
 
 /* ── init reaper ─────────────────────────────────────────────────────────── */
@@ -9846,6 +9860,21 @@ static int landlock_add_path_rule(int rs_fd, const char* path,
  *
  * Returns 0 on success or no-op (unsupported kernel under AUTO), -1 on error.
  */
+/*
+ * How to report a Landlock step that did not take effect.
+ *
+ * --landlock (MODE_ON) asked for the sandbox by name, so any failure is
+ * fatal.  --strict asked for every security-relevant degradation to be fatal,
+ * which covers a sandbox that was available but could not be enforced — that
+ * used to fall through to "return 0" and start the workload unsandboxed,
+ * while --strict was documented to refuse exactly this.  Plain AUTO on a
+ * kernel that cannot do it keeps skipping.
+ */
+static int landlock_degraded(const struct container_opts* opts)
+{
+    return (opts->landlock_mode == LANDLOCK_MODE_ON || opts->strict) ? -1 : 0;
+}
+
 static int apply_landlock_sandbox(const struct container_opts* opts)
 {
 #ifdef __NR_landlock_create_ruleset
@@ -9893,13 +9922,11 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
                              sizeof(ra), 0UL);
     if (rs_fd < 0)
     {
-        if (mode == LANDLOCK_MODE_ON)
-        {
-            fprintf(stderr, "oci2bin: landlock_create_ruleset: %s\n",
-                    strerror(errno));
-            return -1;
-        }
-        return 0;    /* AUTO: silently skip */
+        /* Always report it: under --strict this aborts the run, so the
+         * operator needs the reason either way. */
+        fprintf(stderr, "oci2bin: landlock_create_ruleset: %s\n",
+                strerror(errno));
+        return landlock_degraded(opts);
     }
 
     /* Allow the rootfs subtree (full RWX). After chroot, "/" IS the rootfs. */
@@ -9908,7 +9935,7 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
         fprintf(stderr, "oci2bin: landlock add rootfs '/': %s\n",
                 strerror(errno));
         close(rs_fd);
-        return mode == LANDLOCK_MODE_ON ? -1 : 0;
+        return landlock_degraded(opts);
     }
 
     /* Allow each bind-mount container path: bind mounts have a different
@@ -9968,7 +9995,7 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
                 "oci2bin: prctl(PR_SET_NO_NEW_PRIVS) failed (landlock): %s\n",
                 strerror(errno));
         close(rs_fd);
-        return mode == LANDLOCK_MODE_ON ? -1 : 0;
+        return landlock_degraded(opts);
     }
 
     if (syscall(__NR_landlock_restrict_self, rs_fd, 0UL) < 0)
@@ -9976,7 +10003,7 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
         fprintf(stderr, "oci2bin: landlock_restrict_self: %s\n",
                 strerror(errno));
         close(rs_fd);
-        return mode == LANDLOCK_MODE_ON ? -1 : 0;
+        return landlock_degraded(opts);
     }
     close(rs_fd);
 
@@ -11951,12 +11978,17 @@ static int apply_seccomp_profile(const char* profile_path)
 
     free(json);
 
-    /* PR_SET_NO_NEW_PRIVS */
+    /* PR_SET_NO_NEW_PRIVS.  Fatal here: without it the workload can still
+     * regain privilege through a setuid binary, which makes the profile the
+     * caller explicitly asked for weaker than written.  --seccomp-profile is
+     * an explicit flag, and those fail closed whether or not --strict is set
+     * (the caller already refuses to fall back to the default filter). */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
     {
         fprintf(stderr,
-                "oci2bin: prctl(PR_SET_NO_NEW_PRIVS) failed: %s (non-fatal)\n",
-                strerror(errno));
+                "oci2bin: --seccomp-profile: prctl(PR_SET_NO_NEW_PRIVS)"
+                " failed: %s\n", strerror(errno));
+        return -1;
     }
 
     if (n_listed == 0)
@@ -13184,7 +13216,13 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     /* Apply capability drops/adds before seccomp/fork (applies to all paths) */
     if (opts->cap_drop_all || opts->cap_drop_mask || opts->cap_add_mask)
     {
-        apply_capabilities(opts);
+        if (apply_capabilities(opts) < 0 && opts->strict)
+        {
+            fprintf(stderr,
+                    "oci2bin: --strict: aborting because the kernel rejected"
+                    " a requested capability change\n");
+            return 1;
+        }
     }
 
     /* --seccomp-deny-write PATH: bind-mount each path on top of itself and
@@ -13955,8 +13993,9 @@ static void usage(const char* prog)
             "                     beefy      16 GiB / 8 CPUs / 4096 pids\n"
             "                     auto       half of host RAM (clamped 256m–4g) and CPUs (1–8)\n"
             "  --strict            Fail closed on every security-relevant degradation\n"
-            "                     (seccomp install / NO_NEW_PRIVS / landlock-unsupported /\n"
-            "                     cap drop/add rejected) — never silently continue\n"
+            "                     (seccomp install / NO_NEW_PRIVS / landlock\n"
+            "                     unsupported or unenforceable / cap drop/add\n"
+            "                     rejected) — never silently continue\n"
             "  --allow-degraded    Run without enforcement if --memory/--cpus/\n"
             "                     --pids-limit were requested but cgroup v2 setup\n"
             "                     failed (default: refuse to start unconstrained)\n"

@@ -173,6 +173,24 @@ Check the deployment host with the artifact itself:
 ./app.bin --doctor
 ```
 
+`--landlock` requires the sandbox: the run aborts if the kernel cannot provide
+it or it cannot be enforced. Without the flag, Landlock is applied when
+available and skipped otherwise — unless `--strict` is set, which also refuses
+to start when the sandbox is unavailable or fails to install.
+
+## Fail-Closed Mode
+
+`--strict` turns every security-relevant degradation that would otherwise be a
+warning into a hard failure:
+
+- the default seccomp filter (or `PR_SET_NO_NEW_PRIVS`) failing to install
+- Landlock unsupported by the kernel, or supported but not enforceable
+- a capability drop or add the kernel rejects
+
+Failures of an explicitly requested flag — `--read-only`, `--landlock`,
+`--seccomp-profile`, `--seccomp-deny-write`, `-v`, `--secret`,
+`--allow-egress` — always abort the run, with or without `--strict`.
+
 ## AppArmor And SELinux
 
 ```bash

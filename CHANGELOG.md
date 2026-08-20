@@ -6,6 +6,24 @@ All notable changes to oci2bin are documented here.
 
 ### Security
 
+- **`--strict` now covers the cases it documents.** Its help text and the
+  option's own comment promised to fail closed on "cap drop/add rejected" and
+  on `PR_SET_NO_NEW_PRIVS` failure, but `opts->strict` was consulted in only
+  two places. `apply_capabilities()` returned `void` and logged every
+  `capset` / `PR_CAP_AMBIENT_RAISE` / `PR_CAPBSET_DROP` rejection as
+  "(non-fatal)", so `--strict --cap-drop all` could start a workload that
+  kept a capability the caller asked to remove and still exit 0. It now
+  reports failure and `--strict` aborts. `--seccomp-profile` likewise treated
+  a `PR_SET_NO_NEW_PRIVS` failure as non-fatal, leaving the workload able to
+  regain privilege through a setuid binary despite the filter; that is now
+  fatal, as it already was for the built-in filter.
+
+- **`--strict` and `--landlock` now refuse a Landlock sandbox that installs
+  but does not enforce.** Only "kernel does not support Landlock" was checked.
+  A failing `landlock_create_ruleset`, path-rule add, or `landlock_restrict_self`
+  fell through to `return 0` and started the workload unsandboxed, including
+  under `--strict`.
+
 - **`--seccomp-deny-write` now actually enforces, and fails closed when it
   cannot.** The flag issued its own `MS_BIND|MS_REMOUNT|MS_RDONLY` remount,
   which cannot succeed inside a user namespace on a mount propagated in from

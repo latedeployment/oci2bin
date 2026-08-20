@@ -214,6 +214,14 @@ UTS hostname; run as a numeric user.
 Capability and seccomp controls; generate a least-privilege profile.
 @item --landlock / --no-landlock / --security-opt apparmor=|label=
 Landlock sandbox (auto by default); AppArmor/SELinux confinement.
+@option{--landlock} aborts the run when the sandbox is unavailable or cannot
+be enforced.
+@item --strict
+Fail closed on every security-relevant degradation: the default seccomp filter
+or @code{PR_SET_NO_NEW_PRIVS} failing to install, Landlock unsupported or
+unenforceable, and capability drops or adds the kernel rejects.  Failures of
+an explicitly requested flag abort the run with or without
+@option{--strict}.
 @item --memory / --cpus / --pids-limit / --ulimit T=N / --size NAME
 cgroup v2 limits, setrlimit, and resource presets.  A requested cgroup
 limit aborts the run if cgroup v2 setup fails, unless @option{--allow-degraded}
