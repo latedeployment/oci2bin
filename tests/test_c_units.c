@@ -7218,6 +7218,117 @@ static void test_run_cmd_capture_stdin(void)
     rmdir(tdir);
 }
 
+/*
+ * The x86-64 x32 ABI reports arch == AUDIT_ARCH_X86_64, so it clears the arch
+ * gate, but ORs __X32_SYSCALL_BIT into seccomp_data.nr. A filter that only
+ * compares nr against native numbers matches nothing under x32 and falls
+ * through to its default action, which made every deny rule bypassable. Both
+ * filter builders must kill the whole 0x40000000+ range.
+ *
+ * Each case runs in a forked child: the filter is process-wide and
+ * irreversible, so it cannot be installed in the test process itself.
+ */
+#ifdef __x86_64__
+static int seccomp_child_status(long nr, const char* profile)
+{
+    fflush(stdout);
+    fflush(stderr);
+    pid_t p = fork();
+    if (p < 0)
+    {
+        return -1;
+    }
+    if (p == 0)
+    {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        int rc = profile ? apply_seccomp_profile(profile)
+                 : apply_seccomp_filter();
+        if (rc < 0)
+        {
+            _exit(70);    /* filter never installed — inconclusive */
+        }
+        syscall(nr, 0, 0, 0, 0);
+        _exit(0);         /* syscall was permitted */
+    }
+    int st = 0;
+    while (waitpid(p, &st, 0) < 0 && errno == EINTR)
+    {
+        ;
+    }
+    return st;
+}
+
+static int seccomp_child_was_killed(long nr, const char* profile)
+{
+    int st = seccomp_child_status(nr, profile);
+    return st >= 0 && WIFSIGNALED(st);
+}
+
+static int seccomp_child_survived(long nr, const char* profile)
+{
+    int st = seccomp_child_status(nr, profile);
+    return st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static void test_seccomp_blocks_x32_abi(void)
+{
+    const long X32 = 0x40000000L;
+
+    ASSERT(seccomp_child_was_killed(__NR_ptrace, NULL),
+           "seccomp x32: built-in filter blocks native ptrace");
+    ASSERT(seccomp_child_was_killed(X32 | __NR_ptrace, NULL),
+           "seccomp x32: built-in filter blocks x32 ptrace");
+    ASSERT(seccomp_child_was_killed(X32 | __NR_bpf, NULL),
+           "seccomp x32: built-in filter blocks x32 bpf");
+    ASSERT(seccomp_child_was_killed(X32 | __NR_init_module, NULL),
+           "seccomp x32: built-in filter blocks x32 init_module");
+    ASSERT(seccomp_child_survived(__NR_getpid, NULL),
+           "seccomp x32: built-in filter still allows native getpid");
+
+    /* An allowlist profile (defaultAction ALLOW) had the same hole: a denied
+     * syscall re-issued over x32 matched no rule and hit the ALLOW default. */
+    char tmpl[] = "/tmp/oci2bin-x32-prof-XXXXXX";
+    char* tdir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(tdir, "seccomp x32: mkdtemp for profile");
+    if (!tdir)
+    {
+        return;
+    }
+    char prof[320];
+    snprintf(prof, sizeof(prof), "%s/allow.json", tdir);
+    static const char body[] =
+        "{\"defaultAction\":\"SCMP_ACT_ALLOW\","
+        "\"syscalls\":[{\"names\":[\"chroot\"],"
+        "\"action\":\"SCMP_ACT_ERRNO\"}]}";
+    int fd = open(prof, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT(fd >= 0, "seccomp x32: create allowlist profile");
+    if (fd >= 0)
+    {
+        ASSERT_INT_EQ(write_all_fd(fd, body, sizeof(body) - 1), 0,
+                      "seccomp x32: write allowlist profile");
+        close(fd);
+
+        ASSERT(seccomp_child_was_killed(X32 | __NR_chroot, prof),
+               "seccomp x32: allowlist profile blocks x32 chroot");
+        ASSERT(seccomp_child_survived(__NR_getpid, prof),
+               "seccomp x32: allowlist profile still allows native getpid");
+    }
+    unlink(prof);
+    rmdir(tdir);
+}
+#else
+static void test_seccomp_blocks_x32_abi(void)
+{
+    /* x32 is an x86-64-only ABI; the prologue carries no extra instructions
+     * on other architectures. */
+}
+#endif
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -7320,6 +7431,7 @@ int main(void)
     test_parse_opts_overlay_persist_injection();
     test_credential_file_is_safe();
     test_run_cmd_capture_stdin();
+    test_seccomp_blocks_x32_abi();
 
     printf("1..%d\n", tap_test_num);
 

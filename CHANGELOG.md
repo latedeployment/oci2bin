@@ -4,6 +4,20 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **Seccomp filters are no longer bypassable through the x86-64 x32 ABI.**
+  Both the built-in filter and `--seccomp-profile` gated on
+  `seccomp_data.arch`, which x32 shares with the native ABI, and then compared
+  `seccomp_data.nr` against native syscall numbers. x32 ORs
+  `__X32_SYSCALL_BIT` into `nr`, so a blocked call re-issued over that ABI
+  matched no rule and fell through to the default action — `ptrace`, `bpf`,
+  `perf_event_open`, `keyctl`, `userfaultfd`, `init_module` and the rest of the
+  deny list were all reachable from the workload. Both builders now share one
+  prologue that kills the whole `0x40000000+` range. Affected x86-64 hosts
+  whose kernel has `CONFIG_X86_X32_ABI=y` (Debian and Arch ship it; Fedora
+  does not).
+
 ## [0.19.0] - 2026-08-15
 
 ### Added

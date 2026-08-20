@@ -9985,6 +9985,57 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
 /* ── seccomp ─────────────────────────────────────────────────────────────── */
 
 /*
+ * The audit arch this build's syscall numbers belong to.  A filter that does
+ * not pin this would compare numbers from one ABI against the table of
+ * another.
+ */
+#ifdef __aarch64__
+#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#else
+#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_X86_64
+#endif
+
+/*
+ * x86-64 exposes a second ABI, x32, that reports arch == AUDIT_ARCH_X86_64 —
+ * so it passes the arch gate — but ORs __X32_SYSCALL_BIT into seccomp_data.nr.
+ * A rule comparing nr against a native syscall number therefore matches
+ * nothing when the same call arrives over x32, and the program falls through
+ * to its default action: every deny rule in both filters below was bypassable
+ * by re-issuing the call with 0x40000000 set.  Kill the whole range instead —
+ * oci2bin has no x32 workloads to keep working.
+ */
+#define SECCOMP_X32_SYSCALL_BIT 0x40000000U
+
+/*
+ * Prologue shared by the built-in filter and the --seccomp-profile builder:
+ * pin the arch, reject x32, then leave seccomp_data.nr in the accumulator for
+ * the per-syscall rules that follow.  Expands to a comma-separated instruction
+ * list so it works both in a sock_filter initializer and in a copied-in array.
+ * Keep SECCOMP_PROLOGUE_LEN in step with the instruction count.
+ */
+#ifdef __x86_64__
+#define SECCOMP_PROLOGUE_LEN 6
+#define SECCOMP_PROLOGUE(kill_action)                                        \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,                                       \
+             (offsetof(struct seccomp_data, arch))),                         \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SECCOMP_AUDIT_ARCH, 1, 0),           \
+    BPF_STMT(BPF_RET | BPF_K, (kill_action)),                                \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,                                       \
+             (offsetof(struct seccomp_data, nr))),                           \
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, SECCOMP_X32_SYSCALL_BIT, 0, 1),      \
+    BPF_STMT(BPF_RET | BPF_K, (kill_action))
+#else
+#define SECCOMP_PROLOGUE_LEN 4
+#define SECCOMP_PROLOGUE(kill_action)                                        \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,                                       \
+             (offsetof(struct seccomp_data, arch))),                         \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SECCOMP_AUDIT_ARCH, 1, 0),           \
+    BPF_STMT(BPF_RET | BPF_K, (kill_action)),                                \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,                                       \
+             (offsetof(struct seccomp_data, nr)))
+#endif
+
+/*
  * Apply a seccomp-BPF filter that blocks syscalls with no legitimate use
  * inside a container (kernel load, reboot, raw BPF, keyring, etc.).
  * Uses the seccomp(2) syscall with TSYNC; falls back to prctl if unavailable.
@@ -9997,13 +10048,6 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
  */
 static int apply_seccomp_filter(void)
 {
-    /* Detect architecture at compile time */
-#ifdef __aarch64__
-#define MY_AUDIT_ARCH AUDIT_ARCH_AARCH64
-#else
-#define MY_AUDIT_ARCH AUDIT_ARCH_X86_64
-#endif
-
     /* Helper macros to build the BPF program */
 #define SC_ALLOW  SECCOMP_RET_ALLOW
 #define SC_KILL   SECCOMP_RET_KILL_PROCESS
@@ -10015,77 +10059,69 @@ static int apply_seccomp_filter(void)
 
     struct sock_filter filter[] =
     {
-        /* 1. Verify architecture — kill if wrong arch */
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-        (offsetof(struct seccomp_data, arch))),
-            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, MY_AUDIT_ARCH, 1, 0),
-            BPF_STMT(BPF_RET | BPF_K, SC_KILL),
+        /* 1-2. Pin the arch, reject x32, load the syscall number */
+        SECCOMP_PROLOGUE(SC_KILL),
 
-        /* 2. Load syscall number */
-            BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
-            (offsetof(struct seccomp_data, nr))),
-
-            /* 3. Block dangerous syscalls */
+        /* 3. Block dangerous syscalls */
 #ifdef __NR_kexec_load
-                BPF_BLOCK(__NR_kexec_load),
+        BPF_BLOCK(__NR_kexec_load),
 #endif
 #ifdef __NR_kexec_file_load
-                BPF_BLOCK(__NR_kexec_file_load),
+        BPF_BLOCK(__NR_kexec_file_load),
 #endif
 #ifdef __NR_reboot
-                BPF_BLOCK(__NR_reboot),
+        BPF_BLOCK(__NR_reboot),
 #endif
 #ifdef __NR_syslog
-                BPF_BLOCK(__NR_syslog),
+        BPF_BLOCK(__NR_syslog),
 #endif
 #ifdef __NR_perf_event_open
-                BPF_BLOCK(__NR_perf_event_open),
+        BPF_BLOCK(__NR_perf_event_open),
 #endif
 #ifdef __NR_bpf
-                BPF_BLOCK(__NR_bpf),
+        BPF_BLOCK(__NR_bpf),
 #endif
 #ifdef __NR_add_key
-                BPF_BLOCK(__NR_add_key),
+        BPF_BLOCK(__NR_add_key),
 #endif
 #ifdef __NR_request_key
-                BPF_BLOCK(__NR_request_key),
+        BPF_BLOCK(__NR_request_key),
 #endif
 #ifdef __NR_keyctl
-                BPF_BLOCK(__NR_keyctl),
+        BPF_BLOCK(__NR_keyctl),
 #endif
 #ifdef __NR_userfaultfd
-                BPF_BLOCK(__NR_userfaultfd),
+        BPF_BLOCK(__NR_userfaultfd),
 #endif
 #ifdef __NR_nfsservctl
-                BPF_BLOCK(__NR_nfsservctl),
+        BPF_BLOCK(__NR_nfsservctl),
 #endif
 #ifdef __NR_pivot_root
-                BPF_BLOCK(__NR_pivot_root),
+        BPF_BLOCK(__NR_pivot_root),
 #endif
 #ifdef __NR_ptrace
-                BPF_BLOCK(__NR_ptrace),
+        BPF_BLOCK(__NR_ptrace),
 #endif
 #ifdef __NR_process_vm_readv
-                BPF_BLOCK(__NR_process_vm_readv),
+        BPF_BLOCK(__NR_process_vm_readv),
 #endif
 #ifdef __NR_process_vm_writev
-                BPF_BLOCK(__NR_process_vm_writev),
+        BPF_BLOCK(__NR_process_vm_writev),
 #endif
 #ifdef __NR_init_module
-                BPF_BLOCK(__NR_init_module),
+        BPF_BLOCK(__NR_init_module),
 #endif
 #ifdef __NR_finit_module
-                BPF_BLOCK(__NR_finit_module),
+        BPF_BLOCK(__NR_finit_module),
 #endif
 
-            /* 4. Default: allow */
-                BPF_STMT(BPF_RET | BPF_K, SC_ALLOW),
-            };
+        /* 4. Default: allow */
+        BPF_STMT(BPF_RET | BPF_K, SC_ALLOW),
+    };
 
 #undef BPF_BLOCK
 #undef SC_ALLOW
 #undef SC_KILL
-#undef MY_AUDIT_ARCH
 
     struct sock_fprog prog =
     {
@@ -11729,12 +11765,6 @@ static int seccomp_profile_check_supported(const char* json)
  */
 static int apply_seccomp_profile(const char* profile_path)
 {
-#ifdef __aarch64__
-#define MY_AUDIT_ARCH_PROFILE AUDIT_ARCH_AARCH64
-#else
-#define MY_AUDIT_ARCH_PROFILE AUDIT_ARCH_X86_64
-#endif
-
     size_t json_sz = 0;
     char* json = read_file(profile_path, &json_sz);
     if (!json)
@@ -11944,10 +11974,10 @@ static int apply_seccomp_profile(const char* profile_path)
     /*
      * Build BPF program.
      * Each instruction is a struct sock_filter (8 bytes).
-     * Maximum size: arch check (3) + load nr (1) + per-syscall (2 each) + default (1)
-     * = 4 + 2*n_listed + 1
+     * Maximum size: shared prologue + per-syscall (2 each) + default (1)
+     * = SECCOMP_PROLOGUE_LEN + 2*n_listed + 1
      */
-    int max_insns = 4 + 2 * n_listed + 1;
+    int max_insns = SECCOMP_PROLOGUE_LEN + 2 * n_listed + 1;
     struct sock_filter* filter = calloc((size_t)max_insns,
                                         sizeof(struct sock_filter));
     if (!filter)
@@ -11958,19 +11988,17 @@ static int apply_seccomp_profile(const char* profile_path)
 
     int fi = 0;
 
-    /* 1. Verify architecture */
-    filter[fi++] = (struct sock_filter)BPF_STMT(
-                       BPF_LD | BPF_W | BPF_ABS,
-                       offsetof(struct seccomp_data, arch));
-    filter[fi++] = (struct sock_filter)BPF_JUMP(
-                       BPF_JMP | BPF_JEQ | BPF_K, MY_AUDIT_ARCH_PROFILE, 1, 0);
-    filter[fi++] = (struct sock_filter)BPF_STMT(
-                       BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
-
-    /* 2. Load syscall number */
-    filter[fi++] = (struct sock_filter)BPF_STMT(
-                       BPF_LD | BPF_W | BPF_ABS,
-                       offsetof(struct seccomp_data, nr));
+    /* 1-2. Pin the arch, reject x32, load the syscall number.  Same prologue
+     * the built-in filter uses, so a profile cannot be weaker than it on the
+     * ABI gate. */
+    {
+        static const struct sock_filter prologue[] =
+        {
+            SECCOMP_PROLOGUE(SECCOMP_RET_KILL_PROCESS)
+        };
+        memcpy(filter, prologue, sizeof(prologue));
+        fi = SECCOMP_PROLOGUE_LEN;
+    }
 
     /* 3. Per-syscall rules */
     if (default_is_allow)
@@ -12071,7 +12099,6 @@ static int apply_seccomp_profile(const char* profile_path)
 
     free(filter);
 
-#undef MY_AUDIT_ARCH_PROFILE
     return rc;
 }
 
