@@ -1886,46 +1886,114 @@ static int notify_detached_pid(int fd, pid_t pid)
  * (keys longer than 254 bytes).  Shared by json_get_string,
  * json_get_array, and json_parse_names_array.
  */
+static void json_skip_ws(const char** p)
+{
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r')
+    {
+        (*p)++;
+    }
+}
+
+/*
+ * Advance past the string literal starting at *p (which must be its opening
+ * quote), honoring backslash escapes.  Returns 0 on success with *p just past
+ * the closing quote, -1 if the literal is unterminated.
+ */
+static int json_skip_string(const char** p)
+{
+    const char* q = *p;
+    if (*q != '"')
+    {
+        return -1;
+    }
+    q++;
+    while (*q && *q != '"')
+    {
+        if (*q == '\\')
+        {
+            if (!q[1])
+            {
+                return -1;
+            }
+            q++;
+        }
+        q++;
+    }
+    if (*q != '"')
+    {
+        return -1;
+    }
+    *p = q + 1;
+    return 0;
+}
+
 static const char* json_skip_to_value(const char* json, const char* key)
 {
-    char needle[256];
-    int nlen = snprintf(needle, sizeof(needle), "\"%s\"", key);
-    if (nlen < 0 || (size_t)nlen >= sizeof(needle))
+    if (!json || !key)
+    {
+        return NULL;
+    }
+    size_t klen = strlen(key);
+    if (klen == 0 || klen > 254)
     {
         return NULL;    /* key too long */
     }
-    /* Reject matches that sit inside a JSON string value: a hostile
-     * manifest could embed `\"Cmd\":fake` in an unrelated string.
-     * Require the matched key to appear at a structural position —
-     * the previous non-whitespace byte must be '{' or ',' (object
-     * start or member separator), or the key is at the start. */
+
+    /*
+     * Walk the document rather than substring-searching it, so a key is only
+     * ever matched where a key can actually appear.  The previous version
+     * used strstr() plus a "previous non-space byte is '{' or ','" test,
+     * which a string value could satisfy from the inside: "a\",\"User\":\"0"
+     * put the bytes of a member separator and a key into the document without
+     * either being structure.  Every quote here either opens our key or opens
+     * a literal we skip whole, so string contents can never be read as
+     * structure.  The match must also be followed by ':' to be a member.
+     *
+     * Depth is deliberately not tracked: callers look up keys nested inside
+     * image-config objects.  Use json_skip_to_toplevel_value() where only a
+     * root-level member is acceptable.
+     */
     const char* p = json;
-    while ((p = strstr(p, needle)) != NULL)
+    while (*p)
     {
+        if (*p != '"')
+        {
+            p++;
+            continue;
+        }
         const char* q = p;
         while (q > json && (q[-1] == ' ' || q[-1] == '\t' ||
                             q[-1] == '\n' || q[-1] == '\r'))
         {
             q--;
         }
-        if (q == json || q[-1] == '{' || q[-1] == ',')
+        if ((q == json || q[-1] == '{' || q[-1] == ',') &&
+                strncmp(p + 1, key, klen) == 0 && p[1 + klen] == '"')
         {
-            const char* v = p + (size_t)nlen;
-            while (*v == ' ' || *v == ':' || *v == '\t' || *v == '\n')
+            const char* v = p + 1 + klen + 1;
+            json_skip_ws(&v);
+            if (*v == ':')
             {
                 v++;
+                json_skip_ws(&v);
+                return v;
             }
-            return v;
         }
-        p++;    /* not at structural position; keep scanning */
+        if (json_skip_string(&p) < 0)
+        {
+            return NULL;    /* unterminated literal — stop rather than guess */
+        }
     }
     return NULL;
 }
 
-/* Find a JSON string value for a given key. Returns malloc'd string or NULL. */
-static char* json_get_string(const char* json, const char* key)
+/*
+ * Copy the string literal at p (which must be its opening quote) into a fresh
+ * buffer, raw — escapes are preserved as written, matching what every existing
+ * caller expects.  Returns NULL if p is not a literal or it is unterminated.
+ */
+static char* extract_string_literal(const char* p)
 {
-    const char* p = json_skip_to_value(json, key);
     if (!p || *p != '"')
     {
         return NULL;
@@ -1960,89 +2028,42 @@ static char* json_get_string(const char* json, const char* key)
     return result;
 }
 
-/* Find a JSON array value for a given key. Returns malloc'd string (with []) or NULL. */
-static char* json_get_array(const char* json, const char* key)
+/* Find a JSON string value for a given key. Returns malloc'd string or NULL. */
+static char* json_get_string(const char* json, const char* key)
 {
-    const char* p = json_skip_to_value(json, key);
-    if (!p || *p != '[')
-    {
-        return NULL;
-    }
-    /* find matching ] */
-    int depth = 0;
-    const char* start = p;
-    while (*p)
-    {
-        if (*p == '[')
-        {
-            depth++;
-        }
-        if (*p == ']')
-        {
-            depth--;
-            if (depth == 0)
-            {
-                break;
-            }
-        }
-        p++;
-    }
-    if (depth != 0)
-    {
-        return NULL;    /* unmatched '[', string was truncated */
-    }
-    size_t len = p - start + 1;
-    char* result = malloc(len + 1);
-    if (!result)
-    {
-        return NULL;
-    }
-    memcpy(result, start, len);
-    result[len] = '\0';
-    return result;
+    return extract_string_literal(json_skip_to_value(json, key));
 }
 
-/* Find a JSON object value for a given key. Returns malloc'd string (with the
- * surrounding {}) or NULL.  String contents are skipped so that braces inside
- * quoted strings do not confuse the depth counter. */
-/* Given a pointer at a '{', return the malloc'd balanced {...} object string
- * (string contents and nesting honored), or NULL on truncation. */
-static char* extract_balanced_braces(const char* p)
+/*
+ * Given a pointer at `open`, return the malloc'd balanced run up to and
+ * including its matching `close`, or NULL on truncation.  String contents are
+ * skipped, so a bracket or brace inside a quoted value cannot close the run
+ * early — an array element of "]" used to truncate json_get_array()'s result
+ * mid-element and hand the caller a fragment.
+ */
+static char* extract_balanced(const char* p, char open, char close)
 {
-    if (!p || *p != '{')
+    if (!p || *p != open)
     {
         return NULL;
     }
     int depth = 0;
-    int in_str = 0;
     const char* start = p;
     while (*p)
     {
-        char c = *p;
-        if (in_str)
+        if (*p == '"')
         {
-            if (c == '\\')
+            if (json_skip_string(&p) < 0)
             {
-                if (!*(p + 1))
-                {
-                    break;    /* truncated escape */
-                }
-                p++; /* skip the escaped char */
+                return NULL;    /* unterminated literal */
             }
-            else if (c == '"')
-            {
-                in_str = 0;
-            }
+            continue;
         }
-        else if (c == '"')
-        {
-            in_str = 1;
-        }
-        else if (c == '{')
+        if (*p == open)
         {
             depth++;
         }
-        else if (c == '}')
+        else if (*p == close)
         {
             depth--;
             if (depth == 0)
@@ -2052,9 +2073,9 @@ static char* extract_balanced_braces(const char* p)
         }
         p++;
     }
-    if (depth != 0 || *p != '}')
+    if (depth != 0 || *p != close)
     {
-        return NULL;    /* unmatched '{', string was truncated */
+        return NULL;    /* unmatched delimiter, value was truncated */
     }
     size_t len = (size_t)(p - start) + 1;
     char* result = malloc(len + 1);
@@ -2065,6 +2086,22 @@ static char* extract_balanced_braces(const char* p)
     memcpy(result, start, len);
     result[len] = '\0';
     return result;
+}
+
+/* Find a JSON array value for a given key. Returns malloc'd string (with []) or NULL. */
+static char* json_get_array(const char* json, const char* key)
+{
+    return extract_balanced(json_skip_to_value(json, key), '[', ']');
+}
+
+/* Find a JSON object value for a given key. Returns malloc'd string (with the
+ * surrounding {}) or NULL.  String contents are skipped so that braces inside
+ * quoted strings do not confuse the depth counter. */
+/* Given a pointer at a '{', return the malloc'd balanced {...} object string
+ * (string contents and nesting honored), or NULL on truncation. */
+static char* extract_balanced_braces(const char* p)
+{
+    return extract_balanced(p, '{', '}');
 }
 
 static char* json_get_object(const char* json, const char* key)
@@ -2163,6 +2200,16 @@ static const char* json_skip_to_toplevel_value(const char* json,
 static char* json_get_toplevel_object(const char* json, const char* key)
 {
     return extract_balanced_braces(json_skip_to_toplevel_value(json, key));
+}
+
+static char* json_get_toplevel_string(const char* json, const char* key)
+{
+    return extract_string_literal(json_skip_to_toplevel_value(json, key));
+}
+
+static char* json_get_toplevel_array(const char* json, const char* key)
+{
+    return extract_balanced(json_skip_to_toplevel_value(json, key), '[', ']');
 }
 
 /* Split a JSON array of objects into individual {...} object strings. Returns
@@ -5117,12 +5164,23 @@ static int read_oci_config(const char* rootfs, struct oci_config* out)
     {
         return -1;
     }
-    out->entrypoint_json = json_get_array(cfg, "Entrypoint");
-    out->cmd_json        = json_get_array(cfg, "Cmd");
-    out->env_json        = json_get_array(cfg, "Env");
-    out->workdir         = json_get_string(cfg, "WorkingDir");
-    out->user            = json_get_string(cfg, "User");
-    out->healthcheck_json = json_get_object(cfg, "Healthcheck");
+    /*
+     * Top-level lookups only.  .oci2bin_config is written by
+     * extract_oci_rootfs() with a fixed root shape, and the Cmd / Entrypoint /
+     * Env / Healthcheck values are spliced into it as raw text straight from
+     * the image config.  A depth-agnostic lookup let a crafted image put
+     * `"User":"0"` inside its own Env array and have it win the lookup over
+     * the real, escaped User member emitted later in the same object — the
+     * loader then disagreed with every real JSON parser about what the image
+     * declares.  Anchoring to depth 1 means only the members we wrote can be
+     * read back.
+     */
+    out->entrypoint_json = json_get_toplevel_array(cfg, "Entrypoint");
+    out->cmd_json        = json_get_toplevel_array(cfg, "Cmd");
+    out->env_json        = json_get_toplevel_array(cfg, "Env");
+    out->workdir         = json_get_toplevel_string(cfg, "WorkingDir");
+    out->user            = json_get_toplevel_string(cfg, "User");
+    out->healthcheck_json = json_get_toplevel_object(cfg, "Healthcheck");
     free(cfg);
     return 0;
 }

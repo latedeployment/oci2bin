@@ -7329,6 +7329,83 @@ static void test_seccomp_blocks_x32_abi(void)
 }
 #endif
 
+/*
+ * extract_oci_rootfs() splices the image's Cmd/Entrypoint/Env/Healthcheck into
+ * .oci2bin_config as raw text, escaping only WorkingDir and User. A crafted
+ * image config could therefore put its own "User" member inside the Env array,
+ * and the depth-agnostic lookup in read_oci_config() matched that first —
+ * the loader read User "0" from a config whose real User member said something
+ * else, disagreeing with any real JSON parser. Lookups against the generated
+ * config are anchored to the root object, and the scanner no longer reads
+ * string contents as structure.
+ */
+static void test_json_lookup_resists_injection(void)
+{
+    /* .oci2bin_config exactly as the builder emits it for a hostile image. */
+    const char* emitted =
+        "{\"Cmd\":null,\"Entrypoint\":null,"
+        "\"Env\":[\"PATH=/bin\", \"User\":\"0\", "
+        "\"WorkingDir\":\"/root\", \"x\"],"
+        "\"WorkingDir\":\"/app\",\"User\":\"appuser\","
+        "\"Healthcheck\":null}";
+
+    char* user = json_get_toplevel_string(emitted, "User");
+    ASSERT_STR_EQ(user, "appuser",
+                  "json injection: root User wins over one inside Env");
+    free(user);
+
+    char* wdir = json_get_toplevel_string(emitted, "WorkingDir");
+    ASSERT_STR_EQ(wdir, "/app",
+                  "json injection: root WorkingDir wins over one inside Env");
+    free(wdir);
+
+    char* env = json_get_toplevel_array(emitted, "Env");
+    ASSERT_STR_EQ(env,
+                  "[\"PATH=/bin\", \"User\":\"0\", "
+                  "\"WorkingDir\":\"/root\", \"x\"]",
+                  "json injection: Env array still read whole");
+    free(env);
+
+    /* Key bytes carried inside a string literal are not structure. */
+    const char* hidden =
+        "{\"Env\":[\"a\\\",\\\"User\\\":\\\"0\\\",\\\"b\"],"
+        "\"User\":\"appuser\"}";
+    char* h1 = json_get_toplevel_string(hidden, "User");
+    ASSERT_STR_EQ(h1, "appuser",
+                  "json injection: escaped key inside a literal is not a key");
+    free(h1);
+    char* h2 = json_get_string(hidden, "User");
+    ASSERT_STR_EQ(h2, "appuser",
+                  "json injection: same for the depth-agnostic lookup");
+    free(h2);
+
+    /* A ']' inside an element must not truncate the array. */
+    const char* brk = "{\"Env\":[\"a]b\",\"c\"],\"User\":\"appuser\"}";
+    char* arr = json_get_array(brk, "Env");
+    ASSERT_STR_EQ(arr, "[\"a]b\",\"c\"]",
+                  "json injection: ']' inside a string does not close the array");
+    free(arr);
+    char* u2 = json_get_toplevel_string(brk, "User");
+    ASSERT_STR_EQ(u2, "appuser",
+                  "json injection: key after such an array still found");
+    free(u2);
+
+    /* A member is only a member when a ':' follows the key. */
+    ASSERT_NULL(json_get_string("{\"a\":[\"User\",\"x\"]}", "User"),
+                "json injection: bare string element is not a key");
+
+    /* Unchanged behaviour: nested keys are still reachable depth-agnostically,
+     * which the image-config readers rely on. */
+    char* nested = json_get_string("{\"config\":{\"User\":\"nobody\"}}",
+                                   "User");
+    ASSERT_STR_EQ(nested, "nobody",
+                  "json injection: nested lookup still works");
+    free(nested);
+    ASSERT_NULL(json_get_toplevel_string("{\"config\":{\"User\":\"x\"}}",
+                                         "User"),
+                "json injection: toplevel lookup ignores nested keys");
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -7432,6 +7509,7 @@ int main(void)
     test_credential_file_is_safe();
     test_run_cmd_capture_stdin();
     test_seccomp_blocks_x32_abi();
+    test_json_lookup_resists_injection();
 
     printf("1..%d\n", tap_test_num);
 
