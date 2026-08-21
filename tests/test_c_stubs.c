@@ -1260,6 +1260,159 @@ static void test_stub_make_mount_tree_private(void)
                   "mount namespace private: failure is fatal");
 }
 
+/* ── test_stub_recursive_remount_rdonly ───────────────────────────────────
+ *
+ * recursive_remount_rdonly(path, add_nosuid) prefers mount_setattr(2) with
+ * AT_RECURSIVE.  The stub syscall() reports ENOSYS for it, so these cases
+ * exercise the pre-5.12 MS_* fallback and pin the flag composition:
+ * --seccomp-deny-write passes add_nosuid=1 and must still get MS_NOSUID,
+ * `-v ...:ro` passes 0 and must not.  A failure that is not ENOSYS (here:
+ * open() failing) must not silently fall back to the weaker remount.
+ */
+static void test_stub_recursive_remount_rdonly(void)
+{
+    const unsigned long ro_flags = MS_BIND | MS_REMOUNT | MS_RDONLY;
+
+    stub_reset();
+    ASSERT_INT_EQ(recursive_remount_rdonly("/", 0), 0,
+                  "remount-ro: -v :ro path succeeds via fallback");
+    ASSERT_INT_EQ(stub_count("mount"), 1,
+                  "remount-ro: one fallback mount call");
+    ASSERT((unsigned long)g_stub_calls[0].arg0 == ro_flags,
+           "remount-ro: add_nosuid=0 uses MS_BIND|MS_REMOUNT|MS_RDONLY only");
+
+    stub_reset();
+    ASSERT_INT_EQ(recursive_remount_rdonly("/", 1), 0,
+                  "remount-ro: deny-write path succeeds via fallback");
+    ASSERT((unsigned long)g_stub_calls[0].arg0 == (ro_flags | MS_NOSUID),
+           "remount-ro: add_nosuid=1 adds MS_NOSUID to the fallback remount");
+
+    /* The mount_setattr attribute the recursive path sets must match the
+     * kernel UAPI values, since loader.c defines them itself on old headers. */
+    ASSERT_INT_EQ((int)MOUNT_ATTR_RDONLY, 0x00000001,
+                  "remount-ro: MOUNT_ATTR_RDONLY matches kernel UAPI");
+    ASSERT_INT_EQ((int)MOUNT_ATTR_NOSUID, 0x00000002,
+                  "remount-ro: MOUNT_ATTR_NOSUID matches kernel UAPI");
+
+    /* open() failure is not ENOSYS: fail closed, never fall back. */
+    stub_reset();
+    ASSERT_INT_EQ(recursive_remount_rdonly("/nonexistent-oci2bin-audit", 1), -1,
+                  "remount-ro: unopenable path fails closed");
+    ASSERT_INT_EQ(stub_count("mount"), 0,
+                  "remount-ro: unopenable path does not attempt a weaker remount");
+
+    stub_reset();
+    g_stub_mount_retval = -1;
+    g_stub_mount_errno = EPERM;
+    ASSERT_INT_EQ(recursive_remount_rdonly("/", 1), -1,
+                  "remount-ro: remount failure is reported to the caller");
+}
+
+/* ── test_stub_apply_capabilities_strict ──────────────────────────────────
+ *
+ * apply_capabilities() returns -1 when the kernel rejects a requested change
+ * so --strict can abort.  EINVAL from PR_CAPBSET_DROP under --cap-drop all
+ * only means the capability does not exist on this kernel — the loop walks
+ * caps 0..40 blindly — and must NOT count as a failure, or --strict would
+ * abort on every kernel that lacks the newest capabilities.
+ */
+static void test_stub_apply_capabilities_strict(void)
+{
+    struct container_opts opts;
+
+    stub_reset();
+    memset(&opts, 0, sizeof(opts));
+    opts.cap_drop_all = 1;
+    ASSERT_INT_EQ(apply_capabilities(&opts), 0,
+                  "apply_caps: drop-all with every drop accepted returns 0");
+
+    stub_reset();
+    g_stub_prctl_retval = -1;
+    g_stub_prctl_errno  = EINVAL;
+    ASSERT_INT_EQ(apply_capabilities(&opts), 0,
+                  "apply_caps: PR_CAPBSET_DROP EINVAL (cap absent) is not a "
+                  "failure");
+
+    stub_reset();
+    g_stub_prctl_retval = -1;
+    g_stub_prctl_errno  = EPERM;
+    ASSERT_INT_EQ(apply_capabilities(&opts), -1,
+                  "apply_caps: PR_CAPBSET_DROP EPERM reports failure");
+
+    /* Explicit --cap-drop list: a rejected drop is a failure. */
+    stub_reset();
+    memset(&opts, 0, sizeof(opts));
+    opts.cap_drop_mask = (1ULL << 21);
+    ASSERT_INT_EQ(apply_capabilities(&opts), 0,
+                  "apply_caps: accepted --cap-drop returns 0");
+    stub_reset();
+    g_stub_prctl_retval = -1;
+    g_stub_prctl_errno  = EPERM;
+    ASSERT_INT_EQ(apply_capabilities(&opts), -1,
+                  "apply_caps: rejected --cap-drop reports failure");
+
+    /* --cap-add: a rejected capset must be reported too. */
+    stub_reset();
+    memset(&opts, 0, sizeof(opts));
+    opts.cap_drop_all = 1;
+    opts.cap_add_mask = (1ULL << 10); /* CAP_NET_BIND_SERVICE */
+    ASSERT_INT_EQ(apply_capabilities(&opts), 0,
+                  "apply_caps: accepted --cap-add returns 0");
+    stub_reset();
+    g_stub_capset_retval = -1;
+    g_stub_capset_errno  = EPERM;
+    ASSERT_INT_EQ(apply_capabilities(&opts), -1,
+                  "apply_caps: rejected capset for --cap-add reports failure");
+}
+
+/* ── test_stub_landlock_strict ────────────────────────────────────────────
+ *
+ * landlock_degraded() decides whether a Landlock step that did not take
+ * effect is fatal.  The stub syscall() reports ENOSYS, so the kernel looks
+ * like it has no Landlock: AUTO must still skip silently, while --landlock
+ * or --strict must abort.  --no-landlock wins over --strict.
+ */
+static void test_stub_landlock_strict(void)
+{
+    struct container_opts opts;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.landlock_mode = LANDLOCK_MODE_AUTO;
+    ASSERT_INT_EQ(landlock_degraded(&opts), 0,
+                  "landlock_degraded: auto without --strict skips");
+    opts.strict = 1;
+    ASSERT_INT_EQ(landlock_degraded(&opts), -1,
+                  "landlock_degraded: --strict makes a degraded sandbox fatal");
+    memset(&opts, 0, sizeof(opts));
+    opts.landlock_mode = LANDLOCK_MODE_ON;
+    ASSERT_INT_EQ(landlock_degraded(&opts), -1,
+                  "landlock_degraded: --landlock makes it fatal without --strict");
+
+    stub_reset();
+    memset(&opts, 0, sizeof(opts));
+    opts.landlock_mode = LANDLOCK_MODE_AUTO;
+    ASSERT_INT_EQ(apply_landlock_sandbox(&opts), 0,
+                  "landlock: unsupported kernel under auto is a silent skip");
+
+    stub_reset();
+    opts.strict = 1;
+    ASSERT_INT_EQ(apply_landlock_sandbox(&opts), -1,
+                  "landlock: --strict refuses to skip an unavailable sandbox");
+
+    stub_reset();
+    memset(&opts, 0, sizeof(opts));
+    opts.landlock_mode = LANDLOCK_MODE_ON;
+    ASSERT_INT_EQ(apply_landlock_sandbox(&opts), -1,
+                  "landlock: --landlock on an unsupported kernel aborts");
+
+    stub_reset();
+    memset(&opts, 0, sizeof(opts));
+    opts.landlock_mode = LANDLOCK_MODE_OFF;
+    opts.strict = 1;
+    ASSERT_INT_EQ(apply_landlock_sandbox(&opts), 0,
+                  "landlock: --no-landlock is honoured under --strict");
+}
+
 /* ── test_stub_container_main ─────────────────────────────────────────────
  *
  * container_main() is the heart of the runtime: it sets up mounts, chroot,

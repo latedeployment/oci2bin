@@ -411,6 +411,91 @@ class TestLayerCache(unittest.TestCase):
                 bp.verify_layer_digests(tampered, use_cache=True)
             self.assertEqual(cm.exception.code, 1)
 
+    def _make_oci_tar_with_config(self, layers, mutate):
+        """Build a tar, then rewrite config.json via `mutate`."""
+        honest = self._make_oci_tar(layers)
+        out = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(honest), mode='r:*') as src, \
+                tarfile.open(fileobj=out, mode='w:') as dst:
+            for member in src.getmembers():
+                data = src.extractfile(member).read()
+                if member.name == 'config.json':
+                    cfg = json.loads(data)
+                    mutate(cfg)
+                    data = json.dumps(cfg, separators=(',', ':')).encode()
+                info = tarfile.TarInfo(member.name)
+                info.size = len(data)
+                dst.addfile(info, io.BytesIO(data))
+        return out.getvalue()
+
+    def test_verify_layer_digests_refuses_unverifiable(self):
+        """
+        Every reason the digests cannot be determined is reachable from the
+        input tar alone, so warning and continuing would leave "delete
+        rootfs.diff_ids" as a one-line bypass of the whole check.
+        """
+        layers = [('layer0/layer.tar', b'layer-zero')]
+        cases = {
+            'diff_ids deleted': lambda c: c['rootfs'].pop('diff_ids'),
+            'diff_ids empty': lambda c: c['rootfs'].update(diff_ids=[]),
+            'diff_ids not a list': lambda c: c['rootfs'].update(diff_ids='x'),
+            'diff_ids not a digest':
+                lambda c: c['rootfs'].update(diff_ids=['bogus']),
+            'rootfs deleted': lambda c: c.pop('rootfs'),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(case=name):
+                oci_data = self._make_oci_tar_with_config(layers, mutate)
+                with tempfile.TemporaryDirectory() as td, \
+                        mock.patch.dict(os.environ,
+                                        {'XDG_CACHE_HOME': td}, clear=False):
+                    with self.assertRaises(SystemExit) as cm:
+                        bp.verify_layer_digests(oci_data, use_cache=True)
+                    self.assertEqual(cm.exception.code, 1)
+
+    def test_verify_layer_digests_rejects_bad_gzip(self):
+        """A layer claiming gzip that does not decompress fails with an error,
+        not an uncaught BadGzipFile traceback."""
+        layers = [('layer0/layer.tar', b'\x1f\x8bnot really gzip')]
+        oci_data = self._make_oci_tar(layers)
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {'XDG_CACHE_HOME': td}, clear=False):
+            with self.assertRaises(SystemExit) as cm:
+                bp.verify_layer_digests(oci_data, use_cache=True)
+            self.assertEqual(cm.exception.code, 1)
+
+    def test_write_cached_layer_does_not_follow_symlinks(self):
+        """
+        XDG_CACHE_HOME is user-settable, so a predictable temp path in a shared
+        cache root was an arbitrary-file-write primitive.
+        """
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ,
+                                {'XDG_CACHE_HOME': td + '/cache'}, clear=False):
+            victim = Path(td) / 'victim'
+            victim.write_bytes(b'PRECIOUS')
+            cache_root = Path(bp.get_layer_cache_root())
+            cache_root.mkdir(parents=True, exist_ok=True)
+            data = b'layer-zero'
+            digest = hashlib.sha256(data).hexdigest()
+            # the path the old implementation used
+            os.symlink(victim, cache_root / f'{digest}.tar.tmp.{os.getpid()}')
+
+            bp._write_cached_layer(str(cache_root), digest, data)
+
+            self.assertEqual(victim.read_bytes(), b'PRECIOUS')
+            self.assertEqual((cache_root / f'{digest}.tar').read_bytes(), data)
+            self.assertEqual(
+                (cache_root / f'{digest}.tar').stat().st_mode & 0o777, 0o600)
+
+    def test_layer_cache_root_created_private(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ,
+                                {'XDG_CACHE_HOME': td + '/fresh'}, clear=False):
+            root = bp.get_layer_cache_root()
+            bp._write_cached_layer(root, hashlib.sha256(b'x').hexdigest(), b'x')
+            self.assertEqual(os.stat(root).st_mode & 0o777, 0o700)
+
     def test_verify_layer_digests_mismatch_not_masked_by_no_cache(self):
         oci_data = self._make_mismatched_oci_tar()
         with tempfile.TemporaryDirectory() as td, \

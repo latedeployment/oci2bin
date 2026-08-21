@@ -58,7 +58,16 @@ oci2bin --no-cache redis:7-alpine
 
 `--no-cache` controls caching only. Every layer is still hashed and checked
 against the `diff_id` the image config declares for it, on every build, and a
-mismatch aborts the build.
+mismatch aborts the build. So does an image whose config does not let the
+build determine the digests at all — a missing or malformed
+`rootfs.diff_ids`, or a count that disagrees with the manifest's layer list.
+(A `--tar` payload with no `manifest.json` is not an image and is passed
+through with a note; the loader rejects such an artifact at run time.)
+
+This is a self-consistency check: `diff_ids` travel in the same tar as the
+layers, so it catches corruption, truncation and partial tampering, not a
+forged image. For authenticity use `--require-signed`, `--pin-digest`, or
+cosign verification.
 
 ## Detached Containers
 

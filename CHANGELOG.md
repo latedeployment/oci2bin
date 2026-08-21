@@ -64,7 +64,27 @@ All notable changes to oci2bin are documented here.
   different bytes unverified, and `--no-cache`, documented purely as a cache
   control, silently turned off the build's only integrity check. Verification
   is now unconditional; `--no-cache` only controls whether verified layers are
-  stored.
+  stored. Being unable to determine the digests is refused rather than warned
+  about, too — every such reason (unreadable config, missing or malformed
+  `rootfs.diff_ids`, a count disagreeing with `Layers`) is reachable from the
+  input tar alone, so continuing would have left "delete `rootfs.diff_ids`" as
+  a one-line bypass. (A `--tar` payload carrying no `manifest.json` is not an
+  image, makes no claim to verify, and is passed through with a note.) Note
+  the scope: `diff_ids` travel in the same tar as the
+  layers, so this catches corruption and partial tampering, not a forged
+  image; authenticity comes from `--require-signed`, `--pin-digest` and cosign.
+
+- **The layer cache no longer follows symlinks when writing.** Entries went to
+  a predictable `<digest>.tar.tmp.<pid>` path opened with plain `open()`, and
+  the cache root was created with the default umask. Since `XDG_CACHE_HOME` is
+  user-settable, a symlink planted at that path redirected the write, giving a
+  local attacker an arbitrary-file-write primitive. The cache root is now
+  created 0700 and entries are staged with `tempfile.mkstemp` (`O_EXCL`, 0600,
+  unpredictable name).
+
+- **A layer claiming gzip that does not decompress now fails with an error**
+  instead of an uncaught `BadGzipFile` traceback. This path is newly always
+  taken now that verification cannot be skipped.
 
 - **Seccomp filters are no longer bypassable through the x86-64 x32 ABI.**
   Both the built-in filter and `--seccomp-profile` gated on

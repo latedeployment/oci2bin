@@ -2040,6 +2040,16 @@ static char* json_get_string(const char* json, const char* key)
  * skipped, so a bracket or brace inside a quoted value cannot close the run
  * early — an array element of "]" used to truncate json_get_array()'s result
  * mid-element and hand the caller a fragment.
+ *
+ * Both delimiter kinds are counted, not just the requested pair, so the run
+ * is only accepted when '{}' and '[]' nest properly inside it.  That matters
+ * because extract_oci_rootfs() splices what this returns into
+ * .oci2bin_config as raw text, and read_oci_config() reads it back with a
+ * depth-counting scanner: a value like `[}]` is balanced in brackets alone
+ * but leaves that scanner one level short, so every member emitted after it
+ * (WorkingDir, User, Healthcheck) reads back as absent and the image's
+ * declared user is silently dropped.  Requiring the counts to agree with
+ * what json_skip_to_toplevel_value() does keeps the two in step.
  */
 static char* extract_balanced(const char* p, char open, char close)
 {
@@ -2059,11 +2069,11 @@ static char* extract_balanced(const char* p, char open, char close)
             }
             continue;
         }
-        if (*p == open)
+        if (*p == '{' || *p == '[')
         {
             depth++;
         }
-        else if (*p == close)
+        else if (*p == '}' || *p == ']')
         {
             depth--;
             if (depth == 0)

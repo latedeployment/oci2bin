@@ -7390,6 +7390,47 @@ static void test_json_lookup_resists_injection(void)
                   "json injection: key after such an array still found");
     free(u2);
 
+    /*
+     * A value that balances its own delimiter kind but not the other one used
+     * to desync the reader: extract_oci_rootfs() splices what json_get_array()
+     * returns into .oci2bin_config verbatim, and read_oci_config() reads that
+     * back with a depth counter that moves on both '{}' and '[]'.  An Env of
+     * `[}]` is bracket-balanced, so it was copied through, but it left that
+     * counter one level short — every member after it (WorkingDir, User,
+     * Healthcheck) read back as absent and the image's declared user was
+     * silently dropped, running the workload as root instead.
+     */
+    ASSERT_NULL(json_get_array("{\"Env\":[}]}", "Env"),
+                "json injection: array closed by a brace is rejected");
+    ASSERT_NULL(json_get_array("{\"Env\":[{]}", "Env"),
+                "json injection: array with an unbalanced brace is rejected");
+    ASSERT_NULL(json_get_object("{\"H\":{]}}", "H"),
+                "json injection: object closed by a bracket is rejected");
+    {
+        /* The emitted config with such a value replaced by null still reads
+         * back completely. */
+        const char* emitted =
+            "{\"Cmd\":null,\"Entrypoint\":null,\"Env\":null,"
+            "\"WorkingDir\":\"/app\",\"User\":\"appuser\","
+            "\"Healthcheck\":null}";
+        char* u = json_get_toplevel_string(emitted, "User");
+        ASSERT_STR_EQ(u, "appuser",
+                      "json injection: members after a rejected value survive");
+        free(u);
+    }
+
+    /* Mixed nesting that is genuinely well-formed must still be accepted. */
+    {
+        char* a = json_get_array("{\"E\":[{\"a\":1},{\"b\":[2,3]}]}", "E");
+        ASSERT_STR_EQ(a, "[{\"a\":1},{\"b\":[2,3]}]",
+                      "json injection: object inside array still parses");
+        free(a);
+        char* o = json_get_object("{\"H\":{\"T\":[\"CMD\",\"x\"]}}", "H");
+        ASSERT_STR_EQ(o, "{\"T\":[\"CMD\",\"x\"]}",
+                      "json injection: array inside object still parses");
+        free(o);
+    }
+
     /* A member is only a member when a ':' follows the key. */
     ASSERT_NULL(json_get_string("{\"a\":[\"User\",\"x\"]}", "User"),
                 "json injection: bare string element is not a key");
@@ -7404,6 +7445,61 @@ static void test_json_lookup_resists_injection(void)
     ASSERT_NULL(json_get_toplevel_string("{\"config\":{\"User\":\"x\"}}",
                                          "User"),
                 "json injection: toplevel lookup ignores nested keys");
+
+    /*
+     * Anchoring read_oci_config() to the root object is only safe while the
+     * root object stays scannable, and extract_oci_rootfs() splices whatever
+     * json_get_array()/json_get_object() returned for Cmd/Entrypoint/Env/
+     * Healthcheck in as raw text.  A value that balances its own delimiter
+     * but not the other kind — `[}]` — leaves the depth-counting toplevel
+     * scanner one level short, so WorkingDir, User and Healthcheck all read
+     * back as absent and the image's declared user is silently dropped
+     * (the container then runs as uid 0).  Such a value must never be
+     * extracted in the first place.
+     */
+    ASSERT_NULL(json_get_array("{\"Env\":[}],\"User\":\"appuser\"}", "Env"),
+                "json balance: '[}]' is not a well-formed array");
+    ASSERT_NULL(json_get_array("{\"Env\":[{],\"User\":\"appuser\"}", "Env"),
+                "json balance: '[{]' is not a well-formed array");
+    ASSERT_NULL(json_get_array("{\"Env\":[}}{{],\"User\":\"x\"}", "Env"),
+                "json balance: '[}}{{]' is not a well-formed array");
+    ASSERT_NULL(json_get_object("{\"Healthcheck\":{]},\"User\":\"x\"}",
+                                "Healthcheck"),
+                "json balance: '{]}' is not a well-formed object");
+
+    /* Properly nested values — including delimiters inside string literals —
+     * are still extracted whole. */
+    char* nest = json_get_array(
+                     "{\"Env\":[\"A={b}\",\"C=]d[\"],\"User\":\"x\"}", "Env");
+    ASSERT_STR_EQ(nest, "[\"A={b}\",\"C=]d[\"]",
+                  "json balance: delimiters inside strings do not unbalance");
+    free(nest);
+    char* obj = json_get_object(
+                    "{\"a\":{\"b\":[{\"c\":[[1]]}]},\"d\":1}", "a");
+    ASSERT_STR_EQ(obj, "{\"b\":[{\"c\":[[1]]}]}",
+                  "json balance: mixed nesting still extracted whole");
+    free(obj);
+
+    /* End to end: the splice extract_oci_rootfs() performs from a hostile
+     * image config must still round-trip the real User through the
+     * root-anchored read in read_oci_config(). */
+    const char* hostile_img =
+        "{\"User\":\"appuser\",\"WorkingDir\":\"/app\",\"Env\":[}],"
+        "\"Cmd\":null,\"Entrypoint\":null,\"Healthcheck\":null}";
+    char* h_env  = json_get_array(hostile_img, "Env");
+    char* h_user = json_get_string(hostile_img, "User");
+    char emitted_buf[512];
+    snprintf(emitted_buf, sizeof(emitted_buf),
+             "{\"Cmd\":null,\"Entrypoint\":null,\"Env\":%s,"
+             "\"WorkingDir\":\"/app\",\"User\":\"%s\","
+             "\"Healthcheck\":null}",
+             h_env ? h_env : "null", h_user ? h_user : "");
+    free(h_env);
+    free(h_user);
+    char* back = json_get_toplevel_string(emitted_buf, "User");
+    ASSERT_STR_EQ(back, "appuser",
+                  "json balance: hostile Env cannot hide the emitted User");
+    free(back);
 }
 
 int main(void)

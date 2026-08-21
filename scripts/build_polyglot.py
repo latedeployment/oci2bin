@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zlib
 
 
 # ── ELF64 constants ──────────────────────────────────────────────────────────
@@ -489,12 +490,25 @@ def _read_cached_layer(cache_root, digest_hex):
 
 
 def _write_cached_layer(cache_root, digest_hex, data):
-    os.makedirs(cache_root, exist_ok=True)
+    # mode=0o700 so a cache root created under a shared XDG_CACHE_HOME is not
+    # writable by other users, and mkstemp (O_CREAT|O_EXCL, 0600, random name)
+    # so a pre-planted symlink at the temp path cannot redirect the write.
+    os.makedirs(cache_root, mode=0o700, exist_ok=True)
     cache_path = _layer_cache_path(cache_root, digest_hex)
-    tmp_path = f'{cache_path}.tmp.{os.getpid()}'
-    with open(tmp_path, 'wb') as f:
-        f.write(data)
-    os.replace(tmp_path, cache_path)
+    fd, tmp_path = tempfile.mkstemp(dir=cache_root, prefix=f'{digest_hex}.',
+                                    suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        # os.replace renames over cache_path itself; it does not follow a
+        # symlink planted there.
+        os.replace(tmp_path, cache_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def verify_layer_digests(oci_data, use_cache=True):
@@ -517,38 +531,66 @@ def verify_layer_digests(oci_data, use_cache=True):
       - `use_cache` must not skip it. That flag comes from --no-cache, which
         is documented as a cache control; silently turning off integrity
         checking is not something a performance flag may do.
+      - Not being *able* to verify must not skip it either, once the payload
+        claims to be an OCI image. Every reason the digests cannot be
+        determined -- an unreadable config, a missing or malformed
+        rootfs.diff_ids, a count that disagrees with Layers -- is reached from
+        the input tar alone, so warning and continuing would have left "just
+        delete rootfs.diff_ids" as a one-line bypass of the whole check.
+        rootfs.diff_ids is mandatory in the OCI image-config spec, so an image
+        tar without usable ones is malformed, not merely unusual. A payload
+        with no manifest.json at all is the one exception: it is not an image,
+        makes no claim to verify, and the loader rejects it at run time.
 
-    `use_cache` therefore only controls whether verified layers are also
-    stored under the cache root.
+    Note what this does and does not buy: diff_ids live in the same tar as the
+    layers, so an attacker who can rewrite one can rewrite the other. This is
+    a self-consistency check -- it catches corruption, truncation and partial
+    tampering, not a forged image. Authenticity comes from --require-signed,
+    --pin-digest and cosign verification.
+
+    `use_cache` only controls whether verified layers are also stored under
+    the cache root.
     """
-    unverifiable = {'hits': 0, 'misses': 0, 'verified': 0}
-
     def cannot_verify(reason):
-        print(f'  warning: cannot verify layer digests ({reason}); '
-              'the build will embed the layers as-is', file=sys.stderr)
-        return unverifiable
+        print(f'error: cannot verify layer digests: {reason}', file=sys.stderr)
+        print('       rootfs.diff_ids is required by the OCI image-config '
+              'spec; refusing to embed unverifiable layers', file=sys.stderr)
+        sys.exit(1)
+
+    # A tar with no manifest.json is not an OCI image and makes no claim to
+    # verify -- --tar accepts arbitrary payloads, and the loader refuses such
+    # an artifact at run time anyway ("cannot read manifest.json"). Everything
+    # past this point *does* claim to be an image, so from here on being unable
+    # to verify is an error rather than a warning.
+    try:
+        with tarfile.open(fileobj=io.BytesIO(oci_data), mode='r:*') as tf:
+            tf.getmember('manifest.json')
+    except (KeyError, tarfile.TarError) as exc:
+        print(f'  note: payload carries no OCI manifest ({exc}); '
+              'nothing to verify', file=sys.stderr)
+        return {'hits': 0, 'misses': 0, 'verified': 0}
 
     try:
         manifest, _, config, _ = _parse_oci_manifest_and_config(oci_data)
     except (KeyError, json.JSONDecodeError, tarfile.TarError) as exc:
-        return cannot_verify(f'unreadable manifest or config: {exc}')
+        cannot_verify(f'unreadable manifest or config: {exc}')
 
     if not manifest:
-        return cannot_verify('no manifest entries')
+        cannot_verify('no manifest entries')
 
     layers = manifest[0].get('Layers', [])
     diff_ids = config.get('rootfs', {}).get('diff_ids', [])
     if not isinstance(layers, list) or not isinstance(diff_ids, list):
-        return cannot_verify('Layers or rootfs.diff_ids is not a list')
+        cannot_verify('Layers or rootfs.diff_ids is not a list')
     if len(layers) != len(diff_ids):
-        return cannot_verify(
+        cannot_verify(
             f'{len(layers)} layer(s) but {len(diff_ids)} diff_id(s)')
 
     layer_digests = {}
     for layer_name, diff_id in zip(layers, diff_ids):
         digest_hex = _parse_sha256_hex(diff_id)
         if digest_hex is None:
-            return cannot_verify(f'unparseable diff_id {diff_id!r}')
+            cannot_verify(f'unparseable diff_id {diff_id!r}')
         layer_digests[layer_name] = digest_hex
 
     cache_root = get_layer_cache_root()
@@ -574,7 +616,15 @@ def verify_layer_digests(oci_data, use_cache=True):
             # OCI image layout (Docker 29+) stores compressed layers; diff_ids
             # are sha256 of the *uncompressed* content, so decompress first.
             if layer_data[:2] == b'\x1f\x8b':
-                layer_data = gzip.decompress(layer_data)
+                try:
+                    layer_data = gzip.decompress(layer_data)
+                except (OSError, EOFError, zlib.error) as exc:
+                    # Attacker-controlled bytes: fail closed with a real error
+                    # instead of an uncaught BadGzipFile traceback.
+                    print(f'error: OCI layer {layer_name} claims gzip '
+                          f'compression but does not decompress: {exc}',
+                          file=sys.stderr)
+                    sys.exit(1)
             actual = hashlib.sha256(layer_data).hexdigest()
             if actual != digest_hex:
                 print(
