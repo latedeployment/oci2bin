@@ -15,6 +15,7 @@ scripts/merge_layers.py
 scripts/oci_layout_to_tar.py
 scripts/oci_tar.py
 scripts/pod_stack.py
+scripts/prune_cache.py
 scripts/reconstruct.py
 scripts/sbom_generate.py
 scripts/sign_binary.py

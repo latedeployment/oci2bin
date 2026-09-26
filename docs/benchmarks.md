@@ -11,7 +11,7 @@ Build one SquashFS artifact, then benchmark both namespace rootfs paths:
 ```bash
 oci2bin --rootfs-format squashfs alpine:latest alpine.bin
 oci2bin benchmark ./alpine.bin \
-  --modes extract,lazy \
+  --modes extract,cached,lazy \
   --runs 20 \
   -- /bin/true
 ```
@@ -26,6 +26,11 @@ oci2bin benchmark ./alpine-vm.bin \
   --runs 20 \
   -- /bin/true
 ```
+
+The `extract` mode runs with `--rootfs-cache off` and measures a full layer
+extraction on every launch; `cached` is the default launch path once the
+extracted-rootfs cache is warm (the warmup launch fills it). `cached` is
+skipped for encrypted artifacts, which auto mode never caches.
 
 The benchmark skips modes whose host prerequisites are unavailable. A mode
 that starts but cannot run the command is reported as failed rather than being

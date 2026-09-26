@@ -19,8 +19,12 @@ from pathlib import Path
 import inspect_image
 
 
+# "extract" measures a full per-run layer extraction; "cached" the default
+# launch path once the extracted rootfs cache is warm (the warmup run fills
+# it); "lazy" the SquashFS mount; "vm" the microVM boot.
 MODE_ARGS = {
-    "extract": [],
+    "extract": ["--rootfs-cache", "off"],
+    "cached": ["--rootfs-cache", "auto"],
     "lazy": ["--lazy"],
     "vm": ["--vm", "--net", "none"],
 }
@@ -99,6 +103,11 @@ def parse_modes(value):
 
 
 def mode_preflight(mode, meta):
+    if mode == "cached":
+        encoding = meta.get("payload_encoding", "tar")
+        if isinstance(encoding, str) and encoding.startswith("age"):
+            return ("encrypted payloads are not cached in auto mode; "
+                    "run with --rootfs-cache always to opt in")
     if mode == "lazy":
         if meta.get("rootfs_format", "tar") != "squashfs":
             return ("artifact has no SquashFS rootfs; rebuild with "
@@ -281,10 +290,11 @@ def main(argv=None):
         epilog="CMD runs inside the artifact and defaults to /bin/true.")
     parser.add_argument("binary", help="oci2bin executable to benchmark")
     parser.add_argument(
-        "--modes", type=parse_modes, default=parse_modes("extract,lazy"),
+        "--modes", type=parse_modes,
+        default=parse_modes("extract,cached,lazy"),
         metavar="LIST",
-        help="comma-separated extract,lazy,vm modes, or all "
-             "(default: extract,lazy)")
+        help="comma-separated extract,cached,lazy,vm modes, or all "
+             "(default: extract,cached,lazy)")
     parser.add_argument("--runs", type=int, default=10,
                         help="measured launches per mode (default: 10)")
     parser.add_argument("--warmups", type=int, default=1,

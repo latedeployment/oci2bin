@@ -1,0 +1,1 @@
+../../scripts/prune_cache.py

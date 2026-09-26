@@ -570,6 +570,32 @@ The run aborts if the read-only remount fails.
 Use a writable temporary overlay whose upper layer is discarded on exit.
 .
 .TP
+.BI \-\-rootfs\-cache " auto|off|always"
+Whether to reuse the extracted root filesystem across launches.
+The first launch merges the image layers once into
+.IR ${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/ KEY
+(the SHA-256 of the image config); later launches of the same image skip
+extraction and run on a private writable layer over the cached tree
+(kernel overlayfs in the user namespace, else
+.BR fuse-overlayfs ,
+else a reflink/copy), so workload writes never reach the cache.
+.B auto
+(the default) caches every image except encrypted ones;
+.B always
+also caches the decrypted tree of an encrypted image;
+.B off
+extracts into the runtime tmpdir on every launch.
+.B \-\-no\-rootfs\-cache
+is the same as
+.BR off .
+A cache entry that fails its integrity check is rebuilt, not trusted.
+See also
+.B OCI2BIN_ROOTFS_CACHE
+and
+.B oci2bin prune
+.RB ( \-\-max\-age ", " \-\-max\-size ", " \-\-all ).
+.
+.TP
 .BI \-\-cap\-drop " CAP"
 Drop capability
 .I CAP
@@ -786,9 +812,20 @@ List all cached binaries with image name, digest, size, and build date.
 emits machine-readable JSON.
 .
 .TP
-.B oci2bin prune \fR[\fB\-\-dry\-run\fR]
-Remove outdated cache entries, keeping only the most recently built binary
-for each image name.
+.B oci2bin prune \fR[\fB\-\-dry\-run\fR] [\fB\-\-max\-age\fR \fIDAYS\fR] [\fB\-\-max\-size\fR \fISIZE\fR] [\fB\-\-all\fR]
+Remove outdated cache entries: superseded build outputs (keeping only the
+most recently built binary for each image name) and extracted root
+filesystems the produced binaries keep under
+.IR ${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs .
+Those are evicted when unused for
+.I DAYS
+(default 30), then least-recently-used first until the cache fits in
+.I SIZE
+(for example
+.BR 5G ),
+or all of them with
+.BR \-\-all .
+Entries a running container still uses are skipped.
 .B \-\-dry\-run
 shows what would be deleted without deleting.
 .

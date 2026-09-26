@@ -7717,6 +7717,612 @@ static void test_json_lookup_resists_injection(void)
     free(back);
 }
 
+/* ── rootfs cache tests ──────────────────────────────────────────────────── */
+
+/* Temp directory under $TMPDIR (the Makefile points it at build/test-tmp). */
+static char* cache_test_mkdtemp(char* buf, size_t sz, const char* tag)
+{
+    const char* base = getenv("TMPDIR");
+    if (!base || !base[0])
+    {
+        base = "/tmp";
+    }
+    snprintf(buf, sz, "%s/oci2bin-%s-XXXXXX", base, tag);
+    return mkdtemp(buf);
+}
+
+static int cache_test_write(const char* dir, const char* rel,
+                            const void* data, size_t len, mode_t mode)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dir, rel);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    int rc = write_all_fd(fd, data, len);
+    fchmod(fd, mode);
+    close(fd);
+    return rc;
+}
+
+static void test_sha256_vectors(void)
+{
+    struct sha256_ctx ctx;
+    unsigned char digest[32];
+    char hex[65];
+
+    sha256_init(&ctx);
+    sha256_final(&ctx, digest);
+    sha256_to_hex(digest, hex);
+    ASSERT_STR_EQ(hex,
+                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "sha256: empty input");
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, "abc", 3);
+    sha256_final(&ctx, digest);
+    sha256_to_hex(digest, hex);
+    ASSERT_STR_EQ(hex,
+                  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                  "sha256: abc");
+
+    /* One million 'a', fed in odd-sized chunks to exercise buffering. */
+    sha256_init(&ctx);
+    char chunk[977];
+    memset(chunk, 'a', sizeof(chunk));
+    size_t left = 1000000;
+    while (left > 0)
+    {
+        size_t n = left < sizeof(chunk) ? left : sizeof(chunk);
+        sha256_update(&ctx, chunk, n);
+        left -= n;
+    }
+    sha256_final(&ctx, digest);
+    sha256_to_hex(digest, hex);
+    ASSERT_STR_EQ(hex,
+                  "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+                  "sha256: one million a");
+
+    /* The cache key is a prefixed hash of the config bytes. */
+    rootfs_cache_key_from_config("{\"a\":1}", 7, hex);
+    ASSERT_STR_EQ(hex,
+                  "3cfa3ebb84ee95b9d1f46a19d3df723683416971757896172ed5697178c2002c",
+                  "cache key: prefix + config bytes");
+    ASSERT(is_hex_key(hex), "cache key: 64 lowercase hex chars");
+    ASSERT(!is_hex_key("3CFA"), "is_hex_key: rejects short/uppercase");
+}
+
+/* Append one ustar member to an in-memory archive. */
+static size_t tar_append(unsigned char* buf, size_t off, const char* name,
+                         const void* data, size_t len, char type)
+{
+    unsigned char* h = buf + off;
+    memset(h, 0, 512);
+    memcpy(h, name, strlen(name));
+    memcpy(h + 100, "0000644", 8);
+    memcpy(h + 108, "0000000", 8);
+    memcpy(h + 116, "0000000", 8);
+    char sz[13];
+    snprintf(sz, sizeof(sz), "%011lo", (unsigned long)len);
+    memcpy(h + 124, sz, 12);
+    memcpy(h + 136, "00000000000", 12);
+    h[156] = (unsigned char)type;
+    memcpy(h + 257, "ustar", 6);
+    memcpy(h + 263, "00", 2);
+    memset(h + 148, ' ', 8);
+    unsigned long sum = 0;
+    for (int i = 0; i < 512; i++)
+    {
+        sum += h[i];
+    }
+    char cs[8];
+    snprintf(cs, sizeof(cs), "%06lo", sum);
+    memcpy(h + 148, cs, 7);
+    h[155] = ' ';
+    off += 512;
+    memcpy(buf + off, data, len);
+    off += (len + 511) & ~(size_t)511;
+    return off;
+}
+
+static void test_embedded_tar_config_key(void)
+{
+    const char* config = "{\"architecture\":\"amd64\",\"rootfs\":{}}";
+    const char* manifest =
+        "[{\"Config\":\"blobs/sha256/deadbeef\",\"Layers\":[]}]";
+    const char* long_name =
+        "a-very-long-directory-name-that-does-not-fit-in-one-hundred-bytes/"
+        "and-then-some-more-path-components/blobs/sha256/deadbeef";
+
+    unsigned char* tar = calloc(1, 32768);
+    ASSERT_NOT_NULL(tar, "embedded tar: alloc");
+    if (!tar)
+    {
+        return;
+    }
+    size_t off = 0;
+    off = tar_append(tar, off, "./", "", 0, '5');
+    /* A pax header that renames the next member: must not confuse lookup. */
+    const char* pax = "31 path=blobs/sha256/otherfile\n";
+    off = tar_append(tar, off, "PaxHeader/x", pax, strlen(pax), 'x');
+    off = tar_append(tar, off, "ignored", "zzzz", 4, '0');
+    /* GNU long name for a member we do not want, then the real members. */
+    off = tar_append(tar, off, "././@LongLink", long_name,
+                     strlen(long_name) + 1, 'L');
+    off = tar_append(tar, off, "truncated-name", "nope", 4, '0');
+    off = tar_append(tar, off, "manifest.json", manifest, strlen(manifest),
+                     '0');
+    off = tar_append(tar, off, "blobs/sha256/deadbeef", config,
+                     strlen(config), '0');
+    off += 1024;    /* end-of-archive blocks (zeros) */
+
+    char dir[PATH_MAX];
+    ASSERT_NOT_NULL(cache_test_mkdtemp(dir, sizeof(dir), "tarscan"),
+                    "embedded tar: mkdtemp");
+    char self[PATH_MAX];
+    snprintf(self, sizeof(self), "%s/self.bin", dir);
+    /* Some ELF-ish padding before the payload, like the real polyglot. */
+    unsigned char pad[4096];
+    memset(pad, 0x7f, sizeof(pad));
+    int fd = open(self, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    ASSERT(fd >= 0, "embedded tar: create self file");
+    write_all_fd(fd, (char*)pad, sizeof(pad));
+    write_all_fd(fd, (char*)tar, off);
+    close(fd);
+
+    unsigned long saved_off = OCI_DATA_OFFSET;
+    unsigned long saved_size = OCI_DATA_SIZE;
+    OCI_DATA_OFFSET = sizeof(pad);
+    OCI_DATA_SIZE   = off;
+
+    unsigned long moff = 0, mlen = 0;
+    int sfd = open(self, O_RDONLY);
+    ASSERT_INT_EQ(embedded_tar_find_member(sfd, sizeof(pad), off,
+                                           "manifest.json", &moff, &mlen), 1,
+                  "embedded tar: finds manifest.json");
+    ASSERT_INT_EQ((int)mlen, (int)strlen(manifest),
+                  "embedded tar: manifest length");
+    ASSERT_INT_EQ(embedded_tar_find_member(sfd, sizeof(pad), off,
+                                           "blobs/sha256/otherfile", &moff,
+                                           &mlen), 1,
+                  "embedded tar: pax path override is honoured");
+    ASSERT_INT_EQ((int)mlen, 4, "embedded tar: pax-renamed member length");
+    ASSERT_INT_EQ(embedded_tar_find_member(sfd, sizeof(pad), off, long_name,
+                                           &moff, &mlen), 1,
+                  "embedded tar: GNU long name is honoured");
+    ASSERT_INT_EQ(embedded_tar_find_member(sfd, sizeof(pad), off,
+                                           "missing", &moff, &mlen), 0,
+                  "embedded tar: absent member returns 0");
+    ASSERT_INT_EQ(embedded_tar_find_member(sfd, 0, off, "manifest.json",
+                                           &moff, &mlen), -1,
+                  "embedded tar: non-tar bytes are rejected");
+    close(sfd);
+
+    char key[65] = {0};
+    ASSERT_INT_EQ(rootfs_cache_key_from_embedded_tar(self, key), 0,
+                  "embedded tar: key derived without unpacking");
+    char want[65];
+    rootfs_cache_key_from_config(config, strlen(config), want);
+    ASSERT_STR_EQ(key, want, "embedded tar: key equals config hash");
+
+    /* A zstd or age header at the payload offset forces the slow path. */
+    unsigned char zmagic[4] = {0x28, 0xB5, 0x2F, 0xFD};
+    fd = open(self, O_WRONLY);
+    pwrite(fd, zmagic, 4, (off_t)sizeof(pad));
+    close(fd);
+    ASSERT_INT_EQ(rootfs_cache_key_from_embedded_tar(self, key), -1,
+                  "embedded tar: zstd payload is not scanned");
+    ASSERT_INT_EQ(embedded_payload_is_encrypted(self), 0,
+                  "payload: zstd is not encrypted");
+    fd = open(self, O_WRONLY);
+    pwrite(fd, AGE_MAGIC_BINARY, strlen(AGE_MAGIC_BINARY),
+           (off_t)sizeof(pad));
+    close(fd);
+    ASSERT_INT_EQ(embedded_payload_is_encrypted(self), 1,
+                  "payload: age header detected at the payload offset");
+    ASSERT_INT_EQ(rootfs_cache_key_from_embedded_tar(self, key), -1,
+                  "embedded tar: encrypted payload is not scanned");
+
+    OCI_DATA_OFFSET = saved_off;
+    OCI_DATA_SIZE   = saved_size;
+    unlink(self);
+    rmdir(dir);
+    free(tar);
+
+    /* Field decoding corner cases. */
+    unsigned char oct[12] = "00000000644";
+    ASSERT_INT_EQ((int)tar_field_number(oct, 12), 0644,
+                  "tar field: octal");
+    unsigned char b256[12] = {0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00};
+    ASSERT_INT_EQ((int)tar_field_number(b256, 12), 256,
+                  "tar field: GNU base-256");
+    unsigned char bad[12] = "0000000089x";
+    ASSERT(tar_field_number(bad, 12) == ULONG_MAX,
+           "tar field: non-octal digit rejected");
+    char pth[64];
+    ASSERT_INT_EQ(pax_extract_path("12 uid=1000\n16 path=a/b/c.d\n", 28,
+                                   pth, sizeof(pth)), 1,
+                  "pax: path record found after another record");
+    ASSERT_STR_EQ(pth, "a/b/c.d", "pax: path value");
+    ASSERT_INT_EQ(pax_extract_path("12 uid=1000\n", 12, pth, sizeof(pth)), 0,
+                  "pax: no path record");
+    ASSERT_INT_EQ(pax_extract_path("99 path=x\n", 10, pth, sizeof(pth)), -1,
+                  "pax: bad record length rejected");
+}
+
+/* Build a small tree: dirs, files with modes, symlink, hardlink, fifo. */
+static int cache_test_make_tree(const char* root)
+{
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/bin", root);
+    if (mkdir(p, 0755) < 0)
+    {
+        return -1;
+    }
+    snprintf(p, sizeof(p), "%s/etc", root);
+    if (mkdir(p, 0700) < 0)
+    {
+        return -1;
+    }
+    if (cache_test_write(root, "bin/tool", "#!/bin/sh\necho hi\n", 18,
+                         0755) < 0 ||
+            cache_test_write(root, "etc/conf", "key=value\n", 10, 0600) < 0 ||
+            cache_test_write(root, ".oci2bin_config", "{}", 2, 0644) < 0)
+    {
+        return -1;
+    }
+    char src[PATH_MAX], dst[PATH_MAX];
+    snprintf(src, sizeof(src), "%s/bin/tool", root);
+    snprintf(dst, sizeof(dst), "%s/bin/tool-link", root);
+    if (link(src, dst) < 0)
+    {
+        return -1;
+    }
+    snprintf(dst, sizeof(dst), "%s/bin/sym", root);
+    if (symlink("tool", dst) < 0)
+    {
+        return -1;
+    }
+    snprintf(dst, sizeof(dst), "%s/etc/fifo", root);
+    if (mkfifo(dst, 0600) < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static void test_rootfs_tree_fingerprint(void)
+{
+    char a[PATH_MAX], b[PATH_MAX];
+    ASSERT_NOT_NULL(cache_test_mkdtemp(a, sizeof(a), "fp-a"),
+                    "fingerprint: mkdtemp a");
+    ASSERT_NOT_NULL(cache_test_mkdtemp(b, sizeof(b), "fp-b"),
+                    "fingerprint: mkdtemp b");
+    ASSERT_INT_EQ(cache_test_make_tree(a), 0, "fingerprint: build tree a");
+    ASSERT_INT_EQ(cache_test_make_tree(b), 0, "fingerprint: build tree b");
+
+    struct tree_fingerprint fa, fb;
+    ASSERT_INT_EQ(rootfs_tree_fingerprint(a, &fa), 0,
+                  "fingerprint: walk a");
+    ASSERT_INT_EQ(rootfs_tree_fingerprint(b, &fb), 0,
+                  "fingerprint: walk b");
+    ASSERT(fa.hash == fb.hash && fa.entries == fb.entries &&
+           fa.bytes == fb.bytes,
+           "fingerprint: identical trees at different paths agree");
+    ASSERT_INT_EQ((int)fa.entries, 8, "fingerprint: counts every entry");
+
+    /* Each kind of tampering changes the value. */
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "%s/etc/conf", b);
+    chmod(p, 0644);
+    ASSERT_INT_EQ(rootfs_tree_fingerprint(b, &fb), 0, "fingerprint: rewalk");
+    ASSERT(fa.hash != fb.hash, "fingerprint: mode change detected");
+    chmod(p, 0600);
+    cache_test_write(b, "etc/conf", "key=value!\n", 11, 0600);
+    rootfs_tree_fingerprint(b, &fb);
+    ASSERT(fa.hash != fb.hash && fa.bytes != fb.bytes,
+           "fingerprint: size change detected");
+    cache_test_write(b, "etc/conf", "key=value\n", 10, 0600);
+    snprintf(p, sizeof(p), "%s/bin/sym", b);
+    unlink(p);
+    symlink("tool-link", p);
+    rootfs_tree_fingerprint(b, &fb);
+    ASSERT(fa.hash != fb.hash, "fingerprint: symlink target change detected");
+    unlink(p);
+    symlink("tool", p);
+    rootfs_tree_fingerprint(b, &fb);
+    ASSERT(fa.hash == fb.hash, "fingerprint: restored tree agrees again");
+    cache_test_write(b, "etc/extra", "x", 1, 0644);
+    rootfs_tree_fingerprint(b, &fb);
+    ASSERT(fa.hash != fb.hash && fb.entries == fa.entries + 1,
+           "fingerprint: added file detected");
+
+    rm_rf_dir(a);
+    rm_rf_dir(b);
+}
+
+static void test_copy_tree_private(void)
+{
+    char src[PATH_MAX], dst[PATH_MAX];
+    ASSERT_NOT_NULL(cache_test_mkdtemp(src, sizeof(src), "copy-src"),
+                    "copy: mkdtemp src");
+    ASSERT_NOT_NULL(cache_test_mkdtemp(dst, sizeof(dst), "copy-dst"),
+                    "copy: mkdtemp dst");
+    ASSERT_INT_EQ(cache_test_make_tree(src), 0, "copy: build source tree");
+    chmod(src, 0755);
+
+    ASSERT_INT_EQ(copy_tree_private(src, dst), 0, "copy: succeeds");
+
+    struct tree_fingerprint fs, fd_;
+    rootfs_tree_fingerprint(src, &fs);
+    rootfs_tree_fingerprint(dst, &fd_);
+    ASSERT(fs.hash == fd_.hash && fs.entries == fd_.entries,
+           "copy: destination fingerprint matches source");
+
+    char p[PATH_MAX];
+    struct stat st1, st2;
+    snprintf(p, sizeof(p), "%s/bin/tool", dst);
+    ASSERT_INT_EQ(stat(p, &st1), 0, "copy: file exists");
+    ASSERT_INT_EQ((int)(st1.st_mode & 07777), 0755, "copy: file mode kept");
+    size_t sz = 0;
+    char* body = read_file(p, &sz);
+    ASSERT(body && sz == 18 && memcmp(body, "#!/bin/sh\necho hi\n", 18) == 0,
+           "copy: file contents kept");
+    free(body);
+    snprintf(p, sizeof(p), "%s/bin/tool-link", dst);
+    ASSERT_INT_EQ(stat(p, &st2), 0, "copy: hardlink exists");
+    ASSERT(st1.st_ino == st2.st_ino && st1.st_nlink == 2,
+           "copy: hardlink preserved as a link, not a second copy");
+    snprintf(p, sizeof(p), "%s/bin/sym", dst);
+    char target[64];
+    ssize_t tl = readlink(p, target, sizeof(target) - 1);
+    ASSERT(tl == 4 && memcmp(target, "tool", 4) == 0,
+           "copy: symlink target kept");
+    snprintf(p, sizeof(p), "%s/etc", dst);
+    ASSERT(stat(p, &st1) == 0 && (st1.st_mode & 07777) == 0700,
+           "copy: directory mode kept");
+    snprintf(p, sizeof(p), "%s/etc/fifo", dst);
+    ASSERT(lstat(p, &st1) == 0 && S_ISFIFO(st1.st_mode),
+           "copy: fifo recreated");
+
+    /* The copy is independent: writing to it leaves the source alone. */
+    cache_test_write(dst, "bin/tool", "changed", 7, 0755);
+    rootfs_tree_fingerprint(src, &fd_);
+    ASSERT(fs.hash == fd_.hash, "copy: source untouched by writes to copy");
+
+    /* Refuses to follow a symlinked source root. */
+    char link_root[PATH_MAX];
+    snprintf(link_root, sizeof(link_root), "%s-link", src);
+    symlink(src, link_root);
+    char dst2[PATH_MAX];
+    cache_test_mkdtemp(dst2, sizeof(dst2), "copy-dst2");
+    ASSERT_INT_EQ(copy_tree_private(link_root, dst2), -1,
+                  "copy: symlinked source root rejected");
+    unlink(link_root);
+    rm_rf_dir(dst2);
+
+    rm_rf_dir(src);
+    rm_rf_dir(dst);
+}
+
+static void test_rootfs_cache_root_resolution(void)
+{
+    char out[PATH_MAX];
+    char* saved_xdg  = getenv("XDG_CACHE_HOME");
+    char* saved_home = getenv("HOME");
+    saved_xdg  = saved_xdg ? strdup(saved_xdg) : NULL;
+    saved_home = saved_home ? strdup(saved_home) : NULL;
+
+    setenv("XDG_CACHE_HOME", "/var/cache/me", 1);
+    setenv("HOME", "/home/me", 1);
+    ASSERT_INT_EQ(rootfs_cache_root(out, sizeof(out)), 0,
+                  "cache root: XDG_CACHE_HOME resolves");
+    ASSERT_STR_EQ(out, "/var/cache/me/oci2bin/rootfs",
+                  "cache root: XDG_CACHE_HOME wins");
+
+    setenv("XDG_CACHE_HOME", "relative/dir", 1);
+    ASSERT_INT_EQ(rootfs_cache_root(out, sizeof(out)), 0,
+                  "cache root: relative XDG ignored");
+    ASSERT_STR_EQ(out, "/home/me/.cache/oci2bin/rootfs",
+                  "cache root: falls back to HOME/.cache");
+
+    unsetenv("XDG_CACHE_HOME");
+    setenv("HOME", "/home/a,b", 1);
+    ASSERT_INT_EQ(rootfs_cache_root(out, sizeof(out)), -1,
+                  "cache root: ',' in path disables the cache");
+    setenv("HOME", "/home/../etc", 1);
+    ASSERT_INT_EQ(rootfs_cache_root(out, sizeof(out)), -1,
+                  "cache root: '..' in path disables the cache");
+    unsetenv("HOME");
+    ASSERT_INT_EQ(rootfs_cache_root(out, sizeof(out)), -1,
+                  "cache root: no HOME and no XDG disables the cache");
+
+    if (saved_xdg)
+    {
+        setenv("XDG_CACHE_HOME", saved_xdg, 1);
+        free(saved_xdg);
+    }
+    if (saved_home)
+    {
+        setenv("HOME", saved_home, 1);
+        free(saved_home);
+    }
+}
+
+static void test_rootfs_cache_publish_verify(void)
+{
+    char root[PATH_MAX];
+    ASSERT_NOT_NULL(cache_test_mkdtemp(root, sizeof(root), "cache-root"),
+                    "cache entry: mkdtemp root");
+    const char* key =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    char build[PATH_MAX], entry[PATH_MAX], tree[PATH_MAX];
+    snprintf(build, sizeof(build), "%s/.build-%s-XXXXXX", root, key);
+    ASSERT_NOT_NULL(mkdtemp(build), "cache entry: mkdtemp build dir");
+    snprintf(tree, sizeof(tree), "%s/rootfs", build);
+    ASSERT_INT_EQ(mkdir(tree, 0755), 0, "cache entry: mkdir build rootfs");
+    ASSERT_INT_EQ(cache_test_make_tree(tree), 0, "cache entry: build tree");
+    snprintf(entry, sizeof(entry), "%s/%s", root, key);
+
+    ASSERT_INT_EQ(rootfs_cache_verify_entry(entry, key), -1,
+                  "cache entry: absent entry does not verify");
+    ASSERT_INT_EQ(rootfs_cache_publish(root, key, build, entry), 0,
+                  "cache entry: publish renames build dir into place");
+    struct stat st;
+    ASSERT(lstat(build, &st) < 0 && errno == ENOENT,
+           "cache entry: build dir gone after publish");
+    ASSERT_INT_EQ(rootfs_cache_verify_entry(entry, key), 0,
+                  "cache entry: published entry verifies");
+
+    char stored_key[65];
+    struct tree_fingerprint fp;
+    ASSERT_INT_EQ(rootfs_cache_read_meta(entry, stored_key, &fp), 0,
+                  "cache entry: meta parses");
+    ASSERT_STR_EQ(stored_key, key, "cache entry: meta records the key");
+    ASSERT_INT_EQ((int)fp.entries, 8, "cache entry: meta records entries");
+
+    ASSERT_INT_EQ(rootfs_cache_verify_entry(entry,
+                                            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+                  -1, "cache entry: key mismatch does not verify");
+
+    /* Corrupt the tree: verification must fail, not trust it. */
+    char victim[PATH_MAX];
+    snprintf(victim, sizeof(victim), "%s/rootfs/etc/conf", entry);
+    int fd = open(victim, O_WRONLY | O_APPEND);
+    write_all_fd(fd, "tampered\n", 9);
+    close(fd);
+    ASSERT_INT_EQ(rootfs_cache_verify_entry(entry, key), -1,
+                  "cache entry: modified file fails verification");
+
+    /* A truncated marker is not trusted either. */
+    char meta[PATH_MAX];
+    snprintf(meta, sizeof(meta), "%s/meta", entry);
+    truncate(meta, 30);
+    ASSERT_INT_EQ(rootfs_cache_read_meta(entry, stored_key, &fp), -1,
+                  "cache entry: truncated meta rejected");
+
+    /* Discard moves it away and removes it. */
+    rootfs_cache_discard_entry(root, key, entry);
+    ASSERT(lstat(entry, &st) < 0 && errno == ENOENT,
+           "cache entry: discarded entry removed");
+    char trash[PATH_MAX];
+    snprintf(trash, sizeof(trash), "%s/.trash-%s-%d", root, key,
+             (int)getpid());
+    ASSERT(lstat(trash, &st) < 0, "cache entry: trash dir removed too");
+
+    /* Losing the publish race: the existing good entry wins, ours is
+     * dropped. */
+    snprintf(build, sizeof(build), "%s/.build-%s-XXXXXX", root, key);
+    mkdtemp(build);
+    snprintf(tree, sizeof(tree), "%s/rootfs", build);
+    mkdir(tree, 0755);
+    cache_test_make_tree(tree);
+    ASSERT_INT_EQ(rootfs_cache_publish(root, key, build, entry), 0,
+                  "cache entry: republish");
+    char build2[PATH_MAX];
+    snprintf(build2, sizeof(build2), "%s/.build-%s-XXXXXX", root, key);
+    mkdtemp(build2);
+    snprintf(tree, sizeof(tree), "%s/rootfs", build2);
+    mkdir(tree, 0755);
+    cache_test_make_tree(tree);
+    ASSERT_INT_EQ(rootfs_cache_publish(root, key, build2, entry), 0,
+                  "cache entry: racing publish reports success");
+    ASSERT(lstat(build2, &st) < 0 && errno == ENOENT,
+           "cache entry: racing builder's copy discarded");
+    ASSERT_INT_EQ(rootfs_cache_verify_entry(entry, key), 0,
+                  "cache entry: winner still verifies");
+
+    /* The lock file: shared for use, exclusive to rebuild. */
+    int lfd = rootfs_cache_lock_open(root, key);
+    ASSERT(lfd >= 0, "cache lock: opens");
+    ASSERT_INT_EQ(flock(lfd, LOCK_SH), 0, "cache lock: shared lock");
+    int lfd2 = rootfs_cache_lock_open(root, key);
+    ASSERT(flock(lfd2, LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK,
+           "cache lock: exclusive lock blocked while an entry is in use");
+    close(lfd);
+    ASSERT_INT_EQ(flock(lfd2, LOCK_EX | LOCK_NB), 0,
+                  "cache lock: exclusive lock once released");
+    close(lfd2);
+
+    rm_rf_dir(root);
+}
+
+static void test_parse_opts_rootfs_cache(void)
+{
+    struct container_opts opts;
+
+    char* argv_default[] = {"prog", NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(1, argv_default, &opts), 0,
+                  "rootfs-cache: no flag parses");
+    ASSERT_INT_EQ(opts.rootfs_cache_mode, ROOTFS_CACHE_UNSET,
+                  "rootfs-cache: unset by default");
+
+    char* saved = getenv("OCI2BIN_ROOTFS_CACHE");
+    saved = saved ? strdup(saved) : NULL;
+    unsetenv("OCI2BIN_ROOTFS_CACHE");
+    ASSERT_INT_EQ(effective_rootfs_cache_mode(&opts), ROOTFS_CACHE_AUTO,
+                  "rootfs-cache: unset resolves to auto");
+    setenv("OCI2BIN_ROOTFS_CACHE", "off", 1);
+    ASSERT_INT_EQ(effective_rootfs_cache_mode(&opts), ROOTFS_CACHE_OFF,
+                  "rootfs-cache: env OCI2BIN_ROOTFS_CACHE=off honoured");
+    setenv("OCI2BIN_ROOTFS_CACHE", "nonsense", 1);
+    ASSERT_INT_EQ(effective_rootfs_cache_mode(&opts), ROOTFS_CACHE_AUTO,
+                  "rootfs-cache: bad env value falls back to auto");
+
+    char always[] = "always";
+    char* argv_always[] = {"prog", "--rootfs-cache", always, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, argv_always, &opts), 0,
+                  "rootfs-cache: --rootfs-cache always parses");
+    ASSERT_INT_EQ(opts.rootfs_cache_mode, ROOTFS_CACHE_ALWAYS,
+                  "rootfs-cache: always stored");
+    setenv("OCI2BIN_ROOTFS_CACHE", "off", 1);
+    ASSERT_INT_EQ(effective_rootfs_cache_mode(&opts), ROOTFS_CACHE_ALWAYS,
+                  "rootfs-cache: flag wins over env");
+    if (saved)
+    {
+        setenv("OCI2BIN_ROOTFS_CACHE", saved, 1);
+        free(saved);
+    }
+    else
+    {
+        unsetenv("OCI2BIN_ROOTFS_CACHE");
+    }
+
+    char off[] = "off";
+    char* argv_off[] = {"prog", "--rootfs-cache", off, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, argv_off, &opts), 0,
+                  "rootfs-cache: --rootfs-cache off parses");
+    ASSERT_INT_EQ(opts.rootfs_cache_mode, ROOTFS_CACHE_OFF,
+                  "rootfs-cache: off stored");
+
+    char* argv_no[] = {"prog", "--no-rootfs-cache", NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(2, argv_no, &opts), 0,
+                  "rootfs-cache: --no-rootfs-cache parses");
+    ASSERT_INT_EQ(opts.rootfs_cache_mode, ROOTFS_CACHE_OFF,
+                  "rootfs-cache: --no-rootfs-cache means off");
+
+    char bad[] = "sometimes";
+    char* argv_bad[] = {"prog", "--rootfs-cache", bad, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, argv_bad, &opts), -1,
+                  "rootfs-cache: unknown mode rejected");
+    char* argv_missing[] = {"prog", "--rootfs-cache", NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(2, argv_missing, &opts), -1,
+                  "rootfs-cache: missing mode rejected");
+
+    ASSERT_INT_EQ(parse_rootfs_cache_mode("none"), ROOTFS_CACHE_OFF,
+                  "rootfs-cache: 'none' is an alias for off");
+    ASSERT_STR_EQ(rootfs_cache_mode_name(ROOTFS_CACHE_ALWAYS), "always",
+                  "rootfs-cache: mode name");
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -7823,6 +8429,13 @@ int main(void)
     test_run_cmd_capture_stdin();
     test_seccomp_blocks_x32_abi();
     test_json_lookup_resists_injection();
+    test_sha256_vectors();
+    test_embedded_tar_config_key();
+    test_rootfs_tree_fingerprint();
+    test_copy_tree_private();
+    test_rootfs_cache_root_resolution();
+    test_rootfs_cache_publish_verify();
+    test_parse_opts_rootfs_cache();
 
     printf("1..%d\n", tap_test_num);
 
