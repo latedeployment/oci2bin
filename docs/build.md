@@ -130,7 +130,8 @@ Supported instructions:
 `RUN` behaves like Docker's: it runs in the current `WORKDIR` through the
 current `SHELL` (default `/bin/sh -c`, without an implicit `set -e`), and
 exec-form `RUN ["cmd", "arg"]` runs without a shell. Variables from `ARG` and
-`ENV` — `$NAME`, `${NAME}`, `${NAME:-default}`, `${NAME:+alt}` — are expanded
+`ENV` — `$NAME`, `${NAME}`, `${NAME:-default}`, `${NAME:+alt}`, nested as in
+`${NAME:-${OTHER:-x}}` — are expanded
 in `ADD`, `COPY`, `ENV`, `EXPOSE`, `FROM`, `LABEL`, `STOPSIGNAL`, `USER`,
 `VOLUME`, `WORKDIR` and `ARG`; `RUN`, `CMD` and `ENTRYPOINT` get them as
 environment variables for the shell. Line continuations may contain comment

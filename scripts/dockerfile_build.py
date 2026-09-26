@@ -135,9 +135,38 @@ def _parse_dockerfile(path: str) -> list:
 _VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _matching_brace(text: str, start: int) -> int:
+    """Index of the `}` closing the `${` whose `{` is at text[start], or
+    -1.  Counts nested `${` so `${A:-${B:-c}}` closes at the last brace,
+    not the first; a `\\` escapes the next character as in the rest of
+    the expander."""
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "{":
+            depth += 1
+            i += 2
+            continue
+        if ch == "{" and i == start:
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
 def _expand_vars(text: str, variables: dict) -> str:
     """Dockerfile variable substitution: $NAME, ${NAME}, ${NAME:-word},
     ${NAME:+word}; `\\$` is a literal dollar.  Unset names expand to "".
+    The word after :- or :+ is itself expanded, nested braces included
+    (${A:-${B:-c}}), as BuildKit does.
 
     Replaces the old per-build-arg str.replace(), which substituted
     prefixes ($FOO inside $FOOBAR), ignored ${VAR:-default} and never
@@ -157,7 +186,7 @@ def _expand_vars(text: str, variables: dict) -> str:
             i += 1
             continue
         if text[i + 1] == "{":
-            end = text.find("}", i + 2)
+            end = _matching_brace(text, i + 1)
             if end < 0:
                 out.append(text[i:])
                 break

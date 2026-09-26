@@ -206,6 +206,12 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- **Dockerfile builder: nested `${A:-${B}}` expands.** The expander took
+  the first `}` as the end of `${…}`, so a default or alternative that
+  was itself a `${…}` came out as `${B` plus a stray `}`. Braces are now
+  matched with nesting, so `${A:-${B:-c}}` and `${A:+${B}}` expand as
+  BuildKit does.
+
 - **No Python on the launch path.** Every start ran the pinned-digest check
   through `python3`, so artifacts failed on hosts without it (Alpine,
   distroless) even with no pin set. It now only runs when the binary carries a
