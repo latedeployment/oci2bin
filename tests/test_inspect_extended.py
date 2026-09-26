@@ -143,6 +143,31 @@ class ReadOciDataTest(unittest.TestCase):
             self.assertEqual(mod.read_oci_data(f.name), blob)
 
 
+class ReadOciDataDiffImagesTest(ReadOciDataTest):
+    """diff_images.py used to carry its own copy of read_oci_data without the
+    span validation; it must behave exactly like inspect_image.py's."""
+
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "diff_images", _ROOT / "scripts" / "diff_images.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+
+class ReadOciDataSbomTest(ReadOciDataTest):
+    """Same for sbom_generate.py."""
+
+    def _mod(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "sbom_generate", _ROOT / "scripts" / "sbom_generate.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+
 class SignaturePresenceTest(unittest.TestCase):
     def _mod(self):
         import importlib.util

@@ -98,6 +98,187 @@ All notable changes to oci2bin are documented here.
   whose kernel has `CONFIG_X86_X32_ABI=y` (Debian and Arch ship it; Fedora
   does not).
 
+- **Signature and digest verifiers run Python in isolated mode.** The
+  `--verify-key`, `--require-signed`, `--pin-digest` and self-update helpers
+  exec'd `/usr/bin/python3` with the caller's environment, so a `PYTHONPATH`
+  directory holding a fake `hashlib`/`json`/`struct` decided every verdict.
+  They now run with `python3 -I`.
+
+- **`--cap-drop all --cap-add X` really leaves only X.** The old `capset()`
+  cleared the effective set before the bounding-set drops, so every
+  `PR_CAPBSET_DROP` failed and a root workload regained all capabilities at
+  `execve`. Bounding-set drops now happen first; added caps are raised into
+  the ambient set after the `--user` switch (so non-root workloads keep them).
+
+- **MCP server hardening.** `run_container` forwards only `KEY=VALUE`
+  environment entries (a bare `NAME` copied the server's own environment —
+  cloud credentials, `SSH_AUTH_SOCK` — into the container). `run_container`
+  and `inspect_image` only exec oci2bin binaries (ELF + `OCI2BIN_META`) that
+  are outside every writable mount root, instead of any executable.
+  `exec_in_container` enters the container's user namespace and root
+  (`nsenter -U -r -w`, plus only the namespaces the container owns), so the
+  command no longer runs with the server's host credentials. `stop_container`
+  checks the process start time before signalling, so a recycled PID is never
+  killed.
+
+- **Health probes run as the workload user** (`--user` or image `User`), not
+  as in-container root.
+
+- **The default seccomp filter covers i386.** 32-bit syscalls were killed
+  outright; they now get the same denylist in i386 numbering. A
+  `--seccomp-profile` still kills them (its `SCMP_ARCH_X86` rules are not
+  implemented) and says so.
+
+- **`--device`, `--tmpfs` and `--security-opt` fail closed.** A device that
+  could not be exposed, a tmpfs that could not be mounted, an AppArmor/SELinux
+  label the kernel rejected — or a loader built without that LSM — only
+  printed "(non-fatal)" and started the workload anyway.
+
+- **The container root is entered with `pivot_root`, not `chroot`.** With
+  `CAP_SYS_CHROOT` kept by default, a chroot escape reached the host tree.
+  The host root is now detached from the container's (private) mount
+  namespace; `chroot` remains only as a warned fallback where pivoting is
+  impossible, and `--strict` refuses it.
+
+- **`PR_SET_DUMPABLE` no longer claims to protect the workload.** `execve`
+  resets it; it is now applied (after the uid switch) to protect only the
+  loader's own memory before exec, and documented as such.
+
+- **Attestations are bound to their binary.** `verify` required only a valid
+  signature over the attestation bytes, so two artifacts signed with the same
+  key could swap attestations. The in-toto `subject` must now match the
+  binary (and `sign --attest FILE` sets it), and `attest verify` requires
+  `--signing-key` and authenticates the attestation before using anything in
+  it, including the key path it passes to `cosign verify`.
+
+- **Metrics socket and SSH keys.** The `--metrics-socket` is created
+  owner-only and only a stale socket at its path is replaced (a regular file
+  there is refused); a client disconnecting early no longer kills the metrics
+  helper. SSH keys are handed to `age` only for images encrypted to an SSH
+  recipient.
+
+- **Dockerfile builder: hardlinks never follow symlinks onto the host.**
+  Extracting a base layer with `b` hardlinked to a symlink `a -> /host/path`
+  resolved the link on the host.
+
+### Fixed
+
+- **No Python on the launch path.** Every start ran the pinned-digest check
+  through `python3`, so artifacts failed on hosts without it (Alpine,
+  distroless) even with no pin set. It now only runs when the binary carries a
+  `pin_digest`. `--doctor` reports `python3` + `openssl` as required only for
+  artifacts with a pin or signature policy.
+- **JSON string escapes are decoded.** Docker writes `&`, `<`, `>` in image
+  configs as `&`, `<`, `>`; `CMD ["sh","-c","a && b"]` was
+  exec'd with the escapes intact. `\"`, `\\`, `\n` and surrogate pairs are
+  decoded too; malformed escapes and `\u0000` are rejected.
+- **DNS in subordinate-ID mode.** `/etc/resolv.conf` was only installed on the
+  single-ID fallback path, so correctly configured rootless hosts got no
+  resolver in images that ship none.
+- **Landlock no longer breaks `rename()`.** The ruleset did not handle
+  `LANDLOCK_ACCESS_FS_REFER`, which Landlock denies by default, so every
+  cross-directory rename/link failed with `EXDEV`. `REFER`, `TRUNCATE` and
+  `IOCTL_DEV` are handled per the kernel's ABI, and the files behind the
+  workload's stdio are granted so `/dev/stdout` re-opens work.
+- **Hardlinked layers extract on kernels before 6.10.** `linkat(AT_EMPTY_PATH)`
+  needs `CAP_DAC_READ_SEARCH` there; the loader now falls back to linking via
+  `/proc/self/fd` (tzdata-bearing Debian images failed rootless on RHEL 9,
+  Ubuntu 22.04/24.04, Debian 12).
+- **`--init`, `--restart` and `--health` apply the full workload setup** —
+  image `User`, PTY, AppArmor/SELinux, capabilities, seccomp profile — which
+  were only applied on the direct path. `--gen-seccomp`/`--gdb` with a
+  supervisor is now an error instead of silently ignored.
+- **Supervisor stop handling.** A stop signal during the restart back-off no
+  longer starts another attempt, and a workload that traps the SIGTERM sent
+  for failing health checks is killed after 10 seconds.
+- **`-t` with a non-TTY stdin** (`</dev/null`, systemd) no longer tears down
+  the PTY and kills the workload; short writes of pasted input are completed.
+- **Decrypted payloads are removed on every extraction failure path.**
+- **`/dev` is complete and set up before volumes**: `/dev/shm`, `/dev/fd`,
+  `/dev/stdin|stdout|stderr`, `/dev/full` and (with a PTY) `/dev/console`
+  exist, and `-v HOST:/dev/...` is no longer hidden under the fresh `/dev`.
+- **`--gen-seccomp` works end to end.** The default filter killed its ptrace
+  tracer, the output path was resolved inside the container, observed
+  syscalls missing from the name table (`getdents64`, `rseq`, `pidfd_*`, ...)
+  were dropped, and replay failed because the profile was installed before
+  the loader's own setup. The table now covers all syscalls, profiles are
+  installed right before `execve`, generated profiles include `execve`, and
+  `--seccomp-profile` is read from the host path.
+- **`--cap-add`/`--cap-drop` accept all 41 capability names.**
+- **`--allow-egress` hostnames resolve reliably**, on the host before the
+  network namespace exists; `nft` no longer becomes PID 1 of the new pid
+  namespace (which made every later fork fail).
+- **`--net slirp` / `--net pasta` work.** The helper was forked inside the new
+  user/network namespace it was meant to connect from; it now runs on the host
+  side, in the foreground, and is stopped on every exit path.
+- **`OCI2BIN_INSPECT` and MCP `inspect_image` work with Docker 25+ layouts**
+  (the config path `blobs/sha256/<hex>` was flattened and never found), and
+  MCP replies are valid JSON (`list_containers` no longer truncates;
+  `inspect_image` returns a string).
+- **`--ulimit`** rejects empty and negative values; **`--config`** after `--`
+  is left to the workload.
+- **cloud-hypervisor `--vm`**: the guest now reads its kernel command line
+  (it was always empty, so `-v` mounts never happened), receives the command,
+  `--entrypoint`, `-e` and `--workdir`, reaps orphans, forwards signals,
+  brings up `lo`, mounts the `--overlay-persist` disk as a persistent overlay
+  root, and reports the workload's exit status (via `hvc0`) as the binary's
+  own. The serial console is attached to the terminal, `virtiofsd` is found in
+  `/usr/libexec` and awaited before boot, and guest memory is shared for
+  virtio-fs. `kernel/microvm.config` enables `CONFIG_PVH`, virtio-PCI,
+  virtio-fs and ACPI (cloud-hypervisor could not boot the kernel it built),
+  and `fetch_kernel.sh` derives the kernel.org directory from the version.
+- **Builders keep symlinks to directories** (`bin -> usr/bin` on merged-/usr
+  bases vanished from `from-chroot`/`build-dockerfile` images), and
+  `from-chroot` no longer defaults `Cmd` to `/bin/sh` when an entrypoint is
+  set. `diff-fs` reports such links too.
+- **Dockerfile builder**: `RUN` runs in `WORKDIR` through `SHELL`, supports
+  exec form and heredocs, and no longer adds `set -e`; a failed `/proc` mount
+  is reported instead of aborting silently; `ARG`/`ENV` expansion handles
+  `$FOOBAR`, `${VAR:-d}` and ENV values and is not applied to `RUN`; comments
+  inside continuations and CRLF files parse; multi-stage builds,
+  `FROM --platform`, `ARG` before `FROM`, `COPY --from` and `--chmod` work;
+  `--chown` warns; absolute symlinks such as `/var/run -> /run` resolve inside
+  the rootfs; `/bin/sh` detection follows in-rootfs symlinks.
+- **Stack files**: `#` inside a value is no longer a comment
+  (`POSTGRES_PASSWORD: abc#123`), block lists at the key's indent parse, and
+  `up` refuses a stack that is already running instead of orphaning its
+  supervisor.
+- **CLI**: a failing pod member no longer aborts `oci2bin pod run` before the
+  others are stopped; `oci2bin systemd` works without `$USER`; `--cache`
+  keys include the architecture, loader and every build option (and are
+  bypassed for encrypted/`--add-file`/`--layer` builds); `from-chroot -- OPTS`
+  passes build options correctly and honours `--arch`; the `--arch all`
+  wrapper finds its binaries whatever directory or characters `OUTPUT` has;
+  an option after `IMAGE` is no longer taken as the output name and an
+  unknown option is an error; installed copies without a writable `build/`
+  compile loaders into `~/.cache/oci2bin/build`, and a missing auto-detected
+  libkrun loader falls back to the static one.
+- **Packaging**: `make install` supports `DESTDIR` and a relative `oci2vm`
+  symlink (the RPM baked its buildroot into the installed script), installs
+  libkrun loaders when built, and the pip `oci2vm` entry point enables VM mode
+  and finds `bash` on `PATH`.
+- **Build pipeline**: after `--reproducible`, `--label`, `--entrypoint`,
+  `--cmd`, `--add-file` or `--embed-loader-layer`, blob names, `manifest.json`
+  and `index.json` are re-derived from content (new `scripts/oci_tar.py`), so
+  `docker load` with the containerd store accepts the binary.
+  `--strip-auto` reads Docker 25+ `blobs/sha256` layers; `--squash` keeps
+  opaque directories' entries, removes whited-out subtrees, reads zstd/xz
+  layers and fails instead of dropping an unreadable layer; `--add-file`
+  layers are root-owned, follow file symlinks and honour `SOURCE_DATE_EPOCH`.
+- **`diff` and `sbom`** use the validated embedded-OCI locator from
+  `inspect`. **SBOMs** decode rpm header blobs (RHEL/Fedora/UBI images
+  reported no packages) and emit canonical purls (`pkg:deb/...`,
+  `pkg:rpm/...`, `pkg:apk/alpine/...`).
+- **`oci2bin doctor`** checks `/dev/kvm` accessibility properly and suggests
+  `libc6-dev` (not the nonexistent `glibc-static`) on Debian.
+
+### Changed
+
+- `oci2bin attest verify` now requires `--signing-key PUB`.
+- A `--seccomp-profile` is installed as the last step before `execve` in each
+  process that runs container code; the default filter keeps covering the
+  `--init`/`--restart` PID 1.
+
 ## [0.19.0] - 2026-08-15
 
 ### Added

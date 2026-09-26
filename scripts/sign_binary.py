@@ -660,6 +660,18 @@ def cmd_sign(args):
                     cosign_result=cosign_res)
             else:
                 att_json = _load_provenance_file(attest_arg)
+                # The statement is signed together with this binary, so its
+                # subject must be this binary — otherwise the signed claim
+                # could be lifted onto any other artifact from the same key.
+                subject = [{"name": "binary",
+                            "digest": {algorithm: content_hash.hex()}}]
+                if isinstance(att_json, dict) and \
+                        att_json.get("subject") != subject:
+                    if att_json.get("subject"):
+                        print("sign_binary: --attest: replacing the "
+                              "statement subject with this binary's digest",
+                              file=sys.stderr)
+                    att_json["subject"] = subject
         except RuntimeError as e:
             print(f"sign_binary: {e}", file=sys.stderr)
             sys.exit(1)
@@ -723,6 +735,68 @@ def cmd_sign(args):
     return 0
 
 
+def _attestation_subject_matches(att_bytes: bytes, content: bytes) -> bool:
+    """Does the in-toto statement name *content* as (one of) its subjects?
+
+    The attestation signature covers only the attestation bytes, so without
+    this check two artifacts signed with the same key could trade
+    attestations and each would still "verify"."""
+    try:
+        statement = json.loads(att_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    subjects = statement.get("subject") if isinstance(statement, dict) \
+        else None
+    if not isinstance(subjects, list):
+        return False
+    hashes = {}
+    for subj in subjects:
+        digest = subj.get("digest") if isinstance(subj, dict) else None
+        if not isinstance(digest, dict):
+            continue
+        for algo, value in digest.items():
+            try:
+                algo = _normalize_hash_algorithm(str(algo))
+            except ValueError:
+                continue
+            if algo not in hashes:
+                hashes[algo] = _hash_bytes(content, algo).hex()
+            if str(value).lower() == hashes[algo]:
+                return True
+    return False
+
+
+def _verify_signed_binary(data: bytes, pub_pem: bytes):
+    """Check the binary signature and, if present, the attestation signature
+    and its binding to this binary.  Returns a dict with block fields and
+    binary_ok / attestation_ok (None when there is no attestation), or None
+    when the binary is not signed."""
+    (block_start, sig_bytes, keyid, algorithm,
+     att_bytes, att_sig) = _find_sig_block(data)
+    if block_start is None:
+        return None
+    content = data[:block_start]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as kf:
+        kf.write(pub_pem)
+        key_path = kf.name
+    try:
+        binary_ok = _verify_hash_with_key(
+            key_path, _hash_bytes(content, algorithm), sig_bytes, algorithm)
+        attestation_ok = None
+        if att_bytes or att_sig:
+            attestation_ok = (
+                bool(att_bytes) and bool(att_sig) and
+                _verify_hash_with_key(
+                    key_path, _hash_bytes(att_bytes, algorithm),
+                    att_sig, algorithm) and
+                _attestation_subject_matches(att_bytes, content))
+    finally:
+        os.unlink(key_path)
+    return {"content": content, "keyid": keyid, "algorithm": algorithm,
+            "att_bytes": att_bytes, "binary_ok": binary_ok,
+            "attestation_ok": attestation_ok}
+
+
 def cmd_verify(args):
     try:
         pub_pem = _read_file_limited(args.key, 65536)
@@ -733,28 +807,16 @@ def cmd_verify(args):
     with open(args.input, "rb") as f:
         data = f.read()
 
-    (block_start, sig_bytes, keyid, algorithm,
-     att_bytes, att_sig) = _find_sig_block(data)
-    if block_start is None:
+    res = _verify_signed_binary(data, pub_pem)
+    if res is None:
         print(f"sign_binary: {args.input}: not signed", file=sys.stderr)
         sys.exit(1)
-
-    content = data[:block_start]
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as kf:
-        kf.write(pub_pem)
-        key_path = kf.name
-    try:
-        binary_ok = _verify_hash_with_key(
-            key_path, _hash_bytes(content, algorithm), sig_bytes, algorithm)
-        attestation_ok = None
-        if att_bytes or att_sig:
-            attestation_ok = bool(att_bytes) and bool(att_sig) and \
-                _verify_hash_with_key(
-                    key_path, _hash_bytes(att_bytes, algorithm),
-                    att_sig, algorithm)
-    finally:
-        os.unlink(key_path)
+    content = res["content"]
+    keyid = res["keyid"]
+    algorithm = res["algorithm"]
+    att_bytes = res["att_bytes"]
+    binary_ok = res["binary_ok"]
+    attestation_ok = res["attestation_ok"]
 
     require_att = bool(getattr(args, "require_attestation", False))
     if require_att and not att_bytes:
@@ -767,7 +829,8 @@ def cmd_verify(args):
         sys.exit(2)
 
     if attestation_ok is False:
-        print(f"Verification FAILED (attestation): {args.input}",
+        print(f"Verification FAILED (attestation: bad signature, or its "
+              f"subject is not this binary): {args.input}",
               file=sys.stderr)
         sys.exit(2)
 
@@ -884,25 +947,6 @@ def _rekor_verify_inclusion(binary_path: str, signed_content: bytes) -> int:
     return 0
 
 
-def _read_attestation(binary_path):
-    """Read the embedded attestation JSON from a signed binary.  Returns
-    the parsed dict.  Raises RuntimeError if the binary isn't signed or
-    has no attestation."""
-    with open(binary_path, "rb") as f:
-        data = f.read()
-    block_start, _sig, _keyid, _algorithm, att_bytes, _att_sig = \
-        _find_sig_block(data)
-    if block_start is None:
-        raise RuntimeError(f"{binary_path}: not signed")
-    if not att_bytes:
-        raise RuntimeError(f"{binary_path}: no attestation embedded")
-    try:
-        return json.loads(att_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise RuntimeError(
-            f"{binary_path}: corrupt attestation: {e}") from e
-
-
 def cmd_attest_verify(args):
     """
     Verify the embedded attestation's recorded cosign verification by
@@ -912,10 +956,41 @@ def cmd_attest_verify(args):
     additionally checks that the image the attestation describes still
     has a valid cosign signature today.
     """
+    # Nothing in the attestation may be acted on — least of all its keyPath,
+    # handed to `cosign verify --key` below — until it is authenticated:
+    # signed by the key the caller trusts and bound to this very binary.
+    signing_key = getattr(args, "signing_key", None)
+    if not signing_key:
+        print("sign_binary: attest-verify: --signing-key PUB (the key the "
+              "binary was signed with) is required to authenticate the "
+              "attestation", file=sys.stderr)
+        sys.exit(1)
     try:
-        att = _read_attestation(args.input)
-    except RuntimeError as e:
-        print(f"sign_binary: {e}", file=sys.stderr)
+        pub_pem = _read_file_limited(signing_key, 65536)
+    except (ValueError, OSError) as e:
+        print(f"sign_binary: --signing-key: {e}", file=sys.stderr)
+        sys.exit(1)
+    with open(args.input, "rb") as f:
+        res = _verify_signed_binary(f.read(), pub_pem)
+    if res is None:
+        print(f"sign_binary: {args.input}: not signed", file=sys.stderr)
+        sys.exit(1)
+    if not res["binary_ok"] or res["attestation_ok"] is not True:
+        print(f"sign_binary: {args.input}: signature or attestation does not "
+              "verify with --signing-key; refusing to trust its contents",
+              file=sys.stderr)
+        sys.exit(2)
+    # Parse the very bytes that were just authenticated — re-reading the
+    # file would let it change between the check and the use.
+    try:
+        att = json.loads(res["att_bytes"].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        print(f"sign_binary: {args.input}: corrupt attestation: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(att, dict):
+        print(f"sign_binary: {args.input}: corrupt attestation",
+              file=sys.stderr)
         sys.exit(1)
     cosign = (att.get("predicate", {}).get("runDetails", {})
               .get("metadata", {}).get("cosignVerification"))
@@ -1141,6 +1216,10 @@ def main():
                                 "cosign-verification record")
     p_atv.add_argument("--in", dest="input", required=True,
                        help="Signed binary to verify")
+    p_atv.add_argument("--signing-key", default=None,
+                       help="PEM public key the binary was signed with; "
+                            "the attestation is authenticated with it "
+                            "before anything in it is used (required)")
     p_atv.add_argument("--recheck", action="store_true",
                        help="Re-run cosign verify against the source image "
                             "referenced in the attestation (requires cosign)")

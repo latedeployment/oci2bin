@@ -20,6 +20,7 @@ import argparse
 import datetime
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -28,58 +29,21 @@ import struct
 import sys
 import tarfile
 import tempfile
+import urllib.parse
 
-# Reuse OCI data reading logic from diff_images.py
-OFFSET_MARKER  = struct.pack('<Q', 0xDEADBEEFCAFEBABE)
-SIZE_MARKER    = struct.pack('<Q', 0xCAFEBABEDEADBEEF)
-PATCHED_MARKER = struct.pack('<Q', 0xAAAAAAAAAAAAAAAA)
+# The embedded-OCI locator lives in inspect_image.py; a private copy here
+# missed the span validation added there and misread truncated binaries.
+_inspect_spec = importlib.util.spec_from_file_location(
+    'oci2bin_inspect_image',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'inspect_image.py'))
+_inspect = importlib.util.module_from_spec(_inspect_spec)
+_inspect_spec.loader.exec_module(_inspect)
 
 
 def read_oci_data(binary_path):
     """Extract embedded OCI tar bytes from an oci2bin binary."""
-    with open(binary_path, 'rb') as f:
-        data = f.read()
-
-    patched_off = data.find(PATCHED_MARKER)
-    if patched_off is not None and patched_off != -1:
-        print(f"sbom: {binary_path}: OCI markers not patched", file=sys.stderr)
-        sys.exit(1)
-
-    loader_region = data[:8 * 1024 * 1024]
-    file_size = len(data)
-
-    sentinels = (0xDEADBEEFCAFEBABE, 0xCAFEBABEDEADBEEF,
-                 0xAAAAAAAAAAAAAAAA, 0)
-
-    def valid_span(candidate_offset, candidate_size):
-        if candidate_offset in sentinels:
-            return False
-        if candidate_offset >= file_size:
-            return False
-        if candidate_size == 0 or candidate_size > file_size:
-            return False
-        if candidate_offset + candidate_size > file_size:
-            return False
-        tar_region = data[candidate_offset:candidate_offset + 512]
-        return len(tar_region) >= 262 and tar_region[257:262] == b'ustar'
-
-    for pos in range(0, len(loader_region) - 8, 8):
-        candidate_offset = struct.unpack_from('<Q', loader_region, pos)[0]
-        size_positions = []
-        if pos + 8 <= len(loader_region) - 8:
-            size_positions.append(pos + 8)
-        if pos >= 8:
-            size_positions.append(pos - 8)
-
-        for size_pos in size_positions:
-            candidate_size = struct.unpack_from('<Q', loader_region,
-                                                size_pos)[0]
-            if valid_span(candidate_offset, candidate_size):
-                return data[candidate_offset:candidate_offset + candidate_size]
-
-    print(f"sbom: could not find embedded OCI tar in {binary_path}",
-          file=sys.stderr)
-    sys.exit(1)
+    return _inspect.read_oci_data(binary_path)
 
 
 def extract_rootfs_to_tmpdir(oci_bytes, tmpdir):
@@ -231,32 +195,118 @@ def parse_apk_installed(installed_path):
     return packages
 
 
+# RPM header tags / types (rpmtag.h) used below.
+_RPMTAG_NAME, _RPMTAG_VERSION, _RPMTAG_RELEASE = 1000, 1001, 1002
+_RPMTAG_EPOCH, _RPMTAG_SUMMARY, _RPMTAG_ARCH = 1003, 1004, 1022
+_RPM_INT32, _RPM_STRING, _RPM_STRING_ARRAY, _RPM_I18NSTRING = 4, 6, 8, 9
+_RPM_WANTED = {_RPMTAG_NAME, _RPMTAG_VERSION, _RPMTAG_RELEASE,
+               _RPMTAG_EPOCH, _RPMTAG_SUMMARY, _RPMTAG_ARCH}
+
+
+def parse_rpm_header_blob(blob):
+    """Decode the tags we need from one rpmdb header blob.
+
+    rpm's sqlite backend stores each package as an opaque header blob in
+    Packages(hnum, blob) — there are no name/version columns to SELECT,
+    which is why every RHEL/Fedora/UBI image used to report "no packages".
+    Layout (headerExport): BE32 index count, BE32 data length, then
+    16-byte index entries (tag, type, offset, count) and the data store.
+    Returns {tag: value} or None for a malformed blob.
+    """
+    if len(blob) < 8:
+        return None
+    il, dl = struct.unpack_from('>II', blob, 0)
+    data_start = 8 + 16 * il
+    if il > 100000 or data_start + dl > len(blob):
+        return None
+    data = blob[data_start:data_start + dl]
+    out = {}
+    for i in range(il):
+        tag, typ, off, count = struct.unpack_from('>iIiI', blob, 8 + 16 * i)
+        if tag not in _RPM_WANTED or off < 0 or off >= dl:
+            continue
+        if typ == _RPM_INT32 and off + 4 <= dl:
+            out[tag] = struct.unpack_from('>i', data, off)[0]
+        elif typ in (_RPM_STRING, _RPM_I18NSTRING, _RPM_STRING_ARRAY):
+            end = data.find(b'\x00', off)
+            if end < 0:
+                continue
+            out[tag] = data[off:end].decode('utf-8', errors='replace')
+    return out
+
+
 def parse_rpm_sqlite(db_path):
-    """Parse /var/lib/rpm/rpmdb.sqlite into a list of package dicts."""
+    """Parse an rpmdb.sqlite into a list of package dicts."""
     packages = []
     try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "SELECT name, version, release, arch, summary "
-                "FROM Packages LIMIT 10000"
-            )
-            for row in cur.fetchall():
-                name, version, release, arch, summary = row
-                packages.append({
-                    'name':    name or '',
-                    'version': f"{version}-{release}" if release else (version or ''),
-                    'arch':    arch or '',
-                    'desc':    summary or '',
-                    'type':    'rpm',
-                })
-        except sqlite3.OperationalError:
-            pass
-        conn.close()
+        conn = sqlite3.connect(
+            f"file:{urllib.parse.quote(db_path)}?mode=ro", uri=True)
     except (sqlite3.Error, OSError):
-        pass
+        return packages
+    try:
+        rows = conn.execute("SELECT blob FROM Packages").fetchall()
+    except sqlite3.Error:
+        rows = []
+    finally:
+        conn.close()
+    for (blob,) in rows:
+        hdr = parse_rpm_header_blob(bytes(blob or b''))
+        if not hdr or _RPMTAG_NAME not in hdr:
+            continue
+        name = hdr[_RPMTAG_NAME]
+        if name == 'gpg-pubkey':
+            continue  # imported signing keys, not software
+        version = hdr.get(_RPMTAG_VERSION, '')
+        release = hdr.get(_RPMTAG_RELEASE, '')
+        packages.append({
+            'name':    name,
+            'version': f"{version}-{release}" if release else version,
+            'epoch':   hdr.get(_RPMTAG_EPOCH),
+            'arch':    hdr.get(_RPMTAG_ARCH, ''),
+            'desc':    hdr.get(_RPMTAG_SUMMARY, ''),
+            'type':    'rpm',
+        })
     return packages
+
+
+def read_os_release_id(rootfs):
+    """The distro ID from /etc/os-release (purl namespace), or ''."""
+    for rel in ('etc/os-release', 'usr/lib/os-release'):
+        try:
+            with open(os.path.join(rootfs, rel), errors='replace') as f:
+                for line in f:
+                    if line.startswith('ID='):
+                        return line[3:].strip().strip('"\'').lower()
+        except OSError:
+            continue
+    return ''
+
+
+# Package-manager database type -> purl type (purl-spec).
+_PURL_TYPE = {'dpkg': 'deb', 'apk': 'apk', 'rpm': 'rpm'}
+
+
+def make_purl(pkg, distro):
+    """Canonical purl, e.g. pkg:deb/debian/bash@5.2-15?arch=amd64.  The old
+    `pkg:dpkg/...` is not a registered purl type, so scanners (Grype,
+    Trivy) ignored every component."""
+    ptype = _PURL_TYPE.get(pkg['type'], pkg['type'])
+    namespace = distro or ('alpine' if ptype == 'apk' else '')
+    q = urllib.parse.quote
+    purl = f"pkg:{ptype}/"
+    if namespace:
+        purl += q(namespace, safe='') + '/'
+    purl += f"{q(pkg['name'], safe='')}@{q(pkg['version'], safe='')}"
+    quals = []
+    if pkg.get('arch'):
+        quals.append(f"arch={q(pkg['arch'], safe='')}")
+    if pkg.get('epoch'):
+        quals.append(f"epoch={pkg['epoch']}")
+    if distro:
+        quals.append(f"distro={q(distro, safe='')}")
+    if quals:
+        purl += '?' + '&'.join(quals)
+    return purl
 
 
 def collect_packages(rootfs):
@@ -272,11 +322,23 @@ def collect_packages(rootfs):
         apk_path = os.path.join(rootfs, 'lib', 'apk', 'db', 'installed')
         packages.extend(parse_apk_installed(apk_path))
 
-    # rpm
+    # rpm — /usr/lib/sysimage/rpm on Fedora 36+/RHEL 10, /var/lib/rpm before
     if not packages:
-        rpm_path = os.path.join(rootfs, 'var', 'lib', 'rpm', 'rpmdb.sqlite')
-        packages.extend(parse_rpm_sqlite(rpm_path))
+        for rel in (('usr', 'lib', 'sysimage', 'rpm', 'rpmdb.sqlite'),
+                    ('var', 'lib', 'rpm', 'rpmdb.sqlite')):
+            rpm_path = os.path.join(rootfs, *rel)
+            # The rootfs comes from the image: never follow a symlink in
+            # it out to a host database.
+            real_root = os.path.realpath(rootfs)
+            if not os.path.realpath(rpm_path).startswith(real_root + os.sep):
+                continue
+            if os.path.isfile(rpm_path):
+                packages.extend(parse_rpm_sqlite(rpm_path))
+                break
 
+    distro = read_os_release_id(rootfs)
+    for pkg in packages:
+        pkg['purl'] = make_purl(pkg, distro)
     return packages
 
 
@@ -314,10 +376,8 @@ def output_spdx(packages, binary_path):
             "comment":          pkg.get('desc', ''),
             "externalRefs": [{
                 "referenceCategory": "PACKAGE-MANAGER",
-                "referenceType":     pkg['type'],
-                "referenceLocator":  (
-                    f"{pkg['name']}@{pkg['version']}"
-                ),
+                "referenceType":     "purl",
+                "referenceLocator":  pkg['purl'],
             }],
         })
 
@@ -343,10 +403,7 @@ def output_cyclonedx(packages, binary_path):
     }
 
     for pkg in packages:
-        purl = (
-            f"pkg:{pkg['type']}/{pkg['name']}@{pkg['version']}"
-            + (f"?arch={pkg['arch']}" if pkg.get('arch') else "")
-        )
+        purl = pkg['purl']
         doc["components"].append({
             "type":        "library",
             "name":        pkg['name'],

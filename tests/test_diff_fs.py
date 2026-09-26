@@ -56,6 +56,13 @@ class TestWalkUpper(unittest.TestCase):
             sorted_paths = sorted([p for (op, p, _e) in entries])
             self.assertEqual(sorted_paths, [p for (op, p, _e) in entries])
 
+    def test_symlink_to_directory_reported(self):
+        with tempfile.TemporaryDirectory() as upper:
+            self._layout(upper)
+            os.symlink('etc', os.path.join(upper, 'etc-link'))
+            paths = [(op, p) for (op, p, _e) in diff_fs.walk_upper(upper)]
+            self.assertIn(('A', '/etc-link'), paths)
+
     def test_whiteout_classified_as_deleted(self):
         with tempfile.TemporaryDirectory() as upper:
             self._layout(upper)

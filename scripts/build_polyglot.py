@@ -1373,6 +1373,18 @@ def resolve_build_passphrase(password_file):
     return p1.encode('utf-8')
 
 
+def _load_oci_tar():
+    """Load the shared OCI-layout consistency helpers (scripts/oci_tar.py)."""
+    helper_path = os.path.join(os.path.dirname(__file__), 'oci_tar.py')
+    spec = importlib.util.spec_from_file_location('_oci2bin_oci_tar',
+                                                  helper_path)
+    if not spec or not spec.loader:
+        raise RuntimeError(f'cannot load OCI helpers: {helper_path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_dockerfile_rootfs_extractor():
     """Load the existing hardened docker-save layer merger by file path."""
     helper_path = os.path.join(os.path.dirname(__file__), 'dockerfile_build.py')
@@ -1585,6 +1597,14 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
     # makes two builds of the same input produce byte-identical output.
     if reproducible:
         oci_data = repack_oci_tar_reproducible(oci_data)
+
+    # Every transform above can change blob bytes (new config, re-gzipped or
+    # extra layers) while leaving blobs/sha256/<name> and index.json as they
+    # were, which `docker load` with the containerd store rejects.  Re-derive
+    # names and the OCI manifest/index from content once, after the last
+    # transform that still produces a tar.
+    oci_data = _load_oci_tar().normalize_oci_layout(
+        oci_data, sort_members=reproducible)
 
     rootfs_data = b''
     if rootfs_format == 'squashfs':

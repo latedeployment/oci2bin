@@ -118,18 +118,29 @@ def should_strip(name, prefixes):
 def _iter_layer_names(input_tar):
     """
     Yield normalised member names from every layer in an image tar.
+
+    Layers are taken from manifest.json, the same list the strip pass uses:
+    Docker 25+ saves them as blobs/sha256/<hex> with no .tar suffix, so a
+    name-pattern scan found nothing and autodetection silently did nothing.
     Silently skips layers that cannot be read.
     """
     try:
         with tarfile.open(input_tar, 'r') as img_tf:
-            for member in img_tf.getmembers():
-                if not member.isfile():
+            try:
+                mf = img_tf.extractfile('manifest.json')
+                manifest = json.loads(mf.read()) if mf else []
+            except (KeyError, ValueError) as e:
+                print(f"strip_image: warning: scan pass: no usable "
+                      f"manifest.json ({e})", file=sys.stderr)
+                return
+            layer_names = []
+            for entry in manifest if isinstance(manifest, list) else []:
+                layer_names.extend(entry.get('Layers') or [])
+            for name in dict.fromkeys(layer_names):
+                try:
+                    f = img_tf.extractfile(name)
+                except KeyError:
                     continue
-                name = member.name
-                if not (name == 'layer.tar' or name.endswith('/layer.tar') or
-                        (name.endswith('.tar') and '/' in name)):
-                    continue
-                f = img_tf.extractfile(member)
                 if f is None:
                     continue
                 layer_bytes = f.read()

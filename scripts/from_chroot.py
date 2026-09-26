@@ -119,7 +119,14 @@ def build_layer(chroot_dir: str) -> tuple:
                 ti.uname = ti.gname = ""
                 tf.addfile(ti)
 
-            for fname in sorted(filenames):
+            # os.walk(followlinks=False) lists a symlink to a directory in
+            # dirnames and never descends into it, so it must be emitted
+            # here as the link it is — otherwise `bin -> usr/bin` on every
+            # merged-/usr base vanished and the image had no /bin/sh.
+            link_dirs = [d for d in dirnames
+                         if os.path.islink(os.path.join(dirpath, d))]
+            dirnames[:] = [d for d in dirnames if d not in link_dirs]
+            for fname in sorted(filenames + link_dirs):
                 arc = os.path.join(rel, fname) if rel else fname
                 _add_entry(tf, os.path.join(dirpath, fname), arc, inode_map)
 
@@ -161,7 +168,10 @@ def build_oci_layout(chroot_dir: str, out_dir: str, *,
         "os": "linux",
         "config": {
             "Entrypoint": entrypoint,
-            "Cmd": cmd if cmd is not None else ["/bin/sh"],
+            # /bin/sh is only the default command when there is no
+            # entrypoint; with one, it would be passed to it as an argument.
+            "Cmd": cmd if cmd is not None else (
+                None if entrypoint else ["/bin/sh"]),
             "Env": env if env is not None else default_env,
             "WorkingDir": workdir,
             "Labels": labels or {},

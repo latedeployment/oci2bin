@@ -25,7 +25,9 @@
 #include <ftw.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/reboot.h>
 #include <sys/un.h>
+#include <net/if.h>
 #include <termios.h>
 #include <pty.h>
 #include <grp.h>
@@ -150,6 +152,15 @@ struct mount_attr
 #define LANDLOCK_ACCESS_FS_MAKE_BLOCK  (1ULL << 11)
 #define LANDLOCK_ACCESS_FS_MAKE_SYM    (1ULL << 12)
 #endif
+#ifndef LANDLOCK_ACCESS_FS_REFER
+#define LANDLOCK_ACCESS_FS_REFER       (1ULL << 13) /* ABI 2 */
+#endif
+#ifndef LANDLOCK_ACCESS_FS_TRUNCATE
+#define LANDLOCK_ACCESS_FS_TRUNCATE    (1ULL << 14) /* ABI 3 */
+#endif
+#ifndef LANDLOCK_ACCESS_FS_IOCTL_DEV
+#define LANDLOCK_ACCESS_FS_IOCTL_DEV   (1ULL << 15) /* ABI 5 */
+#endif
 
 #ifndef LANDLOCK_RULE_PATH_BENEATH
 #define LANDLOCK_RULE_PATH_BENEATH 1
@@ -259,6 +270,7 @@ enum kernel_feature_state
 static signed char g_kernel_feature_state[KERNEL_FEATURE_MAX];
 
 static int write_all_fd(int fd, const char* data, size_t len);
+static int read_self_metadata(const char* self_path, char** out);
 static char* run_cmd_capture_stdin(char* const argv[], int in_fd,
                                    size_t* out_len);
 static char* run_cmd_capture(char* const argv[], size_t* out_len);
@@ -598,6 +610,9 @@ struct container_opts
 
     /* --seccomp-profile FILE  (load Docker-compatible JSON seccomp policy) */
     char* seccomp_profile;
+    /* Its contents, read on the host by main() before the container is
+     * entered — after pivot_root FILE would name a path inside the rootfs. */
+    char* seccomp_profile_json;
 
     /* --add-host HOST:IP  (inject into /etc/hosts) */
     char* add_hosts[32];
@@ -717,6 +732,11 @@ struct container_opts
 
     /* --gen-seccomp FILE  (trace syscalls and emit a Docker-compatible profile) */
     char* gen_seccomp;
+    /* FILE opened on the host by main() before the container is entered;
+     * the tracer runs chrooted, where a fopen(FILE) would land inside the
+     * throwaway rootfs.  Valid only when gen_seccomp_fd_set is 1. */
+    int   gen_seccomp_fd;
+    int   gen_seccomp_fd_set;
 
     /* --gdb  (bind-mount host gdb into container and exec it as debugger) */
     int gdb;
@@ -1987,10 +2007,158 @@ static const char* json_skip_to_value(const char* json, const char* key)
     return NULL;
 }
 
+static int json_hex4(const char* p, unsigned* out)
+{
+    unsigned v = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        char c = p[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9')
+        {
+            v |= (unsigned)(c - '0');
+        }
+        else if (c >= 'a' && c <= 'f')
+        {
+            v |= (unsigned)(c - 'a' + 10);
+        }
+        else if (c >= 'A' && c <= 'F')
+        {
+            v |= (unsigned)(c - 'A' + 10);
+        }
+        else
+        {
+            return -1;
+        }
+    }
+    *out = v;
+    return 0;
+}
+
+/*
+ * Decode the body of a JSON string literal (the `len` bytes between the
+ * quotes) into a fresh NUL-terminated buffer.  Handles every RFC 8259 escape,
+ * including \uXXXX and surrogate pairs (emitted as UTF-8).  Docker writes
+ * image configs with Go's encoding/json, which turns & < > into \u0026
+ * \u003c \u003e — so a raw copy exec'd `sh -c 'nginx \u0026\u0026 ...'`.
+ * Returns NULL on a malformed escape, a lone surrogate, or \u0000 (which a C
+ * string cannot carry and would silently truncate the value).
+ */
+static char* json_unescape(const char* src, size_t len)
+{
+    /* Decoding never grows the text: every escape is >= its UTF-8 form. */
+    char* out = malloc(len + 1);
+    if (!out)
+    {
+        return NULL;
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < len; )
+    {
+        char c = src[i++];
+        if (c != '\\')
+        {
+            out[o++] = c;
+            continue;
+        }
+        if (i >= len)
+        {
+            goto bad;
+        }
+        char e = src[i++];
+        switch (e)
+        {
+            case '"':
+                out[o++] = '"';
+                break;
+            case '\\':
+                out[o++] = '\\';
+                break;
+            case '/':
+                out[o++] = '/';
+                break;
+            case 'b':
+                out[o++] = '\b';
+                break;
+            case 'f':
+                out[o++] = '\f';
+                break;
+            case 'n':
+                out[o++] = '\n';
+                break;
+            case 'r':
+                out[o++] = '\r';
+                break;
+            case 't':
+                out[o++] = '\t';
+                break;
+            case 'u':
+                {
+                    unsigned cp;
+                    if (i + 4 > len || json_hex4(src + i, &cp) < 0)
+                    {
+                        goto bad;
+                    }
+                    i += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF)
+                    {
+                        unsigned lo;
+                        if (i + 6 > len || src[i] != '\\' || src[i + 1] != 'u' ||
+                                json_hex4(src + i + 2, &lo) < 0 ||
+                                lo < 0xDC00 || lo > 0xDFFF)
+                        {
+                            goto bad;
+                        }
+                        i += 6;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    }
+                    else if (cp >= 0xDC00 && cp <= 0xDFFF)
+                    {
+                        goto bad;
+                    }
+                    if (cp == 0)
+                    {
+                        goto bad;
+                    }
+                    if (cp < 0x80)
+                    {
+                        out[o++] = (char)cp;
+                    }
+                    else if (cp < 0x800)
+                    {
+                        out[o++] = (char)(0xC0 | (cp >> 6));
+                        out[o++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                    else if (cp < 0x10000)
+                    {
+                        out[o++] = (char)(0xE0 | (cp >> 12));
+                        out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[o++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                    else
+                    {
+                        out[o++] = (char)(0xF0 | (cp >> 18));
+                        out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                        out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[o++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+            default:
+                goto bad;
+        }
+    }
+    out[o] = '\0';
+    return out;
+bad:
+    free(out);
+    return NULL;
+}
+
 /*
  * Copy the string literal at p (which must be its opening quote) into a fresh
- * buffer, raw — escapes are preserved as written, matching what every existing
- * caller expects.  Returns NULL if p is not a literal or it is unterminated.
+ * buffer with its escapes decoded.  Returns NULL if p is not a literal, it is
+ * unterminated, or an escape is malformed.
  */
 static char* extract_string_literal(const char* p)
 {
@@ -2017,15 +2185,7 @@ static char* extract_string_literal(const char* p)
     {
         return NULL;
     }
-    size_t len = end - p;
-    char* result = malloc(len + 1);
-    if (!result)
-    {
-        return NULL;
-    }
-    memcpy(result, p, len);
-    result[len] = '\0';
-    return result;
+    return json_unescape(p, (size_t)(end - p));
 }
 
 /* Find a JSON string value for a given key. Returns malloc'd string or NULL. */
@@ -2344,7 +2504,8 @@ static long long json_get_longlong(const char* json, const char* key, int* ok)
     return v;
 }
 
-/* Parse a JSON array of strings into an array. Returns count. */
+/* Parse a JSON array of strings into an array, decoding escapes.  Stops at
+ * the first malformed element.  Returns count. */
 static int json_parse_string_array(const char* arr, char** out, int max)
 {
     int count = 0;
@@ -2375,14 +2536,11 @@ static int json_parse_string_array(const char* arr, char** out, int max)
         {
             break;    /* unterminated string */
         }
-        size_t len = end - p;
-        out[count] = malloc(len + 1);
+        out[count] = json_unescape(p, (size_t)(end - p));
         if (!out[count])
         {
-            break;
+            break;    /* malformed escape, or out of memory */
         }
-        memcpy(out[count], p, len);
-        out[count][len] = '\0';
         count++;
         p = end + 1;
     }
@@ -3633,6 +3791,50 @@ static int create_hardlink_in_root(struct layer_merge_ctx* ctx,
         return -1;
     }
     int rc = linkat(source_fd, "", parent_fd, leaf, AT_EMPTY_PATH);
+    /* Before Linux 6.10, AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH in the
+     * initial user namespace and fails with ENOENT for everyone else — i.e.
+     * for every rootless extraction of a layer with hardlinks (tzdata ships
+     * hundreds).  Linking through the fd's /proc magic link needs no
+     * capability.  A symlink source cannot go that way (the lookup would
+     * follow it), so it is recreated as an identical symlink instead. */
+    if (rc < 0 && errno == ENOENT)
+    {
+        struct stat sst;
+        if (fstatat(source_fd, "", &sst, AT_EMPTY_PATH) < 0)
+        {
+            rc = -1;
+        }
+        else if (S_ISLNK(sst.st_mode))
+        {
+            char    target[PATH_MAX];
+            ssize_t tl = readlinkat(source_fd, "", target, sizeof(target) - 1);
+            if (tl < 0)
+            {
+                rc = -1;
+            }
+            else
+            {
+                target[tl] = '\0';
+                rc = symlinkat(target, parent_fd, leaf);
+            }
+        }
+        else
+        {
+            char proc_path[64];
+            int  pn = snprintf(proc_path, sizeof(proc_path),
+                               "/proc/self/fd/%d", source_fd);
+            if (pn < 0 || (size_t)pn >= sizeof(proc_path))
+            {
+                errno = ENAMETOOLONG;
+                rc    = -1;
+            }
+            else
+            {
+                rc = linkat(AT_FDCWD, proc_path, parent_fd, leaf,
+                            AT_SYMLINK_FOLLOW);
+            }
+        }
+    }
     int saved = errno;
     close(parent_fd);
     close(source_fd);
@@ -6090,9 +6292,13 @@ static int blob_is_zstd_compressed(const char* path)
 }
 
 /* Resolve the age identity file used to decrypt an encrypted image.
- * Order: $OCI2BIN_IDENTITY, then a few conventional defaults. Writes the
- * chosen readable path into `out` and returns 0, or -1 if none is found. */
-static int resolve_age_identity(char* out, size_t outsz)
+ * Order: $OCI2BIN_IDENTITY, ~/.config/oci2bin/identity, then — only when
+ * `allow_ssh` says the image was encrypted to an SSH recipient — the user's
+ * ~/.ssh/id_ed25519 / id_rsa.  An image encrypted to an X25519 recipient
+ * cannot be opened by an SSH key anyway, so there is no reason to hand one
+ * to age for it.  Writes the chosen readable path into `out` and returns 0,
+ * or -1 if none is found. */
+static int resolve_age_identity(char* out, size_t outsz, int allow_ssh)
 {
     const char* env = getenv("OCI2BIN_IDENTITY");
     if (env && env[0])
@@ -6121,7 +6327,8 @@ static int resolve_age_identity(char* out, size_t outsz)
         "/.ssh/id_ed25519",
         "/.ssh/id_rsa",
     };
-    for (size_t i = 0; i < sizeof(rels) / sizeof(rels[0]); i++)
+    size_t n_rels = allow_ssh ? sizeof(rels) / sizeof(rels[0]) : 1;
+    for (size_t i = 0; i < n_rels; i++)
     {
         int n = snprintf(out, outsz, "%s%s", home, rels[i]);
         if (n < 0 || (size_t)n >= outsz)
@@ -6130,6 +6337,11 @@ static int resolve_age_identity(char* out, size_t outsz)
         }
         if (access(out, R_OK) == 0)
         {
+            if (i > 0)
+            {
+                fprintf(stderr, "oci2bin: decrypting with SSH key %s\n",
+                        out);
+            }
             return 0;
         }
     }
@@ -6141,26 +6353,28 @@ static int resolve_age_identity(char* out, size_t outsz)
  * 0 if it uses recipient (X25519/ssh) encryption, -1 on read error. The age
  * header lists its first stanza right after the version line: "-> scrypt ..."
  * for passphrase mode, "-> X25519"/"-> ssh-..." for recipients. */
-static int blob_age_is_passphrase(const char* path)
+static int blob_age_header_has(const char* path, const char* needle)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
     {
         return -1;
     }
-    char head[256];
-    ssize_t n = read(fd, head, sizeof(head) - 1);
+    /* The header ends at the "---" MAC line; one stanza per recipient, so
+     * leave room for a handful of them. */
+    char head[4096];
+    ssize_t n = read_all_fd(fd, head, sizeof(head));
     close(fd);
     if (n < 0)
     {
         return -1;
     }
-    head[n] = '\0';
-    if (memmem(head, (size_t)n, "-> scrypt", 9) != NULL)
-    {
-        return 1;
-    }
-    return 0;
+    return memmem(head, (size_t)n, needle, strlen(needle)) != NULL;
+}
+
+static int blob_age_is_passphrase(const char* path)
+{
+    return blob_age_header_has(path, "-> scrypt");
 }
 
 /* Resolve the passphrase used to decrypt a passphrase-encrypted image.
@@ -6367,7 +6581,9 @@ static int maybe_decrypt_oci_blob(const char* in_path, const char* tmpdir,
     {
         /* Asymmetric (recipient / X25519) image. */
         char identity[PATH_MAX];
-        if (resolve_age_identity(identity, sizeof(identity)) < 0)
+        int  ssh_recipient = blob_age_header_has(in_path, "\n-> ssh-") == 1;
+        if (resolve_age_identity(identity, sizeof(identity),
+                                 ssh_recipient) < 0)
         {
             fprintf(stderr,
                     "oci2bin: image is encrypted; set OCI2BIN_IDENTITY to your "
@@ -6671,9 +6887,17 @@ static int verify_oci_descriptors(const char* oci_dir,
  *
  * Returns path to rootfs (static buffer) or NULL on failure.
  */
+static char* extract_oci_rootfs_into(const char* self_path,
+                                     const char* tmpdir);
+
+/*
+ * Extract the embedded image into a fresh runtime tmpdir.  Every failure
+ * inside removes the tmpdir: it can hold the decrypted payload
+ * (image.dec.tar) and a partial rootfs, and main() only registers its
+ * atexit cleanup once extraction has succeeded.
+ */
 static char* extract_oci_rootfs(const char* self_path)
 {
-    char* rootfs = s_oci_rootfs;
     char tmpdir[PATH_MAX];
 
     debug_log("extract.begin", "self=%s oci_offset=0x%lx oci_size=0x%lx",
@@ -6684,6 +6908,18 @@ static char* extract_oci_rootfs(const char* self_path)
         perror("mkdtemp");
         return NULL;
     }
+    char* rootfs = extract_oci_rootfs_into(self_path, tmpdir);
+    if (!rootfs)
+    {
+        rm_rf_dir(tmpdir);
+    }
+    return rootfs;
+}
+
+static char* extract_oci_rootfs_into(const char* self_path,
+                                     const char* tmpdir)
+{
+    char* rootfs = s_oci_rootfs;
 
     /* 1-2. Copy the embedded OCI tar out of ourselves, decrypt/inflate it as
      * needed, prescan it, and extract it into tmpdir/oci/. */
@@ -7217,9 +7453,6 @@ static void patch_rootfs_ids(const char* rootfs)
     }
 
     close(rootfs_fd);
-
-    /* ── /etc/resolv.conf ── copy host resolver into chroot ── */
-    install_resolv_conf(rootfs);
 }
 
 static int current_has_cap(int cap_num)
@@ -7394,6 +7627,29 @@ static int egress_resolve_and_pin(const char* host, const char* port,
 }
 
 /*
+ * The slirp4netns/pasta helper forked by main().  Stopped by stop_net_helper()
+ * on every exit path of the loader — including early returns, via atexit.
+ * pasta drops privileges after exec, which clears PR_SET_PDEATHSIG, so the
+ * parent has to do it.  The owner check keeps forked children that happen
+ * to call exit() from killing it.
+ */
+static pid_t g_net_helper_pid   = -1;
+static pid_t g_net_helper_owner = -1;
+
+static void stop_net_helper(void)
+{
+    if (g_net_helper_pid <= 0 || getpid() != g_net_helper_owner)
+    {
+        return;
+    }
+    kill(g_net_helper_pid, SIGTERM);
+    while (waitpid(g_net_helper_pid, NULL, 0) < 0 && errno == EINTR)
+    {
+    }
+    g_net_helper_pid = -1;
+}
+
+/*
  * tool_is_available: return 1 if an executable named `prog` is reachable via
  * $PATH or in the two fixed fallback directories the net-helper exec chain
  * tries (/usr/bin, /usr/local/bin), else 0. `prog` must be a bare name (no
@@ -7444,18 +7700,31 @@ static int tool_is_available(const char* prog)
     return 0;
 }
 
+/* The nft ruleset and /etc/hosts pins, built by build_egress_allowlist()
+ * and applied by apply_egress_allowlist(). */
+static char   g_egress_rules[65536];
+static size_t g_egress_rules_len;
+static char   g_egress_hosts[8192];
+static size_t g_egress_hosts_len;
+
 /*
- * Install a default-deny outbound allowlist in the current network namespace
- * via nftables. Each --allow-egress entry is HOST:PORT or CIDR:PORT; literal
- * IPs/CIDRs are used directly, hostnames are resolved once and pinned (both
- * into the ruleset and into the container's /etc/hosts so name lookups return
- * the allowlisted IPs without any DNS egress). Must run after unshare(NEWNET).
- * Fails closed: a missing nft, an unresolvable host, or a failed apply all
- * abort the run rather than silently leaving egress open.
+ * Build the default-deny outbound allowlist for --allow-egress. Each entry is
+ * HOST:PORT or CIDR:PORT; literal IPs/CIDRs are used directly, hostnames are
+ * resolved once and pinned (both into the ruleset and into the container's
+ * /etc/hosts so name lookups return the allowlisted IPs without any DNS
+ * egress).
+ *
+ * Must run BEFORE unshare(CLONE_NEWNET): hostnames are resolved with the
+ * host's network and resolver.  Resolving after the unshare raced the
+ * slirp4netns/pasta helper (nothing waited for it to come up) and could
+ * never reach a 127.0.0.53 systemd-resolved stub at all, so hostname
+ * entries failed nondeterministically or always.
+ * Fails closed: a missing nft or an unresolvable host aborts the run.
  */
-static int apply_egress_allowlist(struct container_opts* opts,
-                                  const char* rootfs)
+static int build_egress_allowlist(struct container_opts* opts)
 {
+    g_egress_rules_len = 0;
+    g_egress_hosts_len = 0;
     if (opts->n_egress == 0)
     {
         return 0;
@@ -7479,21 +7748,21 @@ static int apply_egress_allowlist(struct container_opts* opts,
         return -1;
     }
 
-    static char rules[65536];
+    char*  rules = g_egress_rules;
     size_t off = 0;
-    int n = snprintf(rules, sizeof(rules),
+    int n = snprintf(rules, sizeof(g_egress_rules),
                      "table inet oci2bin_egress {\n"
                      "  chain output {\n"
                      "    type filter hook output priority 0; policy drop;\n"
                      "    ct state established,related accept\n"
                      "    oifname \"lo\" accept\n");
-    if (n < 0 || (size_t)n >= sizeof(rules))
+    if (n < 0 || (size_t)n >= sizeof(g_egress_rules))
     {
         return -1;
     }
     off = (size_t)n;
 
-    char hosts_add[8192];
+    char*  hosts_add = g_egress_hosts;
     size_t hoff = 0;
     hosts_add[0] = '\0';
 
@@ -7569,7 +7838,7 @@ static int apply_egress_allowlist(struct container_opts* opts,
                         "'%s'\n", host);
                 return -1;
             }
-            if (egress_append_rule(rules, sizeof(rules), &off, v6, host, port)
+            if (egress_append_rule(rules, sizeof(g_egress_rules), &off, v6, host, port)
                     < 0)
             {
                 return -1;
@@ -7578,7 +7847,7 @@ static int apply_egress_allowlist(struct container_opts* opts,
         }
         if (inet_pton(AF_INET, host, &a4) == 1)
         {
-            if (egress_append_rule(rules, sizeof(rules), &off, 0, host, port)
+            if (egress_append_rule(rules, sizeof(g_egress_rules), &off, 0, host, port)
                     < 0)
             {
                 return -1;
@@ -7587,7 +7856,7 @@ static int apply_egress_allowlist(struct container_opts* opts,
         }
         if (inet_pton(AF_INET6, host, &a6) == 1)
         {
-            if (egress_append_rule(rules, sizeof(rules), &off, 1, host, port)
+            if (egress_append_rule(rules, sizeof(g_egress_rules), &off, 1, host, port)
                     < 0)
             {
                 return -1;
@@ -7596,8 +7865,8 @@ static int apply_egress_allowlist(struct container_opts* opts,
         }
 
         /* Hostname: resolve once (via getent) and pin every address. */
-        int added = egress_resolve_and_pin(host, port, rules, sizeof(rules),
-                                           &off, hosts_add, sizeof(hosts_add),
+        int added = egress_resolve_and_pin(host, port, rules, sizeof(g_egress_rules),
+                                           &off, hosts_add, sizeof(g_egress_hosts),
                                            &hoff);
         if (added <= 0)
         {
@@ -7605,12 +7874,43 @@ static int apply_egress_allowlist(struct container_opts* opts,
         }
     }
 
-    int n2 = snprintf(rules + off, sizeof(rules) - off, "  }\n}\n");
-    if (n2 < 0 || (size_t)n2 >= sizeof(rules) - off)
+    int n2 = snprintf(rules + off, sizeof(g_egress_rules) - off, "  }\n}\n");
+    if (n2 < 0 || (size_t)n2 >= sizeof(g_egress_rules) - off)
     {
         return -1;
     }
     off += (size_t)n2;
+
+    g_egress_rules_len = off;
+    g_egress_hosts_len = hoff;
+    return 0;
+}
+
+/*
+ * Install the ruleset built by build_egress_allowlist() in the current
+ * (container) network namespace via nftables, and pin the resolved names in
+ * the container's /etc/hosts. Must run after unshare(NEWNET). Fails closed.
+ */
+static int apply_egress_allowlist(struct container_opts* opts,
+                                  const char* rootfs)
+{
+    if (opts->n_egress == 0)
+    {
+        return 0;
+    }
+    char nft_bin[PATH_MAX];
+    if (g_egress_rules_len == 0 ||
+            find_helper_binary("nft", nft_bin, sizeof(nft_bin)) < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: --allow-egress: ruleset not prepared or 'nft'"
+                " missing; refusing to run\n");
+        return -1;
+    }
+    const char* rules     = g_egress_rules;
+    size_t      off       = g_egress_rules_len;
+    const char* hosts_add = g_egress_hosts;
+    size_t      hoff      = g_egress_hosts_len;
 
     char rules_path[] = "/tmp/oci2bin-egress-XXXXXX";
     int rfd = mkstemp(rules_path);
@@ -9070,200 +9370,79 @@ static void audit_emit_cap_set_event(const struct container_opts* opts)
 
 /*
  * Map a capability name (case-insensitive, with or without "CAP_" prefix)
- * to its number (0-40). Returns -1 if unknown.
+ * to its number (0-40). Returns -1 if unknown.  Index == capability number,
+ * per linux/capability.h.
  */
 static int cap_name_to_num(const char* name)
 {
-    /* normalise: skip "cap_" or "CAP_" prefix */
+    static const char* const cap_names[] =
+    {
+        "chown", "dac_override", "dac_read_search", "fowner", "fsetid",
+        "kill", "setgid", "setuid", "setpcap", "linux_immutable",
+        "net_bind_service", "net_broadcast", "net_admin", "net_raw",
+        "ipc_lock", "ipc_owner", "sys_module", "sys_rawio", "sys_chroot",
+        "sys_ptrace", "sys_pacct", "sys_admin", "sys_boot", "sys_nice",
+        "sys_resource", "sys_time", "sys_tty_config", "mknod", "lease",
+        "audit_write", "audit_control", "setfcap", "mac_override",
+        "mac_admin", "syslog", "wake_alarm", "block_suspend", "audit_read",
+        "perfmon", "bpf", "checkpoint_restore",
+    };
     const char* n = name;
-    if ((n[0] == 'c' || n[0] == 'C') &&
-            (n[1] == 'a' || n[1] == 'A') &&
-            (n[2] == 'p' || n[2] == 'P') &&
-            n[3] == '_')
+    if (strncasecmp(n, "cap_", 4) == 0)
     {
         n += 4;
     }
-    /* lowercase comparison via tolower-equivalent inline */
-#define STREQI(a, b) (strcasecmp((a), (b)) == 0)
-    if (STREQI(n, "chown"))
+    for (size_t i = 0; i < sizeof(cap_names) / sizeof(cap_names[0]); i++)
     {
-        return 0;
+        if (strcasecmp(n, cap_names[i]) == 0)
+        {
+            return (int)i;
+        }
     }
-    if (STREQI(n, "dac_override"))
-    {
-        return 1;
-    }
-    if (STREQI(n, "dac_read_search"))
-    {
-        return 2;
-    }
-    if (STREQI(n, "fowner"))
-    {
-        return 3;
-    }
-    if (STREQI(n, "fsetid"))
-    {
-        return 4;
-    }
-    if (STREQI(n, "kill"))
-    {
-        return 5;
-    }
-    if (STREQI(n, "setgid"))
-    {
-        return 6;
-    }
-    if (STREQI(n, "setuid"))
-    {
-        return 7;
-    }
-    if (STREQI(n, "setpcap"))
-    {
-        return 8;
-    }
-    if (STREQI(n, "net_bind_service"))
-    {
-        return 10;
-    }
-    if (STREQI(n, "net_raw"))
-    {
-        return 13;
-    }
-    if (STREQI(n, "sys_chroot"))
-    {
-        return 18;
-    }
-    if (STREQI(n, "mknod"))
-    {
-        return 27;
-    }
-    if (STREQI(n, "audit_write"))
-    {
-        return 29;
-    }
-    if (STREQI(n, "setfcap"))
-    {
-        return 31;
-    }
-    if (STREQI(n, "net_admin"))
-    {
-        return 12;
-    }
-    if (STREQI(n, "sys_admin"))
-    {
-        return 21;
-    }
-    if (STREQI(n, "sys_ptrace"))
-    {
-        return 19;
-    }
-    if (STREQI(n, "sys_module"))
-    {
-        return 16;
-    }
-    if (STREQI(n, "ipc_lock"))
-    {
-        return 14;
-    }
-#undef STREQI
     return -1;
 }
 
 /*
- * Apply capability bounding set drops and ambient cap raises.
- * Called after chroot/chdir and before seccomp.
+ * Drop capabilities from the bounding set.  Called after chroot/chdir and
+ * before seccomp, while the loader still holds CAP_SETPCAP in its effective
+ * set — PR_CAPBSET_DROP needs it, so this must run before anything narrows
+ * the effective set.  --cap-add is not handled here: the ambient raise has to
+ * happen after the --user switch (a setuid away from 0 always clears the
+ * ambient set), so it lives in raise_added_capabilities(), called right
+ * before exec.
  *
- * Returns 0 if every requested drop and add took effect, -1 if the kernel
- * rejected any of them.  --strict turns that into an aborted run: a
- * PR_CAPBSET_DROP the kernel refuses means the workload keeps a capability the
- * caller asked to remove, which is exactly the "security-relevant
- * degradation" --strict exists to refuse.  Without --strict the failures stay
- * warn-and-continue, as before.
+ * With --cap-drop all, every cap not named by --cap-add leaves the bounding
+ * set, so a uid-0 workload recomputes its permitted set at execve from
+ * exactly the added caps.
+ *
+ * Returns 0 if every requested drop took effect, -1 if the kernel rejected
+ * any of them.  --strict turns that into an aborted run: a PR_CAPBSET_DROP
+ * the kernel refuses means the workload keeps a capability the caller asked
+ * to remove.  Without --strict the failures stay warn-and-continue.
  */
 static int apply_capabilities(const struct container_opts* opts)
 {
     int cap;
     int failed = 0;
 
-    if (opts->cap_drop_all)
+    for (cap = 0; cap <= 40; cap++)
     {
-        /*
-         * When --cap-drop all is combined with --cap-add, we must set up
-         * permitted+inheritable and raise ambient BEFORE dropping from the
-         * bounding set.  PR_CAP_AMBIENT_RAISE requires the cap to still be
-         * in the bounding set at the time of the call; if we drop the bounding
-         * set first, the ambient raise will always fail with EPERM.
-         *
-         * Order:
-         *   1. capset: put add_mask into permitted+inheritable
-         *   2. PR_CAP_AMBIENT_RAISE for each cap in add_mask
-         *   3. PR_CAPBSET_DROP for every cap NOT in add_mask
-         */
-        if (opts->cap_add_mask)
+        int drop;
+        if (opts->cap_drop_all)
         {
-            /* Step 1: set permitted+inheritable so ambient raise can succeed */
-            struct cap_header hdr;
-            struct cap_data   data[2];
-            memset(&hdr,  0, sizeof(hdr));
-            memset(data,  0, sizeof(data));
-            hdr.version = _LINUX_CAPABILITY_VERSION_3;
-            hdr.pid     = 0;
-            data[0].permitted   = (uint32_t)(opts->cap_add_mask & 0xFFFFFFFF);
-            data[0].inheritable = (uint32_t)(opts->cap_add_mask & 0xFFFFFFFF);
-            data[1].permitted   = (uint32_t)(opts->cap_add_mask >> 32);
-            data[1].inheritable = (uint32_t)(opts->cap_add_mask >> 32);
-            if (syscall(SYS_capset, &hdr, data) < 0)
-            {
-                fprintf(stderr, "oci2bin: capset for --cap-add: %s\n",
-                        strerror(errno));
-                failed = 1;
-            }
-            /* Step 2: raise ambient caps (bounding set still intact here) */
-            for (cap = 0; cap <= 40; cap++)
-            {
-                if (!((opts->cap_add_mask >> cap) & 1))
-                {
-                    continue;
-                }
-                if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE,
-                          (unsigned long)cap, 0, 0) < 0)
-                {
-                    fprintf(stderr,
-                            "oci2bin: PR_CAP_AMBIENT_RAISE %d: %s\n",
-                            cap, strerror(errno));
-                    failed = 1;
-                }
-            }
+            drop = !((opts->cap_add_mask >> cap) & 1);
         }
-        /* Step 3: drop all bounding-set caps except those being re-added */
-        for (cap = 0; cap <= 40; cap++)
+        else
         {
-            if ((opts->cap_add_mask >> cap) & 1)
-            {
-                continue; /* keep in bounding set — ambient needs it */
-            }
-            if (prctl(PR_CAPBSET_DROP, (unsigned long)cap, 0, 0, 0) < 0)
-            {
-                if (errno != EINVAL) /* EINVAL = cap doesn't exist on this kernel */
-                {
-                    fprintf(stderr,
-                            "oci2bin: PR_CAPBSET_DROP %d: %s\n",
-                            cap, strerror(errno));
-                    failed = 1;
-                }
-            }
+            drop = (int)((opts->cap_drop_mask >> cap) & 1);
         }
-    }
-    else if (opts->cap_drop_mask)
-    {
-        /* Drop only specified caps from the bounding set */
-        for (cap = 0; cap <= 40; cap++)
+        if (!drop)
         {
-            if (!((opts->cap_drop_mask >> cap) & 1))
-            {
-                continue;
-            }
-            if (prctl(PR_CAPBSET_DROP, (unsigned long)cap, 0, 0, 0) < 0)
+            continue;
+        }
+        if (prctl(PR_CAPBSET_DROP, (unsigned long)cap, 0, 0, 0) < 0)
+        {
+            if (errno != EINVAL) /* EINVAL = cap doesn't exist on this kernel */
             {
                 fprintf(stderr,
                         "oci2bin: PR_CAPBSET_DROP %d: %s\n",
@@ -9275,6 +9454,345 @@ static int apply_capabilities(const struct container_opts* opts)
 
     audit_emit_cap_set_event(opts);
     return failed ? -1 : 0;
+}
+
+/*
+ * Make the --cap-add caps survive execve for any workload uid: put them in
+ * permitted+inheritable, then raise them into the ambient set.  Runs in the
+ * workload process after the uid switch (drop_workload_identity() set
+ * PR_SET_KEEPCAPS so permitted survived it) and before exec.  The effective
+ * set is left empty; execve recomputes it.
+ */
+static int raise_added_capabilities(const struct container_opts* opts)
+{
+    if (!opts->cap_add_mask)
+    {
+        return 0;
+    }
+    int failed = 0;
+    struct cap_header hdr;
+    struct cap_data   data[2];
+    memset(&hdr, 0, sizeof(hdr));
+    memset(data, 0, sizeof(data));
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid     = 0;
+    data[0].permitted   = (uint32_t)(opts->cap_add_mask & 0xFFFFFFFF);
+    data[0].inheritable = (uint32_t)(opts->cap_add_mask & 0xFFFFFFFF);
+    data[1].permitted   = (uint32_t)(opts->cap_add_mask >> 32);
+    data[1].inheritable = (uint32_t)(opts->cap_add_mask >> 32);
+    if (syscall(SYS_capset, &hdr, data) < 0)
+    {
+        fprintf(stderr, "oci2bin: capset for --cap-add: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    for (int cap = 0; cap <= 40; cap++)
+    {
+        if (!((opts->cap_add_mask >> cap) & 1))
+        {
+            continue;
+        }
+        if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE,
+                  (unsigned long)cap, 0, 0) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: PR_CAP_AMBIENT_RAISE %d: %s\n",
+                    cap, strerror(errno));
+            failed = 1;
+        }
+    }
+    return failed ? -1 : 0;
+}
+
+/* ── workload identity and exec context ──────────────────────────────────── */
+
+/*
+ * Who the workload runs as.  Resolved once in container_main() (--user
+ * overrides the image User field) and applied by enter_workload_context() in
+ * every process that runs container code: the direct exec, the --init and
+ * --restart children, and health probes.  `strict` is set for an explicit
+ * --user, where failing to switch must abort rather than run as root.
+ */
+struct workload_ident
+{
+    int   do_drop;
+    int   strict;
+    uid_t uid;
+    gid_t gid;
+};
+
+static int resolve_user(const char* spec, uid_t* out_uid, gid_t* out_gid);
+
+static void resolve_workload_ident(const struct container_opts* opts,
+                                   const char* image_user,
+                                   struct workload_ident* id)
+{
+    memset(id, 0, sizeof(*id));
+    if (opts->has_user)
+    {
+        id->uid     = opts->run_uid;
+        id->gid     = opts->run_gid;
+        id->do_drop = 1;
+        id->strict  = 1;
+        return;
+    }
+    if (!image_user || !image_user[0])
+    {
+        return;
+    }
+    uid_t uid = 0;
+    gid_t gid = 0;
+    if (resolve_user(image_user, &uid, &gid) == 0)
+    {
+        if (uid != 0 || gid != 0)
+        {
+            id->uid     = uid;
+            id->gid     = gid;
+            id->do_drop = 1;
+            debug_log("container.user", "spec=%s uid=%d gid=%d",
+                      image_user, (int)uid, (int)gid);
+        }
+        return;
+    }
+    fprintf(stderr,
+            "oci2bin: warning: could not resolve image User \"%s\"\n",
+            image_user);
+}
+
+/*
+ * Switch to the workload uid/gid.  An explicit --user must take effect;
+ * the image-User fallback stays best-effort (in a single-ID user namespace
+ * only uid 0 is mapped and other IDs fail with EINVAL — expected).
+ */
+static int drop_workload_identity(const struct container_opts* opts,
+                                  const struct workload_ident* id)
+{
+    if (!id || !id->do_drop)
+    {
+        return 0;
+    }
+    /* Keep permitted across the uid switch so --cap-add can still raise
+     * ambient caps afterwards.  Cleared again by execve. */
+    if (opts->cap_add_mask && id->uid != 0
+            && prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
+    {
+        fprintf(stderr, "oci2bin: PR_SET_KEEPCAPS: %s\n", strerror(errno));
+        return -1;
+    }
+    if (setgroups(0, NULL) < 0 && id->strict && errno != EPERM)
+    {
+        fprintf(stderr, "oci2bin: --user: setgroups failed: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    if (setgid(id->gid) < 0)
+    {
+        if (id->strict)
+        {
+            fprintf(stderr, "oci2bin: --user: setgid(%d) failed: %s\n",
+                    (int)id->gid, strerror(errno));
+            return -1;
+        }
+        debug_log("container.setgid_skip", "gid=%d err=%s",
+                  (int)id->gid, strerror(errno));
+    }
+    if (setuid(id->uid) < 0)
+    {
+        if (id->strict)
+        {
+            fprintf(stderr, "oci2bin: --user: setuid(%d) failed: %s\n",
+                    (int)id->uid, strerror(errno));
+            return -1;
+        }
+        debug_log("container.setuid_skip", "uid=%d err=%s",
+                  (int)id->uid, strerror(errno));
+    }
+    return 0;
+}
+
+/*
+ * Apply the --security-opt AppArmor profile / SELinux exec label.  These are
+ * explicitly requested confinement, so a failure — including a loader built
+ * without the matching support — aborts instead of running unconfined.
+ */
+static int apply_security_labels(const struct container_opts* opts)
+{
+#ifdef HAVE_APPARMOR
+    if (opts->security_opt_apparmor)
+    {
+        if (aa_change_onexec(opts->security_opt_apparmor) < 0)
+        {
+            fprintf(stderr, "oci2bin: --security-opt apparmor=%s: %s\n",
+                    opts->security_opt_apparmor, strerror(errno));
+            return -1;
+        }
+        debug_log("container.apparmor", "profile=%s",
+                  opts->security_opt_apparmor);
+    }
+#else
+    if (opts->security_opt_apparmor)
+    {
+        fprintf(stderr,
+                "oci2bin: --security-opt apparmor: not compiled with "
+                "AppArmor support (-DHAVE_APPARMOR); refusing to run "
+                "unconfined\n");
+        return -1;
+    }
+#endif
+#ifdef HAVE_SELINUX
+    if (opts->security_opt_label)
+    {
+        if (setexeccon(opts->security_opt_label) < 0)
+        {
+            fprintf(stderr, "oci2bin: --security-opt label=%s: %s\n",
+                    opts->security_opt_label, strerror(errno));
+            return -1;
+        }
+        debug_log("container.selinux", "label=%s", opts->security_opt_label);
+    }
+#else
+    if (opts->security_opt_label)
+    {
+        fprintf(stderr,
+                "oci2bin: --security-opt label: not compiled with "
+                "SELinux support (-DHAVE_SELINUX); refusing to run "
+                "unconfined\n");
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+/*
+ * Make the PTY slave allocated in main() the controlling terminal and stdio
+ * of this process (setsid + TIOCSCTTY) so the workload gets job control.
+ */
+static void claim_pty_slave(const struct container_opts* opts)
+{
+    if (opts->pty_slave_fd < 0)
+    {
+        return;
+    }
+    if (opts->pty_master_fd >= 0)
+    {
+        close(opts->pty_master_fd);
+    }
+    if (setsid() < 0)
+    {
+        debug_log("container.setsid", "err=%s", strerror(errno));
+    }
+    if (ioctl(opts->pty_slave_fd, TIOCSCTTY, 0) == 0)
+    {
+        dup2(opts->pty_slave_fd, STDIN_FILENO);
+        dup2(opts->pty_slave_fd, STDOUT_FILENO);
+        dup2(opts->pty_slave_fd, STDERR_FILENO);
+    }
+    if (opts->pty_slave_fd > STDERR_FILENO)
+    {
+        close(opts->pty_slave_fd);
+    }
+}
+
+static int apply_seccomp_profile(const char* profile_path);
+static int apply_seccomp_profile_json(char* json);
+
+/*
+ * Install --seccomp-profile in the process about to exec container code.
+ *
+ * This is deliberately the last step before execve, as in runc: a profile
+ * is usually an allowlist (--gen-seccomp output is one), and everything the
+ * loader itself still does after installing it — the uid switch, capset,
+ * setsid, LSM labels — would otherwise have to be in the profile too.  The
+ * default denylist filter has no such problem and stays installed earlier
+ * by container_main(), where it also covers the --init/--restart PID 1.
+ */
+static int install_workload_seccomp_profile(const struct container_opts* opts)
+{
+    if (!opts->seccomp_profile || opts->no_seccomp || opts->gdb ||
+            opts->gen_seccomp)
+    {
+        return 0;
+    }
+    int rc;
+    if (opts->seccomp_profile_json)
+    {
+        char* json = strdup(opts->seccomp_profile_json);
+        if (!json)
+        {
+            fprintf(stderr, "oci2bin: --seccomp-profile: out of memory\n");
+            return -1;
+        }
+        rc = apply_seccomp_profile_json(json);
+    }
+    else
+    {
+        rc = apply_seccomp_profile(opts->seccomp_profile);
+    }
+    if (rc < 0)
+    {
+        /* --seccomp-profile is explicit: running the workload under the
+         * built-in defaults instead would leave it less restricted than the
+         * caller asked for. */
+        fprintf(stderr,
+                "oci2bin: --seccomp-profile %s failed to load or apply;"
+                " refusing to fall back to default filter\n",
+                opts->seccomp_profile);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Everything that must hold for the process that execs container code, in
+ * one place so the direct path, the --init/--restart children and health
+ * probes cannot drift apart: uid/gid switch, --cap-add ambient raise,
+ * (for the workload, not probes) the PTY, LSM labels and non-dumpable flag,
+ * and finally --seccomp-profile.  `id` may be NULL, in which case only an
+ * explicit --user is honoured.
+ * Returns 0, or -1 when the process must not exec.
+ */
+static int enter_workload_context(const struct container_opts* opts,
+                                  const struct workload_ident* id,
+                                  int is_probe)
+{
+    struct workload_ident fallback;
+    if (!id)
+    {
+        resolve_workload_ident(opts, NULL, &fallback);
+        id = &fallback;
+    }
+    if (drop_workload_identity(opts, id) < 0)
+    {
+        return -1;
+    }
+    if (raise_added_capabilities(opts) < 0 && opts->strict)
+    {
+        fprintf(stderr,
+                "oci2bin: --strict: aborting because the kernel rejected"
+                " a requested capability change\n");
+        return -1;
+    }
+    if (!is_probe)
+    {
+        claim_pty_slave(opts);
+        if (apply_security_labels(opts) < 0)
+        {
+            return -1;
+        }
+        /* Non-dumpable until exec: keeps same-uid host processes out of this
+         * loader's /proc/<pid>/mem while it may still hold decrypted keys or
+         * secrets.  Set after the uid switch, which would reset it.  This
+         * does NOT protect the workload — execve of a non-setuid binary
+         * resets dumpable, so the exec'd process is ptrace-able as usual by
+         * anything with rights over its user namespace. */
+        if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: warning: PR_SET_DUMPABLE 0 failed: %s\n",
+                    strerror(errno));
+        }
+    }
+    return install_workload_seccomp_profile(opts);
 }
 
 /* ── init reaper ─────────────────────────────────────────────────────────── */
@@ -9302,7 +9820,8 @@ static void init_forward_signal(int sig)
  * once. Must be called AFTER seccomp/capability setup.
  */
 static pid_t spawn_workload(char** exec_args,
-                            const struct container_opts* opts)
+                            const struct container_opts* opts,
+                            const struct workload_ident* id)
 {
     pid_t child = fork();
     if (child < 0)
@@ -9319,15 +9838,10 @@ static pid_t spawn_workload(char** exec_args,
         signal(SIGHUP, SIG_DFL);
         signal(SIGUSR1, SIG_DFL);
         signal(SIGUSR2, SIG_DFL);
-        if (opts->has_user)
+        audit_emit_exec_event(exec_args[0]);
+        if (enter_workload_context(opts, id, 0) < 0)
         {
-            if (setgroups(0, NULL) < 0
-                    || setgid(opts->run_gid) < 0
-                    || setuid(opts->run_uid) < 0)
-            {
-                perror("oci2bin: workload setuid/setgid");
-                _exit(1);
-            }
+            _exit(1);
         }
         execvp(exec_args[0], exec_args);
         perror("execvp");
@@ -9340,12 +9854,13 @@ static pid_t spawn_workload(char** exec_args,
  * run_as_init: fork the entrypoint as a child, then loop reaping all zombies.
  * Returns the child's exit code, or 1 on fork failure.
  * Must be called AFTER seccomp/capability setup (both apply to parent+child).
- * The --user UID drop is applied only in the child.
+ * The UID drop, PTY and LSM labels are applied only in the child.
  */
 static int run_as_init(char** exec_args,
-                       const struct container_opts* opts)
+                       const struct container_opts* opts,
+                       const struct workload_ident* id)
 {
-    pid_t child = spawn_workload(exec_args, opts);
+    pid_t child = spawn_workload(exec_args, opts, id);
     if (child < 0)
     {
         return 1;
@@ -9614,8 +10129,13 @@ static void free_health_state(struct health_state* hs)
  * Run one health probe.  Returns 0 (healthy) when the probe command exits 0,
  * or 1 (unhealthy) on non-zero exit, exec failure, or timeout.  Probe stdio
  * is connected to /dev/null so the workload's own output is not polluted.
+ * The probe runs as the workload user, like Docker's HEALTHCHECK: running it
+ * as in-container root would hand root to anything the workload user can
+ * place on PATH.
  */
-static int run_health_probe(char* const argv[], long timeout_s)
+static int run_health_probe(char* const argv[], long timeout_s,
+                            const struct container_opts* opts,
+                            const struct workload_ident* id)
 {
     pid_t pid = fork();
     if (pid < 0)
@@ -9634,6 +10154,10 @@ static int run_health_probe(char* const argv[], long timeout_s)
             {
                 close(devnull);
             }
+        }
+        if (enter_workload_context(opts, id, 1) < 0)
+        {
+            _exit(126);
         }
         execvp(argv[0], argv);
         _exit(127);
@@ -9695,9 +10219,14 @@ static void supervise_forward_signal(int sig)
  * when health monitoring is enabled, probe it on its interval.  Reaps orphaned
  * grandchildren like the --init reaper.  Returns the workload's last exit code.
  */
+/* Grace period between the SIGTERM sent to an unhealthy workload and the
+ * SIGKILL that follows if it has not exited (Docker's stop timeout). */
+#define SUPERVISE_KILL_GRACE_S 10
+
 static int run_supervised(char** exec_args,
                           const struct container_opts* opts,
-                          const struct health_state* hs)
+                          const struct health_state* hs,
+                          const struct workload_ident* id)
 {
     g_supervise_stop = 0;
     g_init_child_pid = 0;
@@ -9718,7 +10247,7 @@ static int run_supervised(char** exec_args,
 
     for (;;)
     {
-        pid_t child = spawn_workload(exec_args, opts);
+        pid_t child = spawn_workload(exec_args, opts, id);
         if (child < 0)
         {
             return 1;
@@ -9739,6 +10268,7 @@ static int run_supervised(char** exec_args,
         int    consec_fail  = 0;
         int    cur_health   = 0; /* 0 unknown, 1 healthy, 2 unhealthy */
         int    health_acted = 0;
+        time_t term_sent    = 0;
         int    status       = 0;
         int    got_child    = 0;
 
@@ -9767,7 +10297,15 @@ static int run_supervised(char** exec_args,
                     break;
                 }
             }
-            /* r == 0: workload still running */
+            /* r == 0: workload still running.  A workload that traps the
+             * SIGTERM sent for failing health checks is killed after the
+             * grace period instead of hanging the supervisor forever. */
+            if (health_acted && term_sent > 0
+                    && time(NULL) - term_sent >= SUPERVISE_KILL_GRACE_S)
+            {
+                kill(child, SIGKILL);
+                term_sent = 0;
+            }
             if (hs && hs->enabled && !health_acted)
             {
                 time_t now = time(NULL);
@@ -9775,7 +10313,8 @@ static int run_supervised(char** exec_args,
                         && (now - last_probe) >= hs->interval_s)
                 {
                     last_probe = now;
-                    int probe  = run_health_probe(hs->argv, hs->timeout_s);
+                    int probe  = run_health_probe(hs->argv, hs->timeout_s,
+                                                  opts, id);
                     if (probe == 0)
                     {
                         consec_fail = 0;
@@ -9805,6 +10344,7 @@ static int run_supervised(char** exec_args,
                             {
                                 kill(child, SIGTERM);
                                 health_acted = 1;
+                                term_sent    = time(NULL);
                             }
                         }
                     }
@@ -9864,9 +10404,17 @@ static int run_supervised(char** exec_args,
                 "oci2bin: restarting container (policy attempt %d, "
                 "last exit %d)\n",
                 restart_count, last_code);
-        /* Brief backoff to avoid a hot crash loop. */
+        /* Brief backoff to avoid a hot crash loop.  A stop signal landing
+         * here interrupts the sleep (no SA_RESTART for nanosleep) and must
+         * end the loop instead of starting another workload. */
         struct timespec bo = {1, 0};
-        nanosleep(&bo, NULL);
+        while (!g_supervise_stop && nanosleep(&bo, &bo) < 0 && errno == EINTR)
+        {
+        }
+        if (g_supervise_stop)
+        {
+            break;
+        }
     }
 
     return last_code;
@@ -9878,36 +10426,39 @@ static int run_supervised(char** exec_args,
  * the kernel can pin the inode, then calls landlock_add_rule.  The fd is
  * closed before returning.  Returns 0 on success or -1 (errno set) on failure.
  */
+static int landlock_add_fd_rule(int rs_fd, int fd,
+                                unsigned long long allowed_access)
+{
+#ifdef __NR_landlock_add_rule
+    struct landlock_path_beneath_attr pb;
+    memset(&pb, 0, sizeof(pb));
+    pb.allowed_access = allowed_access;
+    pb.parent_fd      = fd;
+    return syscall(__NR_landlock_add_rule, rs_fd,
+                   (unsigned long)LANDLOCK_RULE_PATH_BENEATH,
+                   &pb, 0UL) < 0 ? -1 : 0;
+#else
+    (void)rs_fd;
+    (void)fd;
+    (void)allowed_access;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
 static int landlock_add_path_rule(int rs_fd, const char* path,
                                   unsigned long long allowed_access)
 {
-#ifdef __NR_landlock_add_rule
     int parent_fd = open(path, O_PATH | O_CLOEXEC);
     if (parent_fd < 0)
     {
         return -1;
     }
-    struct landlock_path_beneath_attr pb;
-    pb.allowed_access = allowed_access;
-    pb.parent_fd      = parent_fd;
-    long rc = syscall(__NR_landlock_add_rule, rs_fd,
-                      (unsigned long)LANDLOCK_RULE_PATH_BENEATH,
-                      &pb, 0UL);
+    int rc    = landlock_add_fd_rule(rs_fd, parent_fd, allowed_access);
     int saved = errno;
     close(parent_fd);
-    if (rc < 0)
-    {
-        errno = saved;
-        return -1;
-    }
-    return 0;
-#else
-    (void)rs_fd;
-    (void)path;
-    (void)allowed_access;
-    errno = ENOSYS;
-    return -1;
-#endif
+    errno = saved;
+    return rc;
 }
 
 /*
@@ -9983,7 +10534,28 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
         LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
         LANDLOCK_ACCESS_FS_MAKE_SYM;
 
+    /* REFER is special: it is denied by every ruleset whether handled or
+     * not, so leaving it out made every cross-directory rename()/link()
+     * fail with EXDEV (os.replace, dpkg staging, ...).  Handle it — and the
+     * later rights — on kernels that know them, and grant them on the rules
+     * below like the rest. */
+    long abi = syscall(__NR_landlock_create_ruleset, NULL, 0UL,
+                       (unsigned long)LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi >= 2)
+    {
+        handled |= LANDLOCK_ACCESS_FS_REFER;
+    }
+    if (abi >= 3)
+    {
+        handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+    if (abi >= 5)
+    {
+        handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+
     struct landlock_ruleset_attr ra;
+    memset(&ra, 0, sizeof(ra));
     ra.handled_access_fs = handled;
 
     int rs_fd = (int)syscall(__NR_landlock_create_ruleset, &ra,
@@ -10051,6 +10623,50 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
             {
                 debug_log("landlock.secret", "skip %s: %s",
                           p, strerror(errno));
+            }
+        }
+    }
+
+    /* The workload's stdio (and the PTY slave that becomes its stdio) may be
+     * host files or a host terminal, outside every rule above.  Writing to
+     * the inherited fds needs no rule, but /dev/stdout, /dev/stderr and
+     * /dev/stdin are links to /proc/self/fd/N and re-open the file — which
+     * Landlock would deny (nginx's error.log -> /dev/stderr).  Grant exactly
+     * those files the matching direction.  Pipes and sockets are not
+     * path-based and are refused by the kernel here; that is fine. */
+    {
+        int stdio_fds[4] = {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO,
+                            opts->pty_slave_fd
+                           };
+        for (int i = 0; i < 4; i++)
+        {
+            struct stat fst;
+            if (stdio_fds[i] < 0 || fstat(stdio_fds[i], &fst) < 0 ||
+                    (!S_ISREG(fst.st_mode) && !S_ISCHR(fst.st_mode)))
+            {
+                continue;
+            }
+            unsigned long long acc = (i == 0) ? LANDLOCK_ACCESS_FS_READ_FILE
+                                     : LANDLOCK_ACCESS_FS_WRITE_FILE;
+            if (i == 3)
+            {
+                acc = LANDLOCK_ACCESS_FS_READ_FILE |
+                      LANDLOCK_ACCESS_FS_WRITE_FILE;
+            }
+            if (S_ISCHR(fst.st_mode))
+            {
+                acc |= handled & LANDLOCK_ACCESS_FS_IOCTL_DEV;
+            }
+            else if (acc & LANDLOCK_ACCESS_FS_WRITE_FILE)
+            {
+                /* `>/dev/stdout` opens with O_TRUNC; on ABI 3+ that needs
+                 * TRUNCATE when stdout is a regular (log) file. */
+                acc |= handled & LANDLOCK_ACCESS_FS_TRUNCATE;
+            }
+            if (landlock_add_fd_rule(rs_fd, stdio_fds[i], acc) < 0 && g_debug)
+            {
+                debug_log("landlock.stdio", "skip fd %d: %s", stdio_fds[i],
+                          strerror(errno));
             }
         }
     }
@@ -10230,15 +10846,64 @@ static int apply_seccomp_filter(void)
         BPF_STMT(BPF_RET | BPF_K, SC_ALLOW),
     };
 
-#undef BPF_BLOCK
-#undef SC_ALLOW
-#undef SC_KILL
-
+#ifdef __x86_64__
+    /*
+     * i386 (int 0x80 / 32-bit binaries) reports AUDIT_ARCH_I386 and its own
+     * syscall numbers, so the native rules above cannot apply to it and the
+     * prologue kills it — which also killed every legitimate 32-bit helper.
+     * Give it the same denylist in i386 numbering instead (numbers from
+     * arch/x86/entry/syscalls/syscall_32.tbl; there is no kexec_file_load).
+     */
+    static const struct sock_filter i386_block[] =
+    {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+        (offsetof(struct seccomp_data, nr))),
+            BPF_BLOCK(283), /* kexec_load */
+            BPF_BLOCK(88),  /* reboot */
+            BPF_BLOCK(103), /* syslog */
+            BPF_BLOCK(336), /* perf_event_open */
+            BPF_BLOCK(357), /* bpf */
+            BPF_BLOCK(286), /* add_key */
+            BPF_BLOCK(287), /* request_key */
+            BPF_BLOCK(288), /* keyctl */
+            BPF_BLOCK(374), /* userfaultfd */
+            BPF_BLOCK(169), /* nfsservctl */
+            BPF_BLOCK(217), /* pivot_root */
+            BPF_BLOCK(26),  /* ptrace */
+            BPF_BLOCK(347), /* process_vm_readv */
+            BPF_BLOCK(348), /* process_vm_writev */
+            BPF_BLOCK(128), /* init_module */
+            BPF_BLOCK(350), /* finit_module */
+            BPF_STMT(BPF_RET | BPF_K, SC_ALLOW),
+        };
+    enum { N_I386 = sizeof(i386_block) / sizeof(i386_block[0]),
+           N_NATIVE = sizeof(filter) / sizeof(filter[0])
+         };
+    /* [LD arch][JEQ I386 ? fall into i386_block : skip it] then the native
+     * program, whose own prologue re-loads and pins the arch. */
+    struct sock_filter combined[2 + N_I386 + N_NATIVE];
+    combined[0] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                  (offsetof(struct seccomp_data, arch)));
+    combined[1] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                  AUDIT_ARCH_I386, 0, N_I386);
+    memcpy(&combined[2], i386_block, sizeof(i386_block));
+    memcpy(&combined[2 + N_I386], filter, sizeof(filter));
+    struct sock_fprog prog =
+    {
+        .len    = (unsigned short)(sizeof(combined) / sizeof(combined[0])),
+        .filter = combined,
+    };
+#else
     struct sock_fprog prog =
     {
         .len    = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
         .filter = filter,
     };
+#endif
+
+#undef BPF_BLOCK
+#undef SC_ALLOW
+#undef SC_KILL
 
     int nnp_failed = 0;
     int seccomp_failed = 0;
@@ -10290,7 +10955,7 @@ static int apply_seccomp_filter(void)
  * For defaultAction=ALLOW we emit BPF_BLOCK for each denied syscall.
  * For defaultAction=KILL/ERRNO we build an allowlist (more complex BPF).
  *
- * To keep the BPF program size reasonable we limit to at most 256 syscall
+ * To keep the BPF program size reasonable we limit to at most 512 syscall
  * rules.  PR_SET_NO_NEW_PRIVS is always set.
  *
  * Returns 0 on success, -1 on error (non-fatal: caller should warn and
@@ -11073,6 +11738,423 @@ static const struct sc_entry g_syscall_table[] =
 #ifdef __NR_landlock_restrict_self
     S(landlock_restrict_self),
 #endif
+#ifdef __NR_add_key
+    S(add_key),
+#endif
+#ifdef __NR_adjtimex
+    S(adjtimex),
+#endif
+#ifdef __NR_afs_syscall
+    S(afs_syscall),
+#endif
+#ifdef __NR_bpf
+    S(bpf),
+#endif
+#ifdef __NR_cachestat
+    S(cachestat),
+#endif
+#ifdef __NR_capget
+    S(capget),
+#endif
+#ifdef __NR_capset
+    S(capset),
+#endif
+#ifdef __NR_clock_adjtime64
+    S(clock_adjtime64),
+#endif
+#ifdef __NR_clock_gettime64
+    S(clock_gettime64),
+#endif
+#ifdef __NR_clock_settime64
+    S(clock_settime64),
+#endif
+#ifdef __NR_create_module
+    S(create_module),
+#endif
+#ifdef __NR_delete_module
+    S(delete_module),
+#endif
+#ifdef __NR_epoll_pwait2
+    S(epoll_pwait2),
+#endif
+#ifdef __NR_fchmodat2
+    S(fchmodat2),
+#endif
+#ifdef __NR_fgetxattr
+    S(fgetxattr),
+#endif
+#ifdef __NR_file_getattr
+    S(file_getattr),
+#endif
+#ifdef __NR_file_setattr
+    S(file_setattr),
+#endif
+#ifdef __NR_flistxattr
+    S(flistxattr),
+#endif
+#ifdef __NR_fremovexattr
+    S(fremovexattr),
+#endif
+#ifdef __NR_fsconfig
+    S(fsconfig),
+#endif
+#ifdef __NR_fsetxattr
+    S(fsetxattr),
+#endif
+#ifdef __NR_fsmount
+    S(fsmount),
+#endif
+#ifdef __NR_fsopen
+    S(fsopen),
+#endif
+#ifdef __NR_fspick
+    S(fspick),
+#endif
+#ifdef __NR_fstatat
+    S(fstatat),
+#endif
+#ifdef __NR_futex_requeue
+    S(futex_requeue),
+#endif
+#ifdef __NR_futex_wait
+    S(futex_wait),
+#endif
+#ifdef __NR_futex_waitv
+    S(futex_waitv),
+#endif
+#ifdef __NR_futex_wake
+    S(futex_wake),
+#endif
+#ifdef __NR_getdents64
+    S(getdents64),
+#endif
+#ifdef __NR_get_kernel_syms
+    S(get_kernel_syms),
+#endif
+#ifdef __NR_getpmsg
+    S(getpmsg),
+#endif
+#ifdef __NR_getxattr
+    S(getxattr),
+#endif
+#ifdef __NR_getxattrat
+    S(getxattrat),
+#endif
+#ifdef __NR_init_module
+    S(init_module),
+#endif
+#ifdef __NR_io_cancel
+    S(io_cancel),
+#endif
+#ifdef __NR_io_destroy
+    S(io_destroy),
+#endif
+#ifdef __NR_io_getevents
+    S(io_getevents),
+#endif
+#ifdef __NR_ioperm
+    S(ioperm),
+#endif
+#ifdef __NR_io_pgetevents
+    S(io_pgetevents),
+#endif
+#ifdef __NR_iopl
+    S(iopl),
+#endif
+#ifdef __NR_io_setup
+    S(io_setup),
+#endif
+#ifdef __NR_io_submit
+    S(io_submit),
+#endif
+#ifdef __NR_kexec_file_load
+    S(kexec_file_load),
+#endif
+#ifdef __NR_kexec_load
+    S(kexec_load),
+#endif
+#ifdef __NR_keyctl
+    S(keyctl),
+#endif
+#ifdef __NR_lgetxattr
+    S(lgetxattr),
+#endif
+#ifdef __NR_listmount
+    S(listmount),
+#endif
+#ifdef __NR_listns
+    S(listns),
+#endif
+#ifdef __NR_listxattr
+    S(listxattr),
+#endif
+#ifdef __NR_listxattrat
+    S(listxattrat),
+#endif
+#ifdef __NR_llistxattr
+    S(llistxattr),
+#endif
+#ifdef __NR_lookup_dcookie
+    S(lookup_dcookie),
+#endif
+#ifdef __NR_lremovexattr
+    S(lremovexattr),
+#endif
+#ifdef __NR_lsetxattr
+    S(lsetxattr),
+#endif
+#ifdef __NR_lsm_get_self_attr
+    S(lsm_get_self_attr),
+#endif
+#ifdef __NR_lsm_list_modules
+    S(lsm_list_modules),
+#endif
+#ifdef __NR_lsm_set_self_attr
+    S(lsm_set_self_attr),
+#endif
+#ifdef __NR_map_shadow_stack
+    S(map_shadow_stack),
+#endif
+#ifdef __NR_membarrier
+    S(membarrier),
+#endif
+#ifdef __NR_memfd_secret
+    S(memfd_secret),
+#endif
+#ifdef __NR_migrate_pages
+    S(migrate_pages),
+#endif
+#ifdef __NR_mlock2
+    S(mlock2),
+#endif
+#ifdef __NR_modify_ldt
+    S(modify_ldt),
+#endif
+#ifdef __NR_mount_setattr
+    S(mount_setattr),
+#endif
+#ifdef __NR_move_mount
+    S(move_mount),
+#endif
+#ifdef __NR_mq_getsetattr
+    S(mq_getsetattr),
+#endif
+#ifdef __NR_mq_notify
+    S(mq_notify),
+#endif
+#ifdef __NR_mq_open
+    S(mq_open),
+#endif
+#ifdef __NR_mq_timedreceive
+    S(mq_timedreceive),
+#endif
+#ifdef __NR_mq_timedsend
+    S(mq_timedsend),
+#endif
+#ifdef __NR_mq_unlink
+    S(mq_unlink),
+#endif
+#ifdef __NR_mseal
+    S(mseal),
+#endif
+#ifdef __NR_msgctl
+    S(msgctl),
+#endif
+#ifdef __NR_msgget
+    S(msgget),
+#endif
+#ifdef __NR_msgrcv
+    S(msgrcv),
+#endif
+#ifdef __NR_msgsnd
+    S(msgsnd),
+#endif
+#ifdef __NR_nfsservctl
+    S(nfsservctl),
+#endif
+#ifdef __NR_open_tree
+    S(open_tree),
+#endif
+#ifdef __NR_open_tree_attr
+    S(open_tree_attr),
+#endif
+#ifdef __NR_perf_event_open
+    S(perf_event_open),
+#endif
+#ifdef __NR_pidfd_getfd
+    S(pidfd_getfd),
+#endif
+#ifdef __NR_pidfd_open
+    S(pidfd_open),
+#endif
+#ifdef __NR_pidfd_send_signal
+    S(pidfd_send_signal),
+#endif
+#ifdef __NR_pivot_root
+    S(pivot_root),
+#endif
+#ifdef __NR_pkey_alloc
+    S(pkey_alloc),
+#endif
+#ifdef __NR_pkey_free
+    S(pkey_free),
+#endif
+#ifdef __NR_pkey_mprotect
+    S(pkey_mprotect),
+#endif
+#ifdef __NR_process_madvise
+    S(process_madvise),
+#endif
+#ifdef __NR_process_mrelease
+    S(process_mrelease),
+#endif
+#ifdef __NR_ptrace
+    S(ptrace),
+#endif
+#ifdef __NR_putpmsg
+    S(putpmsg),
+#endif
+#ifdef __NR_query_module
+    S(query_module),
+#endif
+#ifdef __NR_quotactl
+    S(quotactl),
+#endif
+#ifdef __NR_quotactl_fd
+    S(quotactl_fd),
+#endif
+#ifdef __NR_readahead
+    S(readahead),
+#endif
+#ifdef __NR_reboot
+    S(reboot),
+#endif
+#ifdef __NR_recvmmsg
+    S(recvmmsg),
+#endif
+#ifdef __NR_remap_file_pages
+    S(remap_file_pages),
+#endif
+#ifdef __NR_removexattr
+    S(removexattr),
+#endif
+#ifdef __NR_removexattrat
+    S(removexattrat),
+#endif
+#ifdef __NR_request_key
+    S(request_key),
+#endif
+#ifdef __NR_rseq
+    S(rseq),
+#endif
+#ifdef __NR_rseq_slice_yield
+    S(rseq_slice_yield),
+#endif
+#ifdef __NR_rt_sigpending
+    S(rt_sigpending),
+#endif
+#ifdef __NR_rt_sigqueueinfo
+    S(rt_sigqueueinfo),
+#endif
+#ifdef __NR_rt_sigtimedwait
+    S(rt_sigtimedwait),
+#endif
+#ifdef __NR_security
+    S(security),
+#endif
+#ifdef __NR_semctl
+    S(semctl),
+#endif
+#ifdef __NR_semget
+    S(semget),
+#endif
+#ifdef __NR_semop
+    S(semop),
+#endif
+#ifdef __NR_setdomainname
+    S(setdomainname),
+#endif
+#ifdef __NR_sethostname
+    S(sethostname),
+#endif
+#ifdef __NR_set_mempolicy_home_node
+    S(set_mempolicy_home_node),
+#endif
+#ifdef __NR_settimeofday
+    S(settimeofday),
+#endif
+#ifdef __NR_setxattr
+    S(setxattr),
+#endif
+#ifdef __NR_setxattrat
+    S(setxattrat),
+#endif
+#ifdef __NR_shmat
+    S(shmat),
+#endif
+#ifdef __NR_shmctl
+    S(shmctl),
+#endif
+#ifdef __NR_shmdt
+    S(shmdt),
+#endif
+#ifdef __NR_shmget
+    S(shmget),
+#endif
+#ifdef __NR_statmount
+    S(statmount),
+#endif
+#ifdef __NR_sync_file_range2
+    S(sync_file_range2),
+#endif
+#ifdef __NR__sysctl
+    S(_sysctl),
+#endif
+#ifdef __NR_sysfs
+    S(sysfs),
+#endif
+#ifdef __NR_time
+    S(time),
+#endif
+#ifdef __NR_timerfd_gettime64
+    S(timerfd_gettime64),
+#endif
+#ifdef __NR_timerfd_settime64
+    S(timerfd_settime64),
+#endif
+#ifdef __NR_timer_gettime64
+    S(timer_gettime64),
+#endif
+#ifdef __NR_timer_settime64
+    S(timer_settime64),
+#endif
+#ifdef __NR_tkill
+    S(tkill),
+#endif
+#ifdef __NR_tuxcall
+    S(tuxcall),
+#endif
+#ifdef __NR_uprobe
+    S(uprobe),
+#endif
+#ifdef __NR_uretprobe
+    S(uretprobe),
+#endif
+#ifdef __NR_uselib
+    S(uselib),
+#endif
+#ifdef __NR_userfaultfd
+    S(userfaultfd),
+#endif
+#ifdef __NR_ustat
+    S(ustat),
+#endif
+#ifdef __NR_utime
+    S(utime),
+#endif
+#ifdef __NR_vserver
+    S(vserver),
+#endif
 #undef S
 };
 
@@ -11279,7 +12361,8 @@ static void gs_pid_toggle(struct gs_pid_state* states, int n, pid_t pid)
  * makes, then write a Docker-compatible JSON allowlist to out_path.
  * Returns the child's exit code (or 1 on tracer error).
  */
-static int do_gen_seccomp(const char* out_path, char* const* exec_args)
+static int do_gen_seccomp(const char* out_path, int out_fd,
+                          char* const* exec_args)
 {
     /* Bitset: seen[nr/8] bit (nr%8) = syscall nr was observed */
     unsigned char seen[64];
@@ -11470,6 +12553,12 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
         }
     }
 
+    /* The profile is installed right before execve, so the exec itself
+     * runs under it; the tracer only starts seeing syscalls after it. */
+#ifdef __NR_execve
+    seen[__NR_execve / 8] |= (unsigned char)(1u << (__NR_execve % 8));
+#endif
+
     /* Map observed syscall numbers to names via g_syscall_table */
     const char* names[512];
     int         n_names = 0;
@@ -11480,6 +12569,7 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
         {
             continue;
         }
+        int found = 0;
         for (int i = 0; i < g_syscall_table_size; i++)
         {
             if (g_syscall_table[i].nr == nr)
@@ -11488,13 +12578,23 @@ static int do_gen_seccomp(const char* out_path, char* const* exec_args)
                 {
                     names[n_names++] = g_syscall_table[i].name;
                 }
+                found = 1;
                 break;
             }
+        }
+        if (!found)
+        {
+            /* A syscall the profile cannot name stays denied on replay —
+             * say which one instead of producing a profile that silently
+             * breaks the program it was generated from. */
+            fprintf(stderr,
+                    "oci2bin: --gen-seccomp: warning: syscall %d has no"
+                    " name in this loader's table; it will be denied\n", nr);
         }
     }
 
     /* Emit Docker-compatible JSON seccomp profile */
-    FILE* f = fopen(out_path, "w");
+    FILE* f = out_fd >= 0 ? fdopen(out_fd, "w") : fopen(out_path, "w");
     if (!f)
     {
         fprintf(stderr, "oci2bin: --gen-seccomp: cannot write %s: %s\n",
@@ -11866,9 +12966,24 @@ static int seccomp_profile_check_supported(const char* json)
                     " \"architectures\" that do not include %s\n", self_arch);
             return -1;
         }
+#ifdef __x86_64__
+        /* The profile builder only knows native syscall numbers, so its
+         * program kills every i386 call. That is stricter than the profile,
+         * not weaker, but it breaks 32-bit helpers the profile meant to
+         * allow — say so instead of letting them die unexplained. */
+        if (strstr(json, "\"SCMP_ARCH_X86\""))
+        {
+            fprintf(stderr,
+                    "oci2bin: --seccomp-profile: warning: SCMP_ARCH_X86 rules"
+                    " are not implemented; 32-bit (i386) syscalls will be"
+                    " killed\n");
+        }
+#endif
     }
     return 0;
 }
+
+static int apply_seccomp_profile_json(char* json);
 
 /*
  * Apply a Docker-compatible JSON seccomp profile.
@@ -11884,7 +12999,12 @@ static int apply_seccomp_profile(const char* profile_path)
                 profile_path, strerror(errno));
         return -1;
     }
+    return apply_seccomp_profile_json(json);
+}
 
+/* Same, from the profile text; takes ownership of (and frees) `json`. */
+static int apply_seccomp_profile_json(char* json)
+{
     if (seccomp_profile_check_supported(json) < 0)
     {
         free(json);
@@ -11905,8 +13025,9 @@ static int apply_seccomp_profile(const char* profile_path)
     int default_is_allow = (strstr(default_action_str, "ALLOW") != NULL);
     free(default_action_str);
 
-    /* We support up to 256 syscall numbers from the profile */
-    int listed_nrs[256];
+    /* Up to 512 syscall numbers from the profile — room for every name in
+     * g_syscall_table, so a --gen-seccomp profile always loads back. */
+    int listed_nrs[512];
     int n_listed = 0;
     int listed_is_allow = -1; /* -1 = unset; 0 = deny; 1 = allow */
     int mixed_actions   = 0;  /* set if profile has conflicting entry actions */
@@ -12276,15 +13397,22 @@ static void relay_pty(int master_fd, struct termios *saved_termios,
             break;
         }
 
-        /* stdin → master: user keystrokes into container */
+        /* stdin → master: user keystrokes into container.  EOF on stdin
+         * (`-t </dev/null`, a systemd unit) only ends the input side; the
+         * workload keeps running and its output keeps flowing.  Short writes
+         * are completed so pasted input is not dropped. */
         if (fds[0].revents & POLLIN)
         {
             ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+            if (r < 0 && errno == EINTR)
+            {
+                continue;
+            }
             if (r <= 0)
             {
-                break;
+                fds[0].fd = -1;
             }
-            if (write(master_fd, buf, r) < 0)
+            else if (write_all_fd(master_fd, buf, (size_t)r) < 0)
             {
                 break;
             }
@@ -12298,15 +13426,9 @@ static void relay_pty(int master_fd, struct termios *saved_termios,
             {
                 break;
             }
-            ssize_t w = 0;
-            while (w < r)
+            if (write_all_fd(STDOUT_FILENO, buf, (size_t)r) < 0)
             {
-                ssize_t ww = write(STDOUT_FILENO, buf + w, r - w);
-                if (ww < 0)
-                {
-                    goto done;
-                }
-                w += ww;
+                goto done;
             }
         }
 
@@ -12327,15 +13449,9 @@ static void relay_pty(int master_fd, struct termios *saved_termios,
                 {
                     break;
                 }
-                ssize_t w = 0;
-                while (w < r)
+                if (write_all_fd(STDOUT_FILENO, buf, (size_t)r) < 0)
                 {
-                    ssize_t ww = write(STDOUT_FILENO, buf + w, r - w);
-                    if (ww < 0)
-                    {
-                        goto done;
-                    }
-                    w += ww;
+                    goto done;
                 }
             }
             break;
@@ -12469,6 +13585,186 @@ static int make_mount_tree_private(void)
                 "oci2bin: make mount namespace private failed: %s\n",
                 strerror(errno));
         return -1;
+    }
+    return 0;
+}
+
+/*
+ * Make `rootfs` the root of this mount namespace.
+ *
+ * pivot_root + detaching the old root, not chroot: a chroot leaves the host
+ * tree mounted beneath the container, and a workload holding CAP_SYS_CHROOT
+ * (kept by default) can walk back out to it with the classic
+ * chroot-then-chdir("..") escape.  After the pivot the host tree is simply
+ * not in the namespace any more.
+ *
+ * /proc is mounted before the pivot: the kernel only allows a new procfs in
+ * a user namespace while a fully visible one exists in the mount namespace,
+ * and the host's goes away with the old root.
+ *
+ * Falls back to chroot only when pivot_root is impossible (EINVAL: e.g. the
+ * host root is an initramfs), with a warning; --strict refuses instead.
+ */
+static int enter_rootfs(const char* rootfs, const struct container_opts* opts)
+{
+    /* pivot_root re-roots every process in the mount namespace whose root is
+     * the old one — and the parent loader, its slirp/pasta and metrics
+     * helpers share this namespace.  Take a private copy first so only the
+     * container moves; the parent keeps the host view it cleans up with. */
+    if (unshare(CLONE_NEWNS) < 0)
+    {
+        fprintf(stderr, "oci2bin: unshare(CLONE_NEWNS) for pivot_root: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    if (make_mount_tree_private() < 0)
+    {
+        return -1;
+    }
+    /* pivot_root needs the new root to be a mount point.  --read-only has
+     * already made it one (and a second bind would keep its flags anyway). */
+    if (!opts->read_only &&
+            mount(rootfs, rootfs, NULL, MS_BIND | MS_REC, NULL) < 0)
+    {
+        fprintf(stderr, "oci2bin: bind rootfs onto itself: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    char proc_dir[PATH_MAX];
+    int  n = snprintf(proc_dir, sizeof(proc_dir), "%s/proc", rootfs);
+    if (n < 0 || (size_t)n >= sizeof(proc_dir))
+    {
+        fprintf(stderr, "oci2bin: /proc path too long\n");
+        return -1;
+    }
+    if (mount("proc", proc_dir, "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              NULL) < 0)
+    {
+        perror("mount /proc (non-fatal)");
+    }
+
+    if (chdir(rootfs) < 0)
+    {
+        fprintf(stderr, "oci2bin: chdir %s: %s\n", rootfs, strerror(errno));
+        return -1;
+    }
+    /* pivot_root(".", "."): the old root ends up stacked on "/" and is
+     * detached right away, leaving only the container tree. */
+    if (syscall(SYS_pivot_root, ".", ".") == 0)
+    {
+        if (umount2(".", MNT_DETACH) < 0)
+        {
+            fprintf(stderr, "oci2bin: detach old root: %s\n",
+                    strerror(errno));
+            return -1;
+        }
+    }
+    else
+    {
+        int saved = errno;
+        if (saved != EINVAL || opts->strict)
+        {
+            fprintf(stderr, "oci2bin: pivot_root: %s\n", strerror(saved));
+            return -1;
+        }
+        fprintf(stderr,
+                "oci2bin: warning: pivot_root not possible here (%s);"
+                " falling back to chroot\n", strerror(saved));
+        if (chroot(".") < 0)
+        {
+            perror("chroot");
+            return -1;
+        }
+    }
+    if (chdir("/") < 0)
+    {
+        perror("chdir /");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * The /dev entries every container runtime provides besides the host device
+ * binds: /dev/shm (its own tmpfs), the /proc/self/fd aliases, and — with a
+ * PTY — /dev/console bound to the PTY slave.  Without them nginx's
+ * `access_log /dev/stdout`, Python multiprocessing and `>/dev/stderr` fail
+ * with ENOENT.  `rootfs` is the pre-chroot path; /dev is already the fresh
+ * tmpfs.  Returns 0, or -1 on a path/mount error.
+ */
+static int populate_dev_standard_nodes(const char* rootfs,
+                                       const struct container_opts* opts)
+{
+    static const struct
+    {
+        const char* link;
+        const char* target;
+    } links[] =
+    {
+        {"/dev/fd", "/proc/self/fd"},
+        {"/dev/stdin", "/proc/self/fd/0"},
+        {"/dev/stdout", "/proc/self/fd/1"},
+        {"/dev/stderr", "/proc/self/fd/2"},
+    };
+    char path[PATH_MAX];
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++)
+    {
+        int n = snprintf(path, sizeof(path), "%s%s", rootfs, links[i].link);
+        if (n < 0 || (size_t)n >= sizeof(path))
+        {
+            fprintf(stderr, "oci2bin: /dev path too long\n");
+            return -1;
+        }
+        if (symlink(links[i].target, path) < 0 && errno != EEXIST)
+        {
+            fprintf(stderr, "oci2bin: symlink %s: %s\n", links[i].link,
+                    strerror(errno));
+            return -1;
+        }
+    }
+
+    int n = snprintf(path, sizeof(path), "%s/dev/shm", rootfs);
+    if (n < 0 || (size_t)n >= sizeof(path))
+    {
+        fprintf(stderr, "oci2bin: /dev/shm path too long\n");
+        return -1;
+    }
+    if (mkdir_p_secure(path, 01777, "/dev/shm") < 0)
+    {
+        return -1;
+    }
+    if (mount("shm", path, "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              "mode=1777,size=65536k") < 0)
+    {
+        fprintf(stderr, "oci2bin: mount /dev/shm: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (opts->pty_slave_fd >= 0)
+    {
+        char src[64];
+        n = snprintf(src, sizeof(src), "/proc/self/fd/%d", opts->pty_slave_fd);
+        if (n < 0 || (size_t)n >= sizeof(src))
+        {
+            return -1;
+        }
+        n = snprintf(path, sizeof(path), "%s/dev/console", rootfs);
+        if (n < 0 || (size_t)n >= sizeof(path))
+        {
+            fprintf(stderr, "oci2bin: /dev/console path too long\n");
+            return -1;
+        }
+        if (ensure_bind_mount_target("/dev/null", path, "/dev/console") < 0)
+        {
+            return -1;
+        }
+        if (mount(src, path, NULL, MS_BIND, NULL) < 0)
+        {
+            fprintf(stderr, "oci2bin: bind /dev/console: %s\n",
+                    strerror(errno));
+            return -1;
+        }
     }
     return 0;
 }
@@ -12648,6 +13944,17 @@ static int container_main(const char* rootfs, struct container_opts *opts)
 {
     debug_log("container_main.begin", "rootfs=%s", rootfs);
 
+    /* Default-deny egress allowlist (--allow-egress): install the nftables
+     * policy in the container's network namespace.  Done here, as PID 1 of
+     * the new pid namespace and before pivot_root (the host nft is still
+     * reachable): run from main(), nft was the first process forked after
+     * unshare(CLONE_NEWPID), became that namespace's init, and its exit left
+     * every later fork failing with ENOMEM.  Fails closed. */
+    if (apply_egress_allowlist(opts, rootfs) != 0)
+    {
+        return 1;
+    }
+
     /* Read OCI image config and build exec argv */
     struct oci_config oci_cfg;
     read_oci_config(rootfs, &oci_cfg);
@@ -12761,6 +14068,152 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Mount tmpfs on rootfs/dev and bind-mount host device nodes.
+     * Must be done before chroot so the host paths are still reachable as
+     * bind-mount sources, and before setup_volumes() so a -v target under
+     * /dev (e.g. -v /dev/shm:/dev/shm) is mounted on top of the fresh tmpfs
+     * rather than hidden beneath it.  After chroot the paths resolve inside the
+     * container and the bind would silently map an empty tmpfs file to
+     * itself instead of the real host device node. */
+    {
+        char dev_dir[PATH_MAX];
+        int dlen = snprintf(dev_dir, sizeof(dev_dir), "%s/dev", rootfs);
+        if (dlen > 0 && (size_t)dlen < sizeof(dev_dir))
+        {
+            if (mkdir_p_secure(dev_dir, 0755, "/dev") < 0)
+            {
+                return 1;
+            }
+            if (mount("tmpfs", dev_dir, "tmpfs",
+                      MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
+            {
+                perror("mount /dev tmpfs (non-fatal)");
+            }
+            else
+            {
+                if (!opts->no_host_dev)
+                {
+                    static const char* const HOST_DEVS[] =
+                    {
+                        "/dev/null", "/dev/zero", "/dev/full",
+                        "/dev/random", "/dev/urandom", "/dev/tty", NULL,
+                    };
+                    for (int di = 0; HOST_DEVS[di]; di++)
+                    {
+                        char dst[PATH_MAX];
+                        int plen = snprintf(dst, sizeof(dst), "%s%s",
+                                            rootfs, HOST_DEVS[di]);
+                        if (plen < 0 || (size_t)plen >= sizeof(dst))
+                        {
+                            continue;
+                        }
+                        if (ensure_bind_mount_target(HOST_DEVS[di], dst,
+                                                     "/dev") < 0)
+                        {
+                            continue;
+                        }
+                        if (mount(HOST_DEVS[di], dst, NULL,
+                                  MS_BIND, NULL) < 0)
+                        {
+                            fprintf(stderr,
+                                    "oci2bin: bind-mount %s"
+                                    " (non-fatal): %s\n",
+                                    HOST_DEVS[di], strerror(errno));
+                        }
+                    }
+                }
+                if (populate_dev_standard_nodes(rootfs, opts) < 0)
+                {
+                    return 1;
+                }
+                /* Create /dev/pts dir; devpts is mounted after chroot */
+                char pts_dir[PATH_MAX];
+                int plen = snprintf(pts_dir, sizeof(pts_dir),
+                                    "%s/dev/pts", rootfs);
+                if (plen > 0 && (size_t)plen < sizeof(pts_dir))
+                {
+                    if (mkdir_p_secure(pts_dir, 0755, "/dev/pts") < 0)
+                    {
+                        return 1;
+                    }
+                }
+                /* Create /dev/ptmx placeholder for post-chroot bind */
+                char ptmx_path[PATH_MAX];
+                int mlen = snprintf(ptmx_path, sizeof(ptmx_path),
+                                    "%s/dev/ptmx", rootfs);
+                if (mlen > 0 && (size_t)mlen < sizeof(ptmx_path))
+                {
+                    if (ensure_bind_mount_target("/dev/null", ptmx_path,
+                                                 "/dev/ptmx") < 0)
+                    {
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Expose --device host devices inside the container.  An explicitly
+     * requested device that cannot be exposed aborts the run.
+     * Must be done PRE-CHROOT so host device paths resolve on the host
+     * filesystem, not inside the container's /dev tmpfs.  Container paths
+     * are prefixed with rootfs so bind-mount targets land in the right place.
+     * stat() and mknod() fallback to bind-mount use the host-side source. */
+    for (int di = 0; di < opts->n_devices; di++)
+    {
+        const char* host_dev = opts->devices[di];
+        const char* ctr_dev  = opts->device_ctr[di]
+                               ? opts->device_ctr[di]
+                               : host_dev;
+
+        struct stat st;
+        if (stat(host_dev, &st) < 0)
+        {
+            fprintf(stderr, "oci2bin: --device stat %s: %s\n",
+                    host_dev, strerror(errno));
+            return 1;
+        }
+
+        /* Destination inside rootfs (pre-chroot path) */
+        char dst[PATH_MAX];
+        int dlen = snprintf(dst, sizeof(dst), "%s%s", rootfs, ctr_dev);
+        if (dlen < 0 || (size_t)dlen >= sizeof(dst))
+        {
+            fprintf(stderr, "oci2bin: --device destination path too long:"
+                            " %s%s\n", rootfs, ctr_dev);
+            return 1;
+        }
+
+        /* Try mknod first; fall back to bind-mount in user namespaces */
+        if (mknod(dst, st.st_mode, st.st_rdev) < 0)
+        {
+            if (errno == EPERM || errno == ENOTSUP)
+            {
+                if (ensure_bind_mount_target(host_dev, dst, "--device") < 0)
+                {
+                    return 1;
+                }
+                if (mount(host_dev, dst, NULL, MS_BIND, NULL) < 0)
+                {
+                    fprintf(stderr,
+                            "oci2bin: --device bind-mount %s→%s: %s\n",
+                            host_dev, ctr_dev, strerror(errno));
+                    return 1;
+                }
+            }
+            else
+            {
+                fprintf(stderr, "oci2bin: --device mknod %s: %s\n",
+                        dst, strerror(errno));
+                return 1;
+            }
+        }
+        else
+        {
+            chmod(dst, st.st_mode & 0777);
+        }
+    }
+
     /* Set up volume bind mounts BEFORE chroot (host paths still reachable).
      * Both fail closed: a requested -v/--secret that cannot be validated or
      * mounted aborts the run rather than starting the workload without it. */
@@ -12841,143 +14294,6 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         install_custom_resolv_conf(rootfs,
                                    opts->dns_servers, opts->n_dns_servers,
                                    opts->dns_search, opts->n_dns_search);
-    }
-
-    /* Mount tmpfs on rootfs/dev and bind-mount host device nodes.
-     * Must be done before chroot so the host paths are still reachable as
-     * bind-mount sources.  After chroot the paths resolve inside the
-     * container and the bind would silently map an empty tmpfs file to
-     * itself instead of the real host device node. */
-    {
-        char dev_dir[PATH_MAX];
-        int dlen = snprintf(dev_dir, sizeof(dev_dir), "%s/dev", rootfs);
-        if (dlen > 0 && (size_t)dlen < sizeof(dev_dir))
-        {
-            if (mkdir_p_secure(dev_dir, 0755, "/dev") < 0)
-            {
-                return 1;
-            }
-            if (mount("tmpfs", dev_dir, "tmpfs",
-                      MS_NOSUID | MS_NOEXEC, "mode=0755") < 0)
-            {
-                perror("mount /dev tmpfs (non-fatal)");
-            }
-            else
-            {
-                if (!opts->no_host_dev)
-                {
-                    static const char* const HOST_DEVS[] =
-                    {
-                        "/dev/null", "/dev/zero", "/dev/random",
-                        "/dev/urandom", "/dev/tty", NULL,
-                    };
-                    for (int di = 0; HOST_DEVS[di]; di++)
-                    {
-                        char dst[PATH_MAX];
-                        int plen = snprintf(dst, sizeof(dst), "%s%s",
-                                            rootfs, HOST_DEVS[di]);
-                        if (plen < 0 || (size_t)plen >= sizeof(dst))
-                        {
-                            continue;
-                        }
-                        if (ensure_bind_mount_target(HOST_DEVS[di], dst,
-                                                     "/dev") < 0)
-                        {
-                            continue;
-                        }
-                        if (mount(HOST_DEVS[di], dst, NULL,
-                                  MS_BIND, NULL) < 0)
-                        {
-                            fprintf(stderr,
-                                    "oci2bin: bind-mount %s"
-                                    " (non-fatal): %s\n",
-                                    HOST_DEVS[di], strerror(errno));
-                        }
-                    }
-                }
-                /* Create /dev/pts dir; devpts is mounted after chroot */
-                char pts_dir[PATH_MAX];
-                int plen = snprintf(pts_dir, sizeof(pts_dir),
-                                    "%s/dev/pts", rootfs);
-                if (plen > 0 && (size_t)plen < sizeof(pts_dir))
-                {
-                    if (mkdir_p_secure(pts_dir, 0755, "/dev/pts") < 0)
-                    {
-                        return 1;
-                    }
-                }
-                /* Create /dev/ptmx placeholder for post-chroot bind */
-                char ptmx_path[PATH_MAX];
-                int mlen = snprintf(ptmx_path, sizeof(ptmx_path),
-                                    "%s/dev/ptmx", rootfs);
-                if (mlen > 0 && (size_t)mlen < sizeof(ptmx_path))
-                {
-                    if (ensure_bind_mount_target("/dev/null", ptmx_path,
-                                                 "/dev/ptmx") < 0)
-                    {
-                        return 1;
-                    }
-                }
-            }
-        }
-    }
-
-    /* Expose --device host devices inside the container.
-     * Must be done PRE-CHROOT so host device paths resolve on the host
-     * filesystem, not inside the container's /dev tmpfs.  Container paths
-     * are prefixed with rootfs so bind-mount targets land in the right place.
-     * stat() and mknod() fallback to bind-mount use the host-side source. */
-    for (int di = 0; di < opts->n_devices; di++)
-    {
-        const char* host_dev = opts->devices[di];
-        const char* ctr_dev  = opts->device_ctr[di]
-                               ? opts->device_ctr[di]
-                               : host_dev;
-
-        struct stat st;
-        if (stat(host_dev, &st) < 0)
-        {
-            fprintf(stderr, "oci2bin: --device stat %s: %s (non-fatal)\n",
-                    host_dev, strerror(errno));
-            continue;
-        }
-
-        /* Destination inside rootfs (pre-chroot path) */
-        char dst[PATH_MAX];
-        int dlen = snprintf(dst, sizeof(dst), "%s%s", rootfs, ctr_dev);
-        if (dlen < 0 || (size_t)dlen >= sizeof(dst))
-        {
-            fprintf(stderr, "oci2bin: --device destination path too long: %s%s"
-                            " (non-fatal)\n", rootfs, ctr_dev);
-            continue;
-        }
-
-        /* Try mknod first; fall back to bind-mount in user namespaces */
-        if (mknod(dst, st.st_mode, st.st_rdev) < 0)
-        {
-            if (errno == EPERM || errno == ENOTSUP)
-            {
-                if (ensure_bind_mount_target(host_dev, dst, "--device") < 0)
-                {
-                    continue;
-                }
-                if (mount(host_dev, dst, NULL, MS_BIND, NULL) < 0)
-                {
-                    fprintf(stderr,
-                            "oci2bin: --device bind-mount %s→%s: %s (non-fatal)\n",
-                            host_dev, ctr_dev, strerror(errno));
-                }
-            }
-            else
-            {
-                fprintf(stderr, "oci2bin: --device mknod %s: %s (non-fatal)\n",
-                        dst, strerror(errno));
-            }
-        }
-        else
-        {
-            chmod(dst, st.st_mode & 0777);
-        }
     }
 
     /* --ssh-agent: forward host SSH_AUTH_SOCK into the container.
@@ -13113,23 +14429,9 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* Chroot into rootfs */
-    if (chroot(rootfs) < 0)
+    if (enter_rootfs(rootfs, opts) < 0)
     {
-        perror("chroot");
         return 1;
-    }
-    if (chdir("/") < 0)
-    {
-        perror("chdir /");
-        return 1;
-    }
-
-    /* Mount /proc */
-    mkdir("/proc", 0555);
-    if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
-    {
-        perror("mount /proc (non-fatal)");
     }
 
     /* Mount /tmp as fresh tmpfs so container cannot see host /tmp */
@@ -13176,15 +14478,16 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         /* mkdir at the container path (we are post-chroot) */
         if (mkdir(ctr_path, 0755) < 0 && errno != EEXIST)
         {
-            fprintf(stderr, "oci2bin: --tmpfs mkdir %s: %s (non-fatal)\n",
+            fprintf(stderr, "oci2bin: --tmpfs mkdir %s: %s\n",
                     ctr_path, strerror(errno));
-            continue;
+            return 1;
         }
         if (mount("tmpfs", ctr_path, "tmpfs",
                   MS_NOSUID | MS_NODEV, "mode=0755") < 0)
         {
-            fprintf(stderr, "oci2bin: --tmpfs mount %s: %s (non-fatal)\n",
+            fprintf(stderr, "oci2bin: --tmpfs mount %s: %s\n",
                     ctr_path, strerror(errno));
+            return 1;
         }
     }
 
@@ -13281,8 +14584,9 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
-    /* Apply capability drops/adds before seccomp/fork (applies to all paths) */
-    if (opts->cap_drop_all || opts->cap_drop_mask || opts->cap_add_mask)
+    /* Bounding-set drops before seccomp/fork (applies to all paths); the
+     * --cap-add ambient raise happens in enter_workload_context(). */
+    if (opts->cap_drop_all || opts->cap_drop_mask)
     {
         if (apply_capabilities(opts) < 0 && opts->strict)
         {
@@ -13346,32 +14650,21 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         return 1;
     }
 
-    /* Apply seccomp filter (must be before fork so child inherits it).
-     * --gdb disables seccomp entirely: gdb needs ptrace and many syscalls. */
-    if (opts->gdb)
+    /* Apply the default seccomp filter (before fork, so the --init/--restart
+     * PID 1 is covered too).  An explicit --seccomp-profile is installed
+     * instead by enter_workload_context(), as the last step before exec.
+     * --gdb and --gen-seccomp disable seccomp: both ptrace the workload, and
+     * the default filter kills ptrace (and would hide the syscalls being
+     * recorded). */
+    if (opts->gdb || opts->gen_seccomp)
     {
         fprintf(stderr,
-                "oci2bin: --gdb: seccomp disabled to allow ptrace\n");
+                "oci2bin: %s: seccomp disabled to allow ptrace\n",
+                opts->gdb ? "--gdb" : "--gen-seccomp");
     }
-    if (!opts->no_seccomp && !opts->gdb)
+    if (!opts->no_seccomp && !opts->gdb && !opts->gen_seccomp)
     {
-        if (opts->seccomp_profile)
-        {
-            /* --seccomp-profile is explicit: the user picked a
-             * specific policy. Silently falling back to the built-in
-             * defaults could leave the workload less restricted than
-             * the user requested, which is a security regression. */
-            if (apply_seccomp_profile(opts->seccomp_profile) < 0)
-            {
-                fprintf(stderr,
-                        "oci2bin: --seccomp-profile %s failed to load"
-                        " or apply; refusing to fall back to default"
-                        " filter\n",
-                        opts->seccomp_profile);
-                return 1;
-            }
-        }
-        else
+        if (!opts->seccomp_profile)
         {
             int sc_rc = apply_seccomp_filter();
             if (sc_rc < 0 && opts->strict)
@@ -13385,181 +14678,43 @@ static int container_main(const char* rootfs, struct container_opts *opts)
         }
     }
 
+    /* Resolve the workload identity once — --user overrides the image User
+     * field — so the direct exec, the --init/--restart children and health
+     * probes all run as the same user with the same PTY, labels and caps. */
+    struct workload_ident wid;
+    resolve_workload_ident(opts, image_user, &wid);
+
+
     /* --restart / --health: a supervising PID-1 (re)launches the workload per
      * the restart policy and probes its health.  Subsumes the --init reaper. */
     if (opts->restart_policy != RESTART_NO || supervise_health.enabled)
     {
-        return run_supervised(exec_args, opts, &supervise_health);
+        return run_supervised(exec_args, opts, &supervise_health, &wid);
     }
 
-    /* --init: run a zombie-reaping init loop; UID drop happens inside */
+    /* --init: run a zombie-reaping init loop; the child enters the workload
+     * context (uid, PTY, labels, caps) before exec. */
     if (opts->use_init)
     {
-        int rc = run_as_init(exec_args, opts);
-        return rc;
+        return run_as_init(exec_args, opts, &wid);
     }
 
-    /* Drop to requested UID/GID.  --user overrides the image User field. */
-    uid_t drop_uid = 0;
-    gid_t drop_gid = 0;
-    int   do_drop  = 0;
-
-    if (opts->has_user)
+    if (!opts->gen_seccomp && !opts->gdb)
     {
-        drop_uid = opts->run_uid;
-        drop_gid = opts->run_gid;
-        do_drop  = 1;
+        audit_emit_exec_event(exec_args[0]);
     }
-    else if (image_user && image_user[0])
+    if (enter_workload_context(opts, &wid, 0) < 0)
     {
-        if (resolve_user(image_user, &drop_uid, &drop_gid) == 0 &&
-                (drop_uid != 0 || drop_gid != 0))
-        {
-            do_drop = 1;
-            debug_log("container.user", "spec=%s uid=%d gid=%d",
-                      image_user, (int)drop_uid, (int)drop_gid);
-        }
-        else
-        {
-            fprintf(stderr,
-                    "oci2bin: warning: could not resolve image User \"%s\"\n",
-                    image_user);
-        }
-    }
-
-    if (do_drop)
-    {
-        /* When --user was passed explicitly the workload MUST run as that
-         * UID/GID; failing open would silently leave it running as root.
-         * For the image-User fallback we keep the previous best-effort
-         * behavior (only UID 0 is mapped in a user namespace, so other
-         * IDs fail with EINVAL — that's expected and not a bug). */
-        const int strict = opts->has_user;
-
-        if (setgroups(0, NULL) < 0)
-        {
-            if (strict && errno != EPERM)
-            {
-                fprintf(stderr,
-                        "oci2bin: --user: setgroups failed: %s\n",
-                        strerror(errno));
-                return 1;
-            }
-        }
-        if (setgid(drop_gid) < 0)
-        {
-            if (strict)
-            {
-                fprintf(stderr,
-                        "oci2bin: --user: setgid(%d) failed: %s\n",
-                        (int)drop_gid, strerror(errno));
-                return 1;
-            }
-            debug_log("container.setgid_skip", "gid=%d err=%s",
-                      (int)drop_gid, strerror(errno));
-        }
-        if (setuid(drop_uid) < 0)
-        {
-            if (strict)
-            {
-                fprintf(stderr,
-                        "oci2bin: --user: setuid(%d) failed: %s\n",
-                        (int)drop_uid, strerror(errno));
-                return 1;
-            }
-            debug_log("container.setuid_skip", "uid=%d err=%s",
-                      (int)drop_uid, strerror(errno));
-        }
-    }
-
-    /* Set up PTY slave as controlling terminal for job control.
-     * The PTY master/slave pair was allocated before fork() in main().
-     * The child closes the master (parent's end) and claims the slave
-     * via setsid() + TIOCSCTTY so the container shell gets full job control. */
-    if (opts->pty_slave_fd >= 0)
-    {
-        if (opts->pty_master_fd >= 0)
-        {
-            close(opts->pty_master_fd);
-        }
-        setsid();
-        if (ioctl(opts->pty_slave_fd, TIOCSCTTY, 0) == 0)
-        {
-            dup2(opts->pty_slave_fd, STDIN_FILENO);
-            dup2(opts->pty_slave_fd, STDOUT_FILENO);
-            dup2(opts->pty_slave_fd, STDERR_FILENO);
-        }
-        if (opts->pty_slave_fd > STDERR_FILENO)
-        {
-            close(opts->pty_slave_fd);
-        }
-    }
-
-    /* Apply AppArmor profile if requested (optional compile-time support) */
-#ifdef HAVE_APPARMOR
-    if (opts->security_opt_apparmor)
-    {
-        if (aa_change_onexec(opts->security_opt_apparmor) < 0)
-        {
-            fprintf(stderr,
-                    "oci2bin: --security-opt apparmor=%s: %s (non-fatal)\n",
-                    opts->security_opt_apparmor, strerror(errno));
-        }
-        else
-        {
-            fprintf(stderr, "oci2bin: AppArmor profile '%s' set\n",
-                    opts->security_opt_apparmor);
-        }
-    }
-#else
-    if (opts->security_opt_apparmor)
-    {
-        fprintf(stderr,
-                "oci2bin: --security-opt apparmor: not compiled with "
-                "AppArmor support (-DHAVE_APPARMOR)\n");
-    }
-#endif
-
-    /* Apply SELinux exec label if requested (optional compile-time support) */
-#ifdef HAVE_SELINUX
-    if (opts->security_opt_label)
-    {
-        if (setexeccon(opts->security_opt_label) < 0)
-        {
-            fprintf(stderr,
-                    "oci2bin: --security-opt label=%s: %s (non-fatal)\n",
-                    opts->security_opt_label, strerror(errno));
-        }
-        else
-        {
-            fprintf(stderr, "oci2bin: SELinux label '%s' set\n",
-                    opts->security_opt_label);
-        }
-    }
-#else
-    if (opts->security_opt_label)
-    {
-        fprintf(stderr,
-                "oci2bin: --security-opt label: not compiled with "
-                "SELinux support (-DHAVE_SELINUX)\n");
-    }
-#endif
-
-    /* Block host-side ptrace and /proc/<pid>/mem access.  After execvp the
-     * container process runs as uid 0 inside its own user namespace; without
-     * this, the host root can still attach via ptrace or read /proc/<pid>/mem.
-     * Errors are non-fatal but logged so the operator can see if the kernel
-     * refuses the call. */
-    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
-    {
-        fprintf(stderr, "oci2bin: warning: PR_SET_DUMPABLE 0 failed: %s\n",
-                strerror(errno));
+        return 1;
     }
 
     /* --gen-seccomp: trace the workload instead of exec'ing directly */
     if (opts->gen_seccomp)
     {
-        return do_gen_seccomp(opts->gen_seccomp, exec_args);
+        return do_gen_seccomp(opts->gen_seccomp,
+                              opts->gen_seccomp_fd_set
+                              ? opts->gen_seccomp_fd : -1,
+                              exec_args);
     }
 
     /* --gdb: launch gdb with the container entrypoint as the debuggee.
@@ -13597,7 +14752,6 @@ static int container_main(const char* rootfs, struct container_opts *opts)
     /* Exec the entrypoint */
     debug_log("container.exec", "path=%s argc=%d", safe_str(exec_args[0]),
               exec_argc);
-    audit_emit_exec_event(exec_args[0]);
     execvp(exec_args[0], exec_args);
 
     /* If exec failed, try /bin/sh as fallback */
@@ -13753,7 +14907,7 @@ static void doctor_row(const char* check, const char* status,
  * reflects the actual runtime host rather than the build host. Returns 0 when
  * no blocking issue is found, 1 otherwise (handy for scripting).
  */
-static int run_runtime_doctor(void)
+static int run_runtime_doctor(const char* self_path)
 {
     int issues = 0;
     char helper[PATH_MAX];
@@ -13832,6 +14986,40 @@ static int run_runtime_doctor(void)
     if (!have_tar)
     {
         issues++;
+    }
+
+    /* python3 + openssl: needed only when this artifact carries a pinned
+     * digest or a --require-signed policy (and for --verify-key). */
+    {
+        char* meta = NULL;
+        int   needs_verifier = 0;
+        if (read_self_metadata(self_path, &meta) == 1)
+        {
+            needs_verifier = strstr(meta, "pin_digest") != NULL ||
+                             strstr(meta, "require_signed") != NULL;
+        }
+        free(meta);
+        int have_py = access("/usr/bin/python3", X_OK) == 0;
+        int have_ossl = find_helper_binary("openssl", helper,
+                                           sizeof(helper)) == 0;
+        if (needs_verifier)
+        {
+            doctor_row("python3 + openssl", have_py && have_ossl ? "OK"
+                       : "MISSING",
+                       have_py && have_ossl
+                       ? "present (pinned digest / signature policy)"
+                       : "required by this artifact's pin/signature policy");
+            if (!have_py || !have_ossl)
+            {
+                issues++;
+            }
+        }
+        else
+        {
+            doctor_row("python3 + openssl", "OK",
+                       have_py && have_ossl ? "present (only --verify-key)"
+                       : "not needed by this artifact (only --verify-key)");
+        }
     }
 
     if (ROOTFS_DATA_PATCHED == 1)
@@ -14097,9 +15285,15 @@ static void usage(const char* prog)
 static char** build_merged_argv(int argc, char* argv[], int* out_argc)
 {
     /* First pass: find --config PATH pairs and validate the path */
+    /* Everything after "--" belongs to the container command, so a
+     * "--config" there is an argument to the workload, not to us. */
     const char* config_path = NULL;
     for (int i = 1; i < argc; i++)
     {
+        if (strcmp(argv[i], "--") == 0)
+        {
+            break;
+        }
         if (strcmp(argv[i], "--config") == 0)
         {
             if (i + 1 >= argc)
@@ -14250,9 +15444,14 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc)
      *   [cfg_n+1..]   = original argv[1..] minus --config/PATH pairs
      */
     int real_n = 0; /* count of real argv entries after stripping --config */
+    int past_dd = 0;
     for (int i = 1; i < argc; i++)
     {
-        if (strcmp(argv[i], "--config") == 0)
+        if (!past_dd && strcmp(argv[i], "--") == 0)
+        {
+            past_dd = 1;
+        }
+        if (!past_dd && strcmp(argv[i], "--config") == 0)
         {
             i++; /* skip PATH too */
         }
@@ -14280,9 +15479,14 @@ static char** build_merged_argv(int argc, char* argv[], int* out_argc)
     {
         merged[mi++] = cfg[j];
     }
+    past_dd = 0;
     for (int i = 1; i < argc; i++)
     {
-        if (strcmp(argv[i], "--config") == 0)
+        if (!past_dd && strcmp(argv[i], "--") == 0)
+        {
+            past_dd = 1;
+        }
+        if (!past_dd && strcmp(argv[i], "--config") == 0)
         {
             i++;
         }
@@ -15000,10 +16204,14 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
                         (int)type_len, spec);
                 return -1;
             }
+            /* strtoull() accepts "" (as 0) and "-1" (as ULLONG_MAX, i.e.
+             * RLIM_INFINITY): require at least one digit and nothing else. */
             char*          endp  = NULL;
+            errno = 0;
             unsigned long long val =
                 strtoull(eq + 1, &endp, 10);
-            if (!endp || *endp != '\0')
+            if (eq[1] < '0' || eq[1] > '9' || !endp || *endp != '\0' ||
+                    errno == ERANGE)
             {
                 fprintf(stderr,
                         "oci2bin: --ulimit value must be a non-negative integer\n");
@@ -16528,9 +17736,14 @@ static int run_python_helper(const char* script, const char* arg1,
                              const char* arg2, const char* arg3,
                              const char* arg4)
 {
-    char* args[9];
+    /* -I (isolated mode): ignore PYTHON* variables and the user site dir,
+     * and keep the script directory off sys.path. Without it a PYTHONPATH
+     * entry holding a fake hashlib/json/struct shadows the stdlib, and every
+     * verifier below reports whatever that module says. */
+    char* args[10];
     int ai = 0;
     args[ai++] = "/usr/bin/python3";
+    args[ai++] = "-I";
     args[ai++] = "-c";
     args[ai++] = (char*)script;
     args[ai++] = (char*)arg1;
@@ -16552,6 +17765,33 @@ static int run_python_helper(const char* script, const char* arg1,
 
 static int verify_pinned_digest(const char* self_path)
 {
+    /* Fast path: no python on the launch path unless the binary actually
+     * carries a pin. The C reader strips the signature block and finds the
+     * last OCI2BIN_META exactly like the script does, so "no block" means
+     * the script would exit 0 too. With a block, only skip python when the
+     * key cannot be present: it is absent verbatim and the JSON carries no
+     * \u escape that could spell it. Anything else goes to the script. */
+    char* meta = NULL;
+    int   mrc  = read_self_metadata(self_path, &meta);
+    if (mrc < 0)
+    {
+        fprintf(stderr,
+                "oci2bin: embedded metadata block is unreadable or"
+                " inconsistent; refusing to run\n");
+        return 1;
+    }
+    if (mrc == 0)
+    {
+        return 0;
+    }
+    int may_pin = strstr(meta, "pin_digest") != NULL ||
+                  strstr(meta, "\\u") != NULL;
+    free(meta);
+    if (!may_pin)
+    {
+        return 0;
+    }
+
     /* The script strips a trailing signature block only when it really is
      * one: a bare trailer plus a crafted length would otherwise cut the
      * metadata out of `data` and skip the pin check entirely. Same test the
@@ -16828,6 +18068,14 @@ static int read_self_metadata(const char* self_path, char** out)
     {
         json_len--;
     }
+    /* An interior NUL would hide everything after it from the C string
+     * callers (strstr for "pin_digest"/"require_signed") while python's
+     * json.loads rejects it outright — refuse instead of disagreeing. */
+    if (memchr(json, '\0', json_len) != NULL)
+    {
+        free(json);
+        return -1;
+    }
     json[json_len] = '\0';
     *out = json;
     return 1;
@@ -17054,7 +18302,7 @@ static int run_self_update(const char* self_path, const char* key_path,
         "   sys.exit(1)\n"
         "  f.write(buf)\n"
         " os.lseek(fdnum,0,0)\n"
-        " vr=subprocess.run([sys.executable,helper,'verify-file','--key',key,"
+        " vr=subprocess.run([sys.executable,'-I',helper,'verify-file','--key',key,"
         " '--in',mp,'--sig',sp],capture_output=True,text=True,"
         "pass_fds=(fdnum,))\n"
         " if vr.returncode!=0:\n"
@@ -17441,6 +18689,9 @@ static pid_t start_metrics_helper(const char* socket_path)
         sigaction(SIGTERM, &sa, NULL);
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGHUP, &sa, NULL);
+        /* A client that disconnects before reading must not kill the
+         * helper; the write just fails with EPIPE. */
+        signal(SIGPIPE, SIG_IGN);
 
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
@@ -17455,7 +18706,17 @@ static pid_t start_metrics_helper(const char* socket_path)
             _exit(1);
         }
 
-        /* Unlink any stale socket unconditionally; treat ENOENT as OK. */
+        /* Replace a stale socket, but never delete anything else that
+         * happens to sit at the path (a typo must not cost a file). */
+        struct stat sst;
+        if (lstat(socket_path, &sst) == 0 && !S_ISSOCK(sst.st_mode))
+        {
+            fprintf(stderr, "oci2bin: --metrics-socket %s exists and is not"
+                            " a socket; refusing to replace it\n", socket_path);
+            ignore_io_result(write(sync_pipe[1], "0", 1));
+            close(sync_pipe[1]);
+            _exit(1);
+        }
         if (unlink(socket_path) < 0 && errno != ENOENT)
         {
             fprintf(stderr, "oci2bin: --metrics-socket unlink %s: %s\n",
@@ -17473,7 +18734,12 @@ static pid_t start_metrics_helper(const char* socket_path)
             close(sync_pipe[1]);
             _exit(1);
         }
-        if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+        /* Owner-only socket regardless of the inherited umask: the stats
+         * describe the caller's workload and are nobody else's business. */
+        mode_t old_umask = umask(0077);
+        int    brc = bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr));
+        umask(old_umask);
+        if (brc < 0)
         {
             fprintf(stderr, "oci2bin: --metrics-socket bind %s: %s\n",
                     socket_path, strerror(errno));
@@ -18187,20 +19453,224 @@ static int extract_vm_blob(unsigned long offset, unsigned long size,
     return 0;
 }
 
+/* ── microVM guest init helpers ──────────────────────────────────────── */
+
+/*
+ * Kernel cmdline value for `key` (which includes the trailing '='), up to
+ * the next space.  Returns 0 and fills `out`, or -1 when absent/too long.
+ * Shared by every oci2bin.* parameter the host passes to the guest.
+ */
+static int vm_cmdline_get(const char* cmdline, const char* key, char* out,
+                          size_t out_sz)
+{
+    const char* p = cmdline;
+    size_t      klen = strlen(key);
+    while ((p = strstr(p, key)) != NULL)
+    {
+        if (p == cmdline || p[-1] == ' ')
+        {
+            const char* v   = p + klen;
+            size_t      len = strcspn(v, " \n");
+            if (len >= out_sz)
+            {
+                return -1;
+            }
+            memcpy(out, v, len);
+            out[len] = '\0';
+            return 0;
+        }
+        p += klen;
+    }
+    return -1;
+}
+
+/*
+ * Hex-encoded list of NUL-terminated strings (the host side is
+ * vm_hex_append_list()).  Returns the count; the strings point into `buf`,
+ * which receives the decoded bytes.  -1 on malformed input.
+ */
+static int vm_hex_decode_list(const char* hex, char* buf, size_t buf_sz,
+                              char** out, int max_out)
+{
+    size_t hlen = strlen(hex);
+    if (hlen % 2 != 0 || hlen / 2 >= buf_sz)
+    {
+        return -1;
+    }
+    size_t n = hlen / 2;
+    for (size_t i = 0; i < n; i++)
+    {
+        unsigned v = 0;
+        for (int k = 0; k < 2; k++)
+        {
+            char c = hex[2 * i + (size_t)k];
+            v <<= 4;
+            if (c >= '0' && c <= '9')
+            {
+                v |= (unsigned)(c - '0');
+            }
+            else if (c >= 'a' && c <= 'f')
+            {
+                v |= (unsigned)(c - 'a' + 10);
+            }
+            else
+            {
+                return -1;
+            }
+        }
+        buf[i] = (char)v;
+    }
+    buf[n] = '\0';
+    if (n > 0 && buf[n - 1] != '\0')
+    {
+        return -1; /* every element is NUL-terminated */
+    }
+    int count = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < n && count < max_out; i++)
+    {
+        if (buf[i] == '\0')
+        {
+            out[count++] = buf + start;
+            start = i + 1;
+        }
+    }
+    return count;
+}
+
+/* Bring the loopback interface up: nothing in the initramfs does it, and
+ * services listening on 127.0.0.1 are otherwise unreachable even locally. */
+static void vm_bring_up_lo(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+    {
+        return;
+    }
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "lo");
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) == 0)
+    {
+        ifr.ifr_flags |= IFF_UP;
+        if (ioctl(fd, SIOCSIFFLAGS, &ifr) < 0)
+        {
+            perror("oci2bin-init: bring up lo");
+        }
+    }
+    close(fd);
+}
+
+/*
+ * --overlay-persist: the host attaches an ext2 image as `dev`.  Mount it and
+ * make it the upper layer of an overlay over the initramfs root, then switch
+ * into that overlay — the same "writes persist across runs" meaning the flag
+ * has in container mode.  Returns 0, or -1 (the caller keeps running on the
+ * plain initramfs root, loudly).
+ */
+static int vm_switch_to_persistent_root(const char* dev)
+{
+    if (strncmp(dev, "/dev/", 5) != 0 || path_has_dotdot_component(dev))
+    {
+        return -1;
+    }
+    if ((mkdir("/.oci2bin-data", 0700) < 0 && errno != EEXIST) ||
+            mount(dev, "/.oci2bin-data", "ext2", MS_NOSUID | MS_NODEV,
+                  NULL) < 0)
+    {
+        perror("oci2bin-init: mount data disk");
+        return -1;
+    }
+    if ((mkdir("/.oci2bin-data/upper", 0755) < 0 && errno != EEXIST) ||
+            (mkdir("/.oci2bin-data/work", 0755) < 0 && errno != EEXIST) ||
+            (mkdir("/.oci2bin-root", 0755) < 0 && errno != EEXIST))
+    {
+        perror("oci2bin-init: prepare overlay dirs");
+        return -1;
+    }
+    if (mount("overlay", "/.oci2bin-root", "overlay", 0,
+              "lowerdir=/,upperdir=/.oci2bin-data/upper,"
+              "workdir=/.oci2bin-data/work") < 0)
+    {
+        perror("oci2bin-init: mount persistent overlay");
+        return -1;
+    }
+    /* Carry the pseudo filesystems over, then make the overlay "/" the way
+     * switch_root does (pivot_root is not allowed out of an initramfs). */
+    static const char* const moves[] = {"/proc", "/sys", "/dev"};
+    for (size_t i = 0; i < sizeof(moves) / sizeof(moves[0]); i++)
+    {
+        char dst[64];
+        snprintf(dst, sizeof(dst), "/.oci2bin-root%s", moves[i]);
+        if ((mkdir(dst, 0755) < 0 && errno != EEXIST) ||
+                mount(moves[i], dst, NULL, MS_MOVE, NULL) < 0)
+        {
+            perror("oci2bin-init: move pseudo filesystem");
+            return -1;
+        }
+    }
+    if (chdir("/.oci2bin-root") < 0 ||
+            mount(".", "/", NULL, MS_MOVE, NULL) < 0 ||
+            chroot(".") < 0 || chdir("/") < 0)
+    {
+        perror("oci2bin-init: switch to persistent root");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * The kernel command line as a malloc'd string ("" if unreadable).  Not
+ * read_file(): procfs reports st_size 0, so a size-driven read returned an
+ * empty string and every oci2bin.* parameter — the -v mounts included — was
+ * silently ignored.
+ */
+static char* vm_read_cmdline(void)
+{
+    char* buf = calloc(1, 4097);
+    if (!buf)
+    {
+        return NULL;
+    }
+    int fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0)
+    {
+        ssize_t n = read_all_fd(fd, buf, 4096);
+        close(fd);
+        buf[n > 0 ? n : 0] = '\0';
+    }
+    return buf;
+}
+
+static volatile pid_t g_vm_workload_pid = 0;
+
+static void vm_init_forward_signal(int sig)
+{
+    if (g_vm_workload_pid > 0)
+    {
+        kill(g_vm_workload_pid, sig);
+    }
+}
+
 /*
  * vm_init_main: PID 1 inside the microVM.
  * Called when OCI2BIN_VM_INIT is set in the environment.
+ *
+ * PID 1 forks the workload instead of exec'ing it: it reaps orphans (the
+ * kernel reparents every one to PID 1), forwards SIGTERM/SIGINT/SIGHUP, and
+ * — once the workload exits — writes its exit status to the virtio console
+ * (hvc0) for the host launcher and powers the VM off.  exec'ing the workload
+ * as PID 1 lost the exit code and left zombies unreaped.
  */
 static int vm_init_main(void)
 {
-    size_t dbg_cmdline_size = 0;
-    char* dbg_cmdline = read_file("/proc/cmdline", &dbg_cmdline_size);
-    (void)dbg_cmdline_size;
-    if (dbg_cmdline && strstr(dbg_cmdline, "OCI2BIN_DEBUG=1"))
+    /* OCI2BIN_DEBUG=1 on the kernel command line reaches init as an
+     * environment variable (/proc is not mounted yet). */
+    const char* dbg = getenv("OCI2BIN_DEBUG");
+    if (dbg && strcmp(dbg, "1") == 0)
     {
         g_debug = 1;
     }
-    free(dbg_cmdline);
 
     debug_log("vm.init.begin", "bootstrap=1");
 
@@ -18229,83 +19699,121 @@ static int vm_init_main(void)
     {
         perror("mount /dev/pts");
     }
+    vm_bring_up_lo();
 
-    /* 2. Handle virtiofs mounts from cmdline: oci2bin.mount.N=tag:path */
-    size_t cmdline_size;
-    char* vm_cmdline = read_file("/proc/cmdline", &cmdline_size);
-    if (vm_cmdline)
+    char* vm_cmdline = vm_read_cmdline();
+    if (!vm_cmdline)
     {
-        for (int mi = 0; mi < 64; mi++)
-        {
-            char key[32];
-            int kn = snprintf(key, sizeof(key), "oci2bin.mount.%d=", mi);
-            if (kn < 0 || (size_t)kn >= sizeof(key))
-            {
-                break;
-            }
-            char* pos = strstr(vm_cmdline, key);
-            if (!pos)
-            {
-                break;
-            }
-            pos += strlen(key);
-            /* format: tag:path */
-            char* colon = strchr(pos, ':');
-            if (!colon)
-            {
-                break;
-            }
-            size_t tag_len = (size_t)(colon - pos);
-            char tag[256];
-            if (tag_len >= sizeof(tag))
-            {
-                break;
-            }
-            memcpy(tag, pos, tag_len);
-            tag[tag_len] = '\0';
-            /* path ends at space or end-of-string */
-            char* path_end = colon + 1;
-            while (*path_end && *path_end != ' ' && *path_end != '\n')
-            {
-                path_end++;
-            }
-            size_t path_len = (size_t)(path_end - (colon + 1));
-            char mnt_path[PATH_MAX];
-            if (path_len >= sizeof(mnt_path))
-            {
-                break;
-            }
-            memcpy(mnt_path, colon + 1, path_len);
-            mnt_path[path_len] = '\0';
-            /* validate path — reject .. components and require absolute */
-            if (path_has_dotdot_component(mnt_path) || mnt_path[0] != '/')
-            {
-                fprintf(stderr,
-                        "oci2bin-init: skipping unsafe mount path: %s\n",
-                        mnt_path);
-                continue;
-            }
-            /* mkdir and mount */
-            mkdir(mnt_path, 0755); /* ignore errors */
-            if (mount(tag, mnt_path, "virtiofs", 0, NULL) < 0)
-            {
-                perror("mount virtiofs");
-            }
-        }
-        free(vm_cmdline);
+        return 1;
     }
 
-    /* 3. Read OCI config and build exec argv */
+    debug_log("vm.init.cmdline", "value=%s", vm_cmdline);
+
+    /* 2. --overlay-persist data disk (before the virtiofs mounts, so those
+     *    land inside the root the workload actually sees). */
+    {
+        char dev[64];
+        if (vm_cmdline_get(vm_cmdline, "oci2bin.data=", dev,
+                           sizeof(dev)) == 0 &&
+                vm_switch_to_persistent_root(dev) < 0)
+        {
+            fprintf(stderr, "oci2bin-init: --overlay-persist data disk"
+                            " unusable; changes will NOT persist\n");
+        }
+    }
+
+    /* 3. virtiofs mounts from cmdline: oci2bin.mount.N=tag:path */
+    for (int mi = 0; mi < 64; mi++)
+    {
+        char key[32];
+        int kn = snprintf(key, sizeof(key), "oci2bin.mount.%d=", mi);
+        if (kn < 0 || (size_t)kn >= sizeof(key))
+        {
+            break;
+        }
+        char spec[PATH_MAX + 256];
+        if (vm_cmdline_get(vm_cmdline, key, spec, sizeof(spec)) < 0)
+        {
+            break;
+        }
+        /* format: tag:path */
+        char* colon = strchr(spec, ':');
+        if (!colon || colon == spec || (size_t)(colon - spec) >= 256)
+        {
+            break;
+        }
+        *colon = '\0';
+        const char* tag      = spec;
+        const char* mnt_path = colon + 1;
+        /* validate path — reject .. components and require absolute */
+        if (path_has_dotdot_component(mnt_path) || mnt_path[0] != '/')
+        {
+            fprintf(stderr,
+                    "oci2bin-init: skipping unsafe mount path: %s\n",
+                    mnt_path);
+            continue;
+        }
+        /* mkdir and mount */
+        mkdir(mnt_path, 0755); /* ignore errors */
+        if (mount(tag, mnt_path, "virtiofs", 0, NULL) < 0)
+        {
+            perror("mount virtiofs");
+        }
+    }
+
+    /* 4. Read OCI config and the host's run-time overrides (arguments,
+     *    --entrypoint, -e, --workdir), then build exec argv. */
     struct oci_config oci_cfg;
     if (read_oci_config("", &oci_cfg) < 0)
     {
         fprintf(stderr, "oci2bin-init: /.oci2bin_config not found\n");
+        free(vm_cmdline);
         return 1;
     }
 
+    static char hexval[4096];
+    static char args_buf[2048];
+    static char env_buf[2048];
+    static char ep_buf[1024];
+    static char wd_buf[PATH_MAX];
+    char* extra[MAX_ARGS];
+    char* host_env[MAX_ENV];
+    int   n_extra = 0;
+    int   n_host_env = 0;
+    const char* entrypoint = NULL;
+    const char* workdir    = oci_cfg.workdir;
+    if (vm_cmdline_get(vm_cmdline, "oci2bin.argv=", hexval,
+                       sizeof(hexval)) == 0)
+    {
+        n_extra = vm_hex_decode_list(hexval, args_buf, sizeof(args_buf),
+                                     extra, MAX_ARGS);
+        n_extra = n_extra < 0 ? 0 : n_extra;
+    }
+    if (vm_cmdline_get(vm_cmdline, "oci2bin.env=", hexval,
+                       sizeof(hexval)) == 0)
+    {
+        n_host_env = vm_hex_decode_list(hexval, env_buf, sizeof(env_buf),
+                                        host_env, MAX_ENV);
+        n_host_env = n_host_env < 0 ? 0 : n_host_env;
+    }
+    char* one[1];
+    if (vm_cmdline_get(vm_cmdline, "oci2bin.ep=", hexval,
+                       sizeof(hexval)) == 0 &&
+            vm_hex_decode_list(hexval, ep_buf, sizeof(ep_buf), one, 1) == 1)
+    {
+        entrypoint = one[0];
+    }
+    if (vm_cmdline_get(vm_cmdline, "oci2bin.wd=", hexval,
+                       sizeof(hexval)) == 0 &&
+            vm_hex_decode_list(hexval, wd_buf, sizeof(wd_buf), one, 1) == 1)
+    {
+        workdir = one[0];
+    }
+    free(vm_cmdline);
+
     char* exec_args[MAX_ARGS + 1];
-    int exec_argc = build_exec_args(&oci_cfg, NULL, NULL, 0, exec_args,
-                                    MAX_ARGS);
+    int exec_argc = build_exec_args(&oci_cfg, entrypoint, extra, n_extra,
+                                    exec_args, MAX_ARGS);
     if (g_debug)
     {
         for (int i = 0; i < exec_argc; i++)
@@ -18315,51 +19823,111 @@ static int vm_init_main(void)
         }
     }
 
-    /* 4. Build flat env array */
-    char* flat_env[MAX_ENV + 1];
-    int flat_env_n = 0;
-
-    /* Seed with defaults */
-    flat_env[flat_env_n++] =
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    flat_env[flat_env_n++] = "HOME=/root";
-    flat_env[flat_env_n++] = "TERM=xterm";
-
+    /* 5. Environment: defaults, then image Env, then -e (later wins). */
+    clearenv();
+    setenv("PATH",
+           "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    setenv("HOME", "/root", 1);
+    setenv("TERM", "xterm", 1);
     char* image_envs[MAX_ENV];
     int n_image_env = 0;
     if (oci_cfg.env_json && strcmp(oci_cfg.env_json, "null") != 0)
     {
         n_image_env = json_parse_string_array(oci_cfg.env_json,
                                               image_envs, MAX_ENV);
-        for (int i = 0; i < n_image_env && flat_env_n < MAX_ENV; i++)
-        {
-            flat_env[flat_env_n++] = image_envs[i];
-        }
     }
-    flat_env[flat_env_n] = NULL;
-
-    /* 5. chdir to workdir */
-    if (oci_cfg.workdir && oci_cfg.workdir[0])
+    for (int pass = 0; pass < 2; pass++)
     {
-        if (chdir(oci_cfg.workdir) < 0)
+        int    cnt = pass == 0 ? n_image_env : n_host_env;
+        char** vec = pass == 0 ? image_envs : host_env;
+        for (int i = 0; i < cnt; i++)
         {
-            perror("chdir workdir"); /* non-fatal */
+            char* eq = strchr(vec[i], '=');
+            if (eq && eq != vec[i])
+            {
+                *eq = '\0';
+                setenv(vec[i], eq + 1, 1);
+                *eq = '=';
+            }
         }
     }
 
-    /* 6. exec */
+    /* 6. chdir to workdir */
+    if (workdir && workdir[0] && chdir(workdir) < 0)
+    {
+        perror("chdir workdir"); /* non-fatal */
+    }
+
+    /* 7. Run the workload as a child and supervise it. */
     debug_log("vm.init.exec", "path=%s argc=%d env=%d", safe_str(exec_args[0]),
-              exec_argc, flat_env_n);
-    execvpe(exec_args[0], exec_args, flat_env);
-    perror("oci2bin-init: execvpe");
-
-    /* Cleanup on failure */
-    for (int i = 0; i < n_image_env; i++)
+              exec_argc, n_image_env + n_host_env);
+    pid_t child = fork();
+    if (child < 0)
     {
-        free(image_envs[i]);
+        perror("oci2bin-init: fork");
+        return 1;
     }
-    free_oci_config(&oci_cfg);
-    return 1;
+    if (child == 0)
+    {
+        /* Own session with the console as controlling terminal, so ^C on
+         * the serial console reaches the workload. */
+        setsid();
+        ioctl(STDIN_FILENO, TIOCSCTTY, 1);
+        execvp(exec_args[0], exec_args);
+        perror("oci2bin-init: execvp");
+        _exit(127);
+    }
+    g_vm_workload_pid = child;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = vm_init_forward_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    int code = 1;
+    for (;;)
+    {
+        int   status = 0;
+        pid_t r      = waitpid(-1, &status, 0);
+        if (r < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            break;
+        }
+        if (r == child)
+        {
+            code = WIFEXITED(status) ? WEXITSTATUS(status)
+                   : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+            break;
+        }
+        /* an orphan reparented to PID 1 — reaped, keep waiting */
+    }
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+    {
+    }
+
+    /* 8. Report the exit status to the host over the virtio console, then
+     *    power off (returning from PID 1 would only panic the kernel). */
+    int hvc = open("/dev/hvc0", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+    if (hvc >= 0)
+    {
+        char line[32];
+        int  ln = snprintf(line, sizeof(line), "%d\n", code);
+        if (ln > 0 && (size_t)ln < sizeof(line))
+        {
+            write_all_fd(hvc, line, (size_t)ln);
+        }
+        close(hvc);
+    }
+    sync();
+    reboot(RB_POWER_OFF);
+    return code;
 }
 
 #ifdef USE_LIBKRUN
@@ -18688,10 +20256,14 @@ struct vm_ch_ctx
     char self_dir[PATH_MAX];
     char polyglot_py[PATH_MAX];
     char data_img_path[PATH_MAX];
-    char disk_arg[PATH_MAX + 16];
+    char disk_arg[PATH_MAX + 32];
     char cpus_str[32];
     char mem_str[32];
     char cmdline[4096];
+    char console_arg[PATH_MAX + 16];
+    char exit_path[PATH_MAX];
+    pid_t vfsd_pids[MAX_VOLUMES];
+    int   n_vfsd;
     char fs_args[MAX_VOLUMES][PATH_MAX + 64];
     char cpbuf[65536];
     const char* argv[128];
@@ -18908,15 +20480,63 @@ static int vm_ch_prepare_data_disk(struct vm_ch_ctx* ctx,
 }
 
 /*
+ * Append " key=<hex>" to buf: the strings in `list` hex-encoded, each
+ * NUL-terminated so an empty argument survives (vm_hex_decode_list() is
+ * the guest side).  Hex keeps
+ * arbitrary bytes — spaces, quotes, '=' — out of the kernel's own cmdline
+ * parsing.  Returns -1 when it would not fit.
+ */
+static int vm_hex_append_list(char* buf, size_t buf_sz, const char* key,
+                              char* const* list, int n)
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t len = strlen(buf);
+    int    kn  = snprintf(buf + len, buf_sz - len, " %s=", key);
+    if (kn < 0 || (size_t)kn >= buf_sz - len)
+    {
+        return -1;
+    }
+    len += (size_t)kn;
+    for (int i = 0; i < n; i++)
+    {
+        const unsigned char* p = (const unsigned char*)list[i];
+        size_t plen = strlen(list[i]) + 1; /* with its NUL */
+        for (size_t k = 0; k < plen; k++)
+        {
+            if (len + 3 > buf_sz)
+            {
+                return -1;
+            }
+            buf[len++] = hex[p[k] >> 4];
+            buf[len++] = hex[p[k] & 0xf];
+        }
+    }
+    buf[len] = '\0';
+    return 0;
+}
+
+/* x86 COMMAND_LINE_SIZE; the kernel silently truncates beyond it. */
+#define VM_CMDLINE_MAX 2048
+
+/*
  * Assemble the kernel command line into ctx->cmdline.
  * have_data_disk: 1 if a persistent data disk was prepared.
+ *
+ * Besides boot parameters it carries the run-time overrides the guest init
+ * applies: arguments after the image (`oci2bin.argv`), --entrypoint, -e and
+ * --workdir.  They used to be dropped, so `app --vm -- cmd` ran the image
+ * default instead of cmd.
  */
 static int vm_ch_build_cmdline(struct vm_ch_ctx* ctx,
                                struct container_opts* opts, int have_data_disk)
 {
+    /* No pci=off: cloud-hypervisor attaches every virtio device over PCI.
+     * `quiet` keeps kernel boot noise off the serial console the workload's
+     * output shares, unless debugging. */
     int n = snprintf(ctx->cmdline, sizeof(ctx->cmdline),
-                     "console=ttyS0 reboot=k panic=1 pci=off"
-                     " OCI2BIN_VM_INIT=1 init=/init");
+                     "console=ttyS0 reboot=k panic=1%s"
+                     " OCI2BIN_VM_INIT=1 init=/init",
+                     opts->debug ? "" : " quiet");
     if (n < 0 || (size_t)n >= sizeof(ctx->cmdline))
     {
         fprintf(stderr, "oci2bin: cmdline truncated\n");
@@ -18957,6 +20577,36 @@ static int vm_ch_build_cmdline(struct vm_ch_ctx* ctx,
                        opts->vol_ctr[vi]);
     }
 #undef CMDLINE_APPEND
+    int rc = 0;
+    if (opts->n_extra > 0)
+    {
+        rc |= vm_hex_append_list(ctx->cmdline, sizeof(ctx->cmdline),
+                                 "oci2bin.argv", opts->extra_args,
+                                 opts->n_extra);
+    }
+    if (opts->n_env > 0)
+    {
+        rc |= vm_hex_append_list(ctx->cmdline, sizeof(ctx->cmdline),
+                                 "oci2bin.env", opts->env_vars, opts->n_env);
+    }
+    if (opts->entrypoint)
+    {
+        rc |= vm_hex_append_list(ctx->cmdline, sizeof(ctx->cmdline),
+                                 "oci2bin.ep", &opts->entrypoint, 1);
+    }
+    if (opts->workdir)
+    {
+        rc |= vm_hex_append_list(ctx->cmdline, sizeof(ctx->cmdline),
+                                 "oci2bin.wd", &opts->workdir, 1);
+    }
+    if (rc != 0 || strlen(ctx->cmdline) >= VM_CMDLINE_MAX)
+    {
+        fprintf(stderr,
+                "oci2bin: --vm: arguments, -e and -v specs exceed the %d-byte"
+                " kernel command line of the cloud-hypervisor backend\n",
+                VM_CMDLINE_MAX);
+        return -1;
+    }
     return 0;
 }
 
@@ -18968,6 +20618,26 @@ static int vm_ch_start_virtiofsd(struct vm_ch_ctx* ctx,
                                  struct container_opts* opts,
                                  const char* tmpdir, int* ai)
 {
+    /* Fedora/RHEL and Debian install virtiofsd under libexec, off PATH. */
+    char vfsd_bin[PATH_MAX] = "virtiofsd";
+    if (opts->n_vols > 0 &&
+            find_helper_binary("virtiofsd", vfsd_bin, sizeof(vfsd_bin)) < 0)
+    {
+        static const char* const libexec[] =
+        {
+            "/usr/libexec/virtiofsd", "/usr/lib/virtiofsd",
+            "/usr/lib/qemu/virtiofsd",
+        };
+        snprintf(vfsd_bin, sizeof(vfsd_bin), "virtiofsd");
+        for (size_t i = 0; i < sizeof(libexec) / sizeof(libexec[0]); i++)
+        {
+            if (access(libexec[i], X_OK) == 0)
+            {
+                snprintf(vfsd_bin, sizeof(vfsd_bin), "%s", libexec[i]);
+                break;
+            }
+        }
+    }
     for (int vi = 0; vi < opts->n_vols; vi++)
     {
         if (path_has_dotdot_component(opts->vol_host[vi]))
@@ -18986,15 +20656,44 @@ static int vm_ch_start_virtiofsd(struct vm_ch_ctx* ctx,
         }
         char* vfsd_argv[] =
         {
-            "virtiofsd",
+            vfsd_bin,
             "--socket-path", sock_path,
             "--shared-dir",  opts->vol_host[vi],
             "--sandbox",     "namespace",
             NULL
         };
         /* spawn_daemon: virtiofsd runs for the lifetime of the VM */
-        if (spawn_daemon(vfsd_argv) < 0)
+        pid_t vpid = spawn_daemon(vfsd_argv);
+        if (vpid < 0)
         {
+            return -1;
+        }
+        ctx->vfsd_pids[ctx->n_vfsd++] = vpid;
+        /* cloud-hypervisor connects to the socket at start-up and fails the
+         * whole boot if virtiofsd has not created it yet. */
+        int ready = 0;
+        for (int t = 0; t < 100 && !ready; t++)
+        {
+            struct stat sst;
+            if (stat(sock_path, &sst) == 0 && S_ISSOCK(sst.st_mode))
+            {
+                ready = 1;
+                break;
+            }
+            if (waitpid(vpid, NULL, WNOHANG) == vpid)
+            {
+                /* virtiofsd exited and is reaped: forget its PID so
+                 * vm_ch_stop_virtiofsd() cannot signal a recycled one. */
+                ctx->vfsd_pids[ctx->n_vfsd - 1] = -1;
+                break;
+            }
+            struct timespec ts = {0, 50L * 1000L * 1000L};
+            nanosleep(&ts, NULL);
+        }
+        if (!ready)
+        {
+            fprintf(stderr, "oci2bin: virtiofsd for %s did not come up\n",
+                    opts->vol_host[vi]);
             return -1;
         }
         nn = snprintf(ctx->fs_args[vi], sizeof(ctx->fs_args[vi]),
@@ -19019,6 +20718,93 @@ static int vm_ch_start_virtiofsd(struct vm_ch_ctx* ctx,
         ctx->argv[(*ai)++] = ctx->fs_args[vi];
     }
     return 0;
+}
+
+static void vm_ch_stop_virtiofsd(struct vm_ch_ctx* ctx)
+{
+    for (int i = 0; i < ctx->n_vfsd; i++)
+    {
+        if (ctx->vfsd_pids[i] > 0)
+        {
+            kill(ctx->vfsd_pids[i], SIGTERM);
+            while (waitpid(ctx->vfsd_pids[i], NULL, 0) < 0 && errno == EINTR)
+            {
+            }
+        }
+    }
+    ctx->n_vfsd = 0;
+}
+
+static volatile pid_t g_vmm_pid = 0;
+
+static void vm_ch_forward_signal(int sig)
+{
+    if (g_vmm_pid > 0)
+    {
+        kill(g_vmm_pid, sig);
+    }
+}
+
+/*
+ * Run cloud-hypervisor as a child and return the workload's exit status,
+ * which the guest init writes to the virtio console file.  The VMM used to
+ * be exec'd, so the loader could neither report that status nor clean up
+ * after the VM.
+ */
+static int vm_ch_run_vmm(struct vm_ch_ctx* ctx, const char* vmm_bin)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("oci2bin: fork cloud-hypervisor");
+        return 1;
+    }
+    if (pid == 0)
+    {
+        execvp(vmm_bin, (char* const*)ctx->argv);
+        perror("execvp cloud-hypervisor");
+        _exit(127);
+    }
+    g_vmm_pid = pid;
+    struct sigaction sa, old_term, old_int, old_hup;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = vm_ch_forward_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &sa, &old_term);
+    sigaction(SIGINT, &sa, &old_int);
+    sigaction(SIGHUP, &sa, &old_hup);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    {
+    }
+    g_vmm_pid = 0;
+    sigaction(SIGTERM, &old_term, NULL);
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGHUP, &old_hup, NULL);
+
+    size_t sz   = 0;
+    char*  text = read_file(ctx->exit_path, &sz);
+    if (text)
+    {
+        char* endp = NULL;
+        long  code = strtol(text, &endp, 10);
+        int   ok   = endp != text && code >= 0 && code <= 255;
+        free(text);
+        if (ok)
+        {
+            return (int)code;
+        }
+    }
+    /* No status from the guest: the VM died (or the VMM failed) before the
+     * workload finished. */
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+    {
+        return WEXITSTATUS(status);
+    }
+    fprintf(stderr, "oci2bin: --vm: no exit status from the guest\n");
+    return 1;
 }
 
 /* ── run_as_vm_ch ──────────────────────────────────────────────────────── */
@@ -19122,7 +20908,10 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         free(ctx);
         return 1;
     }
-    n = snprintf(ctx->mem_str, sizeof(ctx->mem_str), "size=%luM", mem_mb);
+    /* virtio-fs (-v) is a vhost-user device: cloud-hypervisor refuses it
+     * unless guest memory is shared with the virtiofsd process. */
+    n = snprintf(ctx->mem_str, sizeof(ctx->mem_str), "size=%luM%s", mem_mb,
+                 opts->n_vols > 0 ? ",shared=on" : "");
     if (n < 0 || (size_t)n >= sizeof(ctx->mem_str))
     {
         fprintf(stderr, "oci2bin: memory string truncated\n");
@@ -19154,8 +20943,10 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
 
     if (have_data_disk)
     {
+        /* image_type=raw: cloud-hypervisor refuses writes to sector 0 of a
+         * disk whose type it had to guess, which broke the ext2 superblock. */
         n = snprintf(ctx->disk_arg, sizeof(ctx->disk_arg),
-                     "path=%s", ctx->data_img_path);
+                     "path=%s,image_type=raw", ctx->data_img_path);
         if (n < 0 || (size_t)n >= sizeof(ctx->disk_arg))
         {
             fprintf(stderr, "oci2bin: disk arg too long\n");
@@ -19166,19 +20957,42 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         ctx->argv[ai++] = ctx->disk_arg;
     }
 
-    /* 7. Start virtiofsd daemons for -v mounts */
-    CH_CALL(vm_ch_start_virtiofsd(ctx, opts, tmpdir, &ai));
+    /* 7. Serial console on the caller's terminal (the kernel and the
+     *    workload's stdio use ttyS0; cloud-hypervisor's default is to
+     *    discard serial), and the virtio console into a file the guest init
+     *    writes the workload's exit status to. */
+    n = snprintf(ctx->exit_path, sizeof(ctx->exit_path), "%s/exit-status",
+                 tmpdir);
+    int cn = snprintf(ctx->console_arg, sizeof(ctx->console_arg),
+                      "file=%s", ctx->exit_path);
+    if (n < 0 || (size_t)n >= sizeof(ctx->exit_path) ||
+            cn < 0 || (size_t)cn >= sizeof(ctx->console_arg))
+    {
+        fprintf(stderr, "oci2bin: console path too long\n");
+        free(ctx);
+        return 1;
+    }
+    ctx->argv[ai++] = "--serial";
+    ctx->argv[ai++] = "tty";
+    ctx->argv[ai++] = "--console";
+    ctx->argv[ai++] = ctx->console_arg;
+
+    /* 8. Start virtiofsd daemons for -v mounts */
+    if (vm_ch_start_virtiofsd(ctx, opts, tmpdir, &ai) < 0)
+    {
+        vm_ch_stop_virtiofsd(ctx);
+        free(ctx);
+        return 1;
+    }
 
     ctx->argv[ai] = NULL;
 #undef CH_CALL
 
     debug_log("vm.ch.exec", "binary=%s argc=%d", vmm_bin, ai);
-    /* ctx intentionally not freed: execvp replaces the process image and
-     * ctx->argv contains pointers into ctx. */
-    execvp(vmm_bin, (char* const*)ctx->argv);
-    perror("execvp cloud-hypervisor");
+    int rc = vm_ch_run_vmm(ctx, vmm_bin);
+    vm_ch_stop_virtiofsd(ctx);
     free(ctx);
-    return 1;
+    return rc;
 }
 
 /* ── oci2vm mode ─────────────────────────────────────────────────────────── */
@@ -19364,6 +21178,63 @@ static const struct mcp_mount_root* mcp_mount_root_for_real(
     return NULL;
 }
 
+/*
+ * Validate the 'image' argument of an MCP tool and resolve it into `out`.
+ *
+ * The tool execs this path on the host, outside every sandbox, so "absolute
+ * and executable" is not enough: a client that can write into an
+ * --allow-mount-rw root could drop a script there and have it "inspected".
+ * Require a regular ELF file that carries a well-formed OCI2BIN_META block,
+ * and refuse anything that resolves into a writable mount root.  Callers exec
+ * `out` (the resolved path), not the string the client sent.
+ * Returns NULL on success or a static error message.
+ */
+static const char* mcp_validate_image(const char* image, char* out,
+                                      size_t out_sz)
+{
+    if (!image || !path_is_absolute_and_clean(image))
+    {
+        return "'image' must be an absolute path";
+    }
+    if (out_sz < PATH_MAX || !realpath(image, out))
+    {
+        return "'image' does not exist";
+    }
+    for (int i = 0; i < g_mcp_n_mount_roots; i++)
+    {
+        if (g_mcp_mount_roots[i].writable &&
+                mcp_path_under_root(out, g_mcp_mount_roots[i].real))
+        {
+            return "'image' is inside a writable mount root";
+        }
+    }
+    struct stat st;
+    if (stat(out, &st) < 0 || !S_ISREG(st.st_mode) || access(out, X_OK) < 0)
+    {
+        return "'image' is not an executable regular file";
+    }
+    char magic[4];
+    int  fd = open(out, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return "'image' is not readable";
+    }
+    ssize_t n = read_all_fd(fd, magic, sizeof(magic));
+    close(fd);
+    if (n != (ssize_t)sizeof(magic) || memcmp(magic, "\177ELF", 4) != 0)
+    {
+        return "'image' is not an oci2bin binary";
+    }
+    char* meta = NULL;
+    int   mrc  = read_self_metadata(out, &meta);
+    free(meta);
+    if (mrc != 1)
+    {
+        return "'image' is not an oci2bin binary";
+    }
+    return NULL;
+}
+
 /* Validate an MCP container name: alphanumeric, '-', '_', '.' only */
 static int mcp_name_valid(const char* s)
 {
@@ -19517,6 +21388,46 @@ static void mcp_send_result(const char* id, const char* result_json)
 }
 
 /* Write JSON-RPC error response to stdout */
+static void mcp_send_error(const char* id, int code, const char* msg);
+
+/*
+ * Send a tool result whose single content item is `text`.  MCP requires the
+ * "text" field to be a JSON string, so the payload is always escaped here —
+ * callers pass raw text (which may itself be JSON) and never splice it into
+ * the envelope themselves.
+ */
+static void mcp_send_text_result(const char* id, const char* text)
+{
+    static const char pre[]  = "{\"content\":[{\"type\":\"text\",\"text\":\"";
+    static const char post[] = "\"}]}";
+    size_t tlen = strlen(text);
+    /* Worst case every byte becomes a 6-byte \u00XX escape. */
+    if (tlen > (SIZE_MAX - sizeof(pre) - sizeof(post)) / 6)
+    {
+        mcp_send_error(id, -32603, "result too large");
+        return;
+    }
+    size_t cap = sizeof(pre) + tlen * 6 + sizeof(post);
+    char*  out = malloc(cap);
+    if (!out)
+    {
+        mcp_send_error(id, -32603, "out of memory");
+        return;
+    }
+    memcpy(out, pre, sizeof(pre) - 1);
+    size_t room = cap - (sizeof(pre) - 1);
+    if (json_escape_string(text, out + sizeof(pre) - 1, room) < 0)
+    {
+        free(out);
+        mcp_send_error(id, -32603, "result encoding failed");
+        return;
+    }
+    size_t used = strlen(out);
+    memcpy(out + used, post, sizeof(post)); /* includes the NUL */
+    mcp_send_result(id, out);
+    free(out);
+}
+
 static void mcp_send_error(const char* id, int code, const char* msg)
 {
     char esc[512];
@@ -19678,10 +21589,14 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
     char* vol_arr = json_get_array(args_json, "volumes");
 
     /* Validate image path */
-    if (!image || !path_is_absolute_and_clean(image))
+    char        image_real[PATH_MAX];
+    const char* img_err = mcp_validate_image(image, image_real,
+                          sizeof(image_real));
+    if (img_err)
     {
-        mcp_send_error(id, -32602,
-                       "run_container: 'image' must be an absolute path");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "run_container: %s", img_err);
+        mcp_send_error(id, -32602, msg);
         free(image);
         free(name);
         free(net);
@@ -19689,11 +21604,11 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
         free(vol_arr);
         return;
     }
-    if (access(image, X_OK) < 0)
+    free(image);
+    image = strdup(image_real);
+    if (!image)
     {
-        mcp_send_error(id, -32602,
-                       "run_container: 'image' is not executable");
-        free(image);
+        mcp_send_error(id, -32603, "run_container: out of memory");
         free(name);
         free(net);
         free(env_arr);
@@ -19904,6 +21819,22 @@ static void mcp_tool_run_container(const char* id, const char* args_json,
                 }
                 goto cleanup_env;
             }
+        }
+    }
+
+    /* The CLI reads a bare "-e NAME" as "copy NAME from the host
+     * environment" — here that host is the MCP server, so a client could
+     * ask for AWS_SECRET_ACCESS_KEY or SSH_AUTH_SOCK and read it back.
+     * Only explicit KEY=VALUE pairs are forwarded. */
+    for (int i = 0; i < n_env; i++)
+    {
+        char* eq = strchr(env_strs[i], '=');
+        if (!eq || eq == env_strs[i])
+        {
+            mcp_send_error(id, -32602,
+                           "run_container: each 'env' entry must be"
+                           " KEY=VALUE");
+            goto cleanup_env;
         }
     }
 
@@ -20157,14 +22088,20 @@ cleanup_env:
 /* tools/call: list_containers */
 static void mcp_tool_list_containers(const char* id)
 {
-    char  buf[4096];
-    int   pos  = 0;
-    int   first = 1;
-    const int bufsz = (int)sizeof(buf);
-
-    pos += snprintf(buf + pos, (size_t)(bufsz - pos),
-                    "{\"content\":[{\"type\":\"text\",\"text\":\"[");
-    for (int i = 0; i < g_mcp_n_ctrs && pos < bufsz - 64; i++)
+    /* Each entry is bounded (name <= MCP_NAME_MAX, escaped at most 6x), and
+     * the table holds at most MCP_MAX_CONTAINERS, so this never truncates. */
+    enum { ENTRY_MAX = MCP_NAME_MAX * 6 + 64 };
+    size_t bufsz = 4 + (size_t)MCP_MAX_CONTAINERS * ENTRY_MAX;
+    char*  buf   = malloc(bufsz);
+    if (!buf)
+    {
+        mcp_send_error(id, -32603, "list_containers: out of memory");
+        return;
+    }
+    size_t pos   = 0;
+    int    first = 1;
+    buf[pos++] = '[';
+    for (int i = 0; i < g_mcp_n_ctrs; i++)
     {
         struct mcp_ctr* c = &g_mcp_ctrs[i];
         if (c->pid <= 0)
@@ -20182,23 +22119,26 @@ static void mcp_tool_list_containers(const char* id)
         }
         int running = mcp_ctr_alive(c);
 
-        char name_esc[MCP_NAME_MAX * 2];
-        json_escape_string(c->name, name_esc, sizeof(name_esc));
-        pos += snprintf(buf + pos, (size_t)(bufsz - pos),
-                        "%s{\\\"name\\\":\\\"%s\\\","
-                        "\\\"pid\\\":%d,\\\"running\\\":%s}",
-                        first ? "" : ",",
-                        name_esc,
-                        (int)c->pid,
-                        running ? "true" : "false");
+        char name_esc[MCP_NAME_MAX * 6];
+        if (json_escape_string(c->name, name_esc, sizeof(name_esc)) < 0)
+        {
+            continue;
+        }
+        int n = snprintf(buf + pos, bufsz - pos,
+                         "%s{\"name\":\"%s\",\"pid\":%d,\"running\":%s}",
+                         first ? "" : ",", name_esc, (int)c->pid,
+                         running ? "true" : "false");
+        if (n < 0 || (size_t)n >= bufsz - pos - 1)
+        {
+            break;
+        }
+        pos  += (size_t)n;
         first = 0;
     }
-    if (pos < bufsz - 8)
-    {
-        pos += snprintf(buf + pos, (size_t)(bufsz - pos), "]\"}]}");
-    }
-    buf[bufsz - 1] = '\0';
-    mcp_send_result(id, buf);
+    buf[pos++] = ']';
+    buf[pos]   = '\0';
+    mcp_send_text_result(id, buf);
+    free(buf);
 }
 
 /* tools/call: stop_container */
@@ -20219,13 +22159,32 @@ static void mcp_tool_stop_container(const char* id, const char* args_json)
         return;
     }
 
-    pid_t pid = g_mcp_ctrs[idx].pid;
-    kill(pid, SIGTERM);
-
-    /* Wait up to 10 seconds */
+    /* Every signal goes through mcp_ctr_alive(), which also compares the
+     * process start time: once the container exits its PID can be recycled
+     * by an unrelated process, and a bare kill(pid, ...) would hit that. */
+    struct mcp_ctr* c   = &g_mcp_ctrs[idx];
+    pid_t           pid = c->pid;
     int exit_code = -1;
     int is_child = 1;
-    for (int t = 0; t < 100; t++)
+    if (!mcp_ctr_alive(c))
+    {
+        int status;
+        if (waitpid(pid, &status, WNOHANG) == pid && WIFEXITED(status))
+        {
+            exit_code = WEXITSTATUS(status);
+        }
+        else
+        {
+            exit_code = 0;
+        }
+    }
+    else
+    {
+        kill(pid, SIGTERM);
+    }
+
+    /* Wait up to 10 seconds */
+    for (int t = 0; t < 100 && exit_code == -1; t++)
     {
         struct timespec ts = {0, 100000000}; /* 100 ms */
         nanosleep(&ts, NULL);
@@ -20240,13 +22199,13 @@ static void mcp_tool_stop_container(const char* id, const char* args_json)
         {
             is_child = 0;
         }
-        if (kill(pid, 0) < 0 && errno == ESRCH)
+        if (!mcp_ctr_alive(c))
         {
             exit_code = 0;
             break;
         }
     }
-    if (exit_code == -1)
+    if (exit_code == -1 && mcp_ctr_alive(c))
     {
         kill(pid, SIGKILL);
         if (is_child)
@@ -20268,6 +22227,35 @@ static void mcp_tool_stop_container(const char* id, const char* args_json)
              "{\"content\":[{\"type\":\"text\",\"text\":\"%d\"}]}",
              exit_code);
     mcp_send_result(id, result);
+}
+
+/* Is the container's `ns` namespace a different one from the server's?
+ * Unreadable links count as "differs" so the join is attempted and any
+ * failure surfaces as an error instead of silently skipping isolation. */
+static int mcp_ns_differs(pid_t pid, const char* ns)
+{
+    char path[64];
+    char theirs[64];
+    char ours[64];
+    int  n = snprintf(path, sizeof(path), "/proc/%d/ns/%s", (int)pid, ns);
+    if (n < 0 || (size_t)n >= sizeof(path))
+    {
+        return 1;
+    }
+    ssize_t tl = readlink(path, theirs, sizeof(theirs) - 1);
+    n = snprintf(path, sizeof(path), "/proc/self/ns/%s", ns);
+    if (tl < 0 || n < 0 || (size_t)n >= sizeof(path))
+    {
+        return 1;
+    }
+    ssize_t ol = readlink(path, ours, sizeof(ours) - 1);
+    if (ol < 0)
+    {
+        return 1;
+    }
+    theirs[tl] = '\0';
+    ours[ol]   = '\0';
+    return strcmp(theirs, ours) != 0;
 }
 
 /* tools/call: exec_in_container */
@@ -20295,7 +22283,7 @@ static void mcp_tool_exec_in_container(const char* id, const char* args_json)
     }
 
     pid_t ctr_pid = g_mcp_ctrs[idx].pid;
-    if (kill(ctr_pid, 0) < 0)
+    if (!mcp_ctr_alive(&g_mcp_ctrs[idx]))
     {
         mcp_send_error(id, -32602, "exec_in_container: container is not running");
         free(cmd_arr);
@@ -20312,16 +22300,40 @@ static void mcp_tool_exec_in_container(const char* id, const char* args_json)
         return;
     }
 
-    /* Build nsenter argv */
+    /* Build nsenter argv.  -U first: the command becomes root of the
+     * container's user namespace, not the server's host credentials (the old
+     * argv kept host CAP_SYS_ADMIN when mcp-serve ran as root, and could not
+     * setns at all when it did not).  -n joins the container network, and
+     * -r/-w take the container's root and cwd — the container is chroot'ed,
+     * so the mount namespace root alone would expose the host tree. */
     char pid_str[32];
     snprintf(pid_str, sizeof(pid_str), "%d", (int)ctr_pid);
     char* ns_argv[16 + MCP_CMD_MAX];
     int   ai = 0;
     ns_argv[ai++] = "nsenter";
-    ns_argv[ai++] = "-m";
-    ns_argv[ai++] = "-p";
-    ns_argv[ai++] = "-u";
-    ns_argv[ai++] = "-i";
+    ns_argv[ai++] = "-U";
+    ns_argv[ai++] = "-r";
+    ns_argv[ai++] = "-w";
+    /* Only namespaces the container has of its own: one it shares with the
+     * server (e.g. ipc, or net with --net host) belongs to a user namespace
+     * the command no longer has rights in after -U, so setns() would fail
+     * with EPERM — and there is nothing to enter anyway. */
+    static const struct
+    {
+        const char* ns;
+        const char* flag;
+    } nss[] =
+    {
+        {"mnt", "-m"}, {"pid", "-p"}, {"uts", "-u"}, {"ipc", "-i"},
+        {"net", "-n"},
+    };
+    for (size_t k = 0; k < sizeof(nss) / sizeof(nss[0]); k++)
+    {
+        if (mcp_ns_differs(ctr_pid, nss[k].ns))
+        {
+            ns_argv[ai++] = (char*)(uintptr_t)nss[k].flag;
+        }
+    }
     ns_argv[ai++] = "--target";
     ns_argv[ai++] = pid_str;
     ns_argv[ai++] = "--";
@@ -20354,48 +22366,22 @@ static void mcp_tool_exec_in_container(const char* id, const char* args_json)
     }
     output[out_len] = '\0'; /* safe: run_cmd_capture malloc'd len+cap */
 
-    /* Escape and return */
-    char* esc = malloc(out_len * 6 + 1);
-    if (!esc)
-    {
-        free(output);
-        mcp_send_error(id, -32603, "exec_in_container: out of memory");
-        return;
-    }
-    if (json_escape_string(output, esc, out_len * 6 + 1) < 0)
-    {
-        esc[0] = '\0';
-    }
+    mcp_send_text_result(id, output);
     free(output);
-
-    size_t rlen = strlen(esc) + 64;
-    char*  result = malloc(rlen);
-    if (result)
-    {
-        snprintf(result, rlen,
-                 "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", esc);
-        mcp_send_result(id, result);
-        free(result);
-    }
-    free(esc);
 }
 
 /* tools/call: inspect_image — forks the image with OCI2BIN_INSPECT=1 */
 static void mcp_tool_inspect_image(const char* id, const char* args_json)
 {
-    char* image = json_get_string(args_json, "image");
-    if (!image || !path_is_absolute_and_clean(image))
+    char* image_arg = json_get_string(args_json, "image");
+    char  image[PATH_MAX];
+    const char* img_err = mcp_validate_image(image_arg, image, sizeof(image));
+    free(image_arg);
+    if (img_err)
     {
-        mcp_send_error(id, -32602,
-                       "inspect_image: 'image' must be an absolute path");
-        free(image);
-        return;
-    }
-    if (access(image, X_OK) < 0)
-    {
-        mcp_send_error(id, -32602,
-                       "inspect_image: 'image' is not executable");
-        free(image);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "inspect_image: %s", img_err);
+        mcp_send_error(id, -32602, msg);
         return;
     }
 
@@ -20407,7 +22393,6 @@ static void mcp_tool_inspect_image(const char* id, const char* args_json)
     int pipefd[2];
     if (pipe(pipefd) < 0)
     {
-        free(image);
         mcp_send_error(id, -32603, "inspect_image: pipe failed");
         return;
     }
@@ -20416,7 +22401,6 @@ static void mcp_tool_inspect_image(const char* id, const char* args_json)
     {
         close(pipefd[0]);
         close(pipefd[1]);
-        free(image);
         mcp_send_error(id, -32603, "inspect_image: fork failed");
         return;
     }
@@ -20433,7 +22417,6 @@ static void mcp_tool_inspect_image(const char* id, const char* args_json)
         _exit(127);
     }
     close(pipefd[1]);
-    free(image);
 
     /* Read output */
     size_t cap = 4096, len = 0;
@@ -20481,16 +22464,8 @@ static void mcp_tool_inspect_image(const char* id, const char* args_json)
     }
     buf[len < cap ? len : cap - 1] = '\0';
 
-    /* buf should already be JSON from inspect_image_main() */
-    size_t rlen = len + 64;
-    char*  result = malloc(rlen);
-    if (result)
-    {
-        snprintf(result, rlen,
-                 "{\"content\":[{\"type\":\"text\",\"text\":%s}]}", buf);
-        mcp_send_result(id, result);
-        free(result);
-    }
+    /* inspect_image_main() prints JSON; MCP wants it as a text string. */
+    mcp_send_text_result(id, buf);
     free(buf);
 }
 
@@ -20560,30 +22535,8 @@ static void mcp_tool_get_logs(const char* id, const char* args_json)
         }
     }
 
-    size_t tail_len = log_size - (size_t)(start - log_data);
-    char*  esc      = malloc(tail_len * 6 + 1);
-    if (!esc)
-    {
-        free(log_data);
-        mcp_send_error(id, -32603, "get_logs: out of memory");
-        return;
-    }
-    if (json_escape_string(start, esc, tail_len * 6 + 1) < 0)
-    {
-        esc[0] = '\0';
-    }
+    mcp_send_text_result(id, start);
     free(log_data);
-
-    size_t rlen = strlen(esc) + 64;
-    char*  result = malloc(rlen);
-    if (result)
-    {
-        snprintf(result, rlen,
-                 "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", esc);
-        mcp_send_result(id, result);
-        free(result);
-    }
-    free(esc);
 }
 
 /* Return the MCP tools/list response JSON */
@@ -20706,44 +22659,28 @@ static int inspect_image_main(const char* self_path)
             goto out;
         }
 
-        /* Sanitize config filename: docker-save manifests commonly reference
-         * "<config-digest>.json".  Keep dots, but reject slash-like traversal
-         * by mapping anything outside this small filename alphabet to '_'. */
-        for (char* p = config_digest; *p; p++)
+        /* Docker 25+ references the config as blobs/sha256/<hex>, older
+         * saves as <hex>.json.  Open it beneath the layout dir, exactly as
+         * extract_oci_rootfs() does, instead of flattening the path: the old
+         * character sanitiser turned '/' into '_' and never found a modern
+         * config.  openat_beneath() refuses anything that escapes oci_dir. */
+        if (path_has_dotdot_component(config_digest) ||
+                config_digest[0] == '/')
         {
-            if (!isalnum((unsigned char)*p) && *p != ':' &&
-                    *p != '-' && *p != '_' && *p != '.')
-            {
-                *p = '_';
-            }
-        }
-
-        /* Read config JSON from oci_dir/<digest> */
-        char config_path[PATH_MAX];
-        int n = snprintf(config_path, sizeof(config_path), "%s/%s",
-                         oci_dir, config_digest);
-        free(config_digest);
-        if (n < 0 || n >= (int)sizeof(config_path))
-        {
+            free(config_digest);
             goto out;
         }
-
-        /* Reject path traversal (belt-and-suspenders) */
-        if (path_has_dotdot_component(config_path))
+        int oci_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (oci_fd < 0)
         {
+            free(config_digest);
             goto out;
         }
-        /* Reject paths that escape oci_dir (e.g. from a leading '/' in the
-         * digest after sanitisation still produced a rooted component). */
-        size_t oci_dir_len = strlen(oci_dir);
-        if (strncmp(config_path, oci_dir, oci_dir_len) != 0 ||
-                config_path[oci_dir_len] != '/')
-        {
-            goto out;
-        }
-
         size_t config_size;
-        char*  config_json = read_file(config_path, &config_size);
+        char*  config_json = read_file_beneath(oci_fd, config_digest,
+                                               &config_size);
+        close(oci_fd);
+        free(config_digest);
         if (!config_json)
         {
             goto out;
@@ -21239,7 +23176,7 @@ int main(int argc, char* argv[])
      * host, unlike the build-host `oci2bin doctor`. */
     if (argv_has_doctor_flag(argc, argv))
     {
-        return run_runtime_doctor();
+        return run_runtime_doctor(self_path);
     }
 
     /* 1b. oci2vm mode: if invoked as "oci2vm", prepend --vm to argv so VM
@@ -21542,6 +23479,7 @@ int main(int argc, char* argv[])
         /* MicroVM mode still needs the compatibility shims because ownership
          * changes operate on host IDs through virtiofs. */
         patch_rootfs_ids(rootfs);
+        install_resolv_conf(rootfs);
         char vm_tmpdir[PATH_MAX];
         if (make_runtime_tmpdir(vm_tmpdir, sizeof(vm_tmpdir),
                                 "oci2bin-vm.") < 0)
@@ -21577,7 +23515,11 @@ int main(int argc, char* argv[])
             return run_as_vm_libkrun(rootfs, vm_tmpdir, &opts);
         }
 #endif
-        return run_as_vm_ch(rootfs, vm_tmpdir, &opts);
+        int vm_rc = run_as_vm_ch(rootfs, vm_tmpdir, &opts);
+        /* The kernel copy, initramfs and exit-status file live here; the
+         * VMM now runs as a child, so there is someone left to clean up. */
+        rm_rf_dir(vm_tmpdir);
+        return vm_rc;
     }
 
     /* 6. Capture real UID/GID before entering user namespace */
@@ -21595,6 +23537,10 @@ int main(int argc, char* argv[])
     {
         patch_rootfs_ids(rootfs);
     }
+    /* DNS is needed in both userns modes; it used to be installed only from
+     * patch_rootfs_ids(), so hosts with a working newuidmap + /etc/subuid
+     * setup got no resolver in images that ship none. */
+    install_resolv_conf(rootfs);
 
     /* 6a. Set up cgroup v2 resource limits (before unshare, uses host cgroupfs) */
     int cg_limits_failed = 0;
@@ -21627,6 +23573,160 @@ int main(int argc, char* argv[])
     debug_log("main.cgroup", "enabled=%d limits_failed=%d dir=%s",
               cg_did_setup, cg_limits_failed,
               g_cgroup_dir[0] ? g_cgroup_dir : "(none)");
+
+    /* --allow-egress hostnames resolve on the host network, before any
+     * namespace is entered (see build_egress_allowlist()). */
+    if (build_egress_allowlist(&opts) != 0)
+    {
+        return 1;
+    }
+
+    /* 6b. For slirp/pasta modes: fork the net helper NOW, while this process
+     * is still in the host's user and network namespaces — slirp4netns and
+     * pasta must run there and reach into the container's namespaces from
+     * outside.  (Forked after unshare, the helper sat inside the very
+     * namespace it was meant to connect and could not attach at all.)  It
+     * waits on a pipe until step 10b, once CLONE_NEWNET exists, then targets
+     * /proc/<pid>/ns/{user,net} of this process. */
+    pid_t net_helper_pid = -1;
+    int   net_sync_fd    = -1;
+    if (opts.net &&
+            (strcmp(opts.net, "slirp") == 0 || strcmp(opts.net, "pasta") == 0))
+    {
+        /* Fail closed: if the userspace net helper is not installed, the
+         * forked child would exec-fail and _exit(127) while the container
+         * kept running with an unconfigured, network-less namespace. Verify
+         * the binary is reachable up front and abort with a clear message. */
+        int is_slirp = (strcmp(opts.net, "slirp") == 0);
+        const char* net_tool = is_slirp ? "slirp4netns" : "pasta";
+        if (!tool_is_available(net_tool))
+        {
+            fprintf(stderr,
+                    "oci2bin: --net %s requires '%s', but it was not found in"
+                    " $PATH, /usr/bin, or /usr/local/bin.\n"
+                    "         Install it (%s) or use --net host|none.\n",
+                    opts.net, net_tool,
+                    is_slirp ? "dnf/apt install slirp4netns"
+                    : "dnf install passt / apt install passt");
+            return 1;
+        }
+        int sync_pipe[2];
+        if (pipe2(sync_pipe, O_CLOEXEC) < 0)
+        {
+            perror("oci2bin: slirp: pipe");
+            return 1;
+        }
+        pid_t cur_pid = getpid();
+        net_helper_pid = fork();
+        if (net_helper_pid < 0)
+        {
+            perror("oci2bin: slirp: fork net helper");
+            close(sync_pipe[0]);
+            close(sync_pipe[1]);
+            return 1;
+        }
+        if (net_helper_pid == 0)
+        {
+            /* Net helper child: wait for a byte on the pipe, then exec
+             * slirp4netns/pasta targeting the container's net namespace */
+            close(sync_pipe[1]);
+            char ready;
+            ssize_t rr = read(sync_pipe[0], &ready, 1);
+            close(sync_pipe[0]);
+            if (rr != 1)
+            {
+                _exit(0); /* the loader gave up before the netns existed */
+            }
+            /* Die with the loader: any early return (or a crash) would
+             * otherwise leave slirp4netns/pasta running, holding the
+             * caller's stdio open.  Survives the exec below. */
+            if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) < 0 ||
+                    getppid() != cur_pid)
+            {
+                _exit(0);
+            }
+
+            char pid_str[16];
+            int psn = snprintf(pid_str, sizeof(pid_str),
+                               "%d", (int)cur_pid);
+            if (psn < 0 || psn >= (int)sizeof(pid_str))
+            {
+                _exit(1);
+            }
+
+            if (strcmp(opts.net, "slirp") == 0)
+            {
+                /* Build argv for slirp4netns */
+                const char* slirp_args[64];
+                int ai = 0;
+                slirp_args[ai++] = "slirp4netns";
+                slirp_args[ai++] = "--configure";
+                slirp_args[ai++] = "--mtu=65520";
+                slirp_args[ai++] = "--disable-host-loopback";
+                slirp_args[ai++] = "-6";
+                /* Add port-forwards */
+                char pf_bufs[16][32];
+                for (int pi = 0; pi < opts.n_portfwd && ai + 2 < 60; pi++)
+                {
+                    int bn = snprintf(pf_bufs[pi], sizeof(pf_bufs[pi]),
+                                      ":%s",
+                                      opts.net_portfwd[pi]);
+                    if (bn < 0 || bn >= (int)sizeof(pf_bufs[pi]))
+                    {
+                        continue;
+                    }
+                    slirp_args[ai++] = "-p";
+                    slirp_args[ai++] = pf_bufs[pi];
+                }
+                slirp_args[ai++] = pid_str;
+                slirp_args[ai++] = "tap0";
+                slirp_args[ai]   = NULL;
+
+                /* Try /usr/bin then /usr/local/bin */
+                execvp("slirp4netns", (char* const*)slirp_args);
+                /* If PATH lookup fails, try explicit paths */
+                execv("/usr/bin/slirp4netns", (char* const*)slirp_args);
+                execv("/usr/local/bin/slirp4netns",
+                      (char* const*)slirp_args);
+                fprintf(stderr, "oci2bin: slirp4netns not found in PATH,"
+                                " /usr/bin, or /usr/local/bin\n");
+                _exit(127);
+            }
+            else
+            {
+                /* pasta */
+                /* -f: stay in the foreground so the loader's SIGTERM at exit
+                 * reaches pasta itself (by default it daemonizes and the
+                 * forked pid we track exits at once, leaking pasta).
+                 * --no-netns-quit: the loader owns the helper's lifetime; the
+                 * netns watch pasta would set up instead opens /proc/<pid>/ns
+                 * after sandboxing itself and fails with EACCES.
+                 * -q: no port-scan chatter on the container's terminal. */
+                char* pasta_args[] =
+                {
+                    "pasta",
+                    "-f",
+                    "-q",
+                    "--no-netns-quit",
+                    "--config-net",
+                    pid_str,
+                    NULL
+                };
+                execvp("pasta", pasta_args);
+                execv("/usr/bin/pasta", pasta_args);
+                execv("/usr/local/bin/pasta", pasta_args);
+                fprintf(stderr, "oci2bin: pasta not found in PATH,"
+                                " /usr/bin, or /usr/local/bin\n");
+                _exit(127);
+            }
+        }
+        /* Parent: keep the write end; step 10b releases the helper. */
+        close(sync_pipe[0]);
+        net_sync_fd = sync_pipe[1];
+        g_net_helper_pid   = net_helper_pid;
+        g_net_helper_owner = getpid();
+        atexit(stop_net_helper);
+    }
 
     /* 7-8. Enter the user namespace and install the UID/GID maps. For the
      * subordinate-ID remap, newuidmap/newgidmap are run by a helper that stays
@@ -21764,134 +23864,16 @@ int main(int argc, char* argv[])
         }
     }
 
-    /* 10b. For slirp/pasta modes: fork a net helper AFTER CLONE_NEWNET.
-     * The net helper will exec slirp4netns or pasta, targeting our new
-     * network namespace via /proc/<pid>/ns/net. */
-    pid_t net_helper_pid = -1;
-    if (opts.net &&
-            (strcmp(opts.net, "slirp") == 0 || strcmp(opts.net, "pasta") == 0))
+    /* 10b. slirp/pasta: the helper forked before the user namespace was
+     * entered may now attach to our new network namespace. */
+    if (net_sync_fd >= 0)
     {
-        /* Fail closed: if the userspace net helper is not installed, the
-         * forked child would exec-fail and _exit(127) while the container
-         * kept running with an unconfigured, network-less namespace. Verify
-         * the binary is reachable up front and abort with a clear message. */
-        int is_slirp = (strcmp(opts.net, "slirp") == 0);
-        const char* net_tool = is_slirp ? "slirp4netns" : "pasta";
-        if (!tool_is_available(net_tool))
-        {
-            fprintf(stderr,
-                    "oci2bin: --net %s requires '%s', but it was not found in"
-                    " $PATH, /usr/bin, or /usr/local/bin.\n"
-                    "         Install it (%s) or use --net host|none.\n",
-                    opts.net, net_tool,
-                    is_slirp ? "dnf/apt install slirp4netns"
-                    : "dnf install passt / apt install passt");
-            return 1;
-        }
-        int sync_pipe[2];
-        if (pipe(sync_pipe) < 0)
-        {
-            perror("oci2bin: slirp: pipe");
-            return 1;
-        }
-        pid_t cur_pid = getpid();
-        net_helper_pid = fork();
-        if (net_helper_pid < 0)
-        {
-            perror("oci2bin: slirp: fork net helper");
-            close(sync_pipe[0]);
-            close(sync_pipe[1]);
-            return 1;
-        }
-        if (net_helper_pid == 0)
-        {
-            /* Net helper child: wait for a byte on the pipe, then exec
-             * slirp4netns/pasta targeting the container's net namespace */
-            close(sync_pipe[1]);
-            char ready;
-            ignore_io_result(read(sync_pipe[0], &ready, 1));
-            close(sync_pipe[0]);
-
-            char pid_str[16];
-            int psn = snprintf(pid_str, sizeof(pid_str),
-                               "%d", (int)cur_pid);
-            if (psn < 0 || psn >= (int)sizeof(pid_str))
-            {
-                _exit(1);
-            }
-
-            if (strcmp(opts.net, "slirp") == 0)
-            {
-                /* Build argv for slirp4netns */
-                const char* slirp_args[64];
-                int ai = 0;
-                slirp_args[ai++] = "slirp4netns";
-                slirp_args[ai++] = "--configure";
-                slirp_args[ai++] = "--mtu=65520";
-                slirp_args[ai++] = "--disable-host-loopback";
-                slirp_args[ai++] = "-6";
-                /* Add port-forwards */
-                char pf_bufs[16][32];
-                for (int pi = 0; pi < opts.n_portfwd && ai + 2 < 60; pi++)
-                {
-                    int bn = snprintf(pf_bufs[pi], sizeof(pf_bufs[pi]),
-                                      ":%s",
-                                      opts.net_portfwd[pi]);
-                    if (bn < 0 || bn >= (int)sizeof(pf_bufs[pi]))
-                    {
-                        continue;
-                    }
-                    slirp_args[ai++] = "-p";
-                    slirp_args[ai++] = pf_bufs[pi];
-                }
-                slirp_args[ai++] = pid_str;
-                slirp_args[ai++] = "tap0";
-                slirp_args[ai]   = NULL;
-
-                /* Try /usr/bin then /usr/local/bin */
-                execvp("slirp4netns", (char* const*)slirp_args);
-                /* If PATH lookup fails, try explicit paths */
-                execv("/usr/bin/slirp4netns", (char* const*)slirp_args);
-                execv("/usr/local/bin/slirp4netns",
-                      (char* const*)slirp_args);
-                fprintf(stderr, "oci2bin: slirp4netns not found in PATH,"
-                                " /usr/bin, or /usr/local/bin\n");
-                _exit(127);
-            }
-            else
-            {
-                /* pasta */
-                char* pasta_args[] =
-                {
-                    "pasta",
-                    "--config-net",
-                    pid_str,
-                    NULL
-                };
-                execvp("pasta", pasta_args);
-                execv("/usr/bin/pasta", pasta_args);
-                execv("/usr/local/bin/pasta", pasta_args);
-                fprintf(stderr, "oci2bin: pasta not found in PATH,"
-                                " /usr/bin, or /usr/local/bin\n");
-                _exit(127);
-            }
-        }
-        /* Parent: signal net helper that it can proceed */
-        close(sync_pipe[0]);
-        if (write(sync_pipe[1], "1", 1) < 0)
+        if (write(net_sync_fd, "1", 1) < 0)
         {
             perror("oci2bin: slirp: write sync pipe");
         }
-        close(sync_pipe[1]);
-    }
-
-    /* 10d. Default-deny egress allowlist (--allow-egress): install the
-     * nftables policy now that we are in the network namespace. Fails closed
-     * so a missing nft or unresolvable host aborts rather than running with
-     * egress wide open. */
-    if (apply_egress_allowlist(&opts, rootfs) != 0)
-    {
-        return 1;
+        close(net_sync_fd);
+        net_sync_fd = -1;
     }
 
     /* 11. Allocate a PTY so the container shell gets job control.
@@ -21907,6 +23889,47 @@ int main(int argc, char* argv[])
      * SIGWINCH handler is only installed when stdin is a real terminal. */
     opts.pty_master_fd = -1;
     opts.pty_slave_fd  = -1;
+
+    /* --gen-seccomp traces and --gdb debugs one directly exec'd process; under
+     * a supervisor they would silently never run. */
+    if ((opts.gen_seccomp || opts.gdb)
+            && (opts.restart_policy != RESTART_NO || opts.health_enabled
+                || opts.health_cmd || opts.use_init))
+    {
+        fprintf(stderr,
+                "oci2bin: %s cannot be combined with --init, --restart or"
+                " --health\n", opts.gen_seccomp ? "--gen-seccomp" : "--gdb");
+        return 1;
+    }
+
+    /* --seccomp-profile and --gen-seccomp name host paths: read/open them
+     * now, while the host filesystem and the caller's cwd are still what
+     * the paths refer to. */
+    if (opts.seccomp_profile)
+    {
+        opts.seccomp_profile_json = read_file(opts.seccomp_profile, NULL);
+        if (!opts.seccomp_profile_json)
+        {
+            fprintf(stderr,
+                    "oci2bin: --seccomp-profile: cannot read '%s': %s\n",
+                    opts.seccomp_profile, strerror(errno));
+            return 1;
+        }
+    }
+    if (opts.gen_seccomp)
+    {
+        int gfd = open(opts.gen_seccomp,
+                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                       0644);
+        if (gfd < 0)
+        {
+            fprintf(stderr, "oci2bin: --gen-seccomp: cannot write %s: %s\n",
+                    opts.gen_seccomp, strerror(errno));
+            return 1;
+        }
+        opts.gen_seccomp_fd     = gfd;
+        opts.gen_seccomp_fd_set = 1;
+    }
     struct termios saved_termios;
     int saved_termios_ok = 0;
 
@@ -22099,12 +24122,7 @@ int main(int argc, char* argv[])
     }
 
     /* Reap net helper if it was started */
-    if (net_helper_pid > 0)
-    {
-        kill(net_helper_pid, SIGTERM);
-        int helper_status;
-        waitpid(net_helper_pid, &helper_status, 0);
-    }
+    stop_net_helper();
     if (metrics_pid > 0)
     {
         kill(metrics_pid, SIGTERM);

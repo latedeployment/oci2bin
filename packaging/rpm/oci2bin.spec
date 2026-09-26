@@ -29,7 +29,7 @@ make loader
 make doc
 
 %install
-make install PREFIX=%{buildroot}/usr
+make install DESTDIR=%{buildroot} PREFIX=/usr
 
 %files
 /usr/bin/oci2bin

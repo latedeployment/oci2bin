@@ -15,7 +15,15 @@ CONFIG="$2"
 OUT="$3"
 BUILDDIR="build/linux-${VERSION}"
 TARBALL="build/linux-${VERSION}.tar.xz"
-URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${VERSION}.tar.xz"
+# kernel.org groups releases by major version: v5.x/, v6.x/, v7.x/, ...
+MAJOR="${VERSION%%.*}"
+case "$MAJOR" in
+    ''|*[!0-9]*)
+        echo "fetch_kernel.sh: cannot parse major version from '${VERSION}'" >&2
+        exit 1
+        ;;
+esac
+URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${VERSION}.tar.xz"
 
 mkdir -p build
 

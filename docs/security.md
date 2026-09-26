@@ -155,6 +155,16 @@ Then run with it:
 ./app.bin --seccomp-profile ./seccomp.json
 ```
 
+Both paths are host paths, read or written before the container is entered.
+`--gen-seccomp` runs its tracer without the default filter (like `--gdb`) and
+cannot be combined with `--init`, `--restart` or `--health`. A profile is
+installed as the last step before `execve` — in the workload, the
+`--init`/`--restart` children and health probes — so it only has to allow what
+the workload itself needs (plus `execve`, which generated profiles include).
+The default filter also covers 32-bit (i386) syscalls with the same denylist;
+a profile's `SCMP_ARCH_X86` rules are not implemented and 32-bit calls are
+killed under a profile (the loader warns).
+
 ## Landlock Filesystem Sandbox
 
 When supported by the kernel, Landlock can restrict filesystem access from the
@@ -173,6 +183,13 @@ Check the deployment host with the artifact itself:
 ./app.bin --doctor
 ```
 
+The ruleset handles every right the running kernel's Landlock ABI knows —
+including `REFER` (ABI 2), without which every cross-directory `rename()` and
+`link()` failed with `EXDEV`, `TRUNCATE` (ABI 3) and `IOCTL_DEV` (ABI 5) — and
+grants them within the container's own tree. The files behind the workload's
+stdio (a log file, the terminal) are granted too, so `/dev/stdout`-style
+re-opens work.
+
 `--landlock` requires the sandbox: the run aborts if the kernel cannot provide
 it or it cannot be enforced. Without the flag, Landlock is applied when
 available and skipped otherwise — unless `--strict` is set, which also refuses
@@ -188,8 +205,24 @@ warning into a hard failure:
 - a capability drop or add the kernel rejects
 
 Failures of an explicitly requested flag — `--read-only`, `--landlock`,
-`--seccomp-profile`, `--seccomp-deny-write`, `-v`, `--secret`,
-`--allow-egress` — always abort the run, with or without `--strict`.
+`--seccomp-profile`, `--seccomp-deny-write`, `-v`, `--secret`, `--device`,
+`--tmpfs`, `--security-opt`, `--allow-egress` — always abort the run, with or
+without `--strict`.
+
+## Root Filesystem Isolation
+
+The container root is entered with `pivot_root(2)` in a private mount
+namespace and the host tree is detached, so it is not reachable from inside at
+all — unlike a `chroot`, which a workload holding `CAP_SYS_CHROOT` can leave.
+Only when the host's own root cannot be pivoted (e.g. an initramfs root) does
+the loader fall back to `chroot`, with a warning; `--strict` refuses instead.
+
+## Capabilities
+
+`--cap-drop all --cap-add CAP` leaves exactly the added capabilities in the
+bounding set; they are raised as ambient capabilities after the `--user`
+switch, so a non-root workload keeps them too. `--cap-add` accepts every
+capability name the kernel defines (`sys_nice`, `perfmon`, ...).
 
 ## AppArmor And SELinux
 
@@ -198,7 +231,9 @@ Failures of an explicitly requested flag — `--read-only`, `--landlock`,
 ./app.bin --security-opt label=type:container_t
 ```
 
-The loader must be built with matching AppArmor or SELinux support.
+The loader must be built with matching AppArmor or SELinux support; without
+it, or if the kernel rejects the profile/label, the run is aborted rather than
+started unconfined.
 
 ## Secrets
 
@@ -259,7 +294,9 @@ Recipient mode passes `--recipient` and `--recipients-file` values to the
 installed `age` CLI. This includes native age and SSH recipient types supported
 by that age version. Both options are repeatable. An identity file can hold
 multiple private identities; the loader tries `OCI2BIN_IDENTITY` first, then
-`~/.config/oci2bin/identity`, `~/.ssh/id_ed25519`, and `~/.ssh/id_rsa`.
+`~/.config/oci2bin/identity`. Your SSH keys (`~/.ssh/id_ed25519`, then
+`~/.ssh/id_rsa`) are only handed to `age` when the image was encrypted to an
+SSH recipient, and the loader names the key it used.
 
 Passphrase mode reads `OCI2BIN_PASSWORD_FILE` first, then
 `OCI2BIN_PASSWORD`, and finally prompts on a terminal. Do not put a production
@@ -350,7 +387,16 @@ Generate or verify provenance:
 
 ```bash
 oci2bin sign --key priv.pem --attest slsa.json --in app.bin
+oci2bin verify --key pub.pem --in app.bin --require-attestation
+oci2bin attest verify --signing-key pub.pem --in app.bin --recheck
 ```
+
+An embedded attestation is bound to the binary it rides on: `sign` sets the
+statement's `subject` to the binary's digest (replacing whatever a supplied
+statement named), and `verify` fails when the subject does not match, so two
+artifacts signed with the same key cannot trade attestations. `attest verify`
+authenticates the attestation with `--signing-key` before it reads anything
+from it — including the Cosign key path it passes to `cosign verify`.
 
 ## Source Image Trust
 

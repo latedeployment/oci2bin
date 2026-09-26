@@ -17,9 +17,14 @@ from pathlib import Path
 SH = shutil.which("sh") or "/bin/sh"
 
 
+def _sh_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
 def _wrapper_template(prefix: str) -> str:
     """Mirror the wrapper that `oci2bin --arch all` writes.  Kept in sync
     with oci2bin's heredoc so this test catches regressions in the logic."""
+    base = _sh_single_quote(prefix)
     return textwrap.dedent(f"""\
         #!/bin/sh
         # Allow the test to pin the host arch instead of relying on uname.
@@ -29,8 +34,9 @@ def _wrapper_template(prefix: str) -> str:
             _ARCH=$(uname -m)
         fi
         _DIR=$(cd "$(dirname "$0")" && pwd)
-        _X86=${{_DIR}}/{prefix}_x86_64
-        _ARM=${{_DIR}}/{prefix}_aarch64
+        _BASE={base}
+        _X86="${{_DIR}}/${{_BASE}}_x86_64"
+        _ARM="${{_DIR}}/${{_BASE}}_aarch64"
 
         case "$_ARCH" in
             x86_64)  [ -x "$_X86" ] && exec "$_X86" "$@" ;;
@@ -166,6 +172,34 @@ class TestWrapperMatchesEmittedTemplate(unittest.TestCase):
         ):
             self.assertIn(expected, oci2bin,
                           f"oci2bin wrapper missing {expected!r}")
+
+
+class TestArchWrapperNames(unittest.TestCase):
+    """The wrapper finds its binaries by basename next to itself, whatever
+    directory or characters the requested OUTPUT had."""
+
+    def test_name_with_space_and_quote(self):
+        tmp = Path(tempfile.mkdtemp(prefix="oci2bin-arch-q-"))
+        try:
+            prefix = "my app's"
+            wrapper = tmp / prefix
+            wrapper.write_text(_wrapper_template(prefix))
+            _make_executable(wrapper)
+            x86 = tmp / f"{prefix}_x86_64"
+            x86.write_text("#!/bin/sh\necho ran-x86_64\n")
+            _make_executable(x86)
+            r = subprocess.run([SH, str(wrapper)], capture_output=True,
+                               text=True,
+                               env={"PATH": "/usr/bin:/bin",
+                                    "TEST_ARCH": "x86_64"})
+            self.assertEqual(r.stdout.strip(), "ran-x86_64", r.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_real_oci2bin_uses_basename(self):
+        text = (Path(__file__).resolve().parent.parent / "oci2bin").read_text()
+        self.assertIn('_out_base="$(basename -- "$OUTPUT")"', text)
+        self.assertIn('_X86="\\${_DIR}/\\${_BASE}_x86_64"', text)
 
 
 if __name__ == "__main__":

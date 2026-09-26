@@ -101,6 +101,32 @@ static void test_json_get_string(void)
                     "json_get_string: value with spaces around colon found");
     ASSERT_STR_EQ(spaced, "value123", "json_get_string: value with spaces correct");
     free(spaced);
+
+    /* Escapes are decoded: Go's encoding/json writes & < > as \u0026 etc. */
+    const char* json4 = "{\"W\":\"a \\u0026\\u0026 b\\\\c\\\"d\\/e\\n\"}";
+    char* dec = json_get_string(json4, "W");
+    ASSERT_NOT_NULL(dec, "json_get_string: escaped value found");
+    ASSERT_STR_EQ(dec, "a && b\\c\"d/e\n",
+                  "json_get_string: escapes decoded");
+    free(dec);
+
+    /* Surrogate pair -> 4-byte UTF-8; non-ASCII BMP -> 2 bytes */
+    const char* json5 = "{\"U\":\"\\ud83d\\ude00\\u00e9\"}";
+    char* utf = json_get_string(json5, "U");
+    ASSERT_NOT_NULL(utf, "json_get_string: surrogate pair decoded");
+    ASSERT_STR_EQ(utf, "\xf0\x9f\x98\x80\xc3\xa9",
+                  "json_get_string: UTF-8 output correct");
+    free(utf);
+
+    /* Malformed escapes, lone surrogates and \u0000 are rejected */
+    ASSERT_NULL(json_get_string("{\"X\":\"a\\qb\"}", "X"),
+                "json_get_string: unknown escape rejected");
+    ASSERT_NULL(json_get_string("{\"X\":\"\\ud83d\"}", "X"),
+                "json_get_string: lone high surrogate rejected");
+    ASSERT_NULL(json_get_string("{\"X\":\"a\\u0000b\"}", "X"),
+                "json_get_string: \\u0000 rejected");
+    ASSERT_NULL(json_get_string("{\"X\":\"\\u12\"}", "X"),
+                "json_get_string: short \\u escape rejected");
 }
 
 static void test_json_get_array(void)
@@ -174,8 +200,25 @@ static void test_json_parse_string_array(void)
     char* out_esc[4];
     int n_esc = json_parse_string_array(arr_esc, out_esc, 4);
     ASSERT_INT_EQ(n_esc, 1, "json_parse_string_array: escaped-quote element count");
-    /* The parser skips over backslash-escaped characters */
+    ASSERT_STR_EQ(out_esc[0], "say \"hello\"",
+                  "json_parse_string_array: escaped quotes decoded");
     free(out_esc[0]);
+
+    /* The CMD Docker writes for `nginx && tail -f /dev/null` */
+    const char* arr_amp =
+        "[\"sh\",\"-c\",\"nginx \\u0026\\u0026 tail -f /dev/null\"]";
+    char* out_amp[4];
+    int n_amp = json_parse_string_array(arr_amp, out_amp, 4);
+    ASSERT_INT_EQ(n_amp, 3, "json_parse_string_array: CMD element count");
+    if (n_amp == 3)
+    {
+        ASSERT_STR_EQ(out_amp[2], "nginx && tail -f /dev/null",
+                      "json_parse_string_array: \\u0026 decoded to &");
+    }
+    for (int i = 0; i < n_amp; i++)
+    {
+        free(out_amp[i]);
+    }
 
     char* strict[2] = {NULL, NULL};
     ASSERT_INT_EQ(json_parse_string_array_strict(
@@ -816,6 +859,14 @@ static void test_cap_name_to_num(void)
                   "cap_name_to_num: sys_admin=21");
     ASSERT_INT_EQ(cap_name_to_num("setfcap"),  31,
                   "cap_name_to_num: setfcap=31");
+    ASSERT_INT_EQ(cap_name_to_num("sys_nice"), 23,
+                  "cap_name_to_num: sys_nice=23");
+    ASSERT_INT_EQ(cap_name_to_num("CAP_SYS_RESOURCE"), 24,
+                  "cap_name_to_num: sys_resource=24");
+    ASSERT_INT_EQ(cap_name_to_num("perfmon"), 38,
+                  "cap_name_to_num: perfmon=38");
+    ASSERT_INT_EQ(cap_name_to_num("checkpoint_restore"), 40,
+                  "cap_name_to_num: checkpoint_restore=40");
     ASSERT_INT_EQ(cap_name_to_num("unknown_capability"), -1,
                   "cap_name_to_num: unknown returns -1");
     ASSERT_INT_EQ(cap_name_to_num(""), -1,
@@ -1185,6 +1236,23 @@ static void test_parse_opts_caps(void)
 static void test_parse_opts_ulimit(void)
 {
     struct container_opts opts;
+
+    /* Empty and negative values are rejected (strtoull would read "" as 0
+     * and "-1" as RLIM_INFINITY). */
+    {
+        const char* bad[] = {"nofile=", "nofile=-1", "nofile=+5",
+                             "nofile= 5", "nofile=99999999999999999999999"
+                            };
+        for (size_t b = 0; b < sizeof(bad) / sizeof(bad[0]); b++)
+        {
+            char arg[64];
+            snprintf(arg, sizeof(arg), "%s", bad[b]);
+            char* argv[] = {"prog", "--ulimit", arg, NULL};
+            memset(&opts, 0, sizeof(opts));
+            ASSERT_INT_EQ(parse_opts(3, argv, &opts), -1,
+                          "parse_opts: --ulimit rejects malformed value");
+        }
+    }
 
     /* nofile */
     {
@@ -3313,6 +3381,146 @@ cleanup_ob:
     rmdir(base);
 }
 
+/* Run fn(arg) with stdout redirected to a temp file; return what it wrote
+ * (malloc'd, NUL-terminated) or NULL. */
+static char* capture_stdout_of(void (*fn)(void*), void* arg)
+{
+    char path[] = "/tmp/oci2bin-cap-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0)
+    {
+        return NULL;
+    }
+    unlink(path);
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    dup2(fd, STDOUT_FILENO);
+    fn(arg);
+    fflush(stdout);
+    dup2(saved, STDOUT_FILENO);
+    close(saved);
+    off_t len = lseek(fd, 0, SEEK_END);
+    char* out = malloc((size_t)len + 1);
+    if (out && lseek(fd, 0, SEEK_SET) == 0 &&
+            read_all_fd(fd, out, (size_t)len) == (ssize_t)len)
+    {
+        out[len] = '\0';
+    }
+    else
+    {
+        free(out);
+        out = NULL;
+    }
+    close(fd);
+    return out;
+}
+
+static void send_text_nl_json(void* arg)
+{
+    (void)arg;
+    mcp_send_text_result("7", "{\"a\":\"x\"}\nline2\t\"q\"");
+}
+
+/* ── MCP review fixes: text results, image validation ──────────────────── */
+
+static void test_mcp_review_fixes(void)
+{
+    /* Result text is always a JSON string, whatever it contains. */
+    char* out = capture_stdout_of(send_text_nl_json, NULL);
+    ASSERT_NOT_NULL(out, "mcp_text: captured output");
+    if (out)
+    {
+        ASSERT(strstr(out, "\"text\":\"{\\\"a\\\":\\\"x\\\"}\\nline2\\t"
+                           "\\\"q\\\"\"") != NULL,
+                           "mcp_text: payload escaped into a JSON string");
+        ASSERT(strstr(out, "\n\"") == NULL && strchr(out, '\n') ==
+               out + strlen(out) - 1,
+               "mcp_text: no raw newline inside the reply");
+        free(out);
+    }
+
+    /* inspect_image/run_container: only real oci2bin binaries. */
+    char tmpl[] = "/tmp/oci2bin-mcpimg-XXXXXX";
+    char* dir = mkdtemp(tmpl);
+    ASSERT_NOT_NULL(dir, "mcp_image: mkdtemp");
+    if (!dir)
+    {
+        return;
+    }
+    char script[PATH_MAX];
+    snprintf(script, sizeof(script), "%s/evil.sh", dir);
+    FILE* f = fopen(script, "w");
+    if (f)
+    {
+        fputs("#!/bin/sh\necho pwned\n", f);
+        fclose(f);
+    }
+    chmod(script, 0755);
+    char real[PATH_MAX];
+    ASSERT(mcp_validate_image(script, real, sizeof(real)) != NULL,
+           "mcp_image: executable script rejected");
+    ASSERT(mcp_validate_image("relative/path", real, sizeof(real)) != NULL,
+           "mcp_image: relative path rejected");
+
+    char elf[PATH_MAX];
+    snprintf(elf, sizeof(elf), "%s/fake.bin", dir);
+    f = fopen(elf, "w");
+    if (f)
+    {
+        fputs("\177ELF no metadata here", f);
+        fclose(f);
+    }
+    chmod(elf, 0755);
+    ASSERT(mcp_validate_image(elf, real, sizeof(real)) != NULL,
+           "mcp_image: ELF without OCI2BIN_META rejected");
+
+    /* A binary under a writable mount root is refused even if valid. */
+    g_mcp_n_mount_roots = 1;
+    snprintf(g_mcp_mount_roots[0].path, sizeof(g_mcp_mount_roots[0].path),
+             "%s", dir);
+    ASSERT(realpath(dir, g_mcp_mount_roots[0].real) != NULL,
+           "mcp_image: realpath root");
+    g_mcp_mount_roots[0].writable = 1;
+    const char* why = mcp_validate_image(elf, real, sizeof(real));
+    ASSERT(why && strstr(why, "writable mount root") != NULL,
+           "mcp_image: writable mount root refused first");
+    g_mcp_n_mount_roots = 0;
+
+    unlink(script);
+    unlink(elf);
+    rmdir(dir);
+}
+
+/* ── VM cmdline hex round trip ─────────────────────────────────────────── */
+
+static void test_vm_cmdline_hex(void)
+{
+    char* args[] = {"sh", "-c", "echo \"a b\"=1", ""};
+    char buf[512] = "console=ttyS0";
+    ASSERT_INT_EQ(vm_hex_append_list(buf, sizeof(buf), "oci2bin.argv",
+                                     args, 4), 0,
+                  "vm_hex: encode fits");
+    char hex[512];
+    ASSERT_INT_EQ(vm_cmdline_get(buf, "oci2bin.argv=", hex, sizeof(hex)), 0,
+                  "vm_hex: key found in cmdline");
+    char dec[256];
+    char* out[8];
+    int n = vm_hex_decode_list(hex, dec, sizeof(dec), out, 8);
+    ASSERT_INT_EQ(n, 4, "vm_hex: four args (incl. empty) decoded");
+    if (n == 4)
+    {
+        ASSERT_STR_EQ(out[2], "echo \"a b\"=1", "vm_hex: spaces/quotes kept");
+        ASSERT_STR_EQ(out[3], "", "vm_hex: empty trailing arg kept");
+    }
+    ASSERT_INT_EQ(vm_cmdline_get(buf, "argv=", hex, sizeof(hex)), -1,
+                  "vm_hex: key must start a word");
+    char small[20] = "x";
+    ASSERT_INT_EQ(vm_hex_append_list(small, sizeof(small), "k", args, 3), -1,
+                  "vm_hex: overflow reported");
+    ASSERT_INT_EQ(vm_hex_decode_list("abc", dec, sizeof(dec), out, 8), -1,
+                  "vm_hex: odd length rejected");
+}
+
 static void test_mcp_helpers(void)
 {
     /* mcp_name_valid: accepts alnum + allowed chars */
@@ -4501,6 +4709,13 @@ static void test_build_merged_argv(void)
     char* a4[] = {"oci2bin", "--config", "../evil.cfg", NULL};
     ASSERT_NULL(build_merged_argv(3, a4, &out_argc),
                 "build_merged_argv: --config with .. returns NULL");
+
+    /* 4b. --config after "--" belongs to the workload: argv unchanged. */
+    char* a4b[] = {"oci2bin", "--", "app", "--config", "x.cfg", NULL};
+    char** r4b = build_merged_argv(5, a4b, &out_argc);
+    ASSERT(r4b == a4b,
+           "build_merged_argv: --config after -- is not ours");
+    ASSERT_INT_EQ(out_argc, 5, "build_merged_argv: argc kept after --");
 
     /* 5. --config pointing at a nonexistent file → NULL. */
     char* a5[] = {"oci2bin", "--config", "/nonexistent/oci2bin-xyz.cfg", NULL};
@@ -7530,6 +7745,8 @@ int main(void)
     test_build_exec_args();
     test_build_exec_args_extended();
     test_cap_name_to_num();
+    test_mcp_review_fixes();
+    test_vm_cmdline_hex();
     test_parse_opts_resource_limits();
     test_parse_opts_user();
     test_parse_opts_caps();

@@ -68,8 +68,9 @@ machine, ask the binary itself to check that host:
 `--doctor` is read-only — it never extracts the image or creates namespaces. It
 reports unprivileged user namespaces (including the AppArmor / `clone` knobs
 above), `newuidmap`/`newgidmap` + `/etc/subuid`, seccomp, landlock, cgroup v2,
-`tar`, and `/dev/kvm` (for `--vm`), then exits non-zero if a blocking issue is
-found. You can also probe the kernel knobs by hand:
+`tar`, `python3` + `openssl` (required only when the artifact carries a pinned
+digest or `--require-signed` policy), and `/dev/kvm` (for `--vm`), then exits
+non-zero if a blocking issue is found. You can also probe the kernel knobs by hand:
 
 ```bash
 sysctl kernel.apparmor_restrict_unprivileged_userns   # want 0 (or absent)
@@ -250,8 +251,10 @@ Default-deny egress allowlist:
 ```
 
 Egress allowlists require `--net slirp` or `--net pasta` and the host `nft`
-command. If validation or rule installation fails, the workload does not
-start.
+command. Hostnames are resolved once on the host, before the container's
+network namespace exists, and pinned into its `/etc/hosts`. If validation or
+rule installation fails, the workload does not start. The slirp4netns/pasta
+helper runs in the host namespaces and is stopped when the binary exits.
 
 ## Namespace Sharing
 
@@ -410,8 +413,14 @@ Use GPUs or CDI devices:
 ./app.bin --cdi-device nvidia.com/gpu=all
 ```
 
+A requested `--device` that cannot be exposed aborts the run.
+
 By default the container gets the standard host `/dev` nodes (null, zero,
-random, etc.). Skip bind-mounting them with `--no-host-dev`:
+full, random, urandom, tty) on a fresh `/dev` tmpfs, plus its own `/dev/shm`
+tmpfs, `/dev/fd` and `/dev/stdin|stdout|stderr` (links into `/proc/self/fd`,
+so `access_log /dev/stdout` works) and, with a PTY, `/dev/console`. `-v`
+volumes are mounted after `/dev` is set up, so `-v HOST:/dev/...` targets are
+honoured. Skip bind-mounting the host nodes with `--no-host-dev`:
 
 ```bash
 ./app.bin --no-host-dev
@@ -430,6 +439,10 @@ Drop all and add back one:
 ```bash
 ./app.bin --cap-drop all --cap-add NET_BIND_SERVICE
 ```
+
+Only the added capabilities remain in the bounding set, and they survive a
+`--user` switch (they are raised as ambient capabilities). All kernel
+capability names are accepted.
 
 ## Seccomp And Debugging
 
@@ -457,6 +470,10 @@ Generate a minimal profile from one run:
 ./app.bin --gen-seccomp ./seccomp.json -- /usr/bin/app --warm-up
 ```
 
+The profile is written to the host path given, and replays with
+`--seccomp-profile` (see [Security](security.md#seccomp) for how profiles are
+installed).
+
 Debug with gdb:
 
 ```bash
@@ -477,7 +494,8 @@ Set an SELinux exec label:
 ./app.bin --security-opt label=type:container_t
 ```
 
-These need loaders built with the matching support.
+These need loaders built with the matching support; a loader without it
+refuses to start the workload unconfined.
 
 ## Process Management
 
@@ -524,6 +542,14 @@ Interactive and TTY mode:
 ./app.bin -it /bin/sh
 ```
 
+`--init`, `--restart` and `--health` run the workload with the same user
+(`--user`, or the image `User`), PTY, capabilities, LSM labels and seccomp
+profile as a direct run; health probes run as that user too. A stop signal
+during a restart back-off ends the supervisor instead of starting another
+attempt, and a workload that ignores the SIGTERM sent for failing health checks
+is killed after 10 seconds. With `-t`, end-of-file on stdin (`</dev/null`, a
+systemd unit) only closes the input side; the workload keeps running.
+
 ## VM Mode Runtime
 
 Run inside a microVM:
@@ -562,11 +588,28 @@ This path requires a libkrun-built artifact and a recent `libkrun.so.1`.
 Cloud-hypervisor currently supports `--net none` only; it rejects
 `--net userspace`, slirp/pasta network flags, and `-p`.
 
+With cloud-hypervisor, the guest console is the caller's terminal, the
+command after the image (and `--entrypoint`, `-e`, `--workdir`) is passed to
+the guest, and the binary exits with the workload's exit status. The guest
+init reaps orphaned processes, forwards SIGTERM/SIGINT/SIGHUP, brings up
+`lo`, and powers the VM off when the workload exits. Arguments, `-e` values
+and `-v` specs travel on the kernel command line, which is limited to 2048
+bytes. Because they are on the kernel command line, they are visible to other
+local users in the host's process list (`ps` of cloud-hypervisor) and in the
+guest's `/proc/cmdline`: pass secrets with `--secret`-style files or libkrun
+rather than `-e` on this backend. The guest kernel needs `CONFIG_PVH`, virtio-PCI and virtio-fs (see
+`kernel/microvm.config`); `-v` uses `virtiofsd` (also found in
+`/usr/libexec`).
+
 Persist VM state:
 
 ```bash
 ./app.bin --vm --overlay-persist ./state /bin/sh
 ```
+
+With cloud-hypervisor, `./state/oci2bin-data.ext2` is the upper layer of an
+overlay over the guest root, so changes to the root filesystem persist across
+runs.
 
 ## Metrics And Notifications
 

@@ -26,6 +26,8 @@ make install PREFIX="$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+Packagers stage the install with `make install DESTDIR=... PREFIX=/usr`.
+
 You can also run `./oci2bin` directly from the repository root.
 
 ## Check The Host

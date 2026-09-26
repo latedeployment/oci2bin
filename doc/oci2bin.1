@@ -867,7 +867,17 @@ Dump and restore a running named container with CRIU.
 Sign a binary (optionally publishing a Rekor transparency-log entry and/or an
 in-toto attestation).
 .B oci2bin verify \fB\-\-key \fIPUB\fR \fB\-\-in \fIBINARY\fR
-checks it.
+checks it, including that an embedded attestation names this binary as its
+subject.
+.
+.TP
+.B oci2bin attest verify \fB\-\-signing\-key \fIPUB\fR \fB\-\-in \fIBINARY\fR [\fB\-\-recheck\fR] [\fB\-\-key \fICOSIGN_PUB\fR]
+Report (or with
+.B \-\-recheck
+re-run) the source-image Cosign verification recorded in the attestation.
+The attestation is first authenticated with
+.B \-\-signing\-key
+and must be bound to the binary; nothing in it is used otherwise.
 .
 .TP
 .B oci2bin pod run \fR[\fB\-\-net shared\fR] [\fB\-\-ipc shared\fR] \fIBINARY\fR ...
@@ -965,8 +975,9 @@ Path to the age identity (or SSH private key) used to decrypt an
 recipient image.
 The file may contain multiple identities. If unset, the loader tries
 .IR ~/.config/oci2bin/identity ,
-.IR ~/.ssh/id_ed25519 ,
-then
+then \(em only for images encrypted to an SSH recipient \(em
+.I ~/.ssh/id_ed25519
+and
 .IR ~/.ssh/id_rsa .
 .TP
 .B OCI2BIN_PASSWORD \fR/\fB OCI2BIN_PASSWORD_FILE
@@ -1017,6 +1028,15 @@ Set automatically by
 .B make install
 to
 .IR PREFIX/share/oci2bin .
+.TP
+.B PREFIX \fR/\fB DESTDIR
+.B make install
+installs under
+.IR DESTDIR / PREFIX
+but bakes only
+.I PREFIX
+into the installed files (packaging:
+.BR "make install DESTDIR=%{buildroot} PREFIX=/usr" ).
 .
 .SH FILES
 .TP

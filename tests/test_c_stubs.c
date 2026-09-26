@@ -403,6 +403,11 @@ static long stub_syscall(long nr, ...)
         /* Leave caller's zeroed output buffers untouched — reports 0 caps */
         return 0;
     }
+    if (nr == SYS_pivot_root)
+    {
+        STUB_RECORD("pivot_root", 0, 0);
+        return 0;
+    }
     /* All other syscalls (clone3, mseal, memfd_secret, …): report unavailable */
     errno = ENOSYS;
     return -1;
@@ -457,6 +462,27 @@ static int stub_clearenv(void)
 #define chown(p, u, g)            stub_chown(p, u, g)
 #define lchown(p, u, g)           stub_lchown(p, u, g)
 #define syscall(nr, ...)          stub_syscall((long)(nr), ##__VA_ARGS__)
+
+/* linkat: when g_stub_linkat_empty_enoent is set, the AT_EMPTY_PATH form
+ * fails with ENOENT the way it does on kernels before 6.10 for callers
+ * without CAP_DAC_READ_SEARCH in the initial user namespace.  Everything
+ * else goes to the real linkat — the parenthesised name skips the macro. */
+static int g_stub_linkat_empty_enoent;
+static int stub_linkat(int olddirfd, const char* oldpath, int newdirfd,
+                       const char* newpath, int flags)
+{
+    if (flags & AT_EMPTY_PATH)
+    {
+        STUB_RECORD("linkat_empty", 0, 0);
+        if (g_stub_linkat_empty_enoent)
+        {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return (linkat)(olddirfd, oldpath, newdirfd, newpath, flags);
+}
+#define linkat(a, b, c, d, e)     stub_linkat(a, b, c, d, e)
 
 /* ── Phase 6: include loader.c with statics exposed ─────────────────────── */
 
@@ -524,11 +550,12 @@ static void test_stub_apply_seccomp_filter(void)
 
 /* ── test_stub_apply_capabilities ──────────────────────────────────────────
  *
- * apply_capabilities() branches on:
- *   opts.cap_drop_all: drop all bounding-set caps (41 prctl(CAPBSET_DROP) calls)
- *   opts.cap_add_mask: before dropping, do capset + PR_CAP_AMBIENT_RAISE per bit
+ * apply_capabilities() only touches the bounding set:
+ *   opts.cap_drop_all: drop every cap not in cap_add_mask (PR_CAPBSET_DROP)
  *   opts.cap_drop_mask (no drop_all): drop only specific caps
  *   else: no-op (neither flag set)
+ * The --cap-add capset + ambient raise lives in raise_added_capabilities(),
+ * which runs after the uid switch, right before exec.
  */
 static void test_stub_apply_capabilities(void)
 {
@@ -550,16 +577,16 @@ static void test_stub_apply_capabilities(void)
     ASSERT(r != NULL && r->arg0 == PR_CAPBSET_DROP,
            "apply_caps: drop-all first prctl is PR_CAPBSET_DROP");
 
-    /* Case B: cap_drop_all + cap_add_mask=bit1 → capset + PR_CAP_AMBIENT_RAISE(1)
-     *         + PR_CAPBSET_DROP for all caps except 1 (= 40 drops) */
+    /* Case B: cap_drop_all + cap_add_mask=bit1 → PR_CAPBSET_DROP for all caps
+     *         except 1 (= 40 drops), and no capset/ambient here: the bounding
+     *         drops must run while the effective set still holds SETPCAP. */
     stub_reset();
     opts.cap_drop_all  = 1;
     opts.cap_add_mask  = (1ULL << 1); /* add CAP_DAC_OVERRIDE */
     apply_capabilities(&opts);
 
-    ASSERT_INT_EQ(stub_count("capset"), 1,
-                  "apply_caps: cap_add_mask triggers one capset call");
-    /* PR_CAP_AMBIENT_RAISE for the one added cap */
+    ASSERT_INT_EQ(stub_count("capset"), 0,
+                  "apply_caps: bounding drops do not touch capset");
     int n_ambient = 0;
     for (int i = 0; i < g_stub_n_calls; i++)
     {
@@ -570,8 +597,8 @@ static void test_stub_apply_capabilities(void)
             n_ambient++;
         }
     }
-    ASSERT_INT_EQ(n_ambient, 1,
-                  "apply_caps: one PR_CAP_AMBIENT_RAISE for the added cap");
+    ASSERT_INT_EQ(n_ambient, 0,
+                  "apply_caps: no ambient raise before the uid switch");
     /* Drops: 41 caps total minus 1 kept = 40 */
     int n_drop = 0;
     for (int i = 0; i < g_stub_n_calls; i++)
@@ -609,6 +636,117 @@ static void test_stub_apply_capabilities(void)
                   "apply_caps: no flags → no prctl calls");
     ASSERT_INT_EQ(stub_count("capset"), 0,
                   "apply_caps: no flags → no capset calls");
+}
+
+/* ── test_stub_raise_added_capabilities ────────────────────────────────────
+ *
+ * raise_added_capabilities(): one capset (permitted+inheritable = add mask)
+ * and one PR_CAP_AMBIENT_RAISE per added cap; nothing when the mask is 0.
+ * drop_workload_identity() sets PR_SET_KEEPCAPS before a non-root uid switch
+ * only when caps are being added, so the ambient raise can still succeed.
+ */
+/* ── test_stub_hardlink_fallback ────────────────────────────────────────────
+ *
+ * create_hardlink_in_root() must still produce a hardlink when
+ * linkat(AT_EMPTY_PATH) is refused with ENOENT (pre-6.10 kernels, rootless),
+ * via /proc/self/fd, and recreate a symlink source as a symlink.
+ */
+static void test_stub_hardlink_fallback(void)
+{
+    char tmpl[] = "/tmp/oci2bin-hl-XXXXXX";
+    char* root = mkdtemp(tmpl);
+    ASSERT(root != NULL, "hardlink_fallback: mkdtemp");
+    if (!root)
+    {
+        return;
+    }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/a", root);
+    FILE* f = fopen(path, "w");
+    if (f)
+    {
+        fputs("data", f);
+        fclose(f);
+    }
+    snprintf(path, sizeof(path), "%s/lnk", root);
+    ASSERT(symlink("a", path) == 0, "hardlink_fallback: symlink source");
+
+    struct layer_merge_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.rootfs_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    stub_reset();
+    g_stub_linkat_empty_enoent = 1;
+    ASSERT_INT_EQ(create_hardlink_in_root(&ctx, "a", "b"), 0,
+                  "hardlink_fallback: regular file linked via /proc");
+    ASSERT(stub_count("linkat_empty") >= 1,
+           "hardlink_fallback: AT_EMPTY_PATH tried first");
+    struct stat sa, sb;
+    snprintf(path, sizeof(path), "%s/a", root);
+    stat(path, &sa);
+    snprintf(path, sizeof(path), "%s/b", root);
+    ASSERT(stat(path, &sb) == 0 && sa.st_ino == sb.st_ino,
+           "hardlink_fallback: b is a hardlink of a");
+
+    ASSERT_INT_EQ(create_hardlink_in_root(&ctx, "lnk", "lnk2"), 0,
+                  "hardlink_fallback: symlink source handled");
+    char target[64] = {0};
+    snprintf(path, sizeof(path), "%s/lnk2", root);
+    ASSERT(readlink(path, target, sizeof(target) - 1) == 1 &&
+           strcmp(target, "a") == 0,
+           "hardlink_fallback: symlink recreated, not followed");
+    g_stub_linkat_empty_enoent = 0;
+
+    close(ctx.rootfs_fd);
+    rm_rf_dir(root);
+}
+
+static void test_stub_raise_added_capabilities(void)
+{
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+
+    stub_reset();
+    ASSERT_INT_EQ(raise_added_capabilities(&opts), 0,
+                  "raise_caps: empty mask is a no-op");
+    ASSERT_INT_EQ(stub_count("capset"), 0, "raise_caps: empty mask no capset");
+
+    stub_reset();
+    opts.cap_add_mask = (1ULL << 1) | (1ULL << 10);
+    ASSERT_INT_EQ(raise_added_capabilities(&opts), 0,
+                  "raise_caps: two caps succeed");
+    ASSERT_INT_EQ(stub_count("capset"), 1, "raise_caps: one capset call");
+    int n_ambient = 0;
+    for (int i = 0; i < g_stub_n_calls; i++)
+    {
+        if (g_stub_calls[i].fn && strcmp(g_stub_calls[i].fn, "prctl") == 0 &&
+                g_stub_calls[i].arg0 == PR_CAP_AMBIENT)
+        {
+            n_ambient++;
+        }
+    }
+    ASSERT_INT_EQ(n_ambient, 2, "raise_caps: one ambient raise per cap");
+
+    /* KEEPCAPS precedes setuid for a non-root --user with --cap-add */
+    struct workload_ident id;
+    memset(&id, 0, sizeof(id));
+    id.do_drop = 1;
+    id.strict  = 1;
+    id.uid     = 1000;
+    id.gid     = 1000;
+    stub_reset();
+    ASSERT_INT_EQ(drop_workload_identity(&opts, &id), 0,
+                  "drop_identity: succeeds with stubs");
+    const struct stub_call_rec* first = stub_nth("prctl", 0);
+    ASSERT(first != NULL && first->arg0 == PR_SET_KEEPCAPS,
+           "drop_identity: PR_SET_KEEPCAPS before the uid switch");
+    ASSERT_INT_EQ(stub_count("setuid"), 1, "drop_identity: setuid called");
+
+    opts.cap_add_mask = 0;
+    stub_reset();
+    drop_workload_identity(&opts, &id);
+    ASSERT_INT_EQ(stub_count("prctl"), 0,
+                  "drop_identity: no KEEPCAPS without --cap-add");
 }
 
 /* ── test_stub_setup_volumes ───────────────────────────────────────────────
@@ -866,7 +1004,7 @@ static void test_stub_run_as_init(void)
     /* Case A: no user drop — child execs (stub), exits 127; parent returns 127 */
     stub_reset();
     opts.has_user = 0;
-    int rc = run_as_init(args, &opts);
+    int rc = run_as_init(args, &opts, NULL);
     ASSERT_INT_EQ(rc, 127,
                   "run_as_init: no-user child exits 127 via stub execvp");
 
@@ -875,7 +1013,7 @@ static void test_stub_run_as_init(void)
     opts.has_user = 1;
     opts.run_uid  = 1000;
     opts.run_gid  = 1000;
-    rc = run_as_init(args, &opts);
+    rc = run_as_init(args, &opts, NULL);
     ASSERT_INT_EQ(rc, 127,
                   "run_as_init: user-drop child exits 127 via stub execvp");
     /*
@@ -1537,7 +1675,9 @@ static void test_stub_container_main(void)
         unlink(p);
         snprintf(p, sizeof(p), "%s/dev",       rootfs);
         rmdir(p);
-        rmdir(rootfs);
+        /* container_main() also creates proc/, tmp/, dev/shm, links, ...:
+         * remove the whole tree, not just the entries listed above. */
+        rm_rf_dir(rootfs);
     }
 }
 
@@ -1552,6 +1692,8 @@ int main(void)
     test_stub_setup_volumes();
     test_stub_install_staged_secret();
     test_stub_run_as_init();
+    test_stub_raise_added_capabilities();
+    test_stub_hardlink_fallback();
     test_stub_load_env_file();
     test_stub_resolve_user();
     test_stub_setup_secrets();

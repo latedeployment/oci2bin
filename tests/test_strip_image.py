@@ -410,6 +410,22 @@ class TestAutodetectExtraPrefixes(unittest.TestCase):
             os.unlink(tmp)
         self.assertIn('root/.npm/_cacache/', extra)
 
+    def test_detects_markers_in_oci_blob_layers(self):
+        # Docker 25+ saves layers as blobs/sha256/<hex> without a .tar
+        # suffix; autodetection must follow manifest.json, not name patterns.
+        import tempfile, os
+        layer = _make_layer_tar('var/lib/dpkg/status')
+        name = 'blobs/sha256/' + _sha256(layer)
+        img = _make_image_tar([(name, layer)])
+        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as f:
+            f.write(img)
+            tmp = f.name
+        try:
+            extra = autodetect_extra_prefixes(tmp)
+        finally:
+            os.unlink(tmp)
+        self.assertIn('var/cache/apt/', extra)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -136,6 +136,34 @@ class TestCliFeatures(unittest.TestCase):
         self.assertIn("Restart=always", result.stdout)
         self.assertIn("Description=oci2bin test:latest", result.stdout)
 
+    def test_systemd_without_user_env(self):
+        # cron, CI and `env -i` run without $USER; set -u used to abort.
+        binary = self._build_binary("svc-nouser.bin")
+        env = {k: v for k, v in os.environ.items() if k != "USER"}
+        result = subprocess.run(
+            [str(OCI2BIN), "systemd", str(binary)],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("ExecStart=", result.stdout)
+
+    def test_unknown_option_before_image_is_rejected(self):
+        result = subprocess.run(
+            [str(OCI2BIN), "--no-such-option", "alpine:latest"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown option: --no-such-option", result.stderr)
+
+    def test_option_after_image_is_not_taken_as_output(self):
+        result = subprocess.run(
+            [str(OCI2BIN), "--oci-dir", "/nonexistent-oci2bin", "img",
+             "--bogus"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected argument: --bogus", result.stderr)
+
     def test_healthcheck_none_short_circuits(self):
         binary = self._build_binary(
             "health-none.bin",

@@ -66,8 +66,9 @@ small. Each dependency below is needed **only** for the feature in its row.
 | `curl` | `--notify` | Optional — notifications are silently skipped if absent |
 | `rekor-cli` | `oci2bin verify --rekor` (inclusion check) | Required for that check |
 | `/dev/kvm` | `--vm` (either backend) | Hard for VM mode |
-| `cloud-hypervisor` + embedded kernel | `--vm` via cloud-hypervisor | Required for that backend |
-| `virtiofsd` | `-v` volume mounts under cloud-hypervisor `--vm` | Required for that case |
+| `cloud-hypervisor` + embedded kernel | `--vm` via cloud-hypervisor | Required for that backend. The kernel needs `CONFIG_PVH`, virtio-PCI, virtio-fs and ACPI (`make kernel` builds one from `kernel/microvm.config`) |
+| `virtiofsd` | `-v` volume mounts under cloud-hypervisor `--vm` | Required for that case; found on `PATH`, `/usr/bin`, `/usr/sbin`, or `/usr/libexec` |
+| `mkfs.ext2` | `--vm --overlay-persist` under cloud-hypervisor (creates the data disk once) | Required for that case |
 | `libkrun.so.1` | `--vm` on a libkrun-built binary, including `--net userspace` and VM `-p` | Lazy — `dlopen`'d only when `--vm` runs; **see the note below** |
 | `qemu-<arch>-static` | running a foreign-arch fat-binary without binfmt | Optional fallback |
 

@@ -94,7 +94,12 @@ oci2bin from-chroot ./rootfs -o app.bin \
   --label org.example.service=app
 ```
 
-This path does not require Docker.
+This path does not require Docker. Symlinks — including symlinks to
+directories such as `bin -> usr/bin` on merged-`/usr` systems — are kept as
+links. Without `--cmd`, the default command is `/bin/sh` only when no
+`--entrypoint` is set. Build options go after `--`
+(`oci2bin from-chroot DIR -o OUT -- --strip --squash`), and `--arch arm64`
+builds an aarch64 binary.
 
 ## Build From A Dockerfile Without Docker
 
@@ -107,17 +112,36 @@ Supported instructions:
 - `FROM scratch`
 - `FROM <oci-dir>`
 - `FROM <image>`
-- `COPY`
+- `FROM <earlier-stage>`, `FROM ... AS <name>` (multi-stage builds)
+- `FROM --platform=linux/<arch>` (must match the build's `--arch`)
+- `COPY` (`--from=<stage|image>`, `--chmod=MODE`, heredocs `COPY <<EOF dest`)
 - `ADD`
-- `RUN`
+- `RUN` (shell form through `SHELL`, exec form, heredocs `RUN <<EOF`)
 - `ENV`
 - `ENTRYPOINT`
 - `CMD`
+- `SHELL`
 - `WORKDIR`
 - `LABEL`
 - `USER`
 - `EXPOSE`
-- `ARG`
+- `ARG` (also before the first `FROM`)
+
+`RUN` behaves like Docker's: it runs in the current `WORKDIR` through the
+current `SHELL` (default `/bin/sh -c`, without an implicit `set -e`), and
+exec-form `RUN ["cmd", "arg"]` runs without a shell. Variables from `ARG` and
+`ENV` — `$NAME`, `${NAME}`, `${NAME:-default}`, `${NAME:+alt}` — are expanded
+in `ADD`, `COPY`, `ENV`, `EXPOSE`, `FROM`, `LABEL`, `STOPSIGNAL`, `USER`,
+`VOLUME`, `WORKDIR` and `ARG`; `RUN`, `CMD` and `ENTRYPOINT` get them as
+environment variables for the shell. Line continuations may contain comment
+lines, and CRLF files are accepted. Symlinks inside the rootfs resolve as they
+would in the container (an absolute `/var/run -> /run` is re-rooted, never
+followed onto the host).
+
+Limitations: `RUN` executes as root even after `USER` (only uid 0 is mapped in
+the rootless build namespace; `USER` still sets the image's runtime user), and
+the builder emits one root-owned layer, so `COPY --chown` is accepted with a
+warning but ownership is not preserved.
 
 Supported `RUN --mount` types:
 
@@ -424,7 +448,9 @@ program. Native age recipients and SSH recipients supported by that version of
 age can therefore be used. A recipients file may contain several public
 recipients; the runtime identity file may likewise contain multiple private
 identities. If `OCI2BIN_IDENTITY` is unset, the loader tries
-`~/.config/oci2bin/identity`, `~/.ssh/id_ed25519`, then `~/.ssh/id_rsa`.
+`~/.config/oci2bin/identity`, and — only when the image was encrypted to an SSH
+recipient — `~/.ssh/id_ed25519`, then `~/.ssh/id_rsa` (it says which key it
+used).
 
 Passphrase mode:
 
@@ -481,6 +507,12 @@ oci2bin --reproducible --pin-digest auto app:latest app.bin
 
 `--reproducible` normalizes timestamps and tar metadata controlled by
 `oci2bin`. `--pin-digest` embeds a canonical digest that is checked at runtime.
+After every build-time rewrite (`--reproducible`, `--label`, `--entrypoint`,
+`--cmd`, `--add-file`, `--embed-loader-layer`) the embedded image's
+content-addressed blob names, `manifest.json` and `index.json` are re-derived
+from the blob contents, so the binary stays loadable with `docker load` under
+the containerd image store. Files injected with `--add-file`/`--add-dir` are
+owned by root in the image, and `SOURCE_DATE_EPOCH` clamps their timestamps.
 Recipient and passphrase encryption use fresh age randomness, so encrypted
 builds are not byte-for-byte reproducible even when `--reproducible` is set.
 

@@ -69,6 +69,38 @@ class TestAddFiles(unittest.TestCase):
                 self.assertEqual(len(config["rootfs"]["diff_ids"]), 1)
 
 
+class TestAddFilesReproducible(unittest.TestCase):
+    """Injected layers carry no host identity and follow file symlinks."""
+
+    def test_host_identity_dropped_and_symlink_followed(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            real = tmp / "real.txt"
+            real.write_text("content\n", encoding="utf-8")
+            link = tmp / "link.txt"
+            os.symlink(real, link)
+            layer = add_files_mod.build_layer([(str(link), "/etc/x", False)])
+            with tarfile.open(fileobj=io.BytesIO(layer)) as tf:
+                m = tf.getmember("etc/x")
+                self.assertTrue(m.isfile())
+                self.assertEqual((m.uid, m.gid, m.uname, m.gname),
+                                 (0, 0, "", ""))
+                self.assertEqual(tf.extractfile(m).read(), b"content\n")
+
+    def test_source_date_epoch_clamps_mtime(self):
+        import os
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmpdir:
+            f = Path(tmpdir) / "f"
+            f.write_text("x", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "1000"}):
+                a = add_files_mod.build_layer([(str(f), "/f", False)])
+                os.utime(f, (5000, 5000))
+                b = add_files_mod.build_layer([(str(f), "/f", False)])
+            self.assertEqual(a, b)
+
+
 class TestValidateContainerPath(unittest.TestCase):
     def _ok(self, path):
         return add_files_mod._validate_container_path(

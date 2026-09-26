@@ -16,18 +16,73 @@ import gzip
 import hashlib
 import io
 import json
+import lzma
 import os
 import subprocess
 import sys
 import tarfile
 
+_ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
+_XZ_MAGIC = b'\xfd7zXZ\x00'
+
+
+def _zstd_decompress(data):
+    """Decompress zstd with the stdlib module (3.14+) or the zstd CLI."""
+    try:
+        from compression import zstd as _zstd  # Python 3.14+
+    except ImportError:
+        _zstd = None
+    if _zstd is not None:
+        try:
+            return _zstd.decompress(data)
+        except _zstd.ZstdError as e:
+            raise ValueError(f"zstd layer: {e}") from e
+    result = subprocess.run(['zstd', '-dc', '-q', '-'], input=data,
+                            capture_output=True, check=False)
+    if result.returncode != 0:
+        raise ValueError("zstd layer: zstd CLI not available or failed")
+    return result.stdout
+
+
+def decompress_layer(layer_data):
+    """Return the uncompressed tar bytes of a gzip/zstd/xz/plain layer."""
+    if layer_data[:2] == b'\x1f\x8b':
+        return gzip.decompress(layer_data)
+    if layer_data[:4] == _ZSTD_MAGIC:
+        return _zstd_decompress(layer_data)
+    if layer_data[:6] == _XZ_MAGIC:
+        return lzma.decompress(layer_data)
+    return layer_data
+
 
 def open_layer(layer_data):
-    """Open a layer tarball, handling gzip compression."""
-    if layer_data[:2] == b'\x1f\x8b':
-        return tarfile.open(fileobj=io.BytesIO(gzip.decompress(layer_data)),
-                            mode='r:')
-    return tarfile.open(fileobj=io.BytesIO(layer_data), mode='r:')
+    """Open a layer tarball, handling gzip, zstd and xz compression."""
+    return tarfile.open(fileobj=io.BytesIO(decompress_layer(layer_data)),
+                        mode='r:')
+
+
+def _normalise_member_name(name):
+    while name.startswith('./') or name.startswith('/'):
+        name = name[2:] if name.startswith('./') else name[1:]
+    return name.rstrip('/')
+
+
+def _remove_tree(file_dict, path):
+    """Drop `path` and everything below it ('' = the whole tree)."""
+    if not path:
+        file_dict.clear()
+        return
+    file_dict.pop(path, None)
+    prefix = path + '/'
+    for k in [k for k in file_dict if k.startswith(prefix)]:
+        del file_dict[k]
+
+
+def _remove_children(file_dict, path):
+    """Drop everything below `path` but keep `path` itself (opaque dir)."""
+    prefix = path + '/' if path else ''
+    for k in [k for k in file_dict if k.startswith(prefix) and k != path]:
+        del file_dict[k]
 
 
 def squash_oci_tar(input_path, output_path, compress='gzip'):
@@ -68,63 +123,68 @@ def squash_oci_tar(input_path, output_path, compress='gzip'):
 
     # Merge all layers into a single in-memory filesystem dict
     # file_dict: path -> (tarinfo, data_bytes_or_None)
+    #
+    # Whiteouts in a layer apply to the layers BELOW it, so each layer is
+    # handled in two passes: first its whiteouts are applied to what has been
+    # merged so far, then its own entries are added.  Applying them in tar
+    # order let an opaque marker that sorts after its siblings delete the
+    # layer's own new files.  An opaque dir (.wh..wh..opq) clears the
+    # directory's children but keeps the directory entry — dropping the entry
+    # lost its mode (e.g. /tmp 1777).  A plain .wh.X removes X and, if X was a
+    # directory, everything under it.
     file_dict = {}
-    deleted = set()
 
     for layer_name in layers_names:
         try:
             layer_member = outer_tf.getmember(layer_name)
         except KeyError:
-            continue
+            print(f"squash: layer not found: {layer_name}", file=sys.stderr)
+            sys.exit(1)
         layer_data = outer_tf.extractfile(layer_member).read()
 
         try:
             layer_tf = open_layer(layer_data)
-        except Exception as e:
-            print(f"squash_layers: skipping unreadable layer "
-                  f"{layer_name}: {e}", file=sys.stderr)
-            continue
+            members = layer_tf.getmembers()
+        except (tarfile.TarError, ValueError, OSError, lzma.LZMAError) as e:
+            # Squashing without a layer would silently produce a different
+            # image; refuse instead.
+            print(f"squash: cannot read layer {layer_name}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
 
-        for m in layer_tf.getmembers():
-            name = m.name
-            while name.startswith('./') or name.startswith('/'):
-                name = name[2:] if name.startswith('./') else name[1:]
+        entries = []
+        for m in members:
+            name = _normalise_member_name(m.name)
             if not name:
                 continue
             # Reject path traversal components
             if '..' in name.split('/'):
                 continue
             basename = os.path.basename(name)
+            parent = os.path.dirname(name)
+            if basename == '.wh..wh..opq':
+                _remove_children(file_dict, parent)
+            elif basename.startswith('.wh.'):
+                _remove_tree(file_dict,
+                             os.path.join(parent, basename[4:]).lstrip('/'))
+            else:
+                entries.append((name, m))
 
-            # Whiteout: delete entry
-            if basename.startswith('.wh.'):
-                real_name = basename[4:]
-                parent = os.path.dirname(name)
-                real_path = os.path.join(parent, real_name).lstrip('/')
-                file_dict.pop(real_path, None)
-                deleted.add(real_path)
-                if basename == '.wh..wh..opq':
-                    # Opaque whiteout: remove all children
-                    parent_dir = parent.rstrip('/')
-                    for k in list(file_dict.keys()):
-                        if k.startswith(parent_dir + '/') or k == parent_dir:
-                            del file_dict[k]
-                continue
-
-            if name in deleted:
-                deleted.discard(name)
-
+        for name, m in entries:
+            # A non-directory replacing a directory hides its subtree.
+            prev = file_dict.get(name)
+            if prev is not None and prev[0].isdir() and not m.isdir():
+                _remove_tree(file_dict, name)
             # Read data for regular files
             data = None
             if m.isfile():
                 try:
                     f = layer_tf.extractfile(m)
                     data = f.read() if f else b''
-                except Exception as e:
-                    print(f"squash_layers: failed to read {name!r} "
+                except (tarfile.TarError, OSError) as e:
+                    print(f"squash: failed to read {name!r} "
                           f"in {layer_name}: {e}", file=sys.stderr)
-                    data = b''
-
+                    sys.exit(1)
             file_dict[name] = (m, data)
 
         layer_tf.close()

@@ -211,6 +211,13 @@ make install PREFIX="$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+Packagers stage the install with `DESTDIR`; only `PREFIX` ends up in the
+installed files:
+
+```bash
+make install DESTDIR="$PWD/pkgroot" PREFIX=/usr
+```
+
 ## Quickstart
 
 Build and run an image:
@@ -260,6 +267,11 @@ Build from a Dockerfile without a Docker daemon:
 ```bash
 oci2bin build-dockerfile -f Dockerfile --context . -o myapp.bin
 ```
+
+The builder handles multi-stage builds (`FROM ... AS`, `COPY --from`),
+heredocs, `SHELL`, exec-form `RUN`, `COPY --chmod` and Docker's `${VAR:-default}`
+expansion; `RUN` runs in `WORKDIR` as root (see the build guide for the
+limitations).
 
 Build from an existing root filesystem:
 

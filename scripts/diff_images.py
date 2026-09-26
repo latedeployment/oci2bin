@@ -29,66 +29,29 @@ stdlib only.
 
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
 import stat as stat_module
-import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
 
-# Reuse marker constants from inspect_image.py logic
-OFFSET_MARKER  = struct.pack('<Q', 0xDEADBEEFCAFEBABE)
-SIZE_MARKER    = struct.pack('<Q', 0xCAFEBABEDEADBEEF)
-PATCHED_MARKER = struct.pack('<Q', 0xAAAAAAAAAAAAAAAA)
+# The embedded-OCI locator lives in inspect_image.py; a private copy here
+# missed the span validation added there and misread truncated binaries.
+_inspect_spec = importlib.util.spec_from_file_location(
+    'oci2bin_inspect_image',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 'inspect_image.py'))
+_inspect = importlib.util.module_from_spec(_inspect_spec)
+_inspect_spec.loader.exec_module(_inspect)
 
 
 def read_oci_data(binary_path):
     """Extract embedded OCI tar bytes from an oci2bin binary."""
-    with open(binary_path, 'rb') as f:
-        data = f.read()
-
-    patched_off = data.find(PATCHED_MARKER)
-    if patched_off is not None and patched_off != -1:
-        print(f"diff: {binary_path}: OCI markers not patched", file=sys.stderr)
-        sys.exit(1)
-
-    loader_region = data[:8 * 1024 * 1024]
-    file_size = len(data)
-
-    sentinels = (0xDEADBEEFCAFEBABE, 0xCAFEBABEDEADBEEF,
-                 0xAAAAAAAAAAAAAAAA, 0)
-
-    def valid_span(candidate_offset, candidate_size):
-        if candidate_offset in sentinels:
-            return False
-        if candidate_offset >= file_size:
-            return False
-        if candidate_size == 0 or candidate_size > file_size:
-            return False
-        if candidate_offset + candidate_size > file_size:
-            return False
-        tar_region = data[candidate_offset:candidate_offset + 512]
-        return len(tar_region) >= 262 and tar_region[257:262] == b'ustar'
-
-    for pos in range(0, len(loader_region) - 8, 8):
-        candidate_offset = struct.unpack_from('<Q', loader_region, pos)[0]
-        size_positions = []
-        if pos + 8 <= len(loader_region) - 8:
-            size_positions.append(pos + 8)
-        if pos >= 8:
-            size_positions.append(pos - 8)
-
-        for size_pos in size_positions:
-            candidate_size = struct.unpack_from('<Q', loader_region,
-                                                size_pos)[0]
-            if valid_span(candidate_offset, candidate_size):
-                return data[candidate_offset:candidate_offset + candidate_size]
-
-    print(f"diff: could not find embedded OCI tar in {binary_path}", file=sys.stderr)
-    sys.exit(1)
+    return _inspect.read_oci_data(binary_path)
 
 
 def open_layer(layer_data):

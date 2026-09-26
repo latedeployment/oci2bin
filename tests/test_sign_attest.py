@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -257,6 +258,7 @@ class TestAttestVerifyCosign(unittest.TestCase):
         )
         r = subprocess.run(
             ["python3", str(SIGN_PY), "attest-verify",
+             "--signing-key", str(self.pub),
              "--in", str(self.binary)],
             capture_output=True, text=True,
         )
@@ -271,6 +273,7 @@ class TestAttestVerifyCosign(unittest.TestCase):
         )
         r = subprocess.run(
             ["python3", str(SIGN_PY), "attest-verify",
+             "--signing-key", str(self.pub),
              "--in", str(self.binary)],
             capture_output=True, text=True,
         )
@@ -287,11 +290,114 @@ class TestAttestVerifyCosign(unittest.TestCase):
         )
         r = subprocess.run(
             ["python3", str(SIGN_PY), "attest-verify",
+             "--signing-key", str(self.pub),
              "--in", str(self.binary)],
             capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 1)
         self.assertIn("cosignVerification", r.stderr)
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl not available")
+class TestAttestationBinding(unittest.TestCase):
+    """An attestation must describe the binary it rides on, and attest-verify
+    must authenticate it before using anything inside it."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="oci2bin-bind-"))
+        self.priv = self.tmpdir / "priv.pem"
+        self.pub = self.tmpdir / "pub.pem"
+        self.other_pub = self.tmpdir / "other.pub"
+        other_priv = self.tmpdir / "other.pem"
+        for priv, pub in ((self.priv, self.pub), (other_priv, self.other_pub)):
+            subprocess.run(["openssl", "ecparam", "-name", "prime256v1",
+                            "-genkey", "-noout", "-out", str(priv)],
+                           check=True, capture_output=True)
+            subprocess.run(["openssl", "ec", "-in", str(priv), "-pubout",
+                            "-out", str(pub)],
+                           check=True, capture_output=True)
+        self.a = self.tmpdir / "a.bin"
+        self.b = self.tmpdir / "b.bin"
+        self.a.write_bytes(b"\x7fELF-artifact-A\x00")
+        self.b.write_bytes(b"\x7fELF-artifact-B\x00")
+        for binary in (self.a, self.b):
+            subprocess.run(["python3", str(SIGN_PY), "sign", "--key",
+                            str(self.priv), "--in", str(binary),
+                            "--attest", "auto",
+                            "--cosign-image-ref", "img:tag",
+                            "--cosign-result", "verified"],
+                           check=True, capture_output=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _swap_attestation(self):
+        """Rebuild A's signature block with B's attestation + its sig."""
+        data_a = self.a.read_bytes()
+        data_b = self.b.read_bytes()
+        start_a, sig_a, keyid, alg, _att_a, _asig_a = \
+            sb._find_sig_block(data_a)
+        _s, _sig, _k, _al, att_b, asig_b = sb._find_sig_block(data_b)
+        body = (sb.MAGIC + bytes([sb.VERSION_ATTESTED,
+                                  sb.HASH_ALGORITHMS[alg]])
+                + keyid + struct.pack(">H", len(sig_a)) + sig_a
+                + struct.pack(">I", len(att_b)) + att_b
+                + struct.pack(">H", len(asig_b)) + asig_b)
+        total = len(body) + len(sb.TRAILER) + 4
+        self.a.write_bytes(data_a[:start_a] + body + sb.TRAILER +
+                           struct.pack(">I", total))
+
+    def test_verify_rejects_swapped_attestation(self):
+        self._swap_attestation()
+        r = subprocess.run(["python3", str(SIGN_PY), "verify", "--key",
+                            str(self.pub), "--in", str(self.a)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, msg=r.stdout + r.stderr)
+        self.assertIn("attestation", r.stderr)
+
+    def test_verify_accepts_own_attestation(self):
+        r = subprocess.run(["python3", str(SIGN_PY), "verify", "--key",
+                            str(self.pub), "--in", str(self.a)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+
+    def test_attest_verify_requires_signing_key(self):
+        r = subprocess.run(["python3", str(SIGN_PY), "attest-verify",
+                            "--in", str(self.a)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--signing-key", r.stderr)
+
+    def test_attest_verify_rejects_wrong_key(self):
+        r = subprocess.run(["python3", str(SIGN_PY), "attest-verify",
+                            "--signing-key", str(self.other_pub),
+                            "--in", str(self.a)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
+    def test_attest_verify_rejects_swapped_attestation(self):
+        self._swap_attestation()
+        r = subprocess.run(["python3", str(SIGN_PY), "attest-verify",
+                            "--signing-key", str(self.pub),
+                            "--in", str(self.a)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
+    def test_custom_statement_subject_is_rebound(self):
+        stmt = self.tmpdir / "stmt.json"
+        stmt.write_text(json.dumps({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "other", "digest": {"sha256": "0" * 64}}],
+            "predicateType": "x", "predicate": {}}))
+        subprocess.run(["python3", str(SIGN_PY), "sign", "--key",
+                        str(self.priv), "--in", str(self.a),
+                        "--attest", str(stmt)],
+                       check=True, capture_output=True)
+        r = subprocess.run(["python3", str(SIGN_PY), "verify", "--key",
+                            str(self.pub), "--in", str(self.a)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
 
 
 def _fallback_read_att(path):

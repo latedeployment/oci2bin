@@ -230,7 +230,9 @@ OCI2BIN_HOME="${OCI2BIN_HOME:-$SCRIPT_DIR}"
 # ── oci2vm mode ───────────────────────────────────────────────────────────
 # When invoked as "oci2vm" the output binary is named oci2vm_<image> so that
 # the loader's own basename check fires and VM mode is the runtime default.
-_OCI2BIN_BASENAME="${0##*/}"
+# OCI2BIN_INVOKED_AS: set by the pip entry point, which runs this script via
+# bash (so $0 is always oci2bin.bash) for both the oci2bin and oci2vm commands.
+_OCI2BIN_BASENAME="${OCI2BIN_INVOKED_AS:-${0##*/}}"
 OCI2VM_MODE=0
 if [[ "$_OCI2BIN_BASENAME" == "oci2vm" ]]; then
     OCI2VM_MODE=1
@@ -1420,16 +1422,22 @@ if [[ "${1:-}" == "systemd" ]]; then
         echo "Usage: oci2bin systemd BINARY [--user] [--restart always|on-failure|no]" >&2
         exit 1
     fi
-    exec python3 - "$SYSTEMD_BINARY" "$SYSTEMD_USER" "$SYSTEMD_RESTART" "$USER" "$OCI2BIN_HOME" <<'PYEOF'
+    exec python3 - "$SYSTEMD_BINARY" "$SYSTEMD_USER" "$SYSTEMD_RESTART" "${USER:-}" "$OCI2BIN_HOME" <<'PYEOF'
 import importlib.util
 import os
+import pwd
 import re
 import sys
 
 binary = os.path.abspath(sys.argv[1])
 user_mode = sys.argv[2] == "1"
 restart = sys.argv[3]
-username = sys.argv[4] or os.environ.get("USER", "")
+# $USER is unset under cron, CI and `env -i`; fall back to the passwd entry.
+try:
+    _pw_name = pwd.getpwuid(os.getuid()).pw_name
+except KeyError:
+    _pw_name = ""
+username = sys.argv[4] or os.environ.get("USER", "") or _pw_name
 home = sys.argv[5]
 
 spec = importlib.util.spec_from_file_location(
@@ -1848,7 +1856,10 @@ if [[ "${1:-}" == "pod" ]]; then
         NEW_REMAINING=()
         for cpid in "${REMAINING[@]}"; do
             if ! kill -0 "$cpid" 2>/dev/null; then
-                wait "$cpid" 2>/dev/null; ec=$?
+                # `wait; ec=$?` would abort the whole script under set -e on a
+                # non-zero exit, skipping the SIGTERM-the-others logic below.
+                ec=0
+                wait "$cpid" 2>/dev/null || ec=$?
                 echo "oci2bin pod: PID=$cpid exited with code $ec" >&2
                 if [[ $ec -ne 0 && $ec -gt $WORST_EXIT ]]; then
                     WORST_EXIT=$ec
@@ -1900,6 +1911,7 @@ if [[ "${1:-}" == "from-chroot" ]]; then
     FC_OUTPUT=""
     FC_PY_ARGS=()
     FC_BUILD_ARGS=()
+    FC_ARCH_BUILD_ARG=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1923,6 +1935,11 @@ if [[ "${1:-}" == "from-chroot" ]]; then
                 FC_PY_ARGS+=(--workdir "$2"); shift 2 ;;
             --arch)
                 [[ $# -lt 2 ]] && { echo "oci2bin from-chroot: --arch requires amd64|arm64" >&2; exit 1; }
+                case "$2" in
+                    amd64) FC_ARCH_BUILD_ARG=(--arch x86_64) ;;
+                    arm64) FC_ARCH_BUILD_ARG=(--arch aarch64) ;;
+                    *) echo "oci2bin from-chroot: --arch requires amd64|arm64" >&2; exit 1 ;;
+                esac
                 FC_PY_ARGS+=(--arch "$2"); shift 2 ;;
             --user)
                 [[ $# -lt 2 ]] && { echo "oci2bin from-chroot: --user requires UID[:GID]" >&2; exit 1; }
@@ -1948,8 +1965,10 @@ if [[ "${1:-}" == "from-chroot" ]]; then
         "$FC_CHROOT_DIR" "$FC_TMPDIR/oci" \
         "${FC_PY_ARGS[@]}"
 
-    "$0" --oci-dir "$FC_TMPDIR/oci" "local/chroot:latest" \
-        "$FC_OUTPUT" "${FC_BUILD_ARGS[@]}"
+    # Build options go before the positionals: after IMAGE OUTPUT the main
+    # parser only accepts --kernel/--initramfs.
+    "$0" "${FC_ARCH_BUILD_ARG[@]}" "${FC_BUILD_ARGS[@]}" \
+        --oci-dir "$FC_TMPDIR/oci" "local/chroot:latest" "$FC_OUTPUT"
     exit $?
 fi
 
@@ -2068,6 +2087,7 @@ DO_SQUASH=0
 COMPRESS_FORMAT=""
 ROOTFS_FORMAT="tar"
 OFFLINE_ONLY=0
+LIBKRUN_EXPLICIT=0
 # Auto-detect libkrun; --no-libkrun opts out
 if pkg-config --exists libkrun 2>/dev/null || ldconfig -p 2>/dev/null | grep -q libkrun; then
     USE_LIBKRUN=1
@@ -2159,6 +2179,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --libkrun)
             USE_LIBKRUN=1
+            LIBKRUN_EXPLICIT=1
             shift
             ;;
         --no-libkrun)
@@ -2294,6 +2315,16 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             usage
             ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            # A misspelled option used to fall through to the positional
+            # IMAGE and fail much later as "image not found".
+            echo "oci2bin: unknown option: $1 (see oci2bin --help)" >&2
+            exit 1
+            ;;
         *)
             break
             ;;
@@ -2341,12 +2372,23 @@ if [[ -n "$PINNED_DIGEST" ]]; then
 else
     _name_src="$IMAGE"
 fi
-if [[ "$OCI2VM_MODE" -eq 1 ]]; then
-    OUTPUT="${2:-oci2vm_${_name_src//[:\/@]/_}}"
-else
-    OUTPUT="${2:-${_name_src//[:\/@]/_}}"
+# OUTPUT is optional: a second word that is an option (`oci2bin IMG
+# --kernel vmlinux`) belongs to the trailing-option parser below, not to
+# the output name.
+_out_arg=""
+if [[ $# -ge 2 && "${2:0:1}" != "-" ]]; then
+    _out_arg="$2"
 fi
-shift 2 2>/dev/null || shift 1
+if [[ "$OCI2VM_MODE" -eq 1 ]]; then
+    OUTPUT="${_out_arg:-oci2vm_${_name_src//[:\/@]/_}}"
+else
+    OUTPUT="${_out_arg:-${_name_src//[:\/@]/_}}"
+fi
+if [[ -n "$_out_arg" ]]; then
+    shift 2
+else
+    shift 1
+fi
 
 # Parse any remaining flags that follow the positional args (e.g. --kernel, --initramfs)
 while [[ $# -gt 0 ]]; do
@@ -2444,12 +2486,19 @@ if [[ "$TARGET_ARCH" == "all" ]]; then
     # Native arch is preferred; on mismatched hosts (e.g. running an x86_64
     # bundle on an aarch64 host), the wrapper falls back to qemu-user-static
     # if available — saving the user from "Exec format error" surprises.
+    # The arch binaries sit next to the wrapper, so it refers to them by
+    # basename relative to its own directory (OUTPUT may carry a directory,
+    # which the old wrapper appended to _DIR a second time).  The name is
+    # embedded single-quoted so spaces or shell metacharacters stay data.
+    _out_base="$(basename -- "$OUTPUT")"
+    _out_q="'${_out_base//\'/\'\\\'\'}'"
     cat > "$OUTPUT" <<WRAPPER_EOF
 #!/bin/sh
 _ARCH=\$(uname -m)
 _DIR=\$(cd "\$(dirname "\$0")" && pwd)
-_X86=\${_DIR}/${OUTPUT}_x86_64
-_ARM=\${_DIR}/${OUTPUT}_aarch64
+_BASE=${_out_q}
+_X86="\${_DIR}/\${_BASE}_x86_64"
+_ARM="\${_DIR}/\${_BASE}_aarch64"
 
 # Native execution.
 case "\$_ARCH" in
@@ -2547,21 +2596,69 @@ need python3
 # ── build loader if needed ────────────────────────────────────────────────
 
 SRC="$OCI2BIN_HOME/src/loader.c"
-if [[ "$USE_LIBKRUN" -eq 1 ]]; then
-    LOADER="$OCI2BIN_HOME/build/loader-libkrun-$TARGET_ARCH"
-    if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
-        need "$CC_CROSS"
-        echo "oci2bin: building loader with libkrun for $TARGET_ARCH..."
-        mkdir -p "$OCI2BIN_HOME/build"
-        $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC" -ldl
+
+# A loader that exists and is not older than the source can be used as is —
+# in a checkout's build/, or shipped prebuilt by `make install` / packages.
+loader_is_fresh() {
+    [[ -f "$1" && ! "$SRC" -nt "$1" ]]
+}
+
+# Where to compile a loader that is missing or stale: the checkout's build/
+# when writable, else a per-user cache.  An installed copy's build/ is
+# root-owned (and ships only the static loaders), so compiling there failed.
+loader_build_dir() {
+    if mkdir -p "$OCI2BIN_HOME/build" 2>/dev/null && [[ -w "$OCI2BIN_HOME/build" ]]; then
+        printf '%s' "$OCI2BIN_HOME/build"
+    else
+        printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}/oci2bin/build"
     fi
-else
-    LOADER="$OCI2BIN_HOME/build/loader-$TARGET_ARCH"
-    if [[ ! -f "$LOADER" || "$SRC" -nt "$LOADER" ]]; then
+}
+
+# Resolve the loader for one flavor ("" or "libkrun-"): prefer a fresh
+# prebuilt one, then a fresh cached build, else compile into loader_build_dir.
+# Prints the path; returns 1 when it would have to compile but cannot.
+resolve_loader() {
+    local flavor="$1" name="loader-$1$TARGET_ARCH" out_dir
+    if loader_is_fresh "$OCI2BIN_HOME/build/$name"; then
+        printf '%s' "$OCI2BIN_HOME/build/$name"
+        return 0
+    fi
+    out_dir="$(loader_build_dir)"
+    if loader_is_fresh "$out_dir/$name"; then
+        printf '%s' "$out_dir/$name"
+        return 0
+    fi
+    command -v "$CC_CROSS" >/dev/null 2>&1 || return 1
+    mkdir -p "$out_dir" || return 1
+    if [[ -n "$flavor" ]]; then
+        echo "oci2bin: building loader with libkrun for $TARGET_ARCH..." >&2
+        $CC_CROSS $CFLAGS_CROSS -O2 -s -DUSE_LIBKRUN ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$out_dir/$name" "$SRC" -ldl >&2 || return 1
+    else
+        echo "oci2bin: building loader for $TARGET_ARCH..." >&2
+        $CC_CROSS $CFLAGS_CROSS -static -O2 -s ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$out_dir/$name" "$SRC" >&2 || return 1
+    fi
+    printf '%s' "$out_dir/$name"
+}
+
+LOADER=""
+if [[ "$USE_LIBKRUN" -eq 1 ]]; then
+    if ! LOADER="$(resolve_loader libkrun-)"; then
+        if [[ "$LIBKRUN_EXPLICIT" -eq 1 ]]; then
+            need "$CC_CROSS"
+            echo "oci2bin: failed to build the libkrun loader for $TARGET_ARCH" >&2
+            exit 1
+        fi
+        # Auto-detected libkrun is an optimisation, not a requirement.
+        echo "oci2bin: no libkrun loader available for $TARGET_ARCH; using the static loader" >&2
+        USE_LIBKRUN=0
+        LOADER=""
+    fi
+fi
+if [[ -z "$LOADER" ]]; then
+    if ! LOADER="$(resolve_loader "")"; then
         need "$CC_CROSS"
-        echo "oci2bin: building loader for $TARGET_ARCH..."
-        mkdir -p "$OCI2BIN_HOME/build"
-        $CC_CROSS $CFLAGS_CROSS -static -O2 -s ${VM_CPUS:+-DDEFAULT_VM_CPUS=$VM_CPUS} ${VM_MEM_MB:+-DDEFAULT_VM_MEM_MB=$VM_MEM_MB} -o "$LOADER" "$SRC"
+        echo "oci2bin: failed to build the loader for $TARGET_ARCH" >&2
+        exit 1
     fi
 fi
 
@@ -2830,10 +2927,27 @@ else
     echo "oci2bin: warning: could not determine image digest (no registry origin?)" >&2
 fi
 
-# Update cache key to include digest so different content gets separate entries
+# Cache key: image + digest + a hash of everything else that shapes the
+# output — the normalized build-option vector (the same one --arch all
+# forwards), the target arch and the loader binary itself.  Keyed on image and
+# digest alone, `--arch aarch64`, `--strip`, `--squash`, ... all returned the
+# first cached build.  Inputs whose content the key cannot see (added host
+# files, --layer images by tag) or that must not be replayed (encryption)
+# bypass the cache.  Name layout "<image>_o<opts>_<digest>" keeps `cache
+# prune` grouping per image+options and pruning superseded digests.
 if [[ "$USE_CACHE" -eq 1 && -n "$DIGEST_SHORT" ]]; then
-    CACHE_KEY="${IMAGE//[:\/]/_}_${DIGEST_SHORT}"
-    [[ "$ROOTFS_FORMAT" != "tar" ]] && CACHE_KEY="${CACHE_KEY}_${ROOTFS_FORMAT}"
+    if [[ "$ENCRYPT" -eq 1 || ${#ADD_FILE_ARGS[@]} -gt 0 ||
+          ${#ADD_DIR_ARGS[@]} -gt 0 || ${#LAYER_IMAGES[@]} -gt 0 ]]; then
+        echo "oci2bin: --cache ignored with --encrypt, --add-file, --add-dir or --layer" >&2
+        USE_CACHE=0
+    fi
+fi
+if [[ "$USE_CACHE" -eq 1 && -n "$DIGEST_SHORT" ]]; then
+    build_forward_args_for_arch_all
+    _loader_sum="$(sha256sum "$LOADER" | cut -d' ' -f1)"
+    _opts_sum="$(printf '%s\n' "$TARGET_ARCH" "$_loader_sum" \
+        "${ARCH_ALL_FORWARD_ARGS[@]}" | sha256sum | cut -c1-12)"
+    CACHE_KEY="${IMAGE//[:\/]/_}_o${_opts_sum}_${DIGEST_SHORT}"
     CACHE_DIR="$HOME/.cache/oci2bin/$CACHE_KEY"
     if [[ -s "$CACHE_DIR/output" ]]; then
         echo "oci2bin: cache hit (digest $DIGEST_SHORT) → $OUTPUT"

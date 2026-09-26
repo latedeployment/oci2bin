@@ -88,7 +88,7 @@ def _check_static_libc():
             return _result(
                 "static libc", DEGRADED,
                 "gcc -static failed (no static libc shipped)",
-                "apt install glibc-static / dnf install glibc-static "
+                "apt install libc6-dev / dnf install glibc-static "
                 "(or install musl-gcc)")
     except Exception as e:
         return _result("static libc", DEGRADED, str(e), "")
@@ -315,11 +315,12 @@ def _check_squashfs():
 def _check_kvm_libkrun():
     notes = []
     if os.path.exists("/dev/kvm"):
-        try:
-            os.access("/dev/kvm", os.W_OK)
+        # os.access() reports through its return value; it does not raise.
+        if os.access("/dev/kvm", os.R_OK | os.W_OK):
             notes.append("/dev/kvm present")
-        except OSError:
-            notes.append("/dev/kvm exists but not writable")
+        else:
+            notes.append("/dev/kvm exists but not accessible "
+                         "(add yourself to the kvm group)")
     else:
         notes.append("/dev/kvm absent")
     libkrun = None
@@ -332,8 +333,14 @@ def _check_kvm_libkrun():
     # cloud-hypervisor backend: needs the VMM binary; virtiofsd for -v.
     notes.append("cloud-hypervisor: "
                  + ("present" if _which("cloud-hypervisor") else "absent"))
-    notes.append("virtiofsd: "
-                 + ("present" if _which("virtiofsd") else "absent"))
+    # The loader also looks in libexec, where Fedora/Debian install it.
+    have_vfsd = _which("virtiofsd") or any(
+        os.access(p, os.X_OK) for p in ("/usr/libexec/virtiofsd",
+                                        "/usr/lib/virtiofsd",
+                                        "/usr/lib/qemu/virtiofsd"))
+    notes.append("virtiofsd: " + ("present" if have_vfsd else "absent"))
+    notes.append("mkfs.ext2 (--overlay-persist): "
+                 + ("present" if _which("mkfs.ext2") else "absent"))
     have_backend = bool(libkrun) or _which("cloud-hypervisor")
     if "/dev/kvm absent" in notes or not have_backend:
         return _result(

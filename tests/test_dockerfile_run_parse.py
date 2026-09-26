@@ -89,5 +89,79 @@ class RunParseTest(unittest.TestCase):
         self.assertEqual(unsupported, [])
 
 
+class DockerfileParserTest(unittest.TestCase):
+    """_parse_dockerfile: continuations, comments, CRLF and heredocs."""
+
+    def _parse_text(self, text):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", delete=False, newline="",
+                                         suffix=".Dockerfile") as f:
+            f.write(text)
+            path = f.name
+        try:
+            return MOD._parse_dockerfile(path)
+        finally:
+            import os
+            os.unlink(path)
+
+    def test_comment_inside_continuation_is_skipped(self):
+        ins = self._parse_text("FROM scratch\nRUN a && \\\n# note\n    b\n")
+        self.assertEqual(ins[1][0], "RUN")
+        self.assertIn("a && b", ins[1][1])
+        self.assertEqual(len(ins), 2)
+
+    def test_crlf_continuation(self):
+        ins = self._parse_text("FROM scratch\r\nRUN a \\\r\n  b\r\n")
+        self.assertEqual(ins[1], ("RUN", "a b", []))
+
+    def test_heredoc_body_is_not_parsed_as_instructions(self):
+        ins = self._parse_text("FROM scratch\nRUN <<EOF\nFROM evil\n"
+                               "echo hi\nEOF\nCMD x\n")
+        self.assertEqual([i[0] for i in ins], ["FROM", "RUN", "CMD"])
+        self.assertEqual(ins[1][2], [("EOF", "FROM evil\necho hi\n")])
+
+    def test_dash_heredoc_strips_tabs(self):
+        ins = self._parse_text("FROM scratch\nRUN <<-E\n\techo x\n\tE\n")
+        self.assertEqual(ins[1][2], [("E", "echo x\n")])
+
+
+class ExpandVarsTest(unittest.TestCase):
+    def test_no_prefix_substitution(self):
+        self.assertEqual(MOD._expand_vars("$FOO $FOOBAR", {"FOO": "x"}),
+                         "x ")
+
+    def test_braces_and_defaults(self):
+        v = {"A": "1", "E": ""}
+        self.assertEqual(MOD._expand_vars("${A}-${B:-d}-${E:-e}", v),
+                         "1-d-e")
+        self.assertEqual(MOD._expand_vars("${A:+set}${B:+unset}", v), "set")
+
+    def test_escaped_dollar(self):
+        self.assertEqual(MOD._expand_vars("\\$A", {"A": "1"}), "$A")
+
+    def test_run_is_not_expanded_by_the_builder(self):
+        self.assertNotIn("RUN", MOD._EXPANDED_INSTRUCTIONS)
+        self.assertIn("ENV", MOD._EXPANDED_INSTRUCTIONS)
+
+
+class FromParseTest(unittest.TestCase):
+    def _state(self):
+        return MOD._State(".", {}, {}, "amd64")
+
+    def test_stage_name(self):
+        self.assertEqual(MOD._parse_from(self._state(), "alpine AS Build"),
+                         ("alpine", "build"))
+
+    def test_platform_matching_arch_accepted(self):
+        self.assertEqual(
+            MOD._parse_from(self._state(),
+                            "--platform=linux/amd64 alpine"),
+            ("alpine", None))
+
+    def test_platform_other_arch_rejected(self):
+        with self.assertRaises(SystemExit):
+            MOD._parse_from(self._state(), "--platform=linux/arm64 alpine")
+
+
 if __name__ == "__main__":
     unittest.main()

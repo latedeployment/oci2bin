@@ -50,6 +50,12 @@ Build using the output cache:
 oci2bin --cache redis:7-alpine
 ```
 
+A cached binary is reused only when the image digest, the target
+architecture, the loader and every build option (`--strip`, `--squash`,
+`--label`, ...) match. Builds with `--encrypt`/`--passphrase`, `--add-file`,
+`--add-dir` or `--layer` bypass the cache, since their inputs are not part of
+the key.
+
 Disable the per-layer cache for one build:
 
 ```bash
@@ -271,7 +277,11 @@ oci2bin sbom app.bin
 ```
 
 Generate an SBOM when downstream inventory or vulnerability scanning needs a
-software list for the embedded image.
+software list for the embedded image. Packages are read from dpkg, apk and rpm
+databases (rpm's `rpmdb.sqlite` header blobs, under `/usr/lib/sysimage/rpm` or
+`/var/lib/rpm`), and each carries a canonical purl such as
+`pkg:deb/debian/bash@5.2.15-2?arch=amd64&distro=debian`, which Grype and Trivy
+consume.
 
 ## Push
 
@@ -351,7 +361,8 @@ oci2bin mcp-serve
 ```
 
 The MCP server exposes `oci2bin` functionality to AI agents through structured
-tool calls.
+tool calls. See [Commands](reference/commands.md) for its mount, network,
+image and environment rules.
 
 ## Local Validation
 

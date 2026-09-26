@@ -98,7 +98,12 @@ def walk_upper(upper_root):
             full = os.path.join(upper_root, rel_dir)
             extra = 'opaque' if _is_opaque(full) else None
             entries.append(('A', '/' + rel_dir, extra))
-        for name in filenames:
+        # A symlink to a directory lands in dirnames (os.walk does not follow
+        # it with followlinks=False); report it like any other entry.
+        link_dirs = [d for d in dirnames
+                     if os.path.islink(os.path.join(dirpath, d))]
+        dirnames[:] = [d for d in dirnames if d not in link_dirs]
+        for name in sorted(filenames + link_dirs):
             full = os.path.join(dirpath, name)
             rel = os.path.join(rel_dir, name) if rel_dir else name
             try:

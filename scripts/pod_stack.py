@@ -125,7 +125,9 @@ def _tokenize(text):
     """Return (indent, content) for each significant line."""
     out = []
     for raw in text.splitlines():
-        # Strip trailing comments that are not inside quotes.
+        # Strip trailing comments that are not inside quotes.  As in YAML, a
+        # '#' only starts a comment at the start of a line or after
+        # whitespace — `POSTGRES_PASSWORD: abc#123` keeps its full value.
         line, q = '', None
         for ch in raw:
             if q:
@@ -135,7 +137,7 @@ def _tokenize(text):
             elif ch in ('"', "'"):
                 q = ch
                 line += ch
-            elif ch == '#':
+            elif ch == '#' and (not line or line[-1] in ' \t'):
                 break
             else:
                 line += ch
@@ -159,8 +161,16 @@ def _parse_block(lines, idx, indent):
                 break
             if ind > indent:
                 die("YAML subset: unexpected indentation in list")
-            result.append(_parse_scalar(content[2:]))
+            item = content[2:].strip()
+            if (item.startswith('[') and item.endswith(']')) or \
+                    (item.startswith('{') and item.endswith('}')):
+                result.append(_parse_flow_value(item))
+            else:
+                result.append(_parse_scalar(item))
             idx += 1
+            if idx < len(lines) and lines[idx][0] > ind:
+                die("YAML subset: nested block under a list item is not "
+                    "supported; use a flow mapping ({k: v})")
         return result, idx
 
     result = {}
@@ -178,8 +188,14 @@ def _parse_block(lines, idx, indent):
         idx += 1
         if rest == '':
             # Nested block (map or list) on following deeper-indented lines.
+            # A block sequence may also sit at the key's own indent
+            # (`ports:` then `- "5432:5432"`), which YAML allows; that used
+            # to yield None plus a junk key, silently dropping the list.
             if idx < len(lines) and lines[idx][0] > ind:
                 value, idx = _parse_block(lines, idx, lines[idx][0])
+            elif idx < len(lines) and lines[idx][0] == ind and \
+                    (lines[idx][1] == '-' or lines[idx][1].startswith('- ')):
+                value, idx = _parse_block(lines, idx, ind)
             else:
                 value = None
         elif (rest.startswith('[') and rest.endswith(']')) or \
@@ -498,9 +514,24 @@ def _supervise(stack, start_delay, log_dir=None):
     return worst
 
 
+def _refuse_if_running(name):
+    """A second `up` of a live stack would overwrite its manifest and orphan
+    the first supervisor (and its services).  A manifest whose supervisor is
+    gone is stale and is cleared."""
+    m = _read_manifest(name)
+    if not m:
+        return
+    sup = m.get('supervisor_pid')
+    if sup and _pid_alive(sup):
+        die(f"stack '{name}' is already running (supervisor PID {sup}); "
+            f"run 'oci2bin down {name}' first")
+    _remove_manifest(name)
+
+
 def cmd_up(args):
     stack = load_stack(args.file)
     _check_binaries(stack)
+    _refuse_if_running(stack.name)
 
     if not args.detach:
         return _supervise(stack, args.start_delay, log_dir=None)

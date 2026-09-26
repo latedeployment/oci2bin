@@ -279,6 +279,7 @@ make          # compile the loader into build/
 sudo make install  # install system-wide to /usr/local
 make install PREFIX="$HOME/.local"  # install for the current user
 export PATH="$HOME/.local/bin:$PATH"
+make install DESTDIR="$PWD/pkgroot" PREFIX=/usr  # stage for packaging
 @end example
 
 After installation @command{oci2bin} is on your @env{PATH}.  To use it
@@ -968,7 +969,10 @@ Quiesce SQLite-backed volumes for a consistent snapshot, and release it.
 Dump and restore a running container with CRIU.
 @item oci2bin sign --key KEY --in BIN [--rekor] [--attest A] / verify --key PUB --in BIN
 Sign a binary (optionally publishing a Rekor entry / embedding an attestation)
-and verify it.
+and verify it; an embedded attestation must name the binary as its subject.
+@item oci2bin attest verify --signing-key PUB --in BIN [--recheck] [--key COSIGN_PUB]
+Report (or re-run) the source-image Cosign verification recorded in the
+attestation, after authenticating it with @option{--signing-key}.
 @item oci2bin sign-file / verify-file
 Sign or verify an arbitrary detached file.
 @item oci2bin pod run [--net shared] [--ipc shared] BIN ...
@@ -1083,8 +1087,8 @@ Fallback extraction directory (then @file{/tmp}, then @file{/var/tmp}).
 Path to the age identity (or SSH private key) used to decrypt an
 @option{--encrypt} recipient image.
 The file may contain multiple identities. If unset, the loader tries
-@file{~/.config/oci2bin/identity}, @file{~/.ssh/id_ed25519}, then
-@file{~/.ssh/id_rsa}.
+@file{~/.config/oci2bin/identity}, then---only for images encrypted to an SSH
+recipient---@file{~/.ssh/id_ed25519} and @file{~/.ssh/id_rsa}.
 @item OCI2BIN_PASSWORD / OCI2BIN_PASSWORD_FILE
 Passphrase (or a file whose first line is the passphrase) for a
 @option{--passphrase} image.

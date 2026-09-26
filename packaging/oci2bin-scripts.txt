@@ -13,6 +13,7 @@ scripts/from_chroot.py
 scripts/inspect_image.py
 scripts/merge_layers.py
 scripts/oci_layout_to_tar.py
+scripts/oci_tar.py
 scripts/pod_stack.py
 scripts/reconstruct.py
 scripts/sbom_generate.py

@@ -3,18 +3,28 @@
 dockerfile_build.py — Build an OCI image layout from a Dockerfile.
 
 Supported instructions:
-  FROM scratch | <oci-layout-dir> | <docker-image>
-  COPY [--chown=] <src...> <dst>
+  FROM [--platform=linux/<arch>] scratch | <oci-layout-dir> | <docker-image>
+       | <earlier-stage> [AS <name>]         (multi-stage builds)
+  COPY [--from=<stage|image>] [--chmod=MODE] [--chown=] <src...> <dst>
+  COPY <<EOF <dst>                          (heredoc file)
   ADD  <src> <dst>         (local files only, same as COPY)
-  RUN  [--mount=...] <cmd>
+  RUN  [--mount=...] <cmd> | ["exec", "form"] | <<EOF ... EOF
+       (runs in WORKDIR through SHELL; as root — see USER)
   ENV  KEY=VAL | KEY VAL
   ENTRYPOINT ["cmd","arg"] | cmd arg
   CMD        ["cmd","arg"] | cmd arg
+  SHELL      ["executable", "param"]
   WORKDIR    /path
   LABEL      key=value
-  USER       uid[:gid]
+  USER       uid[:gid]     (image runtime user; RUN steps stay root)
   EXPOSE     port[/proto]  (informational)
   ARG        NAME[=default]
+
+Variables ($NAME, ${NAME}, ${NAME:-default}, ${NAME:+alt}) from ARG and ENV
+are expanded in ADD, COPY, ENV, EXPOSE, FROM, LABEL, STOPSIGNAL, USER,
+VOLUME, WORKDIR, ARG and SHELL; RUN/CMD/ENTRYPOINT see them as environment
+variables, expanded by the shell.  --chown is accepted with a warning: the
+builder emits a single root-owned layer.
 
 RUN --mount types (BuildKit-compatible):
   --mount=type=bind,source=<src>,target=<dst>[,ro]
@@ -59,33 +69,138 @@ import from_chroot  # noqa: E402
 
 # ── Dockerfile parser ────────────────────────────────────────────────────────
 
+_HEREDOC_RE = re.compile(r'<<(-?)(["\']?)([A-Za-z_][A-Za-z0-9_]*)\2')
+
+
 def _parse_dockerfile(path: str) -> list:
-    """Return list of (INSTRUCTION, raw_args_str) from *path*."""
+    """Return a list of (INSTRUCTION, raw_args_str, heredocs) from *path*.
+
+    heredocs is a list of (word, body) for RUN/COPY/ADD `<<WORD` documents,
+    whose lines are consumed here instead of being read as instructions.
+    Line continuations skip comment and blank lines inside them (as Docker
+    does) instead of turning the next line into a new instruction, and CRLF
+    line endings are accepted.
+    """
     instructions = []
-    with open(path, encoding="utf-8") as f:
-        raw_lines = f.readlines()
+    with open(path, encoding="utf-8", newline="") as f:
+        lines = f.read().replace("\r\n", "\n").split("\n")
+
+    def _skippable(text):
+        t = text.strip()
+        return not t or t.startswith("#")
 
     i = 0
-    while i < len(raw_lines):
-        line = raw_lines[i].rstrip("\n")
+    n = len(lines)
+    while i < n:
+        line = lines[i]
         i += 1
-        while line.endswith("\\"):
-            line = line[:-1]
-            if i < len(raw_lines):
-                line += raw_lines[i].lstrip().rstrip("\n")
-                i += 1
-        line = line.strip()
-        if not line or line.startswith("#"):
+        if _skippable(line):
             continue
+        while line.rstrip().endswith("\\"):
+            line = line.rstrip()[:-1]
+            while i < n and _skippable(lines[i]):
+                i += 1
+            if i >= n:
+                break
+            line += lines[i].lstrip()
+            i += 1
+        line = line.strip()
         parts = line.split(None, 1)
         if not parts:
             continue
-        instructions.append((parts[0].upper(), parts[1] if len(parts) > 1 else ""))
+        instr = parts[0].upper()
+        rest = parts[1] if len(parts) > 1 else ""
+        heredocs = []
+        if instr in ("RUN", "COPY", "ADD"):
+            for dash, _quote, word in _HEREDOC_RE.findall(rest):
+                body = []
+                terminated = False
+                while i < n:
+                    raw = lines[i]
+                    i += 1
+                    text = raw.lstrip("\t") if dash else raw
+                    if text == word:
+                        terminated = True
+                        break
+                    body.append(text)
+                if not terminated:
+                    print(f"error: {instr}: unterminated heredoc <<{word}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                heredocs.append((word, "\n".join(body) + "\n"))
+        instructions.append((instr, rest, heredocs))
     return instructions
 
 
-def _parse_json_or_shell(s: str):
-    """Parse ENTRYPOINT/CMD: JSON array or shell-form string."""
+_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _expand_vars(text: str, variables: dict) -> str:
+    """Dockerfile variable substitution: $NAME, ${NAME}, ${NAME:-word},
+    ${NAME:+word}; `\\$` is a literal dollar.  Unset names expand to "".
+
+    Replaces the old per-build-arg str.replace(), which substituted
+    prefixes ($FOO inside $FOOBAR), ignored ${VAR:-default} and never
+    expanded ENV values.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] == "$":
+            out.append("$")
+            i += 2
+            continue
+        if ch != "$" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        if text[i + 1] == "{":
+            end = text.find("}", i + 2)
+            if end < 0:
+                out.append(text[i:])
+                break
+            inner = text[i + 2:end]
+            m = _VAR_NAME_RE.match(inner)
+            if not m:
+                out.append(text[i:end + 1])
+            else:
+                name = m.group(0)
+                tail = inner[m.end():]
+                value = variables.get(name)
+                if tail.startswith(":-"):
+                    out.append(value if value else
+                               _expand_vars(tail[2:], variables))
+                elif tail.startswith(":+"):
+                    out.append(_expand_vars(tail[2:], variables)
+                               if value else "")
+                elif tail == "":
+                    out.append(value or "")
+                else:
+                    out.append(text[i:end + 1])  # unsupported modifier
+            i = end + 1
+            continue
+        m = _VAR_NAME_RE.match(text, i + 1)
+        if not m:
+            out.append(ch)
+            i += 1
+            continue
+        out.append(variables.get(m.group(0), ""))
+        i = m.end()
+    return "".join(out)
+
+
+# Instructions whose arguments Docker expands with ARG/ENV values.  RUN,
+# CMD and ENTRYPOINT are left to the shell at run time.
+_EXPANDED_INSTRUCTIONS = frozenset((
+    "ADD", "COPY", "ENV", "EXPOSE", "FROM", "LABEL", "STOPSIGNAL", "USER",
+    "VOLUME", "WORKDIR", "ARG", "SHELL",
+))
+
+
+def _parse_json_array(s: str):
+    """Return the list of strings if *s* is a JSON exec-form array."""
     s = s.strip()
     if s.startswith("["):
         try:
@@ -94,7 +209,17 @@ def _parse_json_or_shell(s: str):
                 return val
         except json.JSONDecodeError:
             pass
-    return ["/bin/sh", "-c", s] if s else None
+    return None
+
+
+def _parse_json_or_shell(s: str, shell=None):
+    """Parse ENTRYPOINT/CMD: JSON array or shell-form string (run through
+    the current SHELL, default /bin/sh -c)."""
+    val = _parse_json_array(s)
+    if val is not None:
+        return val
+    s = s.strip()
+    return list(shell or ["/bin/sh", "-c"]) + [s] if s else None
 
 
 def _parse_kvs(spec: str) -> dict:
@@ -343,56 +468,56 @@ class _DockerIgnore:
         return excluded
 
 
-def _safe_resolve(rootfs: str, container_path: str) -> str:
-    """
-    Resolve *container_path* (an absolute path as it would appear
-    inside the container) to an absolute host path under *rootfs*,
-    refusing any escape via symlinks whose target leaves *rootfs*.
-
-    The lookup is symlink-aware on the *parent* directory: if the
-    parent already exists under *rootfs* and contains a symlink that
-    points outside *rootfs*, the call raises. The leaf component is
-    NOT dereferenced — that lets callers safely overwrite or replace
-    a destination symlink without writing through it.
-
-    *container_path* must be absolute. Callers should resolve any
-    relative form (e.g. WORKDIR-based) before invoking this helper.
-    Empty input is rejected.
-
-    Note that posixpath.normpath canonicalizes `..` segments in
-    absolute paths (so `/a/../b` becomes `/b`); the symlink escape
-    check catches the only remaining attack surface, where a `..`
-    traverses through a symlink chain.
-
-    Returns the absolute host path. Raises ValueError on any unsafe
-    input or on a symlink escape.
+def _resolve_in_root(rootfs: str, container_path: str,
+                     follow_leaf: bool) -> str:
+    """Resolve *container_path* the way the kernel would inside a chroot at
+    *rootfs*: every symlink is followed with *rootfs* as "/", so an
+    absolute target (`/var/run -> /run` on Debian/Ubuntu) is re-rooted
+    rather than read as a host path, and `..` stops at the root.  The
+    result is always *rootfs* or below it.  The leaf is only followed
+    when *follow_leaf* is set.
     """
     if not container_path:
         raise ValueError("empty container path")
     if not container_path.startswith("/"):
         raise ValueError(
             f"container path must be absolute: {container_path!r}")
-    norm = posixpath.normpath(container_path)
-    rel = norm.lstrip("/")
     real_root = os.path.realpath(rootfs)
-    if not rel:
-        return real_root
-    parent_rel, leaf = posixpath.split(rel)
-    if parent_rel:
-        parent_host = os.path.join(rootfs, parent_rel)
-        # realpath resolves any symlinks in the parent chain; if the
-        # parent doesn't yet exist on disk, realpath leaves the
-        # nonexistent suffix as-is — which is fine because the only
-        # way to get out is through an existing symlink.
-        real_parent = os.path.realpath(parent_host)
-    else:
-        real_parent = real_root
-    if real_parent != real_root and \
-            not real_parent.startswith(real_root + os.sep):
-        raise ValueError(
-            f"symlink escape: {container_path!r} resolves outside "
-            f"the rootfs ({real_parent!r})")
-    return os.path.join(real_parent, leaf) if leaf else real_parent
+    todo = [p for p in container_path.split("/") if p]
+    done: list = []
+    links_left = 40
+    while todo:
+        comp = todo.pop(0)
+        if comp == ".":
+            continue
+        if comp == "..":
+            if done:
+                done.pop()
+            continue
+        host = os.path.join(real_root, *done, comp)
+        if (todo or follow_leaf) and os.path.islink(host):
+            links_left -= 1
+            if links_left < 0:
+                raise ValueError(
+                    f"too many levels of symlinks: {container_path!r}")
+            target = os.readlink(host)
+            if target.startswith("/"):
+                done = []
+            todo = [p for p in target.split("/") if p] + todo
+            continue
+        done.append(comp)
+    return os.path.join(real_root, *done)
+
+
+def _safe_resolve(rootfs: str, container_path: str) -> str:
+    """
+    Resolve *container_path* (absolute, as seen inside the container) to a
+    host path under *rootfs*.  Symlinks in the parent chain are followed
+    inside the rootfs (see _resolve_in_root); the leaf is NOT dereferenced,
+    so callers can replace a destination symlink without writing through it.
+    Raises ValueError on empty or relative input.
+    """
+    return _resolve_in_root(rootfs, container_path, follow_leaf=False)
 
 
 def _safe_resolve_follow(rootfs: str, container_path: str) -> str:
@@ -402,22 +527,7 @@ def _safe_resolve_follow(rootfs: str, container_path: str) -> str:
     directory.  Callers that are going to replace the leaf should keep using
     _safe_resolve(), which deliberately leaves the leaf unresolved.
     """
-    if not container_path:
-        raise ValueError("empty container path")
-    if not container_path.startswith("/"):
-        raise ValueError(
-            f"container path must be absolute: {container_path!r}")
-    norm = posixpath.normpath(container_path)
-    rel = norm.lstrip("/")
-    real_root = os.path.realpath(rootfs)
-    host_path = os.path.join(rootfs, rel) if rel else rootfs
-    real_path = os.path.realpath(host_path)
-    if real_path != real_root and \
-            not real_path.startswith(real_root + os.sep):
-        raise ValueError(
-            f"symlink escape: {container_path!r} resolves outside "
-            f"the rootfs ({real_path!r})")
-    return real_path
+    return _resolve_in_root(rootfs, container_path, follow_leaf=True)
 
 
 def _safe_unlink_if_present(path: str) -> None:
@@ -677,6 +787,10 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
         member.mode = member.mode & 0o1777
         try:
             if member.isdir():
+                # A symlink left at the leaf by an earlier entry must not be
+                # followed: makedirs/chmod would act on its (host) target.
+                if os.path.islink(dest):
+                    os.unlink(dest)
                 os.makedirs(dest, exist_ok=True)
                 os.chmod(dest, member.mode)
             elif member.issym():
@@ -695,8 +809,11 @@ def _extract_layer_tar(tf: tarfile.TarFile, rootfs: str) -> None:
                     continue
                 _safe_unlink_if_present(dest)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
-                if os.path.exists(link_src):
-                    os.link(link_src, dest)
+                # Never follow a symlink leaf here: exists()/link() would
+                # resolve it against the HOST, so a crafted layer (a -> /x,
+                # b hardlinked to a) could pull a host file into the rootfs.
+                if os.path.lexists(link_src):
+                    os.link(link_src, dest, follow_symlinks=False)
             elif member.isfile():
                 _safe_unlink_if_present(dest)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -790,6 +907,43 @@ class _State:
         self.labels: dict = {}
         self.user = ""
         self.exposed: list = []
+        self.shell: list = ["/bin/sh", "-c"]
+        # Multi-stage: finished stages by name and by index -> _Stage.
+        self.stages: dict = {}
+        self.stage_index = -1
+        self.stage_name = None
+        self.cmd_set_in_stage = False
+        self.copy_images: dict = {}  # COPY --from=<image> -> unpacked root
+        self.tmpdir = ""
+
+
+class _Stage:
+    """A finished build stage: its rootfs and the config it would emit."""
+
+    def __init__(self, state: "_State"):
+        self.rootfs = state.rootfs
+        self.env = list(state.env)
+        self.entrypoint = state.entrypoint
+        self.cmd = state.cmd
+        self.workdir = state.workdir
+        self.labels = dict(state.labels)
+        self.user = state.user
+        self.shell = list(state.shell)
+
+
+_ARCH_ALIASES = {"amd64": {"amd64", "x86_64"}, "arm64": {"arm64", "aarch64"}}
+
+
+def _check_platform(state: "_State", platform: str) -> None:
+    """FROM --platform: only the build's own linux/<arch> can be built."""
+    os_part, _, rest = platform.partition("/")
+    arch_part = rest.split("/", 1)[0]
+    if os_part != "linux" or \
+            arch_part not in _ARCH_ALIASES.get(state.arch, {state.arch}):
+        print(f"error: FROM --platform={platform}: this build targets "
+              f"linux/{state.arch} (use --arch to change it)",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 # ── RUN --mount helpers ──────────────────────────────────────────────────────
@@ -1044,30 +1198,45 @@ def _build_mount_cmds(mounts: list, state: _State) -> tuple:
 
 # ── Instruction handlers ─────────────────────────────────────────────────────
 
-def _do_from(state: _State, args: str, tmpdir: str) -> None:
-    image = args.split()[0]
+def _parse_from(state: _State, args: str) -> tuple:
+    """Split `[--platform=P] IMAGE [AS NAME]` into (image, stage_name)."""
+    words = args.split()
+    while words and words[0].startswith("--"):
+        flag = words.pop(0)
+        if flag.startswith("--platform="):
+            _check_platform(state, flag[len("--platform="):])
+        elif flag == "--platform" and words:
+            _check_platform(state, words.pop(0))
+        else:
+            print(f"error: FROM: unsupported option {flag!r}",
+                  file=sys.stderr)
+            sys.exit(1)
+    if not words:
+        print("error: FROM requires an image", file=sys.stderr)
+        sys.exit(1)
+    image = words[0]
+    name = None
+    if len(words) == 3 and words[1].lower() == "as":
+        name = words[2].lower()
+    elif len(words) != 1:
+        print(f"error: FROM: cannot parse {args!r}", file=sys.stderr)
+        sys.exit(1)
+    return image, name
 
-    if state.rootfs and os.path.isdir(state.rootfs):
-        shutil.rmtree(state.rootfs)
-    state.rootfs = tempfile.mkdtemp(dir=tmpdir, prefix="rootfs_")
-    state.env = []
-    state.entrypoint = None
-    state.cmd = None
-    state.workdir = "/"
-    state.labels = {}
-    state.user = ""
 
+def _materialize_image(state: _State, image: str, dest: str) -> dict:
+    """Unpack *image* (scratch, a local OCI layout, or a registry image)
+    into *dest* and return its image config dict."""
     if image.lower() == "scratch":
         print("oci2bin: FROM scratch — empty rootfs", file=sys.stderr)
-        return
+        return {}
 
     if os.path.isdir(image) and os.path.exists(
             os.path.join(image, "oci-layout")):
         print(f"oci2bin: FROM {image} (local OCI layout)", file=sys.stderr)
-        cfg = _extract_oci_to_rootfs(image, state.rootfs)
-        _inherit_config(state, cfg)
-        return
+        return _extract_oci_to_rootfs(image, dest)
 
+    tmpdir = state.tmpdir
     # Remote image: prefer docker, then podman (CLI-compatible save/pull),
     # then skopeo (daemonless copy into an OCI layout). Same precedence as the
     # top-level `oci2bin` wrapper.
@@ -1079,10 +1248,9 @@ def _do_from(state: _State, args: str, tmpdir: str) -> None:
                         image], check=True)
         save_tar = os.path.join(tmpdir, "base.tar")
         subprocess.run([engine, "save", "-o", save_tar, image], check=True)
-        cfg = _extract_docker_save_to_rootfs(save_tar, state.rootfs)
+        cfg = _extract_docker_save_to_rootfs(save_tar, dest)
         os.unlink(save_tar)
-        _inherit_config(state, cfg)
-        return
+        return cfg
 
     if shutil.which("skopeo"):
         print(f"oci2bin: FROM {image} (skopeo copy, no daemon)",
@@ -1093,14 +1261,59 @@ def _do_from(state: _State, args: str, tmpdir: str) -> None:
                         "--override-arch", state.arch,
                         f"docker://{image}",
                         f"oci:{oci_dir}:latest"], check=True)
-        cfg = _extract_oci_to_rootfs(oci_dir, state.rootfs)
+        cfg = _extract_oci_to_rootfs(oci_dir, dest)
         shutil.rmtree(oci_dir, ignore_errors=True)
-        _inherit_config(state, cfg)
-        return
+        return cfg
 
     print(f"error: FROM {image!r}: not a local OCI dir and no "
           f"docker/podman/skopeo found", file=sys.stderr)
     sys.exit(1)
+
+
+def _finish_stage(state: _State) -> None:
+    """Record the current stage (by index and by its AS name, if any) so a
+    later FROM or COPY --from can use it."""
+    if state.stage_index < 0 or not state.rootfs:
+        return
+    stage = _Stage(state)
+    state.stages[str(state.stage_index)] = stage
+    if state.stage_name:
+        state.stages[state.stage_name] = stage
+
+
+def _do_from(state: _State, args: str, tmpdir: str) -> None:
+    state.tmpdir = tmpdir
+    image, name = _parse_from(state, args)
+    _finish_stage(state)
+    state.stage_index += 1
+    state.stage_name = name
+
+    state.rootfs = tempfile.mkdtemp(dir=tmpdir, prefix="rootfs_")
+    state.env = []
+    state.entrypoint = None
+    state.cmd = None
+    state.workdir = "/"
+    state.labels = {}
+    state.user = ""
+    state.shell = ["/bin/sh", "-c"]
+    state.cmd_set_in_stage = False
+
+    base = state.stages.get(image.lower())
+    if base is not None:
+        # FROM <earlier stage>: start from a copy of its filesystem/config.
+        print(f"oci2bin: FROM stage {image}", file=sys.stderr)
+        shutil.copytree(base.rootfs, state.rootfs, symlinks=True,
+                        dirs_exist_ok=True)
+        state.env = list(base.env)
+        state.entrypoint = base.entrypoint
+        state.cmd = base.cmd
+        state.workdir = base.workdir
+        state.labels = dict(base.labels)
+        state.user = base.user
+        state.shell = list(base.shell)
+        return
+
+    _inherit_config(state, _materialize_image(state, image, state.rootfs))
 
 
 def _inherit_config(state: _State, cfg: dict) -> None:
@@ -1119,9 +1332,65 @@ def _inherit_config(state: _State, cfg: dict) -> None:
         state.user = c["User"]
 
 
-def _do_copy(state: _State, args: str) -> None:
+def _copy_source_root(state: _State, ref: str) -> str:
+    """COPY --from=REF: a finished stage (by AS name or index) or an image,
+    materialized once per build.  Returns the root to copy from."""
+    stage = state.stages.get(ref.lower())
+    if stage is not None:
+        return stage.rootfs
+    cache = state.copy_images
+    if ref not in cache:
+        dest = tempfile.mkdtemp(dir=state.tmpdir, prefix="copyfrom_")
+        _materialize_image(state, ref, dest)
+        cache[ref] = dest
+    return cache[ref]
+
+
+def _apply_chmod(path: str, mode: int) -> None:
+    """COPY --chmod: apply *mode* to *path* and, for a directory, to
+    everything copied below it (symlinks are left alone)."""
+    if os.path.islink(path):
+        return
+    os.chmod(path, mode)
+    if os.path.isdir(path):
+        for dirpath, dirnames, filenames in os.walk(path):
+            for name in dirnames + filenames:
+                full = os.path.join(dirpath, name)
+                if not os.path.islink(full):
+                    os.chmod(full, mode)
+
+
+def _do_copy(state: _State, args: str, heredocs=None) -> None:
     parts = shlex.split(args)
-    parts = [p for p in parts if not p.startswith("--chown=")]
+    copy_from = None
+    chmod_mode = None
+    while parts and parts[0].startswith("--"):
+        flag = parts.pop(0)
+        if flag.startswith("--from="):
+            copy_from = flag[len("--from="):]
+        elif flag.startswith("--chmod="):
+            try:
+                chmod_mode = int(flag[len("--chmod="):], 8)
+            except ValueError:
+                print(f"error: COPY {flag}: expected an octal mode",
+                      file=sys.stderr)
+                sys.exit(1)
+        elif flag.startswith("--chown="):
+            # This builder emits a single layer in which every entry is
+            # owned by root (from_chroot.build_layer); an owner cannot be
+            # carried through, so say so instead of dropping it silently.
+            print(f"  warning: COPY {flag}: ownership is not preserved by "
+                  f"this builder; files will be owned by root",
+                  file=sys.stderr)
+        elif flag == "--link":
+            pass  # a BuildKit cache optimisation; no effect on the result
+        else:
+            print(f"error: COPY: unsupported option {flag!r}",
+                  file=sys.stderr)
+            sys.exit(1)
+    if heredocs:
+        _copy_heredocs(state, parts, heredocs, chmod_mode)
+        return
     if len(parts) < 2:
         print(f"error: COPY requires at least src and dst: {args!r}",
               file=sys.stderr)
@@ -1160,27 +1429,37 @@ def _do_copy(state: _State, args: str) -> None:
                 sys.exit(1)
 
     candidates: list = []
-    for src in srcs:
-        try:
-            candidates.extend(_expand_context_glob(state.context_dir, src))
-        except ValueError as exc:
-            print(f"error: COPY source escapes build context: {exc}",
-                  file=sys.stderr)
-            sys.exit(1)
-    candidates = list(dict.fromkeys(candidates))
-
     sources = []
-    for candidate in candidates:
-        try:
-            src_path = _resolve_context_candidate(
-                state.context_dir, candidate)
-        except ValueError as exc:
-            print(f"error: COPY source escapes build context: {exc}",
-                  file=sys.stderr)
-            sys.exit(1)
-        if _context_source_ignored(state, candidate, src_path):
-            continue
-        sources.append((candidate, src_path))
+    if copy_from is not None:
+        # Paths name files inside the stage/image, resolved within its root
+        # (absolute symlinks re-rooted); .dockerignore does not apply.
+        src_root = _copy_source_root(state, copy_from)
+        for src in srcs:
+            container_src = src if src.startswith("/") else "/" + src
+            src_path = _safe_resolve_follow(src_root, container_src)
+            sources.append((src_path, src_path))
+    else:
+        for src in srcs:
+            try:
+                candidates.extend(_expand_context_glob(state.context_dir,
+                                                       src))
+            except ValueError as exc:
+                print(f"error: COPY source escapes build context: {exc}",
+                      file=sys.stderr)
+                sys.exit(1)
+        candidates = list(dict.fromkeys(candidates))
+
+        for candidate in candidates:
+            try:
+                src_path = _resolve_context_candidate(
+                    state.context_dir, candidate)
+            except ValueError as exc:
+                print(f"error: COPY source escapes build context: {exc}",
+                      file=sys.stderr)
+                sys.exit(1)
+            if _context_source_ignored(state, candidate, src_path):
+                continue
+            sources.append((candidate, src_path))
 
     if not sources:
         print(f"error: COPY: no files matched: {srcs}", file=sys.stderr)
@@ -1191,7 +1470,19 @@ def _do_copy(state: _State, args: str) -> None:
             print(f"error: COPY source not found: {src_path}", file=sys.stderr)
             sys.exit(1)
         if os.path.isdir(src_path) and not os.path.islink(src_path):
-            _copy_dir_contents(state, src_path, dst_container)
+            if copy_from is not None:
+                saved = (state.context_dir, state.dockerignore.patterns)
+                state.context_dir = src_path
+                state.dockerignore.patterns = []
+                try:
+                    _copy_dir_contents(state, src_path, dst_container)
+                finally:
+                    state.context_dir, state.dockerignore.patterns = saved
+            else:
+                _copy_dir_contents(state, src_path, dst_container)
+            if chmod_mode is not None:
+                _apply_chmod(_safe_resolve_follow(state.rootfs,
+                                                  dst_container), chmod_mode)
         else:
             if dst_is_dir or len(sources) > 1:
                 try:
@@ -1213,9 +1504,33 @@ def _do_copy(state: _State, args: str) -> None:
             else:
                 dest = dst_host
             _copy_leaf(src_path, dest)
+            if chmod_mode is not None:
+                _apply_chmod(dest, chmod_mode)
 
 
-def _do_run(state: _State, args: str) -> None:
+def _copy_heredocs(state: _State, parts: list, heredocs: list,
+                   chmod_mode) -> None:
+    """COPY <<NAME [<<NAME2...] DEST: write each heredoc body as a file."""
+    if not parts:
+        print("error: COPY heredoc needs a destination", file=sys.stderr)
+        sys.exit(1)
+    dst_rel = parts[-1]
+    dst_container = posixpath.normpath(
+        dst_rel if dst_rel.startswith("/") else
+        posixpath.join(state.workdir, dst_rel))
+    to_dir = dst_rel.endswith("/") or len(heredocs) > 1
+    for word, body in heredocs:
+        target = posixpath.join(dst_container, word) if to_dir \
+            else dst_container
+        dest = _safe_resolve(state.rootfs, target)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        _safe_unlink_if_present(dest)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.chmod(dest, chmod_mode if chmod_mode is not None else 0o644)
+
+
+def _do_run(state: _State, args: str, heredocs=None) -> None:
     """
     RUN [--mount=type=bind|secret|ssh|cache|tmpfs,...] <cmd>
 
@@ -1233,8 +1548,10 @@ def _do_run(state: _State, args: str) -> None:
               "refusing to silently degrade", file=sys.stderr)
         sys.exit(1)
 
-    sh = os.path.join(state.rootfs, "bin", "sh")
-    if not os.path.exists(sh):
+    # Resolve inside the rootfs: /bin/sh is usually a symlink (alpine:
+    # -> /bin/busybox) whose absolute target means nothing on the host.
+    sh = _safe_resolve_follow(state.rootfs, "/bin/sh")
+    if not os.path.isfile(sh):
         print("error: RUN requires /bin/sh in the rootfs "
               "(FROM scratch cannot execute RUN)", file=sys.stderr)
         sys.exit(1)
@@ -1278,28 +1595,50 @@ def _do_run(state: _State, args: str) -> None:
         if k in os.environ:
             run_env[k] = os.environ[k]
 
-    # Write the command to a temp script inside rootfs so we can exec it.
-    with tempfile.NamedTemporaryFile(
-            dir=state.rootfs, prefix=".oci2bin_run_", suffix=".sh",
-            mode="w", delete=False) as tmp:
-        tmp.write(f"#!/bin/sh\nset -e\n{cmd}\n")
-        tmp_path = tmp.name
-        tmp_arc = "/" + os.path.relpath(tmp_path, state.rootfs)
+    # What runs inside the chroot, with Docker's semantics: exec form runs
+    # the argv as is; shell form runs `SHELL + [cmd]` (default /bin/sh -c) —
+    # no implicit `set -e`, which changed `RUN a; b`.  `RUN <<EOF` runs the
+    # heredoc body as the script; `RUN cmd <<EOF` hands cmd plus its
+    # heredocs to the shell, which implements them.
+    exec_form = None if heredocs else _parse_json_array(cmd)
+    if exec_form is not None:
+        argv = exec_form
+    else:
+        script = cmd
+        if heredocs:
+            if _HEREDOC_RE.fullmatch(cmd.strip()) and len(heredocs) == 1:
+                script = heredocs[0][1]
+            else:
+                script = cmd + "\n" + "".join(
+                    body + word + "\n" for word, body in heredocs)
+        argv = list(state.shell) + [script]
+
+    user = (state.user or "").strip()
+    if user and user.split(":", 1)[0] not in ("0", "root"):
+        # Only uid 0 is mapped in the rootless build namespace, so a switch
+        # to another user cannot happen; say so rather than pretend.
+        print(f"  warning: RUN executes as root; USER {user} only applies "
+              f"to the built image", file=sys.stderr)
+
+    workdir = state.workdir or "/"
+    in_root = ("mkdir -p -- \"$0\" 2>/dev/null; "
+               "cd -- \"$0\" && exec \"$@\"")
 
     try:
-        os.chmod(tmp_path, 0o700)
-
         # Build the inner shell script that runs inside the unshare namespace:
-        #   1. Mount proc (best-effort)
+        #   1. Mount proc — best-effort, and a failure is reported instead
+        #      of aborting the step with no message under `sh -e`
         #   2. Apply RUN --mount bind-mounts (inside the new namespace only)
-        #   3. chroot into rootfs and exec the script
-        steps = [f"mount -t proc proc {shlex.quote(proc_dir)} 2>/dev/null"]
+        #   3. chroot into rootfs, cd to WORKDIR and exec the command
+        steps = [f"mount -t proc proc {shlex.quote(proc_dir)} || "
+                 f"echo 'oci2bin: warning: RUN: could not mount /proc' >&2"]
         steps.extend(mount_cmds)
         steps.append(
-            f"chroot {shlex.quote(state.rootfs)} /bin/sh -e "
-            f"{shlex.quote(tmp_arc)}"
+            f"chroot {shlex.quote(state.rootfs)} /bin/sh -c "
+            f"{shlex.quote(in_root)} {shlex.quote(workdir)} "
+            + " ".join(shlex.quote(a) for a in argv)
         )
-        inner = "; ".join(steps)
+        inner = "\n".join(steps)
 
         subprocess.run(
             ["unshare", "--user", "--map-root-user",
@@ -1309,11 +1648,6 @@ def _do_run(state: _State, args: str) -> None:
             env=run_env,
         )
     finally:
-        # Remove the temp script — it must not appear in the image layer.
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
         # Remove secret/ssh placeholder files left as mount targets.
         for path in cleanup_paths:
             try:
@@ -1369,16 +1703,26 @@ def build_from_dockerfile(dockerfile: str, out_dir: str, *,
     if not instructions:
         print("error: Dockerfile is empty", file=sys.stderr)
         sys.exit(1)
-    if instructions[0][0] != "FROM":
-        print("error: Dockerfile must begin with FROM", file=sys.stderr)
+    # Only ARG may precede the first FROM (global build args, usable in
+    # FROM lines).
+    first = next((ins for ins, _a, _h in instructions if ins != "ARG"), None)
+    if first != "FROM":
+        print("error: Dockerfile must begin with FROM (after any ARG)",
+              file=sys.stderr)
         sys.exit(1)
 
     state = _State(context_dir, build_args, build_secrets, arch)
     tmpdir = tempfile.mkdtemp(prefix="oci2bin_build_")
+    state.tmpdir = tmpdir
     try:
-        for instr, args in instructions:
-            for k, v in state.build_args.items():
-                args = args.replace(f"${k}", v).replace(f"${{{k}}}", v)
+        for instr, args, heredocs in instructions:
+            if instr in _EXPANDED_INSTRUCTIONS:
+                variables = dict(state.build_args)
+                for kv in state.env:
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        variables[k] = v
+                args = _expand_vars(args, variables)
 
             # Summarise: truncate long args for readability
             summary = args[:72].replace("\n", " ")
@@ -1387,15 +1731,27 @@ def build_from_dockerfile(dockerfile: str, out_dir: str, *,
             if instr == "FROM":
                 _do_from(state, args, tmpdir)
             elif instr in ("COPY", "ADD"):
-                _do_copy(state, args)
+                _do_copy(state, args, heredocs)
             elif instr == "RUN":
-                _do_run(state, args)
+                _do_run(state, args, heredocs)
             elif instr == "ENV":
                 _do_env(state, args)
             elif instr == "ENTRYPOINT":
-                state.entrypoint = _parse_json_or_shell(args)
+                state.entrypoint = _parse_json_or_shell(args, state.shell)
+                # Docker: setting ENTRYPOINT resets a CMD inherited from
+                # the base image.
+                if not state.cmd_set_in_stage:
+                    state.cmd = None
             elif instr == "CMD":
-                state.cmd = _parse_json_or_shell(args)
+                state.cmd = _parse_json_or_shell(args, state.shell)
+                state.cmd_set_in_stage = True
+            elif instr == "SHELL":
+                shell = _parse_json_array(args)
+                if not shell:
+                    print("error: SHELL requires a JSON array form",
+                          file=sys.stderr)
+                    sys.exit(1)
+                state.shell = shell
             elif instr == "WORKDIR":
                 _do_workdir(state, args)
             elif instr == "LABEL":
@@ -1411,9 +1767,13 @@ def build_from_dockerfile(dockerfile: str, out_dir: str, *,
                 name_default = args.strip().split("=", 1)
                 name = name_default[0]
                 if name not in state.build_args and len(name_default) == 2:
-                    state.build_args[name] = name_default[1]
+                    default = name_default[1]
+                    if len(default) >= 2 and default[0] == default[-1] \
+                            and default[0] in "'\"":
+                        default = default[1:-1]
+                    state.build_args[name] = default
             elif instr in ("MAINTAINER", "STOPSIGNAL", "HEALTHCHECK",
-                           "SHELL", "ONBUILD", "VOLUME"):
+                           "ONBUILD", "VOLUME"):
                 pass
             else:
                 print(f"  warning: unsupported instruction: {instr}",

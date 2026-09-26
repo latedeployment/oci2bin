@@ -66,18 +66,36 @@ class SafeResolveTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _MOD._safe_resolve(self.rootfs, "")
 
-    def test_absolute_symlink_to_host_path_raises(self):
-        # An absolute symlink in the rootfs points at the host's /usr.
-        # realpath of the parent escapes — must raise.
+    def test_absolute_symlink_is_rerooted(self):
+        # An absolute symlink means what it means inside the container:
+        # /usr-alias -> /usr resolves to <rootfs>/usr, never the host's /usr.
         os.symlink("/usr", os.path.join(self.rootfs, "usr-alias"))
-        with self.assertRaises(ValueError):
-            _MOD._safe_resolve(self.rootfs, "/usr-alias/lib")
+        out = _MOD._safe_resolve(self.rootfs, "/usr-alias/lib")
+        self.assertEqual(out, os.path.join(os.path.realpath(self.rootfs),
+                                           "usr", "lib"))
 
-    def test_escape_via_symlink_raises(self):
-        # /etc -> /tmp (planted by malicious layer)
+    def test_debian_var_run_symlink_resolves_inside(self):
+        # Debian/Ubuntu ship /var/run -> /run; that used to be rejected.
+        os.makedirs(os.path.join(self.rootfs, "var"))
+        os.makedirs(os.path.join(self.rootfs, "run"))
+        os.symlink("/run", os.path.join(self.rootfs, "var", "run"))
+        out = _MOD._safe_resolve_follow(self.rootfs, "/var/run")
+        self.assertEqual(out, os.path.join(os.path.realpath(self.rootfs),
+                                           "run"))
+
+    def test_planted_absolute_symlink_stays_in_rootfs(self):
+        # /etc -> /tmp (planted by malicious layer) resolves to <rootfs>/tmp.
         os.symlink("/tmp", os.path.join(self.rootfs, "etc"))
-        with self.assertRaises(ValueError):
-            _MOD._safe_resolve(self.rootfs, "/etc/passwd")
+        out = _MOD._safe_resolve(self.rootfs, "/etc/passwd")
+        self.assertEqual(out, os.path.join(os.path.realpath(self.rootfs),
+                                           "tmp", "passwd"))
+
+    def test_dotdot_symlink_clamps_at_root(self):
+        # /up -> ../../.. cannot climb above the rootfs, like a chroot.
+        os.symlink("../../..", os.path.join(self.rootfs, "up"))
+        out = _MOD._safe_resolve(self.rootfs, "/up/etc/passwd")
+        self.assertEqual(out, os.path.join(os.path.realpath(self.rootfs),
+                                           "etc", "passwd"))
 
     def test_escape_via_relative_symlink_raises(self):
         # /etc -> ../../etc  (relative escape from rootfs)
@@ -116,9 +134,11 @@ class SafeResolveTest(unittest.TestCase):
 
         state = _MOD._State(ctx, {}, {}, "amd64")
         state.rootfs = self.rootfs
-        with self.assertRaises(SystemExit):
-            _MOD._do_copy(state, "payload /dst/")
+        _MOD._do_copy(state, "payload /dst/")
+        # The host path in the symlink is re-rooted, never followed out.
         self.assertFalse(os.path.exists(os.path.join(outside, "payload")))
+        rerooted = os.path.join(self.rootfs, outside.lstrip("/"), "payload")
+        self.assertTrue(os.path.isfile(rerooted))
 
     def test_copy_file_replaces_leaf_symlink_without_following(self):
         ctx = os.path.join(self.tmp, "ctx")
@@ -156,9 +176,10 @@ class SafeResolveTest(unittest.TestCase):
 
         state = _MOD._State(ctx, {}, {}, "amd64")
         state.rootfs = self.rootfs
-        with self.assertRaises(SystemExit):
-            _MOD._do_copy(state, "src /dst")
+        _MOD._do_copy(state, "src /dst")
         self.assertFalse(os.path.exists(os.path.join(outside, "payload")))
+        rerooted = os.path.join(self.rootfs, outside.lstrip("/"), "payload")
+        self.assertTrue(os.path.isfile(rerooted))
 
     def test_copy_source_symlink_escape_rejected(self):
         ctx = os.path.join(self.tmp, "ctx")
@@ -387,7 +408,7 @@ class SafeResolveTest(unittest.TestCase):
                 state,
             )
 
-    def test_run_bind_target_symlink_escape_rejected(self):
+    def test_run_bind_target_symlink_stays_in_rootfs(self):
         ctx = os.path.join(self.tmp, "ctx")
         outside = os.path.join(self.tmp, "outside")
         os.makedirs(ctx)
@@ -399,11 +420,13 @@ class SafeResolveTest(unittest.TestCase):
 
         state = _MOD._State(ctx, {}, {}, "amd64")
         state.rootfs = self.rootfs
-        with self.assertRaises(SystemExit):
-            _MOD._mount_bind(
-                {"type": "bind", "source": "payload", "target": "/mnt"},
-                state,
-            )
+        cmd, _cleanup = _MOD._mount_bind(
+            {"type": "bind", "source": "payload", "target": "/mnt"},
+            state,
+        )
+        # The bind target is the re-rooted path, never the host one.
+        self.assertFalse(os.path.lexists(os.path.join(outside, "target")))
+        self.assertIn(os.path.realpath(self.rootfs), cmd)
 
 
 if __name__ == "__main__":

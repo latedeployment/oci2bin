@@ -21,7 +21,6 @@ import os
 import posixpath
 import sys
 import tarfile
-import time
 
 
 def _validate_container_path(spec: str, container_path: str) -> str:
@@ -64,20 +63,51 @@ def _validate_container_path(spec: str, container_path: str) -> str:
     return norm
 
 
+def _source_date_epoch():
+    """SOURCE_DATE_EPOCH as an int, or None when unset/invalid."""
+    value = os.environ.get("SOURCE_DATE_EPOCH", "")
+    return int(value) if value.isdigit() else None
+
+
+def _normalize_member(epoch):
+    """tarfile filter: drop host identity, clamp mtimes when requested.
+
+    Injected files used to carry the building user's uid/gid/uname, which
+    both leaks host details into the image and makes every --add-file build
+    differ between machines.  Files are owned by root in the image, as a
+    Dockerfile COPY would produce.
+    """
+    def _filter(info):
+        info.uid = 0
+        info.gid = 0
+        info.uname = ""
+        info.gname = ""
+        if epoch is not None and info.mtime > epoch:
+            info.mtime = epoch
+        return info
+    return _filter
+
+
 def build_layer(entries):
     """
     Build a layer tarball from a list of (host_path, tar_name, is_dir) tuples.
     Returns the layer bytes (uncompressed tar).
     """
     buf = io.BytesIO()
+    member_filter = _normalize_member(_source_date_epoch())
     with tarfile.open(fileobj=buf, mode='w:') as tf:
         for host_path, tar_name, is_dir in entries:
             # Strip leading '/' from tar_name — tar convention
             arc_name = tar_name.lstrip('/')
             if is_dir:
-                tf.add(host_path, arcname=arc_name, recursive=True)
+                tf.add(host_path, arcname=arc_name, recursive=True,
+                       filter=member_filter)
             else:
-                tf.add(host_path, arcname=arc_name, recursive=False)
+                # --file names a file: a host symlink is validated with
+                # isfile() (which follows it), so store what it points to,
+                # not a link that would dangle inside the image.
+                tf.add(os.path.realpath(host_path), arcname=arc_name,
+                       recursive=False, filter=member_filter)
     return buf.getvalue()
 
 
@@ -202,7 +232,7 @@ def add_files(input_tar, output_tar, files, dirs):
             info = tarfile.TarInfo(name=layer_name)
             info.size  = len(layer_bytes)
             info.mode  = 0o644
-            info.mtime = int(time.time())
+            info.mtime = _source_date_epoch() or 0
             out_tf.addfile(info, io.BytesIO(layer_bytes))
 
     print(f"add_files: injected {len(entries)} item(s) as new layer {layer_dir[:12]}")

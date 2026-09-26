@@ -157,36 +157,45 @@ polyglot: build/loader-$(ARCH)
 sync-package-data:
 	python3 scripts/package_manifest.py --manifest $(PACKAGE_SCRIPT_MANIFEST) sync-package
 
+# DESTDIR stages the install under a root (packaging: make install
+# DESTDIR=%{buildroot} PREFIX=/usr); PREFIX is the final location, and is the
+# only path baked into the installed oci2bin and the oci2vm symlink.
+DESTDIR ?=
+INSTALL_ROOT = $(DESTDIR)$(PREFIX)
+
 install: build/loader-$(ARCH)
-	install -d $(PREFIX)/bin
-	install -d $(PREFIX)/share/oci2bin/scripts
-	install -d $(PREFIX)/share/oci2bin/build
-	install -d $(PREFIX)/share/oci2bin/src
-	install -m 755 oci2bin $(PREFIX)/bin/oci2bin
-	ln -sf $(PREFIX)/bin/oci2bin $(PREFIX)/bin/oci2vm
+	install -d $(INSTALL_ROOT)/bin
+	install -d $(INSTALL_ROOT)/share/oci2bin/scripts
+	install -d $(INSTALL_ROOT)/share/oci2bin/build
+	install -d $(INSTALL_ROOT)/share/oci2bin/src
+	install -m 755 oci2bin $(INSTALL_ROOT)/bin/oci2bin
+	ln -sf oci2bin $(INSTALL_ROOT)/bin/oci2vm
 	python3 scripts/package_manifest.py --manifest $(PACKAGE_SCRIPT_MANIFEST) \
-		install-scripts --dest $(PREFIX)/share/oci2bin/scripts
-	install -m 644 src/loader.c $(PREFIX)/share/oci2bin/src/
-	[ -f build/loader-x86_64  ] && install -m 755 build/loader-x86_64  $(PREFIX)/share/oci2bin/build/ || true
-	[ -f build/loader-aarch64 ] && install -m 755 build/loader-aarch64 $(PREFIX)/share/oci2bin/build/ || true
+		install-scripts --dest $(INSTALL_ROOT)/share/oci2bin/scripts
+	install -m 644 src/loader.c $(INSTALL_ROOT)/share/oci2bin/src/
+	for l in loader-x86_64 loader-aarch64 loader-libkrun-x86_64 loader-libkrun-aarch64; do \
+	  if [ -f build/$$l ]; then install -m 755 build/$$l $(INSTALL_ROOT)/share/oci2bin/build/; fi; \
+	done
 	sed -i 's|OCI2BIN_HOME:-\$$SCRIPT_DIR|OCI2BIN_HOME:-$(PREFIX)/share/oci2bin|' \
-		$(PREFIX)/bin/oci2bin
-	install -d $(PREFIX)/share/man/man1
-	install -m 644 $(MAN_DIR)/oci2bin.1 $(PREFIX)/share/man/man1/oci2bin.1
+		$(INSTALL_ROOT)/bin/oci2bin
+	install -d $(INSTALL_ROOT)/share/man/man1
+	install -m 644 $(MAN_DIR)/oci2bin.1 $(INSTALL_ROOT)/share/man/man1/oci2bin.1
 	if [ -f $(INFO_DIR)/oci2bin.info ]; then \
-	  install -d $(PREFIX)/share/info; \
-	  install -m 644 $(INFO_DIR)/oci2bin.info $(PREFIX)/share/info/oci2bin.info; \
-	  install-info --dir-file=$(PREFIX)/share/info/dir $(PREFIX)/share/info/oci2bin.info 2>/dev/null || true; \
+	  install -d $(INSTALL_ROOT)/share/info; \
+	  install -m 644 $(INFO_DIR)/oci2bin.info $(INSTALL_ROOT)/share/info/oci2bin.info; \
+	  if [ -z "$(DESTDIR)" ]; then \
+	    install-info --dir-file=$(INSTALL_ROOT)/share/info/dir $(INSTALL_ROOT)/share/info/oci2bin.info 2>/dev/null || true; \
+	  fi; \
 	fi
 	@echo "Installed. Run: oci2bin <image>"
 
 uninstall:
-	rm -f $(PREFIX)/bin/oci2bin $(PREFIX)/bin/oci2vm
-	rm -rf $(PREFIX)/share/oci2bin
-	rm -f $(PREFIX)/share/man/man1/oci2bin.1
-	-install-info --delete --dir-file=$(PREFIX)/share/info/dir \
-	  $(PREFIX)/share/info/oci2bin.info 2>/dev/null || true
-	rm -f $(PREFIX)/share/info/oci2bin.info
+	rm -f $(INSTALL_ROOT)/bin/oci2bin $(INSTALL_ROOT)/bin/oci2vm
+	rm -rf $(INSTALL_ROOT)/share/oci2bin
+	rm -f $(INSTALL_ROOT)/share/man/man1/oci2bin.1
+	-install-info --delete --dir-file=$(INSTALL_ROOT)/share/info/dir \
+	  $(INSTALL_ROOT)/share/info/oci2bin.info 2>/dev/null || true
+	rm -f $(INSTALL_ROOT)/share/info/oci2bin.info
 
 clean:
 	rm -rf build/loader-* build/test_c_units* build/vmlinux $(OUTPUT)

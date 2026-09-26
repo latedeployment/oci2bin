@@ -200,5 +200,39 @@ class TestValidation(unittest.TestCase):
         self.assertNotEqual(code, 0)
 
 
-if __name__ == '__main__':
+class TestYamlRegressions(unittest.TestCase):
+    def test_hash_inside_value_is_not_a_comment(self):
+        v = ps.parse_stack_text("a: abc#123   # comment\nb: 'x # y'\n")
+        self.assertEqual(v, {"a": "abc#123", "b": "x # y"})
+
+    def test_block_list_at_key_indent(self):
+        v = ps.parse_stack_text('ports:\n- "5432:5432"\n- "8080:80"\n'
+                                'next: 1\n')
+        self.assertEqual(v["ports"], ["5432:5432", "8080:80"])
+        self.assertEqual(v["next"], 1)
+
+    def test_nested_block_under_list_item_is_an_error(self):
+        code, err = expect_die(
+            lambda: ps.parse_stack_text("l:\n  - a\n    b: 1\n"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("nested block", err)
+
+    def test_up_refuses_running_stack(self):
+        import os
+        calls = []
+        orig = (ps._read_manifest, ps._remove_manifest)
+        try:
+            ps._read_manifest = lambda name: {"supervisor_pid": os.getpid()}
+            ps._remove_manifest = lambda name: calls.append(name)
+            code, err = expect_die(lambda: ps._refuse_if_running("s"))
+            self.assertIn("already running", err)
+            self.assertEqual(calls, [])
+            ps._read_manifest = lambda name: {"supervisor_pid": 2 ** 22 + 7}
+            ps._refuse_if_running("s")  # stale manifest: cleared, no die
+            self.assertEqual(calls, ["s"])
+        finally:
+            ps._read_manifest, ps._remove_manifest = orig
+
+
+if __name__ == "__main__":
     unittest.main()

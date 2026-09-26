@@ -44,9 +44,14 @@ This page is a checklist of the feature surface documented by the site.
 | Feature | Support |
 | --- | --- |
 | `FROM` | `scratch`, OCI dir, or image |
-| `COPY` | supported |
+| Multi-stage (`FROM ... AS name`, `COPY --from=`) | supported |
+| `FROM --platform=` | must match `--arch` |
+| `COPY` | supported (`--chmod`; `--chown` warns: single root-owned layer) |
 | `ADD` | supported |
-| `RUN` | supported |
+| `RUN` | supported (shell/exec form, heredocs, runs in `WORKDIR` via `SHELL`, as root) |
+| Heredocs (`RUN <<EOF`, `COPY <<EOF`) | supported |
+| `SHELL` | supported |
+| `$VAR` / `${VAR:-default}` / `${VAR:+alt}` expansion | supported |
 | `RUN --mount=type=bind` | supported |
 | `RUN --mount=type=secret` | supported |
 | `RUN --mount=type=ssh` | supported |
@@ -57,7 +62,7 @@ This page is a checklist of the feature surface documented by the site.
 | `CMD` | supported |
 | `WORKDIR` | supported |
 | `LABEL` | supported |
-| `USER` | supported |
+| `USER` | supported (image runtime user) |
 | `EXPOSE` | supported |
 | `ARG` | supported |
 
@@ -171,7 +176,7 @@ This page is a checklist of the feature surface documented by the site.
 | Runtime password file | `OCI2BIN_PASSWORD_FILE=FILE ./app.bin` |
 | Memory-backed secret staging (ramfs, never swapped) | automatic for `--secret tpm2:` |
 | Show embedded attestation | `oci2bin attest-show --in app.bin` |
-| Verify recorded source-image attestation | `oci2bin attest verify --in app.bin [--recheck]` |
+| Verify recorded source-image attestation | `oci2bin attest verify --signing-key pub.pem --in app.bin [--recheck]` |
 
 Age encryption covers the embedded OCI payload, not the ELF loader or outer
 metadata required to start the executable. It removes direct `docker load`
