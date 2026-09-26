@@ -905,7 +905,17 @@ Sign a binary (optionally publishing a Rekor transparency-log entry and/or an
 in-toto attestation).
 .B oci2bin verify \fB\-\-key \fIPUB\fR \fB\-\-in \fIBINARY\fR
 checks it, including that an embedded attestation names this binary as its
-subject.
+subject, and on success prints one trust summary line:
+.BR keyid ,
+.B hash
+of the signed content,
+.B attestation
+state and the Rekor log index from the
+.I BINARY.rekor.json
+receipt (with
+.B inclusion=confirmed
+after
+.BR \-\-rekor ).
 .
 .TP
 .B oci2bin attest verify \fB\-\-signing\-key \fIPUB\fR \fB\-\-in \fIBINARY\fR [\fB\-\-recheck\fR] [\fB\-\-key \fICOSIGN_PUB\fR]

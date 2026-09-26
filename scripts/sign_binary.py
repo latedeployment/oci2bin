@@ -834,20 +834,70 @@ def cmd_verify(args):
               file=sys.stderr)
         sys.exit(2)
 
-    suffix = ""
-    if attestation_ok is True:
-        suffix = ", attestation: ok"
-    elif att_bytes and not attestation_ok:
-        # unreachable — guarded by branch above, but kept for safety.
-        suffix = ", attestation: BAD"
-    print(
-        f"Verified OK: {args.input} "
-        f"(keyid: {keyid.hex()[:16]}..., hash: {algorithm}{suffix})"
-    )
-
+    # Everything below feeds one summary line, printed only once every
+    # requested check has passed: a "Verified OK" followed by a Rekor
+    # failure used to leave a success line on stdout and exit 2.
+    inclusion = None
     if getattr(args, "rekor", False):
-        return _rekor_verify_inclusion(args.input, content)
+        rc = _rekor_verify_inclusion(args.input, content)
+        if rc != 0:
+            print(f"Verification FAILED (rekor): {args.input}",
+                  file=sys.stderr)
+            sys.exit(rc)
+        inclusion = "confirmed"
+
+    print(format_trust_summary(
+        args.input, keyid, algorithm, _hash_bytes(content, algorithm),
+        attestation_ok is True, _load_rekor_receipt(args.input),
+        hashlib.sha256(content).hexdigest(), inclusion))
     return 0
+
+
+def _load_rekor_receipt(binary_path: str):
+    """The <binary>.rekor.json receipt `sign --rekor` writes, or None when
+    there is none or it is not a JSON object."""
+    sidecar = binary_path + ".rekor.json"
+    try:
+        with open(sidecar, "r", encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def format_trust_summary(input_path: str, keyid: bytes, algorithm: str,
+                         content_hash: bytes, attestation_ok: bool,
+                         receipt, content_sha256: str,
+                         inclusion) -> str:
+    """The one line `verify` prints on success.  key=value tokens so a
+    script can pick out what it needs:
+
+      Verified OK: PATH keyid=<sha256 of the DER public key>
+        hash=<algo>:<hash of the signed content> attestation=ok|none
+        rekor=none | rekor=<log index>@<server> inclusion=confirmed|unchecked
+        | rekor=receipt-mismatch
+
+    A receipt whose artifact hash is not this binary's is reported as
+    such rather than lending it a log index; `inclusion=unchecked` means
+    a receipt sits next to the binary but --rekor was not given, so the
+    log itself was not consulted.
+    """
+    tokens = [
+        f"keyid={keyid.hex()}",
+        f"hash={algorithm}:{content_hash.hex()}",
+        f"attestation={'ok' if attestation_ok else 'none'}",
+    ]
+    if receipt is None:
+        tokens.append("rekor=none")
+    elif str(receipt.get("artifactSha256") or "").lower() != content_sha256:
+        tokens.append("rekor=receipt-mismatch")
+    else:
+        index = receipt.get("logIndex")
+        index = str(index) if isinstance(index, int) and index >= 0 else "?"
+        server = str(receipt.get("rekorServer") or DEFAULT_REKOR_URL)
+        tokens.append(f"rekor={index}@{server}")
+        tokens.append(f"inclusion={inclusion or 'unchecked'}")
+    return f"Verified OK: {input_path} " + " ".join(tokens)
 
 
 def _rekor_value_contains_hash(value, expected_hash: str) -> bool:
@@ -902,11 +952,9 @@ def _rekor_verify_inclusion(binary_path: str, signed_content: bytes) -> int:
         print(f"sign_binary: --rekor: missing receipt {sidecar}",
               file=sys.stderr)
         return 2
-    try:
-        with open(sidecar, "r", encoding="utf-8") as f:
-            record = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"sign_binary: --rekor: cannot read {sidecar}: {e}",
+    record = _load_rekor_receipt(binary_path)
+    if record is None:
+        print(f"sign_binary: --rekor: cannot read {sidecar}",
               file=sys.stderr)
         return 2
     uuid = record.get("uuid") or ""
@@ -943,7 +991,6 @@ def _rekor_verify_inclusion(binary_path: str, signed_content: bytes) -> int:
         print("Rekor: entry found but does not match this binary's "
               "SHA-256 artifact hash", file=sys.stderr)
         return 2
-    print(f"Rekor: entry {uuid} confirmed in {rekor_url}")
     return 0
 
 

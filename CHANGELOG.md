@@ -6,6 +6,15 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`verify` prints one trust summary line.** On success stdout carries
+  exactly `Verified OK: PATH keyid=<sha256 of the DER public key>
+  hash=<algo>:<hash of the signed content> attestation=ok|none
+  rekor=<log index>@<server> inclusion=confirmed|unchecked` (or
+  `rekor=none` / `rekor=receipt-mismatch`), the Rekor fields read from the
+  `PATH.rekor.json` receipt `sign --rekor` writes. A failing `--rekor`
+  check now exits 2 with no success line instead of printing `Verified
+  OK` first.
+
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
   `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, keyed by the SHA-256

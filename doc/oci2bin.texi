@@ -986,6 +986,8 @@ Dump and restore a running container with CRIU.
 @item oci2bin sign --key KEY --in BIN [--rekor] [--attest A] / verify --key PUB --in BIN
 Sign a binary (optionally publishing a Rekor entry / embedding an attestation)
 and verify it; an embedded attestation must name the binary as its subject.
+On success @code{verify} prints one trust summary line (key id, signed-content
+hash, attestation state, Rekor log index and inclusion state).
 @item oci2bin attest verify --signing-key PUB --in BIN [--recheck] [--key COSIGN_PUB]
 Report (or re-run) the source-image Cosign verification recorded in the
 attestation, after authenticating it with @option{--signing-key}.

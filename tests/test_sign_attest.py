@@ -80,7 +80,8 @@ class TestSignAttestRoundtrip(unittest.TestCase):
         r = self._verify()
         self.assertEqual(r.returncode, 0, msg=r.stderr)
         self.assertIn("Verified OK", r.stdout)
-        self.assertNotIn("attestation", r.stdout)
+        self.assertIn(" attestation=none ", r.stdout)
+        self.assertTrue(r.stdout.rstrip().endswith(" rekor=none"))
 
     def test_sign_attest_auto_embeds_provenance(self):
         self._sign("--attest", "auto",
@@ -113,7 +114,60 @@ class TestSignAttestRoundtrip(unittest.TestCase):
         self._sign("--attest", "auto")
         r = self._verify()
         self.assertEqual(r.returncode, 0, msg=r.stderr)
-        self.assertIn("attestation: ok", r.stdout)
+        self.assertIn(" attestation=ok ", r.stdout)
+
+    def test_verify_prints_one_trust_summary_line(self):
+        """Key id, signed-content hash and Rekor state on a single
+        greppable line, and nothing else on stdout."""
+        self._sign("--hash-algorithm", "sha512")
+        data = self.binary.read_bytes()
+        block_start, _sig, keyid, alg, _att, _asig = sb._find_sig_block(data)
+        content = data[:block_start]
+        r = self._verify()
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        lines = r.stdout.splitlines()
+        self.assertEqual(len(lines), 1, r.stdout)
+        tokens = lines[0].split()
+        self.assertEqual(tokens[:2], ["Verified", "OK:"])
+        self.assertEqual(tokens[2], str(self.binary))
+        fields = dict(tok.split("=", 1) for tok in tokens[3:])
+        self.assertEqual(fields["keyid"], keyid.hex())
+        self.assertEqual(fields["keyid"],
+                         sb._compute_keyid(self.pub.read_bytes()).hex())
+        self.assertEqual(alg, "sha512")
+        self.assertEqual(fields["hash"],
+                         f"{alg}:{sb._hash_bytes(content, alg).hex()}")
+        self.assertEqual(fields["attestation"], "none")
+        self.assertEqual(fields["rekor"], "none")
+        self.assertNotIn("inclusion", fields)
+
+        # A receipt next to the binary shows its log index, unchecked
+        # unless --rekor consulted the log.
+        receipt = {"artifactSha256": hashlib.sha256(content).hexdigest(),
+                   "rekorServer": "https://rekor.example",
+                   "logIndex": 4242, "uuid": "abc"}
+        sidecar = Path(str(self.binary) + ".rekor.json")
+        sidecar.write_text(json.dumps(receipt), encoding="utf-8")
+        r = self._verify()
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        fields = dict(tok.split("=", 1)
+                      for tok in r.stdout.split()[3:])
+        self.assertEqual(fields["rekor"], "4242@https://rekor.example")
+        self.assertEqual(fields["inclusion"], "unchecked")
+
+        # A receipt for some other artifact lends this binary nothing.
+        receipt["artifactSha256"] = "0" * 64
+        sidecar.write_text(json.dumps(receipt), encoding="utf-8")
+        r = self._verify()
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertIn(" rekor=receipt-mismatch", r.stdout)
+        self.assertNotIn("inclusion", r.stdout)
+
+        # --rekor with that receipt fails before any success line.
+        r = self._verify("--rekor")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("Verification FAILED (rekor)", r.stderr)
 
     def test_verify_detects_tampered_attestation(self):
         self._sign("--attest", "auto")
@@ -507,6 +561,64 @@ class TestRekorVerification(unittest.TestCase):
             rc = sb._rekor_verify_inclusion(str(self.binary), self.content)
         self.assertEqual(rc, 0)
         self.assertEqual(run.call_count, 2)
+
+    def test_trust_summary_tokens(self):
+        keyid = bytes(range(32))
+        digest = hashlib.sha512(self.content).digest()
+        sha = hashlib.sha256(self.content).hexdigest()
+        base = sb.format_trust_summary("x.bin", keyid, "sha512", digest,
+                                       False, None, sha, None)
+        self.assertEqual(base, "Verified OK: x.bin keyid=" + keyid.hex()
+                         + " hash=sha512:" + digest.hex()
+                         + " attestation=none rekor=none")
+        good = {"artifactSha256": sha.upper(), "logIndex": 7,
+                "rekorServer": "https://r.example"}
+        self.assertTrue(sb.format_trust_summary(
+            "x.bin", keyid, "sha512", digest, True, good, sha, "confirmed")
+            .endswith(" attestation=ok rekor=7@https://r.example"
+                      " inclusion=confirmed"))
+        self.assertTrue(sb.format_trust_summary(
+            "x.bin", keyid, "sha512", digest, False,
+            {"artifactSha256": sha}, sha, None)
+            .endswith(f" rekor=?@{sb.DEFAULT_REKOR_URL} inclusion=unchecked"))
+        self.assertTrue(sb.format_trust_summary(
+            "x.bin", keyid, "sha512", digest, False,
+            {"artifactSha256": sha, "logIndex": "7"}, sha, None)
+            .endswith(" inclusion=unchecked"))
+        self.assertTrue(sb.format_trust_summary(
+            "x.bin", keyid, "sha512", digest, False,
+            {"artifactSha256": "0" * 64, "logIndex": 7}, sha, None)
+            .endswith(" rekor=receipt-mismatch"))
+
+    def test_load_rekor_receipt(self):
+        self.assertIsNone(sb._load_rekor_receipt(str(self.binary)))
+        sidecar = self.tmpdir / "demo.bin.rekor.json"
+        sidecar.write_text("[1, 2]", encoding="utf-8")
+        self.assertIsNone(sb._load_rekor_receipt(str(self.binary)))
+        sidecar.write_text("not json", encoding="utf-8")
+        self.assertIsNone(sb._load_rekor_receipt(str(self.binary)))
+        self._write_receipt("ab" * 32)
+        self.assertEqual(sb._load_rekor_receipt(str(self.binary))["uuid"],
+                         "abc123")
+
+    def test_rekor_verify_confirmation_is_silent_on_stdout(self):
+        """The summary line carries the confirmation; the check itself
+        prints nothing on success."""
+        expected_hash = hashlib.sha256(self.content).hexdigest()
+        self._write_receipt(expected_hash)
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=f"Artifact Hash: sha256:{expected_hash}\n".encode("utf-8"),
+            stderr=b"")
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with mock.patch.object(sb, "shutil_which", return_value="/bin/rekor-cli"), \
+                mock.patch.object(sb.subprocess, "run", return_value=result), \
+                redirect_stdout(buf):
+            rc = sb._rekor_verify_inclusion(str(self.binary), self.content)
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue(), "")
 
     def test_rekor_verify_rejects_entry_for_other_hash(self):
         expected_hash = hashlib.sha256(self.content).hexdigest()

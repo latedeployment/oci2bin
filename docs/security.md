@@ -350,6 +350,23 @@ Verify:
 oci2bin verify --key pub.pem --in app.bin
 ```
 
+On success `verify` prints one trust summary line and nothing else on
+stdout, so a script can pick the fields out:
+
+```
+Verified OK: app.bin keyid=<sha256 of the DER public key> hash=sha512:<hash of the signed content> attestation=ok rekor=1234567@https://rekor.sigstore.dev inclusion=unchecked
+```
+
+`keyid` identifies the key that signed (the first 16 hex digits are what
+`sign` printed), `hash` is the digest the signature covers (the binary
+without its signature block), `attestation` says whether a bound in-toto
+statement was verified, and `rekor` names the log index and server from
+the `app.bin.rekor.json` receipt `sign --rekor` wrote: `inclusion=unchecked`
+until `--rekor` consults the log, `inclusion=confirmed` when it did,
+`rekor=none` without a receipt and `rekor=receipt-mismatch` when the receipt
+belongs to a different artifact. Any failure, the Rekor check included,
+prints `Verification FAILED` on stderr and exits 2 with no success line.
+
 Verify at runtime:
 
 ```bash

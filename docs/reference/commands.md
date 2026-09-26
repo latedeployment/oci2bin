@@ -199,7 +199,7 @@ oci2bin mcp-serve [--allow-net] [--allow-mount PATH] [--allow-mount-rw PATH]
 
 ```bash
 oci2bin sign --key KEY.pem --in BINARY [--out BINARY] [--rekor] [--attest FILE]
-oci2bin verify --key PUB.pem --in BINARY [--require-attestation] [--rekor]
+oci2bin verify --key PUB.pem --in BINARY [--require-attestation] [--rekor]   # one summary line: keyid, hash, attestation, rekor
 oci2bin attest-show --in BINARY
 oci2bin attest verify --signing-key PUB.pem --in BINARY [--recheck] [--key COSIGN_PUB]
 oci2bin sign-file --key KEY.pem --in FILE --out SIG
