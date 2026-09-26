@@ -312,6 +312,38 @@ def _check_squashfs():
         "dnf install squashfs-tools squashfuse fuse-overlayfs")
 
 
+def _rootfs_cache_root():
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = xdg if xdg and os.path.isabs(xdg) else os.path.join(
+        os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "oci2bin", "rootfs")
+
+
+def _check_rootfs_cache():
+    """The loader's extracted-rootfs cache: where it is and how big."""
+    root = _rootfs_cache_root()
+    if not os.path.isdir(root):
+        return _result("rootfs cache", OK, f"empty ({root})")
+    entries = 0
+    total = 0
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if len(name) != 64 or not os.path.isdir(path):
+            continue
+        entries += 1
+        for dirpath, _dirs, files in os.walk(path, onerror=lambda e: None):
+            for fname in files:
+                try:
+                    total += os.lstat(os.path.join(dirpath, fname)).st_size
+                except OSError:
+                    pass
+    return _result(
+        "rootfs cache", OK,
+        f"{entries} entr{'y' if entries == 1 else 'ies'}, "
+        f"{total / (1024 * 1024):.1f} MB in {root}; "
+        "evict with 'oci2bin prune'")
+
+
 def _check_kvm_libkrun():
     notes = []
     if os.path.exists("/dev/kvm"):
@@ -573,6 +605,7 @@ CHECKS = [
     _check_age,
     _check_tpm2_credstore,
     _check_runtime_helpers,
+    _check_rootfs_cache,
 ]
 
 

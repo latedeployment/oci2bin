@@ -99,6 +99,7 @@ This page is a checklist of the feature surface documented by the site.
 | Ephemeral writable root | `--ephemeral-root` |
 | Disable auto tmpfs | `--no-auto-tmpfs` |
 | Persistent overlay state | `--overlay-persist DIR` |
+| Reuse the extracted rootfs across runs | on by default; `--rootfs-cache off\|auto\|always` |
 | Mountable SquashFS rootfs | build with `--rootfs-format squashfs`, run with `--lazy` |
 | Device mount | `--device /dev/HOST[:CONTAINER]` |
 | Skip host /dev nodes | `--no-host-dev` |
@@ -219,6 +220,7 @@ byte-for-byte reproducible.
 | Explain binary | `oci2bin explain app.bin` |
 | List cache | `oci2bin list`, `oci2bin list --json` |
 | Prune cache | `oci2bin prune`, `oci2bin prune --dry-run` |
+| Evict cached rootfs trees | `oci2bin prune --max-age DAYS`, `--max-size SIZE`, `--all` |
 | Compare binaries | `oci2bin diff a b` |
 | Compare overlay filesystem | `oci2bin diff-fs DIR` |
 | Execute in running container | `oci2bin exec PID -- CMD` |

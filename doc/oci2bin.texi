@@ -441,6 +441,21 @@ sha256 digest, so tag updates produce a fresh cache entry.
 Use the @code{list} and @code{prune} subcommands to manage the cache
 (@pxref{Subcommands}).
 
+@opindex --rootfs-cache
+@cindex rootfs cache
+The produced binaries keep a second cache at run time.  The first launch
+merges the image layers once into
+@file{${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/@var{key}} (the SHA-256 of
+the image config, read straight from the embedded tar), and every later
+launch of the same image skips extraction.  Each run works on a private
+writable layer over the cached tree: kernel overlayfs inside the user
+namespace, else @command{fuse-overlayfs}, else a reflink or copy.  The tree
+itself is never modified, and an entry that fails its integrity check is
+rebuilt.  @option{--rootfs-cache off} (or @env{OCI2BIN_ROOTFS_CACHE=off})
+extracts per run as before; encrypted images are cached only with
+@option{--rootfs-cache always}.  @code{oci2bin prune --max-age DAYS},
+@code{--max-size SIZE} and @code{--all} evict entries.
+
 @node Digest Pinning
 @section Reproducible Builds and Digest Pinning
 
@@ -798,7 +813,8 @@ the root read-only aborts the run.
 
 @opindex --ephemeral-root
 @option{--ephemeral-root} instead provides a writable temporary overlay.
-Its upper layer is discarded on exit.
+Its upper layer is discarded on exit.  A launch that reuses the extracted
+rootfs cache (@pxref{Caching}) already runs on such a private layer.
 
 @opindex --lazy
 An artifact built with @option{--rootfs-format squashfs} can use
@@ -941,8 +957,8 @@ Probe the host for oci2bin's toolchain/kernel features and print a fix command
 for each missing piece.
 @item oci2bin list [--json]
 List cached binaries.
-@item oci2bin prune [--dry-run]
-Remove stale cache entries.
+@item oci2bin prune [--dry-run] [--max-age DAYS] [--max-size SIZE] [--all]
+Remove superseded build outputs and evict cached extracted rootfs trees.
 @item oci2bin diff OLD NEW
 Compare two binaries' filesystems (@code{+}/@code{-}/@code{M}).
 @item oci2bin diff-fs OVERLAY_PATH

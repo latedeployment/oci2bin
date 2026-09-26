@@ -97,6 +97,8 @@ Common runtime options:
 --read-only
 --ephemeral-root
 --overlay-persist DIR
+--rootfs-cache auto|off|always
+--no-rootfs-cache
 --tmpfs PATH
 --lazy
 --no-auto-tmpfs
@@ -171,7 +173,7 @@ oci2bin benchmark BINARY [--modes extract,lazy,vm] [--runs N]
                         [-- CMD...]
 oci2bin explain BINARY
 oci2bin list [--json] [--filter label=KEY[=VAL]]
-oci2bin prune [--dry-run]
+oci2bin prune [--dry-run] [--max-age DAYS] [--max-size SIZE] [--all]
 oci2bin diff BINARY1 BINARY2
 oci2bin diff-fs OVERLAY_PATH
 oci2bin freeze NAME [-- CMD]

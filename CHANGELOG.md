@@ -4,6 +4,49 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Extracted rootfs cache: repeat launches skip layer extraction.** The
+  first launch of a binary merges its image layers once into
+  `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, keyed by the SHA-256
+  of the image config (its `rootfs.diff_ids` pin the layer contents). Every
+  later launch of the same image reuses that tree; `--debug` shows
+  `cache.hit` and no `extract.*` events. The key is read straight out of the
+  embedded tar (ustar, GNU long names and pax path overrides are handled), so
+  a warm start neither copies nor unpacks the payload; compressed and
+  encrypted payloads derive it from the unpacked layout instead.
+
+  The cached tree is never written to: each run gets a private writable
+  layer over it, kernel overlayfs mounted inside the container's user
+  namespace when the kernel allows it (probed first in a throwaway
+  namespace), else `fuse-overlayfs` on the host side, else a reflink
+  (`FICLONE`) or byte copy that preserves modes, symlinks, hardlinks, allowed
+  xattrs and timestamps. `--ephemeral-root` is satisfied by that layer;
+  `--overlay-persist DIR` keeps putting upper/work in `DIR`. The
+  `/etc/passwd` rewrite and `resolv.conf` install now happen after the
+  writable layer exists, so they land in the run's upper layer.
+
+  Entries are built in a sibling temp directory and published by `rename`,
+  carry a marker with a fingerprint of the tree (every path, type, mode,
+  size and symlink target), and are re-verified on every hit: a mismatch
+  evicts and rebuilds the entry rather than trusting it. A per-entry
+  `flock` serializes concurrent first launches onto one build and marks
+  entries in use for `prune`. Encrypted images are not cached unless
+  `--rootfs-cache always` is given; `--rootfs-cache off` (also
+  `--no-rootfs-cache` and `OCI2BIN_ROOTFS_CACHE=off`) restores per-run
+  extraction, and `OCI2BIN_ROOTFS_LAYER=overlay|fuse-overlayfs|copy` pins
+  the writable-layer kind. `--lazy` artifacts are unaffected.
+
+- **`oci2bin prune` now covers the rootfs cache.** The inline pruning code
+  moved to `scripts/prune_cache.py`; besides superseded `--cache` build
+  outputs it evicts cached rootfs trees unused for `--max-age DAYS` (default
+  30), then least-recently-used ones until the cache fits `--max-size SIZE`,
+  or all of them with `--all`, skipping entries a running container holds a
+  lock on and removing abandoned build scratch. `oci2bin doctor` reports the
+  cache location and size, and `oci2bin benchmark` gained a `cached` mode
+  (the default set is now `extract,cached,lazy`; `extract` runs with
+  `--rootfs-cache off`).
+
 ### Security
 
 - **`--vm` no longer puts arguments, `-e` values, `--entrypoint`,

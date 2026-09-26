@@ -303,6 +303,48 @@ Writable throwaway root:
 `--ephemeral-root` uses a writable temporary overlay and discards its upper
 layer on exit.
 
+### Extracted rootfs cache
+
+The first launch of a binary extracts its layers once and keeps the merged
+tree under `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, where `<key>`
+is the SHA-256 of the image config. Every later launch of a binary carrying
+the same image skips extraction entirely; `--debug` shows `cache.hit` instead
+of `extract.begin`/`extract.done`. The key is read straight out of the embedded
+tar, so a warm start never copies or unpacks the payload.
+
+The cached tree is never written to. Each run gets a private writable layer
+on top, chosen in this order:
+
+1. kernel overlayfs mounted inside the container's user namespace (Linux
+   5.11+),
+2. `fuse-overlayfs` on the host side (needs `/dev/fuse` and
+   `user_allow_other`),
+3. a reflink or byte copy of the tree into the run's tmpdir (always works,
+   and still far cheaper than gunzip + tar + merge).
+
+`--ephemeral-root` is satisfied by that layer. With `--overlay-persist DIR`
+the overlay kinds put their upper/work directories in `DIR`, as before.
+Writes made by the workload land in the run's upper layer or copy and are
+discarded with the runtime tmpdir; a corrupted or partially written cache
+entry is detected on the next launch (marker plus tree fingerprint) and
+rebuilt rather than trusted.
+
+```bash
+./app.bin --rootfs-cache off        # extract per run, as before
+./app.bin --rootfs-cache always     # also cache the plaintext of an encrypted image
+OCI2BIN_ROOTFS_CACHE=off ./app.bin  # same as the flag, for wrappers
+OCI2BIN_ROOTFS_LAYER=copy ./app.bin # pin the writable-layer kind
+```
+
+Encrypted (`--encrypt` / `--passphrase`) images are not cached unless
+`--rootfs-cache always` is given, because the cache holds the decrypted
+tree in plaintext. `--lazy` artifacts use their SquashFS payload and do not
+touch the cache. Entries are built in a sibling temp directory and renamed
+into place; concurrent first launches of the same image serialize on a lock
+and share one build. `oci2bin prune` evicts entries by age or total size and
+skips entries a running container still uses; `oci2bin doctor` reports the
+cache location and size.
+
 Persist overlay state:
 
 ```bash

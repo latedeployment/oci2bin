@@ -59,6 +59,78 @@ def _minimal_oci_tar(labels=None, healthcheck=None):
     return buf.getvalue()
 
 
+def _userns_available():
+    """Can this user create a user + mount namespace (rootless runtime)?"""
+    try:
+        result = subprocess.run(
+            ["unshare", "-Urm", "true"], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+_WRITER_SRC = r"""
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(void)
+{
+    int fd = open("/leak.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { if (write(fd, "leak\n", 5) < 0) { return 3; } close(fd); }
+    printf("writer ran leak_fd=%d\n", fd);
+    return fd >= 0 ? 0 : 2;
+}
+"""
+
+
+def _program_oci_tar(program_bytes):
+    """A one-layer image whose /bin/sh is a static program."""
+    layer = io.BytesIO()
+    with tarfile.open(fileobj=layer, mode="w:") as tf:
+        for name in ("bin", "etc"):
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            tf.addfile(info)
+        info = tarfile.TarInfo("bin/sh")
+        info.size = len(program_bytes)
+        info.mode = 0o755
+        tf.addfile(info, io.BytesIO(program_bytes))
+        info = tarfile.TarInfo("bin/sh-link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "sh"
+        tf.addfile(info)
+        marker = b"cached-image\n"
+        info = tarfile.TarInfo("etc/marker")
+        info.size = len(marker)
+        info.mode = 0o644
+        tf.addfile(info, io.BytesIO(marker))
+    layer_raw = layer.getvalue()
+    layer_sha = hashlib.sha256(layer_raw).hexdigest()
+    config = {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {"Cmd": ["/bin/sh"], "Env": ["PATH=/bin"]},
+        "rootfs": {"type": "layers", "diff_ids": [f"sha256:{layer_sha}"]},
+    }
+    config_raw = json.dumps(config, separators=(",", ":")).encode()
+    config_sha = hashlib.sha256(config_raw).hexdigest()
+    manifest = [{"Config": f"blobs/sha256/{config_sha}",
+                 "RepoTags": ["cache-test:latest"],
+                 "Layers": [f"blobs/sha256/{layer_sha}"]}]
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:") as tf:
+        for name, data in [
+            ("manifest.json", json.dumps(manifest).encode()),
+            (f"blobs/sha256/{config_sha}", config_raw),
+            (f"blobs/sha256/{layer_sha}", layer_raw),
+        ]:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue(), config_raw
+
+
 def _proc_start_ticks(pid):
     raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").strip()
     rparen = raw.rfind(")")
@@ -119,6 +191,109 @@ class TestCliFeatures(unittest.TestCase):
             if not tool_link.exists():
                 tool_link.symlink_to(tool_path)
         return str(tool_dir)
+
+    def _build_writer_binary(self, name):
+        """Polyglot whose workload writes /leak.txt; returns (path, config)."""
+        writer_src = self.tmpdir / "writer.c"
+        writer_src.write_text(_WRITER_SRC, encoding="utf-8")
+        writer = self.tmpdir / "writer"
+        build = subprocess.run(
+            ["gcc", "-static", "-O2", "-s", "-o", str(writer),
+             str(writer_src)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        tar_bytes, config_raw = _program_oci_tar(writer.read_bytes())
+        tar_path = self.tmpdir / f"{name}.tar"
+        tar_path.write_bytes(tar_bytes)
+        out_path = self.tmpdir / name
+        result = subprocess.run(
+            ["python3", str(ROOT / "scripts" / "build_polyglot.py"),
+             "--loader", str(self.loader), "--tar", str(tar_path),
+             "--image-name", "cache-test:latest", "--output", str(out_path)],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return out_path, config_raw
+
+    def _run_cached(self, binary, xdg, tmp, *extra, env_extra=None):
+        env = dict(os.environ, XDG_CACHE_HOME=str(xdg),
+                   OCI2BIN_TMPDIR=str(tmp), TMPDIR=str(tmp))
+        env.pop("OCI2BIN_ROOTFS_CACHE", None)
+        env.pop("OCI2BIN_ROOTFS_LAYER", None)
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(
+            [str(binary), "--debug", "--net", "none", *extra],
+            capture_output=True, text=True, timeout=120, env=env)
+
+    def test_rootfs_cache_reuses_extraction_and_isolates_writes(self):
+        if not _userns_available():
+            self.skipTest("user namespaces unavailable; cannot run binaries")
+        binary, config_raw = self._build_writer_binary("cached.bin")
+        xdg = self.tmpdir / "xdg-cache"
+        tmp = self.tmpdir / "runtime-tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        expected_key = hashlib.sha256(
+            b"oci2bin-rootfs-cache-v1\n" + config_raw).hexdigest()
+        entry = xdg / "oci2bin" / "rootfs" / expected_key
+
+        first = self._run_cached(binary, xdg, tmp)
+        self.assertEqual(first.returncode, 0, msg=first.stderr)
+        self.assertIn("writer ran leak_fd=", first.stdout)
+        self.assertIn("event=cache.miss", first.stderr)
+        self.assertIn("event=extract.done", first.stderr)
+        self.assertIn("event=cache.stored", first.stderr)
+        self.assertIn(f"key={expected_key}", first.stderr)
+        self.assertTrue((entry / "meta").is_file(), "entry published")
+        self.assertTrue((entry / "rootfs" / "etc" / "marker").is_file())
+
+        second = self._run_cached(binary, xdg, tmp)
+        self.assertEqual(second.returncode, 0, msg=second.stderr)
+        self.assertIn("event=cache.hit", second.stderr)
+        self.assertNotIn("event=extract.begin", second.stderr)
+        self.assertNotIn("event=extract.done", second.stderr)
+        self.assertIn("event=rootfs.layer kind=", second.stderr)
+
+        # The workload wrote /leak.txt on both runs; the shared tree must
+        # not have it, and the run's tmpdir must be gone.
+        self.assertFalse((entry / "rootfs" / "leak.txt").exists(),
+                         "workload write leaked into the cached tree")
+        self.assertEqual([p for p in tmp.iterdir()
+                          if p.name.startswith("oci2bin.")], [])
+
+        # The copy fallback isolates writes just the same.
+        copied = self._run_cached(binary, xdg, tmp,
+                                  env_extra={"OCI2BIN_ROOTFS_LAYER": "copy"})
+        self.assertEqual(copied.returncode, 0, msg=copied.stderr)
+        self.assertIn("event=rootfs.layer kind=copy", copied.stderr)
+        self.assertFalse((entry / "rootfs" / "leak.txt").exists())
+
+        # A corrupted entry is detected and rebuilt, never trusted.
+        marker = entry / "rootfs" / "etc" / "marker"
+        marker.write_bytes(b"tampered\n")
+        third = self._run_cached(binary, xdg, tmp)
+        self.assertEqual(third.returncode, 0, msg=third.stderr)
+        self.assertIn("result=fingerprint-mismatch", third.stderr)
+        self.assertIn("event=cache.corrupt", third.stderr)
+        self.assertIn("event=cache.stored", third.stderr)
+        self.assertEqual(marker.read_bytes(), b"cached-image\n")
+
+        # Opting out extracts per run and leaves the cache alone.
+        before = (entry / "meta").stat().st_mtime_ns
+        off = self._run_cached(binary, xdg, tmp, "--rootfs-cache", "off")
+        self.assertEqual(off.returncode, 0, msg=off.stderr)
+        self.assertIn("event=cache.disabled reason=mode-off", off.stderr)
+        self.assertIn("event=extract.done", off.stderr)
+        self.assertEqual((entry / "meta").stat().st_mtime_ns, before)
+
+        # prune sees the entry and evicts it on request.
+        prune = subprocess.run(
+            ["bash", str(OCI2BIN), "prune", "--all"],
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, XDG_CACHE_HOME=str(xdg),
+                     HOME=str(self.tmpdir / "prune-home")))
+        self.assertEqual(prune.returncode, 0, msg=prune.stderr)
+        self.assertIn("1 rootfs cache entry removed", prune.stdout)
+        self.assertFalse(entry.exists())
 
     def test_systemd_emits_unit_with_label_name(self):
         binary = self._build_binary(

@@ -104,6 +104,7 @@ for threat boundaries, requirements, and complete hardening examples.
 | Build for another architecture | `oci2bin --arch aarch64 alpine:latest` |
 | Build a multi-architecture bundle | `oci2bin --arch all alpine:latest` |
 | Keep writable state between runs | `./myapp.bin --overlay-persist /srv/myapp/state` |
+| Skip layer extraction on repeat launches | on by default (`~/.cache/oci2bin/rootfs`); `./myapp.bin --rootfs-cache off` to opt out |
 | Avoid extracting layers at startup | `oci2bin --rootfs-format squashfs app:latest app.bin && ./app.bin --lazy` |
 | Publish a port from a rootless VM | `./app.bin --vm --net userspace -p 8080:80` |
 | Run with health and restart policies | `./myapp.bin --health-cmd /healthcheck --restart on-failure:5` |

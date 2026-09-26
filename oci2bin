@@ -22,7 +22,7 @@
 #   oci2bin restore NAME
 #   oci2bin top [--once] [--interval SEC]
 #   oci2bin list [--json]
-#   oci2bin prune [--dry-run]
+#   oci2bin prune [--dry-run] [--max-age DAYS] [--max-size SIZE] [--all]
 #   oci2bin diff <binary1> <binary2>
 #   oci2bin reconstruct <image-or-file> [--output PATH] [--no-strip]
 #
@@ -157,7 +157,9 @@
 #
 # Cache subcommands:
 #   list [--json]         List all cached binaries with image name, size, date
-#   prune [--dry-run]     Remove outdated cache entries (keep newest per image)
+#   prune [--dry-run] [--max-age DAYS] [--max-size SIZE] [--all]
+#                         Remove superseded build outputs (keep newest per
+#                         image) and evict cached extracted rootfs trees
 #   diff <b1> <b2>        Show filesystem diff between two oci2bin binaries
 #   diff-fs OVERLAY_PATH  Show A/D classification of an overlayfs upperdir
 #                         (use after a --overlay-persist DIR run)
@@ -204,6 +206,7 @@
 #
 #   oci2bin list                        # show cached binaries
 #   oci2bin prune                       # remove old cache entries
+#   oci2bin prune --max-size 5G         # cap the extracted-rootfs cache
 #   oci2bin diff alpine_latest redis_7  # compare two binaries
 #   oci2bin --embed-loader-layer redis:7-alpine  # embed loader for reconstruction
 #   oci2bin reconstruct redis:7-alpine  # rebuild from Docker image
@@ -645,73 +648,11 @@ fi
 
 if [[ "${1:-}" == "prune" ]]; then
     shift
-    CACHE_ROOT="$HOME/.cache/oci2bin"
-    PRUNE_DRY_RUN=0
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --dry-run) PRUNE_DRY_RUN=1; shift ;;
-            *) echo "oci2bin prune: unknown option: $1" >&2; exit 1 ;;
-        esac
-    done
-    if [[ ! -d "$CACHE_ROOT" ]]; then
-        echo "oci2bin: no cache found at $CACHE_ROOT" >&2
-        exit 0
-    fi
-    python3 - "$CACHE_ROOT" "$PRUNE_DRY_RUN" "$OCI2BIN_HOME" <<'PYEOF'
-import json, os, shutil, sys
-
-cache_root = sys.argv[1]
-dry_run    = sys.argv[2] == "1"
-home       = sys.argv[3]
-inspect    = os.path.join(home, "scripts", "inspect_image.py")
-
-import importlib.util
-
-spec = importlib.util.spec_from_file_location("inspect_image", inspect)
-mod  = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
-# Collect all cache entries keyed by base image name
-# Cache dir names look like "redis_7-alpine_abc123def456" — strip the trailing
-# _<12hexchars> digest suffix to get the image group key.
-import re
-
-groups = {}  # image_key -> list of (mtime, size, cache_dir_path)
-for name in os.listdir(cache_root):
-    out = os.path.join(cache_root, name, "output")
-    if not os.path.isfile(out):
-        continue
-    mtime = os.path.getmtime(out)
-    size  = os.path.getsize(out)
-    # Strip digest suffix: last _<12+ hex chars> at end of name
-    key = re.sub(r'_[0-9a-f]{12,}$', '', name)
-    groups.setdefault(key, []).append((mtime, size, os.path.join(cache_root, name)))
-
-total_freed = 0
-total_deleted = 0
-
-for key, items in sorted(groups.items()):
-    if len(items) <= 1:
-        continue
-    # Sort by mtime descending; keep first (newest), delete the rest
-    items.sort(key=lambda x: x[0], reverse=True)
-    for mtime, size, path in items[1:]:
-        if dry_run:
-            print(f"[dry-run] would remove {path}  ({size/(1024*1024):.1f} MB)")
-        else:
-            print(f"removing {path}  ({size/(1024*1024):.1f} MB)")
-            shutil.rmtree(path, ignore_errors=True)
-        total_freed += size
-        total_deleted += 1
-
-if total_deleted == 0:
-    print("oci2bin prune: nothing to remove")
-else:
-    verb = "would free" if dry_run else "freed"
-    mb   = total_freed / (1024 * 1024)
-    print(f"oci2bin prune: {total_deleted} entr{'y' if total_deleted==1 else 'ies'} removed, {verb} {mb:.1f} MB")
-PYEOF
-    exit 0
+    # Superseded --cache build outputs live directly under
+    # $HOME/.cache/oci2bin; the loader's extracted-rootfs cache under
+    # ${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs is resolved by the script.
+    exec python3 "$OCI2BIN_HOME/scripts/prune_cache.py" \
+        --build-root "$HOME/.cache/oci2bin" "$@"
 fi
 
 # ── diff subcommand ───────────────────────────────────────────────────────
