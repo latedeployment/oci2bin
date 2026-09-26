@@ -296,6 +296,21 @@ databases (rpm's `rpmdb.sqlite` header blobs, under `/usr/lib/sysimage/rpm` or
 `pkg:deb/debian/bash@5.2.15-2?arch=amd64&distro=debian`, which Grype and Trivy
 consume.
 
+Both formats say what the inventory is an inventory of. The SPDX document
+`DESCRIBES` one root package, the embedded image (`SPDXRef-RootPackage`,
+purpose `CONTAINER`), named and versioned from the image name and digest the
+builder recorded, carrying the SHA-256 of the binary file and a `pkg:oci`
+purl; every OS package hangs off it through a `CONTAINS` relationship. The
+CycloneDX document uses `metadata.component` as that root, gives every
+component a `bom-ref` and lists them all as the root's `dependencies`. NTIA
+minimum-element checkers and SPDX validators require the root and the
+`DESCRIBES` relationship; older oci2bin SBOMs had neither. Each package's
+supplier comes from the database that installed it (dpkg `Maintainer`, apk
+`m:`, rpm vendor or packager), as `Person:` or `Organization:` in SPDX and a
+`supplier` entity in CycloneDX; a package without one, and the root package
+(the image publisher is not recorded), stay `NOASSERTION`, which strict NTIA
+checkers still count against the document.
+
 ## Push
 
 ```bash

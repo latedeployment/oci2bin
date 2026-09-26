@@ -853,8 +853,13 @@ Probe the host for the toolchain and kernel features oci2bin uses and print a
 fix command for each missing piece.
 .
 .TP
-.B oci2bin sbom \fIBINARY\fR
-Generate a Software Bill of Materials for the embedded image.
+.B oci2bin sbom \fIBINARY\fR \fR[\fB\-\-format spdx\fR|\fBcyclonedx\fR]
+Generate a Software Bill of Materials for the embedded image: packages from
+the dpkg, apk or rpm database, each with a purl. The SPDX document DESCRIBES a
+root package for the image (name, digest, SHA-256 of the binary, pkg:oci
+purl) that CONTAINS every package; CycloneDX carries the same root as
+.B metadata.component
+with a dependency list.
 .
 .TP
 .B oci2bin reconstruct \fISRC\fR \fR[\fB\-\-output \fIPATH\fR]

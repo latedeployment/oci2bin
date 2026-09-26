@@ -164,35 +164,47 @@ def read_oci_data(binary_path):
     sentinels = (0xDEADBEEFCAFEBABE, 0xCAFEBABEDEADBEEF,
                  0xAAAAAAAAAAAAAAAA, 0)
 
-    def valid_span(candidate_offset, candidate_size):
+    def span_extent(candidate_offset, candidate_size):
+        """How much of the candidate span a docker-save tar actually uses
+        (end of its last member, header and data), or None when the span
+        does not hold one.  A truncated slice of the real archive still
+        parses -- tarfile stops quietly at end of data -- so a plausible
+        size is not enough on its own; the extent tells a complete
+        archive from a cut-off one."""
         if candidate_offset in sentinels:
-            return False
+            return None
         if candidate_offset >= file_size:
-            return False
+            return None
         if candidate_size == 0 or candidate_size > file_size:
-            return False
+            return None
         if candidate_offset + candidate_size > file_size:
-            return False
+            return None
         tar_region = data[candidate_offset:candidate_offset + 512]
         if len(tar_region) < 262 or tar_region[257:262] != b'ustar':
-            return False
-        # Adjacent loader globals can make both the true OCI size and an
-        # unrelated small integer look plausible.  Confirm that the candidate
-        # is a complete docker-save tar instead of accepting the first ustar
-        # header (which may be only a truncated first member).
+            return None
         try:
             with tarfile.open(
                     fileobj=io.BytesIO(
                         data[candidate_offset:candidate_offset + candidate_size]),
                     mode='r:*') as tf:
+                members = tf.getmembers()
                 tf.getmember('manifest.json')
         except (KeyError, tarfile.TarError, EOFError):
-            return False
-        return True
+            return None
+        extent = 0
+        for m in members:
+            end = m.offset_data + ((m.size + 511) // 512) * 512
+            if end > extent:
+                extent = end
+        return extent
 
     # Scan uint64 values in the loader region looking for a plausible offset.
     # Older loader layouts may place offset,size next to each other; current
-    # compiler output stores size,offset. Accept either adjacent order.
+    # compiler output stores size,offset. Accept either adjacent order, and
+    # when both neighbours give a parsable archive (an unrelated global next
+    # to the offset that happens to be a size the real tar can be cut to),
+    # take the one holding the most archive: the true size spans every
+    # member, a cut-off one loses the tail.
     for pos in range(0, len(loader_region) - 8, 8):
         candidate_offset = struct.unpack_from('<Q', loader_region, pos)[0]
         size_positions = []
@@ -201,13 +213,18 @@ def read_oci_data(binary_path):
         if pos >= 8:
             size_positions.append(pos - 8)
 
+        best_extent = -1
         for size_pos in size_positions:
             candidate_size = struct.unpack_from('<Q', loader_region,
                                                 size_pos)[0]
-            if valid_span(candidate_offset, candidate_size):
+            extent = span_extent(candidate_offset, candidate_size)
+            if extent is None:
+                continue
+            if extent > best_extent or (extent == best_extent and
+                                        candidate_size > oci_size):
+                best_extent = extent
                 oci_offset = candidate_offset
                 oci_size   = candidate_size
-                break
         if oci_offset is not None:
             break
 

@@ -159,11 +159,12 @@ def parse_dpkg_status(status_path):
         if 'Package' in pkg and 'Version' in pkg:
             if 'installed' in pkg.get('Status', ''):
                 packages.append({
-                    'name':    pkg['Package'],
-                    'version': pkg['Version'],
-                    'arch':    pkg.get('Architecture', ''),
-                    'desc':    pkg.get('Description', '').split('\n')[0],
-                    'type':    'dpkg',
+                    'name':       pkg['Package'],
+                    'version':    pkg['Version'],
+                    'arch':       pkg.get('Architecture', ''),
+                    'desc':       pkg.get('Description', '').split('\n')[0],
+                    'maintainer': pkg.get('Maintainer', ''),
+                    'type':       'dpkg',
                 })
     return packages
 
@@ -186,11 +187,12 @@ def parse_apk_installed(installed_path):
                 pkg[key] = val
         if 'P' in pkg and 'V' in pkg:
             packages.append({
-                'name':    pkg['P'],
-                'version': pkg['V'],
-                'arch':    pkg.get('A', ''),
-                'desc':    pkg.get('T', ''),
-                'type':    'apk',
+                'name':       pkg['P'],
+                'version':    pkg['V'],
+                'arch':       pkg.get('A', ''),
+                'desc':       pkg.get('T', ''),
+                'maintainer': pkg.get('m', ''),
+                'type':       'apk',
             })
     return packages
 
@@ -198,9 +200,11 @@ def parse_apk_installed(installed_path):
 # RPM header tags / types (rpmtag.h) used below.
 _RPMTAG_NAME, _RPMTAG_VERSION, _RPMTAG_RELEASE = 1000, 1001, 1002
 _RPMTAG_EPOCH, _RPMTAG_SUMMARY, _RPMTAG_ARCH = 1003, 1004, 1022
+_RPMTAG_VENDOR, _RPMTAG_PACKAGER = 1011, 1015
 _RPM_INT32, _RPM_STRING, _RPM_STRING_ARRAY, _RPM_I18NSTRING = 4, 6, 8, 9
 _RPM_WANTED = {_RPMTAG_NAME, _RPMTAG_VERSION, _RPMTAG_RELEASE,
-               _RPMTAG_EPOCH, _RPMTAG_SUMMARY, _RPMTAG_ARCH}
+               _RPMTAG_EPOCH, _RPMTAG_SUMMARY, _RPMTAG_ARCH,
+               _RPMTAG_VENDOR, _RPMTAG_PACKAGER}
 
 
 def parse_rpm_header_blob(blob):
@@ -259,12 +263,16 @@ def parse_rpm_sqlite(db_path):
         version = hdr.get(_RPMTAG_VERSION, '')
         release = hdr.get(_RPMTAG_RELEASE, '')
         packages.append({
-            'name':    name,
-            'version': f"{version}-{release}" if release else version,
-            'epoch':   hdr.get(_RPMTAG_EPOCH),
-            'arch':    hdr.get(_RPMTAG_ARCH, ''),
-            'desc':    hdr.get(_RPMTAG_SUMMARY, ''),
-            'type':    'rpm',
+            'name':       name,
+            'version':    f"{version}-{release}" if release else version,
+            'epoch':      hdr.get(_RPMTAG_EPOCH),
+            'arch':       hdr.get(_RPMTAG_ARCH, ''),
+            'desc':       hdr.get(_RPMTAG_SUMMARY, ''),
+            # Vendor is the distribution ("Fedora Project", "Red Hat,
+            # Inc."); Packager the individual or build system.
+            'maintainer': (hdr.get(_RPMTAG_VENDOR)
+                           or hdr.get(_RPMTAG_PACKAGER) or ''),
+            'type':       'rpm',
         })
     return packages
 
@@ -342,37 +350,183 @@ def collect_packages(rootfs):
     return packages
 
 
+_ORG_WORDS = ('team', 'maintainers', 'developers', 'project', 'inc',
+              'ltd', 'llc', 'gmbh', 'foundation', 'group', 'community',
+              'alpine', 'debian', 'ubuntu', 'fedora', 'red hat', 'suse',
+              'canonical', 'oracle', 'amazon', 'microsoft', 'google')
+
+
+def parse_maintainer(text):
+    """'Name <email>' (dpkg Maintainer, apk m:, rpm Packager) or a bare
+    vendor string -> (name, email); ('', '') when nothing usable."""
+    text = (text or '').strip()
+    if not text:
+        return '', ''
+    name, email = text, ''
+    if text.endswith('>') and '<' in text:
+        name, _, email = text[:-1].rpartition('<')
+        name = name.strip()
+        email = email.strip()
+    return name, email
+
+
+def spdx_supplier(pkg):
+    """SPDX 2.3 supplier: 'Organization: X (email)' or 'Person: X (email)'
+    from the package database's maintainer, NOASSERTION when it has none.
+    NTIA's minimum elements list the supplier; distribution package
+    databases carry it, so it is not left out."""
+    name, email = parse_maintainer(pkg.get('maintainer'))
+    if not name:
+        return 'NOASSERTION'
+    lowered = name.lower()
+    kind = ('Organization' if any(w in lowered for w in _ORG_WORDS)
+            or ' ' not in name.strip() and email == ''
+            else 'Person')
+    return f"{kind}: {name}" + (f" ({email})" if email else '')
+
+
+def cyclonedx_supplier(pkg):
+    """CycloneDX organizationalEntity for the maintainer, or None."""
+    name, email = parse_maintainer(pkg.get('maintainer'))
+    if not name:
+        return None
+    entity = {"name": name}
+    if email:
+        entity["contact"] = [{"email": email}]
+    return entity
+
+
 def make_spdx_id(name, version):
     h = hashlib.sha256(f"{name}@{version}".encode()).hexdigest()[:8]
     safe = ''.join(c if c.isalnum() else '-' for c in name)
     return f"SPDXRef-{safe}-{h}"
 
 
-def output_spdx(packages, binary_path):
-    now = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+ROOT_SPDX_ID = "SPDXRef-RootPackage"
+ROOT_BOM_REF = "oci2bin-root"
+
+
+def _split_image_ref(image):
+    """'registry/ns/name:tag' -> (repository, name, tag); tag may be ''."""
+    repo = image.split('@', 1)[0]
+    tag = ''
+    last = repo.rsplit('/', 1)[-1]
+    if ':' in last:
+        repo, tag = repo.rsplit(':', 1)
+    name = repo.rsplit('/', 1)[-1]
+    return repo, name, tag
+
+
+def make_oci_purl(image, digest_hex):
+    """pkg:oci purl for the embedded image: the name is the repository's
+    last path segment, the version its manifest digest, and the repository
+    and tag ride as qualifiers (purl-spec, type oci)."""
+    repo, name, tag = _split_image_ref(image)
+    purl = f"pkg:oci/{urllib.parse.quote(name.lower(), safe='')}"
+    if digest_hex:
+        purl += f"@sha256%3A{digest_hex}"
+    quals = []
+    if repo and repo != name:
+        quals.append(f"repository_url={urllib.parse.quote(repo, safe='')}")
+    if tag:
+        quals.append(f"tag={urllib.parse.quote(tag, safe='')}")
+    if quals:
+        purl += '?' + '&'.join(quals)
+    return purl
+
+
+def describe_root(binary_path):
+    """What the SBOM describes: the embedded image, identified by the name
+    and digest the builder recorded in the metadata block, plus the SHA-256
+    of the artifact file itself.  Falls back to the file name when the
+    binary predates the metadata block."""
+    meta = _inspect.read_meta_block(binary_path) or {}
+    image = meta.get('image') or os.path.basename(binary_path)
+    digest = meta.get('digest') or ''
+    digest_hex = ''
+    if '@sha256:' in digest or digest.startswith('sha256:'):
+        candidate = digest.rsplit('sha256:', 1)[1].lower()
+        if len(candidate) == 64 and all(c in '0123456789abcdef'
+                                        for c in candidate):
+            digest_hex = candidate
+    h = hashlib.sha256()
+    with open(binary_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return {
+        'image':      image,
+        'digest_hex': digest_hex,
+        'version':    f"sha256:{digest_hex}" if digest_hex else 'unknown',
+        'file_name':  os.path.basename(binary_path),
+        'file_sha256': h.hexdigest(),
+        'purl':       make_oci_purl(image, digest_hex),
+        'built':      meta.get('timestamp', ''),
+    }
+
+
+def build_spdx_document(packages, binary_path, now=None):
+    """SPDX 2.3 JSON: the document DESCRIBES one root package (the embedded
+    image), which CONTAINS every OS package.  Tools such as the NTIA
+    conformance checker and Grype's SPDX reader need the root package and
+    the DESCRIBES relationship to know what the inventory is an inventory
+    of; without them every package hangs off nothing."""
+    now = now or datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    root = describe_root(binary_path)
     doc = {
         "spdxVersion": "SPDX-2.3",
         "dataLicense": "CC0-1.0",
         "SPDXID": "SPDXRef-DOCUMENT",
-        "name": os.path.basename(binary_path),
+        "name": root['file_name'],
         "documentNamespace": (
             f"https://oci2bin.local/sbom/"
-            f"{os.path.basename(binary_path)}-{now}"
+            f"{root['file_name']}-{now}"
         ),
         "creationInfo": {
             "created": now,
             "creators": ["Tool: oci2bin-sbom"],
         },
-        "packages": [],
+        "documentDescribes": [ROOT_SPDX_ID],
+        "packages": [{
+            "SPDXID":                ROOT_SPDX_ID,
+            "name":                  root['image'],
+            "versionInfo":           root['version'],
+            "downloadLocation":      "NOASSERTION",
+            "filesAnalyzed":         False,
+            "primaryPackagePurpose": "CONTAINER",
+            "supplier":              "NOASSERTION",
+            "checksums": [{
+                "algorithm":     "SHA256",
+                "checksumValue": root['file_sha256'],
+            }],
+            "comment": (f"oci2bin artifact {root['file_name']}"
+                        + (f" built {root['built']}" if root['built']
+                           else "")),
+            "externalRefs": [{
+                "referenceCategory": "PACKAGE-MANAGER",
+                "referenceType":     "purl",
+                "referenceLocator":  root['purl'],
+            }],
+        }],
+        "relationships": [{
+            "spdxElementId":      "SPDXRef-DOCUMENT",
+            "relationshipType":   "DESCRIBES",
+            "relatedSpdxElement": ROOT_SPDX_ID,
+        }],
     }
 
+    seen = set()
     for pkg in packages:
+        spdx_id = make_spdx_id(pkg['name'], pkg['version'])
+        if spdx_id in seen:
+            continue    # the same name@version twice is one element
+        seen.add(spdx_id)
         doc["packages"].append({
-            "SPDXID":           make_spdx_id(pkg['name'], pkg['version']),
+            "SPDXID":           spdx_id,
             "name":             pkg['name'],
             "versionInfo":      pkg['version'],
             "downloadLocation": "NOASSERTION",
             "filesAnalyzed":    False,
+            "supplier":         spdx_supplier(pkg),
             "comment":          pkg.get('desc', ''),
             "externalRefs": [{
                 "referenceCategory": "PACKAGE-MANAGER",
@@ -380,12 +534,24 @@ def output_spdx(packages, binary_path):
                 "referenceLocator":  pkg['purl'],
             }],
         })
+        doc["relationships"].append({
+            "spdxElementId":      ROOT_SPDX_ID,
+            "relationshipType":   "CONTAINS",
+            "relatedSpdxElement": spdx_id,
+        })
+    return doc
 
-    print(json.dumps(doc, indent=2))
+
+def output_spdx(packages, binary_path):
+    print(json.dumps(build_spdx_document(packages, binary_path), indent=2))
 
 
-def output_cyclonedx(packages, binary_path):
-    now = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+def build_cyclonedx_document(packages, binary_path, now=None):
+    """CycloneDX 1.4 JSON: metadata.component is the embedded image (the
+    root), every OS package a component with a bom-ref, and one
+    dependencies entry making the root depend on all of them."""
+    now = now or datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    root = describe_root(binary_path)
     doc = {
         "bomFormat":   "CycloneDX",
         "specVersion": "1.4",
@@ -395,24 +561,45 @@ def output_cyclonedx(packages, binary_path):
             "tools": [{"name": "oci2bin-sbom", "version": "1.0"}],
             "component": {
                 "type":    "container",
-                "name":    os.path.basename(binary_path),
-                "version": "unknown",
+                "bom-ref": ROOT_BOM_REF,
+                "name":    root['image'],
+                "version": root['version'],
+                "purl":    root['purl'],
+                "hashes": [{"alg": "SHA-256",
+                            "content": root['file_sha256']}],
             },
         },
         "components": [],
+        "dependencies": [{"ref": ROOT_BOM_REF, "dependsOn": []}],
     }
 
+    seen = set()
     for pkg in packages:
         purl = pkg['purl']
-        doc["components"].append({
+        ref = make_spdx_id(pkg['name'], pkg['version'])[len("SPDXRef-"):]
+        if ref in seen:
+            continue
+        seen.add(ref)
+        component = {
             "type":        "library",
+            "bom-ref":     ref,
             "name":        pkg['name'],
             "version":     pkg['version'],
             "description": pkg.get('desc', ''),
             "purl":        purl,
-        })
+        }
+        supplier = cyclonedx_supplier(pkg)
+        if supplier:
+            component["supplier"] = supplier
+        doc["components"].append(component)
+        doc["dependencies"][0]["dependsOn"].append(ref)
 
-    print(json.dumps(doc, indent=2))
+    return doc
+
+
+def output_cyclonedx(packages, binary_path):
+    print(json.dumps(build_cyclonedx_document(packages, binary_path),
+                     indent=2))
 
 
 def main():

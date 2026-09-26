@@ -6,6 +6,18 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **SBOMs name what they describe.** SPDX output now carries a root package
+  for the embedded image (`SPDXRef-RootPackage`, purpose `CONTAINER`, the
+  recorded image name and digest, the binary's SHA-256 and a `pkg:oci`
+  purl), a `DESCRIBES` relationship from the document to it and a
+  `CONTAINS` relationship to every OS package; duplicate `name@version`
+  rows collapse to one element. CycloneDX output gives the root
+  (`metadata.component`) and every component a `bom-ref` and lists the
+  packages as the root's `dependencies`. NTIA minimum-element checkers
+  and SPDX validators need the root and `DESCRIBES` to accept a document.
+  Packages now carry their supplier (dpkg `Maintainer`, apk `m:`, rpm
+  vendor or packager) instead of `NOASSERTION` throughout.
+
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
   `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, keyed by the SHA-256
@@ -205,6 +217,15 @@ All notable changes to oci2bin are documented here.
   resolved the link on the host.
 
 ### Fixed
+
+- **`sbom` and `diff` read a truncated payload on some builds.** The
+  embedded-OCI locator in `inspect_image.py` takes the 8-byte value on
+  either side of the patched offset as the size; when an unrelated loader
+  global next to it held a smaller number the real archive can be cut to
+  (a slice that still parses, since tarfile stops quietly at end of data),
+  that slice won and later layers vanished, so `sbom` reported no packages.
+  Both neighbours are now parsed and the one holding the complete archive
+  is used.
 
 - **No Python on the launch path.** Every start ran the pinned-digest check
   through `python3`, so artifacts failed on hosts without it (Alpine,

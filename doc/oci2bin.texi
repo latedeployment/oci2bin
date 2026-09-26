@@ -963,8 +963,10 @@ Remove superseded build outputs and evict cached extracted rootfs trees.
 Compare two binaries' filesystems (@code{+}/@code{-}/@code{M}).
 @item oci2bin diff-fs OVERLAY_PATH
 Classify an overlayfs upperdir (after @option{--overlay-persist}).
-@item oci2bin sbom BINARY
-Generate a Software Bill of Materials for the embedded image.
+@item oci2bin sbom BINARY [--format spdx|cyclonedx]
+Generate a Software Bill of Materials for the embedded image. SPDX output
+DESCRIBES a root package for the image that CONTAINS every OS package;
+CycloneDX lists them as the root component's dependencies.
 @item oci2bin reconstruct SRC [--output PATH]
 Rebuild a polyglot from an image/tar carrying an embedded loader.
 @item oci2bin push BINARY REF
