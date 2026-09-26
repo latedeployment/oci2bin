@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shlex
 import sys
 
 
@@ -186,6 +187,9 @@ def main():
             if meta.get("hermetic") == "yes":
                 print(f"  {'hermetic':<12}yes (built with --offline-only,"
                       f" no network used)")
+            if isinstance(meta.get("build_args"), list):
+                print(f"  {'build_args':<12}"
+                      f"{shlex.join(str(a) for a in meta['build_args'])}")
         else:
             print("  (no OCI2BIN_META block — older builder)")
         print()

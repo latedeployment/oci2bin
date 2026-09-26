@@ -232,7 +232,7 @@ byte-for-byte reproducible.
 | Generate systemd unit | `oci2bin systemd app.bin` |
 | Generate SBOM | `oci2bin sbom app.bin` |
 | Push image payload | `oci2bin push app.bin REF` |
-| Update a binary from its signed manifest | `oci2bin update [--check] [--verify-key PATH] app.bin` |
+| Update a binary from its signed manifest or image, replaying its recorded build options | `oci2bin update [--check] [--verify-key PATH] app.bin` |
 | Self-update check | `./app.bin --check-update` |
 | Self-update apply | `./app.bin --self-update` |
 | Freeze and thaw | `oci2bin freeze NAME`, `oci2bin thaw NAME` |

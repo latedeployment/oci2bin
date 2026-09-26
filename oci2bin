@@ -173,6 +173,9 @@
 #                         ~/.local/share/oci2bin/checkpoints/NAME
 #   restore NAME          Restore a CRIU checkpoint from the same directory
 #   top                   Live stats for named running containers
+#   update [--check] [--verify-key PATH] BINARY
+#                         Rebuild BINARY from its image with the build
+#                         options it recorded (--check: report only)
 #   reconstruct <src>     Rebuild polyglot from an image built with
 #                         --embed-loader-layer or --embed-loader-labels;
 #                         <src> is a Docker image name or a .tar/.img file
@@ -218,6 +221,22 @@ need() {
         echo "oci2bin: '$1' not found in PATH" >&2
         exit 1
     }
+}
+
+# Classify a build option (the options accepted before IMAGE).  Shared by
+# `run`, which forwards them ahead of IMAGE, and `update`, which replays the
+# build_args a binary recorded.  Prints "value" (one argument follows),
+# "flag" (none), "optional" (--compress-binary: `zstd` may follow) or
+# nothing for an option the build parser does not know.
+build_option_arity() {
+    case "$1" in
+        --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--pull-with|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--rootfs-format|--entrypoint|--cmd|--self-update-url|--pin-digest|--recipient|--recipients-file|--password-file|--require-signed)
+            echo value ;;
+        --cache|--no-cache|--reproducible|--offline-only|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash|--encrypt|--passphrase)
+            echo flag ;;
+        --compress-binary)
+            echo optional ;;
+    esac
 }
 
 case "${BASH_SOURCE[0]}" in
@@ -900,7 +919,61 @@ PYEOF
         exit 10
     fi
 
-    echo "oci2bin update: rebuilding from $IMAGE_NAME..." >&2
+    # Replay the build options the binary recorded (build_args in the
+    # metadata block) so the rebuilt artifact keeps its --strip, --squash,
+    # --label, --arch, ... choices.  Older binaries carry none: say so and
+    # rebuild with defaults rather than guessing.  The list is data read
+    # from the binary: every token must be a known build option or the
+    # value one takes (build_option_arity), so it cannot smuggle in a
+    # different IMAGE or OUTPUT positional; a malformed list is an error,
+    # not a silent default build.
+    UPDATE_BUILD_ARGS=()
+    UPDATE_ARGS_STATE="$(python3 - "$META_JSON" <<'PYEOF'
+import json, sys
+meta = json.loads(sys.argv[1])
+args = meta.get("build_args")
+if args is None:
+    print("absent")
+elif isinstance(args, list) and all(isinstance(a, str) for a in args):
+    print("present")
+else:
+    print("invalid")
+PYEOF
+)"
+    if [[ "$UPDATE_ARGS_STATE" == "present" ]]; then
+        mapfile -d '' UPDATE_BUILD_ARGS < <(python3 - "$META_JSON" <<'PYEOF'
+import json, sys
+meta = json.loads(sys.argv[1])
+for a in meta.get("build_args") or []:
+    sys.stdout.buffer.write(a.encode("utf-8", "surrogateescape") + b"\0")
+PYEOF
+)
+        _i=0
+        while [[ "$_i" -lt "${#UPDATE_BUILD_ARGS[@]}" ]]; do
+            case "$(build_option_arity "${UPDATE_BUILD_ARGS[$_i]}")" in
+                flag)     _i=$((_i + 1)) ;;
+                value)    _i=$((_i + 2)) ;;
+                optional)
+                    _i=$((_i + 1))
+                    [[ "${UPDATE_BUILD_ARGS[$_i]:-}" == "zstd" ]] && _i=$((_i + 1))
+                    ;;
+                *)        UPDATE_ARGS_STATE="invalid"; break ;;
+            esac
+        done
+        # A value option at the very end has nothing to consume.
+        [[ "$_i" -gt "${#UPDATE_BUILD_ARGS[@]}" ]] && UPDATE_ARGS_STATE="invalid"
+    fi
+    if [[ "$UPDATE_ARGS_STATE" == "invalid" ]]; then
+        echo "oci2bin update: $UPDATE_BINARY carries a malformed build_args record; refusing to replay it" >&2
+        exit 1
+    fi
+    if [[ "$UPDATE_ARGS_STATE" == "present" ]]; then
+        echo "oci2bin update: rebuilding from $IMAGE_NAME with the recorded options:" \
+             "${UPDATE_BUILD_ARGS[*]}" >&2
+    else
+        echo "oci2bin update: rebuilding from $IMAGE_NAME (no build options" \
+             "recorded by the builder that made it; using defaults)" >&2
+    fi
 
     # Build to a temp file in the same directory (for atomic rename)
     UPDATE_DIR="$(dirname "$UPDATE_BINARY")"
@@ -908,7 +981,7 @@ PYEOF
     # shellcheck disable=SC2064
     trap "rm -f \"$UPDATE_TMP\"" EXIT
 
-    "$0" "$IMAGE_NAME" "$UPDATE_TMP"
+    "$0" "${UPDATE_BUILD_ARGS[@]}" "$IMAGE_NAME" "$UPDATE_TMP"
 
     mv "$UPDATE_TMP" "$UPDATE_BINARY"
     chmod +x "$UPDATE_BINARY"
@@ -1266,31 +1339,35 @@ if [[ "${1:-}" == "run" ]]; then
     RUN_IMAGE=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --compress-binary)
-                if [[ "${2:-}" == "zstd" ]]; then
-                    BUILD_ARGS+=("$1" "$2")
-                    shift 2
-                else
-                    BUILD_ARGS+=("$1")
-                    shift
-                fi
-                ;;
-            --arch|--layer|--strip-prefix|--add-file|--add-dir|--oci-dir|--pull-with|--kernel|--initramfs|--label|--label-chunk-size|--loader-dir|--label-prefix|--cosign-key|--compress|--rootfs-format|--entrypoint|--cmd|--self-update-url|--pin-digest|--recipient|--recipients-file|--password-file|--require-signed)
-                [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
-                BUILD_ARGS+=("$1" "$2")
-                shift 2
-                ;;
-            --cache|--no-cache|--reproducible|--offline-only|--strip|--strip-auto|--libkrun|--no-libkrun|--embed-loader-layer|--embed-loader-labels|--verify-cosign|--require-cosign|--squash|--encrypt|--passphrase)
-                BUILD_ARGS+=("$1")
-                shift
-                ;;
             --)
                 echo "oci2bin run: IMAGE is required before --" >&2
                 exit 1
                 ;;
             -*)
-                echo "oci2bin run: unknown build option before IMAGE: $1" >&2
-                exit 1
+                case "$(build_option_arity "$1")" in
+                    optional)
+                        if [[ "${2:-}" == "zstd" ]]; then
+                            BUILD_ARGS+=("$1" "$2")
+                            shift 2
+                        else
+                            BUILD_ARGS+=("$1")
+                            shift
+                        fi
+                        ;;
+                    value)
+                        [[ $# -lt 2 ]] && { echo "oci2bin run: $1 requires an argument" >&2; exit 1; }
+                        BUILD_ARGS+=("$1" "$2")
+                        shift 2
+                        ;;
+                    flag)
+                        BUILD_ARGS+=("$1")
+                        shift
+                        ;;
+                    *)
+                        echo "oci2bin run: unknown build option before IMAGE: $1" >&2
+                        exit 1
+                        ;;
+                esac
                 ;;
             *)
                 RUN_IMAGE="$1"
@@ -2401,6 +2478,9 @@ build_forward_args_for_arch_all() {
     [[ "$ROOTFS_FORMAT" != "tar" ]] && ARCH_ALL_FORWARD_ARGS+=(--rootfs-format "$ROOTFS_FORMAT")
     [[ "$OFFLINE_ONLY" -eq 1 ]] && ARCH_ALL_FORWARD_ARGS+=(--offline-only)
     [[ -n "$COMPRESS_FORMAT" ]] && ARCH_ALL_FORWARD_ARGS+=(--compress "$COMPRESS_FORMAT")
+    # The last test above fails whenever --compress is unset, and under
+    # `set -e` a function whose final command fails aborts the caller.
+    return 0
 }
 
 # ── architecture / compiler selection ─────────────────────────────────────
@@ -3040,6 +3120,18 @@ for _rf in "${ENCRYPT_RECIPIENTS_FILES[@]}"; do EMBED_LOADER_ARG+=(--recipients-
 [[ "$ROOTFS_FORMAT" != "tar" ]] && EMBED_LOADER_ARG+=(--rootfs-format "$ROOTFS_FORMAT")
 [[ -n "$SET_ENTRYPOINT" ]] && EMBED_LOADER_ARG+=(--set-entrypoint "$SET_ENTRYPOINT")
 [[ -n "$SET_CMD" ]] && EMBED_LOADER_ARG+=(--set-cmd "$SET_CMD")
+
+# Record the build options in the metadata block so `oci2bin update` (and
+# anyone reading `oci2bin inspect`) can replay exactly this build: the same
+# canonical option list --arch all forwards and the --cache key hashes, plus
+# the target architecture.  Only options are recorded, never the image or
+# the output path.
+build_forward_args_for_arch_all
+BUILD_ARGS_JSON="$(printf '%s\0' --arch "$TARGET_ARCH" "${ARCH_ALL_FORWARD_ARGS[@]}" \
+    | python3 -c 'import json, sys
+raw = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+print(json.dumps(raw.split("\0")[:-1]))')"
+EMBED_LOADER_ARG+=(--build-args-json "$BUILD_ARGS_JSON")
 
 if [[ -n "$BUILD_TAR_ARG" ]]; then
     python3 "$OCI2BIN_HOME/scripts/build_polyglot.py" \

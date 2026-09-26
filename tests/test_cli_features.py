@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import shutil
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -695,3 +696,193 @@ class TestCliFeatures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _write_oci_layout(dest, layer_files, cmd=("/bin/true",)):
+    """A one-layer OCI image layout at `dest` (no engine needed to build)."""
+    blobs = dest / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+
+    def put(data):
+        digest = hashlib.sha256(data).hexdigest()
+        (blobs / digest).write_bytes(data)
+        return digest, len(data)
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in layer_files:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o644
+            tf.addfile(info, io.BytesIO(data))
+    layer = buf.getvalue()
+    layer_digest, layer_size = put(layer)
+    config = json.dumps({
+        "architecture": "amd64", "os": "linux",
+        "config": {"Cmd": list(cmd)},
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:" + layer_digest]},
+    }).encode()
+    config_digest, config_size = put(config)
+    manifest = json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": "sha256:" + config_digest, "size": config_size},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": "sha256:" + layer_digest, "size": layer_size}],
+    }).encode()
+    manifest_digest, manifest_size = put(manifest)
+    (dest / "index.json").write_text(json.dumps({
+        "schemaVersion": 2,
+        "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                       "digest": "sha256:" + manifest_digest,
+                       "size": manifest_size,
+                       "annotations": {"org.opencontainers.image.ref.name":
+                                       "latest"}}]}))
+    (dest / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}')
+
+
+class TestBuildArgsReplay(unittest.TestCase):
+    """The wrapper records its build options and `update` replays them.
+
+    Builds go through the real `oci2bin` CLI from a local OCI layout, so
+    no container engine is needed; the loader compiled by TestCliFeatures
+    is reused through a private OCI2BIN_HOME.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if os.uname().machine != "x86_64":
+            raise unittest.SkipTest("wrapper build test assumes x86_64")
+        cls._tmp = tempfile.TemporaryDirectory(prefix="oci2bin-replay-")
+        cls.tmpdir = Path(cls._tmp.name)
+        # A stand-in install tree: the repo's scripts and sources, plus a
+        # prebuilt loader so the wrapper does not compile one.
+        cls.home = cls.tmpdir / "home"
+        (cls.home / "build").mkdir(parents=True)
+        for entry in ("scripts", "src", "VERSION"):
+            if (ROOT / entry).exists():
+                os.symlink(ROOT / entry, cls.home / entry)
+        loader = cls.home / "build" / "loader-x86_64"
+        build = subprocess.run(
+            ["gcc", "-static", "-O2", "-s", "-o", str(loader),
+             str(ROOT / "src" / "loader.c")],
+            capture_output=True, text=True, timeout=300)
+        if build.returncode != 0:
+            raise unittest.SkipTest(f"failed to build loader: {build.stderr}")
+        cls.layout = cls.tmpdir / "layout"
+        _write_oci_layout(cls.layout, [("hello.txt", b"hello\n")])
+        cls.env = dict(os.environ, OCI2BIN_HOME=str(cls.home),
+                       XDG_CACHE_HOME=str(cls.tmpdir / "xdg"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def _wrapper(self, *args, cwd=None):
+        return subprocess.run([str(OCI2BIN), *args], capture_output=True,
+                              text=True, timeout=300, env=self.env,
+                              cwd=cwd or self.tmpdir)
+
+    def _meta(self, binary):
+        return _load_module("inspect_image",
+                            ROOT / "scripts" / "inspect_image.py"
+                            ).read_meta_block(str(binary)) or {}
+
+    def test_build_records_options_and_update_replays_them(self):
+        out = self.tmpdir / "app.bin"
+        build = self._wrapper("--oci-dir", str(self.layout), "--no-libkrun",
+                              "--label", "demo=one",
+                              "--label", "spaced=a b",
+                              "replay-test:latest", str(out))
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        recorded = self._meta(out).get("build_args")
+        self.assertEqual(recorded, ["--arch", "x86_64",
+                                    "--oci-dir", str(self.layout),
+                                    "--no-libkrun",
+                                    "--label", "demo=one",
+                                    "--label", "spaced=a b"])
+        for name in ("replay-test:latest", str(out)):
+            self.assertNotIn(name, recorded)
+
+        shown = self._wrapper("inspect", str(out))
+        self.assertEqual(shown.returncode, 0, msg=shown.stderr)
+        self.assertIn("Build args: --arch x86_64 --oci-dir", shown.stdout)
+        self.assertIn("--label 'spaced=a b'", shown.stdout)
+        as_json = self._wrapper("inspect", "--json", str(out))
+        self.assertEqual(as_json.returncode, 0, msg=as_json.stderr)
+        self.assertIn('"build_args"', as_json.stdout)
+
+        # `update` rebuilds through the recorded list: the labels survive
+        # and, since --oci-dir is part of it, no engine is consulted.
+        before = self._meta(out)
+        update = self._wrapper("update", str(out))
+        self.assertEqual(update.returncode, 0, msg=update.stderr)
+        self.assertIn("with the recorded options:", update.stderr)
+        self.assertIn("--label 'spaced=a b'", shlex.join(recorded))
+        after = self._meta(out)
+        self.assertEqual(after.get("build_args"), before.get("build_args"))
+        shown = self._wrapper("inspect", str(out))
+        self.assertIn("demo=one", shown.stdout)
+        self.assertIn("spaced=a b", shown.stdout)
+
+    def test_update_says_when_no_options_were_recorded(self):
+        """A binary from an older builder carries no build_args: update
+        must say so and fall back to defaults rather than guess."""
+        out = self.tmpdir / "legacy.bin"
+        build = self._wrapper("--oci-dir", str(self.layout), "--no-libkrun",
+                              "legacy-test:latest", str(out))
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        # Strip build_args from the metadata block in place (same length).
+        blob = bytearray(out.read_bytes())
+        magic = blob.rfind(b"OCI2BIN_META\x00")
+        total = struct.unpack_from("<I", blob, magic - 4)[0]
+        start, end = magic + 13, (magic - 4) + total
+        raw = bytes(blob[start:end]).rstrip(b"\x00")
+        meta = json.loads(raw)
+        del meta["build_args"]
+        rewritten = json.dumps(meta).encode().ljust(len(raw), b"\x00")
+        blob[start:start + len(rewritten)] = rewritten
+        out.write_bytes(blob)
+        self.assertNotIn("build_args", self._meta(out))
+        # The default rebuild needs a container engine for a bare image
+        # name; with none in PATH the replay fails after the message.
+        env = dict(self.env, PATH=str(self.tmpdir / "empty-bin")
+                   + os.pathsep + os.path.dirname(shutil.which("python3"))
+                   + os.pathsep + "/usr/bin:/bin")
+        update = subprocess.run([str(OCI2BIN), "update", str(out)],
+                                capture_output=True, text=True, timeout=300,
+                                env=env, cwd=self.tmpdir)
+        self.assertIn("no build options recorded", update.stderr)
+        self.assertNotIn("with the recorded options", update.stderr)
+
+    def test_update_refuses_a_record_that_is_not_options(self):
+        """build_args is data from the binary: a token that could act as a
+        positional (a different image or output) is refused outright."""
+        out = self.tmpdir / "tampered.bin"
+        build = self._wrapper("--oci-dir", str(self.layout), "--no-libkrun",
+                              "tamper-test:latest", str(out))
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        for bad in (["--strip", "evil:latest", "--squash"],
+                    ["--", "x"],
+                    ["evil:latest"],
+                    ["--label"],
+                    ["--not-a-build-option"]):
+            blob = bytearray(out.read_bytes())
+            magic = blob.rfind(b"OCI2BIN_META\x00")
+            total = struct.unpack_from("<I", blob, magic - 4)[0]
+            start, end = magic + 13, (magic - 4) + total
+            raw = bytes(blob[start:end]).rstrip(b"\x00")
+            meta = json.loads(raw)
+            meta["build_args"] = bad
+            rewritten = json.dumps(meta, separators=(",", ":")).encode()
+            self.assertLessEqual(len(rewritten), len(raw) + 1)
+            # The block is NUL padded; a shorter JSON is re-padded to size.
+            blob[start:end] = rewritten.ljust(end - start, b"\x00")
+            tampered = self.tmpdir / "tampered-copy.bin"
+            tampered.write_bytes(blob)
+            self.assertEqual(self._meta(tampered).get("build_args"), bad)
+            update = self._wrapper("update", str(tampered))
+            self.assertNotEqual(update.returncode, 0)
+            self.assertIn("malformed build_args record", update.stderr)
+            self.assertNotIn("rebuilding from", update.stderr)

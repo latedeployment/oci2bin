@@ -181,7 +181,7 @@ oci2bin thaw NAME
 oci2bin reconstruct SRC [--output PATH] [--no-strip] [--label-prefix PREFIX]
 oci2bin push BINARY REF
 oci2bin sbom BINARY
-oci2bin update [--check] [--verify-key PATH] BINARY
+oci2bin update [--check] [--verify-key PATH] BINARY   # replays the recorded build options
 oci2bin run [BUILD_OPTIONS] IMAGE [-- RUNTIME_ARGS...]
 oci2bin systemd BINARY [--user] [--restart POLICY]
 oci2bin healthcheck BINARY [--pid PID]

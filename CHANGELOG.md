@@ -6,6 +6,14 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **The build options are recorded in the metadata block.** Every build
+  stores its canonical option list (the same one `--arch all` forwards and
+  the `--cache` key hashes, plus `--arch`; never the image or output path)
+  as `build_args`. `oci2bin update` replays it against the image's current
+  digest instead of rebuilding with defaults, and `oci2bin inspect` /
+  `explain` show it. Binaries from older builders carry no record and
+  `update` says it is falling back to defaults.
+
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
   `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, keyed by the SHA-256
@@ -205,6 +213,11 @@ All notable changes to oci2bin are documented here.
   resolved the link on the host.
 
 ### Fixed
+
+- `--arch all` and `--cache` builds without `--compress` aborted silently:
+  the helper that assembles the forwarded option list ended on a failing
+  `[[ ... ]] &&` test, which `set -e` treated as the function failing. It
+  now returns 0 explicitly.
 
 - **No Python on the launch path.** Every start ran the pinned-digest check
   through `python3`, so artifacts failed on hosts without it (Alpine,

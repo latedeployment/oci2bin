@@ -724,7 +724,8 @@ REPRODUCIBLE_TIMESTAMP = '1970-01-01T00:00:00Z'
 def build_meta_block(image_name, digest=None, self_update_url=None,
                      pin_digest=None, reproducible=False,
                      offline_only=False, require_signed_pubkey=None,
-                     rootfs_format='tar', payload_encoding='tar'):
+                     rootfs_format='tar', payload_encoding='tar',
+                     build_args=None):
     """
     Build the OCI2BIN_META block appended to the end of the output binary.
     Format: uint32_le(total_size) + META_MAGIC + json_bytes + b'\\x00'
@@ -752,6 +753,13 @@ def build_meta_block(image_name, digest=None, self_update_url=None,
         meta['digest'] = digest
     if self_update_url:
         meta['self_update_url'] = self_update_url
+    if build_args is not None:
+        # The oci2bin CLI's canonical option list for this build (never the
+        # image or output path), so `oci2bin update` replays it exactly.
+        if not isinstance(build_args, (list, tuple)) or \
+                not all(isinstance(a, str) for a in build_args):
+            raise ValueError('build_args must be a list of strings')
+        meta['build_args'] = list(build_args)
     if pin_digest:
         algorithm, digest_value = validate_pin_digest(pin_digest)
         if digest_value == 'auto':
@@ -1512,7 +1520,7 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                    encrypt_passphrase=False, password_file=None,
                    require_signed_pubkey=None, compress_binary=None,
                    set_entrypoint=None, set_cmd=None,
-                   rootfs_format='tar'):
+                   rootfs_format='tar', build_args=None):
     """Build the TAR+ELF polyglot file.
 
     If tar_path is given, use it as the pre-saved OCI tar instead of running
@@ -1851,6 +1859,7 @@ def build_polyglot(loader_path, image_name, output_path, tar_path=None,
                                   offline_only=offline_only,
                                   require_signed_pubkey=require_signed_pubkey,
                                   rootfs_format=rootfs_format,
+                                  build_args=build_args,
                                   payload_encoding=(
                                       'age-passphrase' if encrypt_passphrase
                                       else 'age' if (encrypt_recipients or
@@ -1920,6 +1929,9 @@ def main():
                              '(e.g. redis@sha256:abc123...)')
     parser.add_argument('--self-update-url', default=None,
                         help='Signed update manifest URL to embed in metadata')
+    parser.add_argument('--build-args-json', default=None, metavar='JSON',
+                        help='JSON list of the oci2bin build options to record '
+                             'in the metadata block (replayed by oci2bin update)')
     parser.add_argument('--pin-digest', default=None,
                         help='Embed a pinned digest for canonical self-checking '
                              '("auto", 64 hex chars, or ALGO:HEX/ALGO:auto)')
@@ -2110,6 +2122,19 @@ def main():
                   f'{args.require_signed}', file=sys.stderr)
             sys.exit(1)
 
+    build_args = None
+    if args.build_args_json is not None:
+        try:
+            build_args = json.loads(args.build_args_json)
+        except ValueError as e:
+            print(f'--build-args-json: not valid JSON: {e}', file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(build_args, list) or \
+                not all(isinstance(a, str) for a in build_args):
+            print('--build-args-json: expected a JSON list of strings',
+                  file=sys.stderr)
+            sys.exit(1)
+
     image_name_for_meta = args.image_name if args.image_name else (args.image or 'unknown')
     build_polyglot(args.loader, args.image or '', args.output,
                    tar_path=args.tar,
@@ -2135,6 +2160,7 @@ def main():
                    require_signed_pubkey=require_signed_pubkey,
                    compress_binary=args.compress_binary,
                    rootfs_format=args.rootfs_format,
+                   build_args=build_args,
                    set_entrypoint=(parse_exec_value(args.set_entrypoint)
                                    if args.set_entrypoint is not None
                                    else None),

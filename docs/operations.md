@@ -326,6 +326,28 @@ Apply an update:
 
 The manifest is signature-verified before replacement.
 
+Rebuild a binary from its image with the same options it was built with:
+
+```bash
+oci2bin update app.bin
+oci2bin update --check app.bin
+```
+
+Every build records its canonical option list (`--arch`, `--strip`,
+`--squash`, `--label`, `--compress-binary`, ... but never the image or output
+path) as `build_args` in the metadata block; `oci2bin inspect` shows it.
+`update` replays exactly that list against the image's current digest, so a
+rebuilt binary keeps its shape. A binary made by an older oci2bin has no
+record and is rebuilt with default options, which `update` says out loud.
+
+The list is data read from the binary. `update` prints it before rebuilding
+and refuses a list that is not options and their values (so it cannot swap
+in another image or output path), but options such as `--add-file` or
+`--password-file` name host paths: review the printed list before updating a
+binary you did not build. A build pinned with an explicit `--pin-digest` is
+replayed with that pin and so refuses to move to a new digest; re-pin and
+rebuild instead.
+
 ## Reconstruct
 
 ```bash

@@ -866,6 +866,21 @@ loader.
 Push the embedded image payload to an OCI registry reference.
 .
 .TP
+.B oci2bin update \fR[\fB\-\-check\fR] [\fB\-\-verify\-key \fIPATH\fR] \fIBINARY\fR
+Rebuild
+.I BINARY
+from its image when the image's digest has moved, replaying the build options
+recorded in the metadata block (the same list
+.B \-\-arch all
+forwards, plus
+.BR \-\-arch ),
+and replace it atomically. The recorded list is printed first; one that is
+not options and their values is refused. With
+.B \-\-check
+only report whether an update is available. A binary made by an older
+oci2bin carries no record and is rebuilt with default options.
+.
+.TP
 .B oci2bin exec \fIPID\fR \fR[\fB\-\-\fR] \fICMD\fR ...
 Run a command inside a running container's namespaces (needs
 .BR nsenter ).

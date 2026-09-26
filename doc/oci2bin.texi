@@ -969,6 +969,10 @@ Generate a Software Bill of Materials for the embedded image.
 Rebuild a polyglot from an image/tar carrying an embedded loader.
 @item oci2bin push BINARY REF
 Push the embedded image payload to an OCI registry.
+@item oci2bin update [--check] [--verify-key PATH] BINARY
+Rebuild BINARY from its image when its digest moved, replaying the build
+options recorded in the metadata block (@code{build_args}); @option{--check}
+only reports.
 @item oci2bin exec PID [--] CMD ...
 Run a command inside a running container's namespaces (needs @command{nsenter}).
 @item oci2bin ps / stop NAME / logs [-f] NAME

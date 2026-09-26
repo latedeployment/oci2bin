@@ -17,6 +17,7 @@ Pure Python, stdlib only.
 import io
 import json
 import os
+import shlex
 import struct
 import sys
 import tarfile
@@ -494,6 +495,9 @@ def main():
                                ("Encoding", "payload_encoding")):
                 if key in meta:
                     print(f"  {label + ':':10} {meta[key]}")
+            if isinstance(meta.get("build_args"), list):
+                print(f"  {'Build args:':10} "
+                      f"{shlex.join(str(a) for a in meta['build_args'])}")
         return
 
     repo_tags, layers, config = parse_config(oci_bytes)
@@ -578,6 +582,9 @@ def main():
         if meta.get('hermetic') == 'yes':
             print("  Hermetic:  yes (built with --offline-only,"
                   " no network used)")
+        if isinstance(meta.get('build_args'), list):
+            print("  Build args: "
+                  + shlex.join(str(a) for a in meta['build_args']))
 
 
 if __name__ == '__main__':
