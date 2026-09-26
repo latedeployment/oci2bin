@@ -449,9 +449,26 @@ Supported types:
 May be repeated.
 .
 .TP
+.BI \-\-stop\-timeout " N"
+Seconds between the
+.B SIGTERM
+the supervisor forwards to the workload (or sends to an unhealthy one) and the
+.B SIGKILL
+that follows when it is still running.
+Default 10;
+.B 0
+never escalates a user stop.
+Implies
+.BR \-\-init .
+.
+.TP
 .B \-\-init
 Run a zombie-reaping init as PID\~1.
-The entrypoint is forked as a child; the parent loop reaps zombies.
+The entrypoint is forked as a child; the parent waits in one
+.BR poll (2)
+on a signalfd, the child's pidfd and timerfds, reaping zombies as they appear
+and enforcing
+.BR \-\-stop\-timeout .
 .BR SIGTERM ,
 .BR SIGINT ,
 .BR SIGHUP ,

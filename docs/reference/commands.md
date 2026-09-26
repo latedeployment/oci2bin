@@ -129,6 +129,7 @@ Common runtime options:
 --strict
 --allow-degraded
 --init
+--stop-timeout N
 --detach
 --name NAME
 --restart POLICY

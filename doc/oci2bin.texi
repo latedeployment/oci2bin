@@ -908,10 +908,18 @@ privileges.
 @cindex PID 1
 
 @option{--init} runs a tiny zombie-reaping init as PID@tie{}1.  The
-entrypoint is forked as a child; the parent loops reaping zombies.
-@code{SIGTERM}, @code{SIGINT}, @code{SIGHUP}, @code{SIGUSR1}, and
+entrypoint is forked as a child; the parent waits in one @code{poll} on a
+signalfd, the child's pidfd and timerfds, reaping zombies the moment they
+appear.  @code{SIGTERM}, @code{SIGINT}, @code{SIGHUP}, @code{SIGUSR1}, and
 @code{SIGUSR2} are forwarded to the child.  When the main child exits,
 remaining zombies are drained and the exit status is returned.
+
+@opindex --stop-timeout
+@option{--stop-timeout N} is the grace between a forwarded @code{SIGTERM}
+(or the one sent to an unhealthy workload) and the @code{SIGKILL} that
+follows when the workload is still running: 10 seconds by default, as in
+Docker; @code{0} never escalates a user stop.  Given on its own it implies
+@option{--init}.
 
 @example
 ./my-app --init

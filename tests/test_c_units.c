@@ -8323,6 +8323,242 @@ static void test_parse_opts_rootfs_cache(void)
                   "rootfs-cache: mode name");
 }
 
+/* ── event-driven supervisor ─────────────────────────────────────────────── */
+
+static long sv_test_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Fork a helper that sends `sig` to this process after delay_ms. */
+static pid_t sv_test_signal_self_later(int sig, long delay_ms)
+{
+    pid_t parent = getpid();
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        child_unblock_signals();
+        struct timespec ts = { delay_ms / 1000, (delay_ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        kill(parent, sig);
+        _exit(0);
+    }
+    return pid;
+}
+
+static void test_supervisor_init_exit_code_and_orphans(void)
+{
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    /* The workload leaves an orphan behind; the reaper must not hang on it
+     * and must return the workload's own status. */
+    char* args[] = { "/bin/sh", "-c",
+                     "(sleep 0.3 &) ; exit 3", NULL
+                   };
+    long t0 = sv_test_now_ms();
+    int rc = run_as_init(args, &opts, NULL);
+    long dt = sv_test_now_ms() - t0;
+    ASSERT_INT_EQ(rc, 3, "init: returns the workload's exit code");
+    ASSERT(dt < 2000, "init: returns promptly after the workload exits");
+
+    char* sig_args[] = { "/bin/sh", "-c", "kill -TERM $$", NULL };
+    rc = run_as_init(sig_args, &opts, NULL);
+    ASSERT_INT_EQ(rc, 128 + SIGTERM, "init: signal death maps to 128+sig");
+
+    /* The signal mask is back to what it was. */
+    sigset_t cur;
+    sigprocmask(SIG_BLOCK, NULL, &cur);
+    ASSERT(!sigismember(&cur, SIGTERM) && !sigismember(&cur, SIGCHLD),
+           "init: signal mask restored after the supervisor returns");
+}
+
+static void test_supervisor_stop_timeout_escalates(void)
+{
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.stop_timeout_s   = 1;
+    opts.stop_timeout_set = 1;
+    /* A workload that ignores SIGTERM. */
+    char* args[] = { "/bin/sh", "-c", "trap '' TERM; sleep 20", NULL };
+    pid_t helper = sv_test_signal_self_later(SIGTERM, 300);
+    long t0 = sv_test_now_ms();
+    int rc = run_as_init(args, &opts, NULL);
+    long dt = sv_test_now_ms() - t0;
+    ASSERT_INT_EQ(rc, 128 + SIGKILL,
+                  "stop-timeout: workload ignoring SIGTERM is SIGKILLed");
+    ASSERT(dt >= 1200 && dt < 6000,
+           "stop-timeout: escalation happens after the grace period");
+    /* The helper was reaped as an orphan by the supervisor or is done. */
+    waitpid(helper, NULL, WNOHANG);
+
+    /* A workload that honours SIGTERM exits with 143 right away. */
+    char* polite[] = { "/bin/sh", "-c", "sleep 20", NULL };
+    helper = sv_test_signal_self_later(SIGTERM, 300);
+    t0 = sv_test_now_ms();
+    rc = run_as_init(polite, &opts, NULL);
+    dt = sv_test_now_ms() - t0;
+    ASSERT_INT_EQ(rc, 128 + SIGTERM, "stop-timeout: forwarded SIGTERM");
+    ASSERT(dt < 1500, "stop-timeout: no wait when the workload complies");
+    waitpid(helper, NULL, WNOHANG);
+}
+
+static void test_supervisor_restart_policy(void)
+{
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.restart_policy = RESTART_ON_FAILURE;
+    opts.restart_max    = 2;
+    char dir[PATH_MAX];
+    cache_test_mkdtemp(dir, sizeof(dir), "sv-restart");
+    char counter[PATH_MAX];
+    snprintf(counter, sizeof(counter), "%s/runs", dir);
+    char script[PATH_MAX + 64];
+    snprintf(script, sizeof(script), "echo x >> %s; exit 5", counter);
+    char* args[] = { "/bin/sh", "-c", script, NULL };
+    struct health_state hs;
+    memset(&hs, 0, sizeof(hs));
+    long t0 = sv_test_now_ms();
+    int rc = run_supervised(args, &opts, &hs, NULL);
+    long dt = sv_test_now_ms() - t0;
+    ASSERT_INT_EQ(rc, 5, "restart: last exit code returned");
+    size_t sz = 0;
+    char* runs = read_file(counter, &sz);
+    ASSERT_INT_EQ((int)sz, 2 * 3, "restart: on-failure:2 ran three times");
+    free(runs);
+    ASSERT(dt >= 2000 && dt < 8000, "restart: one second of backoff per restart");
+
+    /* A stop during the backoff ends the loop instead of relaunching. */
+    unlink(counter);
+    opts.restart_policy = RESTART_ALWAYS;
+    pid_t helper = sv_test_signal_self_later(SIGINT, 400);
+    t0 = sv_test_now_ms();
+    rc = run_supervised(args, &opts, &hs, NULL);
+    dt = sv_test_now_ms() - t0;
+    runs = read_file(counter, &sz);
+    ASSERT(sz == 2 || sz == 4, "restart: stop during backoff ends the loop");
+    ASSERT(dt < 3000, "restart: no further attempt after a stop");
+    free(runs);
+    waitpid(helper, NULL, WNOHANG);
+    unlink(counter);
+    rmdir(dir);
+}
+
+static void test_supervisor_health_cadence(void)
+{
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.restart_policy = RESTART_ON_FAILURE;
+    opts.restart_max    = 1;
+    opts.stop_timeout_s   = 1;
+    opts.stop_timeout_set = 1;
+    char dir[PATH_MAX];
+    cache_test_mkdtemp(dir, sizeof(dir), "sv-health");
+    char probes[PATH_MAX];
+    snprintf(probes, sizeof(probes), "%s/probes", dir);
+
+    /* Probe every second, fail after two: the workload (which traps TERM) is
+     * killed after the stop timeout and restarted once. */
+    struct health_state hs;
+    memset(&hs, 0, sizeof(hs));
+    hs.enabled    = 1;
+    hs.interval_s = 1;
+    hs.timeout_s  = 5;
+    hs.retries    = 2;
+    char probe_cmd[PATH_MAX + 64];
+    snprintf(probe_cmd, sizeof(probe_cmd), "date +%%s.%%N >> %s; exit 1",
+             probes);
+    hs.argv[0] = "/bin/sh";
+    hs.argv[1] = "-c";
+    hs.argv[2] = probe_cmd;
+    hs.argv[3] = NULL;
+    hs.argc = 3;
+    char* args[] = { "/bin/sh", "-c", "trap '' TERM; sleep 30", NULL };
+    long t0 = sv_test_now_ms();
+    int rc = run_supervised(args, &opts, &hs, NULL);
+    long dt = sv_test_now_ms() - t0;
+    ASSERT_INT_EQ(rc, 128 + SIGKILL,
+                  "health: unhealthy workload ignoring SIGTERM is killed");
+    /* Two lives: 2 probes + 1s grace each, plus 1s backoff: ~7s. */
+    ASSERT(dt >= 5000 && dt < 15000, "health: two lives then done");
+    size_t sz = 0;
+    char* text = read_file(probes, &sz);
+    int lines = 0;
+    for (size_t i = 0; text && i < sz; i++)
+    {
+        lines += text[i] == '\n';
+    }
+    ASSERT_INT_EQ(lines, 4, "health: exactly retries probes per life");
+    /* Consecutive probes are one interval apart (timerfd cadence), not
+     * interval plus probe duration plus a sleep quantum. */
+    if (text && lines >= 2)
+    {
+        double a = 0, b = 0;
+        sscanf(text, "%lf", &a);
+        sscanf(strchr(text, '\n') + 1, "%lf", &b);
+        double gap = b - a;
+        ASSERT(gap > 0.9 && gap < 1.2, "health: probes one interval apart");
+    }
+    free(text);
+    unlink(probes);
+    rmdir(dir);
+}
+
+static void test_health_probe_timeout(void)
+{
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    char* slow[] = { "/bin/sh", "-c", "sleep 10", NULL };
+    long t0 = sv_test_now_ms();
+    int rc = run_health_probe(slow, 1, &opts, NULL);
+    long dt = sv_test_now_ms() - t0;
+    ASSERT_INT_EQ(rc, 1, "probe: timeout counts as unhealthy");
+    ASSERT(dt >= 900 && dt < 3000, "probe: killed at the deadline");
+    char* ok[] = { "/bin/sh", "-c", "exit 0", NULL };
+    ASSERT_INT_EQ(run_health_probe(ok, 5, &opts, NULL), 0,
+                  "probe: exit 0 is healthy");
+    char* bad[] = { "/bin/sh", "-c", "exit 2", NULL };
+    ASSERT_INT_EQ(run_health_probe(bad, 5, &opts, NULL), 1,
+                  "probe: non-zero exit is unhealthy");
+    /* No zombie left behind. */
+    ASSERT(waitpid(-1, NULL, WNOHANG) <= 0, "probe: no zombie left");
+}
+
+static void test_parse_opts_stop_timeout(void)
+{
+    struct container_opts opts;
+    char v[] = "30";
+    char* argv1[] = {"prog", "--stop-timeout", v, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, argv1, &opts), 0, "stop-timeout: parses");
+    ASSERT(opts.stop_timeout_set && opts.stop_timeout_s == 30,
+           "stop-timeout: value stored");
+    ASSERT_INT_EQ((int)effective_stop_timeout(&opts), 30,
+                  "stop-timeout: effective value is the flag");
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ((int)effective_stop_timeout(&opts), DEFAULT_STOP_TIMEOUT_S,
+                  "stop-timeout: default when unset");
+    char zero[] = "0";
+    char* argv0[] = {"prog", "--stop-timeout", zero, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, argv0, &opts), 0, "stop-timeout: 0 accepted");
+    char neg[] = "-1";
+    char* argvn[] = {"prog", "--stop-timeout", neg, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, argvn, &opts), -1,
+                  "stop-timeout: negative rejected");
+    char junk[] = "10s";
+    char* argvj[] = {"prog", "--stop-timeout", junk, NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(3, argvj, &opts), -1,
+                  "stop-timeout: non-numeric rejected");
+    char* argvm[] = {"prog", "--stop-timeout", NULL};
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(parse_opts(2, argvm, &opts), -1,
+                  "stop-timeout: missing value rejected");
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -8436,6 +8672,12 @@ int main(void)
     test_rootfs_cache_root_resolution();
     test_rootfs_cache_publish_verify();
     test_parse_opts_rootfs_cache();
+    test_parse_opts_stop_timeout();
+    test_health_probe_timeout();
+    test_supervisor_init_exit_code_and_orphans();
+    test_supervisor_stop_timeout_escalates();
+    test_supervisor_restart_policy();
+    test_supervisor_health_cadence();
 
     printf("1..%d\n", tap_test_num);
 

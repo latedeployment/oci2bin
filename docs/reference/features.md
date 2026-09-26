@@ -80,6 +80,7 @@ This page is a checklist of the feature surface documented by the site.
 | Detach | `--detach` or `-d` |
 | Name container | `--name NAME` |
 | Restart policy | `--restart always`, `--restart on-failure:5` |
+| Stop grace before SIGKILL | `--stop-timeout N` (default 10, 0 = never) |
 | Health checks | `--health`, `oci2bin healthcheck` |
 | Health probe override | `--health-cmd`, `--health-interval`, `--health-timeout`, `--health-retries`, `--health-start-period` |
 | Disable health | `--no-health` |

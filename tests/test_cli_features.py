@@ -5,9 +5,11 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -79,6 +81,23 @@ int main(void)
     if (fd >= 0) { if (write(fd, "leak\n", 5) < 0) { return 3; } close(fd); }
     printf("writer ran leak_fd=%d\n", fd);
     return fd >= 0 ? 0 : 2;
+}
+"""
+
+
+_TRAP_SRC = r"""
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char** argv)
+{
+    /* Ignore SIGTERM so only SIGKILL ends us; exit code from argv[1]. */
+    signal(SIGTERM, SIG_IGN);
+    printf("trap ran\n");
+    fflush(stdout);
+    if (argc > 1) { return atoi(argv[1]); }
+    for (;;) { sleep(1); }
 }
 """
 
@@ -294,6 +313,68 @@ class TestCliFeatures(unittest.TestCase):
         self.assertEqual(prune.returncode, 0, msg=prune.stderr)
         self.assertIn("1 rootfs cache entry removed", prune.stdout)
         self.assertFalse(entry.exists())
+
+    def test_stop_timeout_escalates_and_restart_policy_counts(self):
+        """--stop-timeout SIGKILLs a workload that ignores SIGTERM, and
+        --restart on-failure:N relaunches exactly N times."""
+        if not _userns_available():
+            self.skipTest("user namespaces unavailable; cannot run binaries")
+        trap_src = self.tmpdir / "trap.c"
+        trap_src.write_text(_TRAP_SRC, encoding="utf-8")
+        trap = self.tmpdir / "trap"
+        build = subprocess.run(
+            ["gcc", "-static", "-O2", "-s", "-o", str(trap), str(trap_src)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        tar_bytes, _config = _program_oci_tar(trap.read_bytes())
+        tar_path = self.tmpdir / "trap.tar"
+        tar_path.write_bytes(tar_bytes)
+        binary = self.tmpdir / "trap.bin"
+        result = subprocess.run(
+            ["python3", str(ROOT / "scripts" / "build_polyglot.py"),
+             "--loader", str(self.loader), "--tar", str(tar_path),
+             "--image-name", "trap:latest", "--output", str(binary)],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        xdg = self.tmpdir / "xdg-trap"
+        tmp = self.tmpdir / "runtime-trap"
+        tmp.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, XDG_CACHE_HOME=str(xdg),
+                   OCI2BIN_TMPDIR=str(tmp), TMPDIR=str(tmp))
+
+        # Stop escalation: SIGTERM to the loader is forwarded, ignored by
+        # the workload, and followed by SIGKILL after one second.
+        proc = subprocess.Popen(
+            [str(binary), "--net", "none", "--stop-timeout", "1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=env)
+        line = proc.stdout.readline()
+        self.assertEqual(line.strip(), "trap ran")
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            _out, err = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.fail("loader did not exit after --stop-timeout")
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 137, msg=err)
+        self.assertIn("sending SIGKILL", err)
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 8.0)
+
+        # Restart policy: three runs for on-failure:2, last exit code kept.
+        started = time.monotonic()
+        run = subprocess.run(
+            [str(binary), "--net", "none", "--restart", "on-failure:2",
+             "--", "/bin/sh", "4"],
+            capture_output=True, text=True, timeout=60, env=env)
+        elapsed = time.monotonic() - started
+        self.assertEqual(run.returncode, 4, msg=run.stderr)
+        self.assertEqual(run.stdout.count("trap ran"), 3)
+        self.assertEqual(run.stderr.count("restarting container"), 2)
+        self.assertGreaterEqual(elapsed, 2.0)
 
     def test_systemd_emits_unit_with_label_name(self):
         binary = self._build_binary(

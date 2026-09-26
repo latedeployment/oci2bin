@@ -21,6 +21,8 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <sys/signalfd.h>
+#include <sys/timerfd.h>
 #include <sys/file.h>
 #include <stdint.h>
 #include <dirent.h>
@@ -279,6 +281,7 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len);
 static int run_cmd(char* const argv[]);
 static int run_cmd_umask(char* const argv[], mode_t child_umask);
 static void rm_rf_dir(const char* path);
+static void child_unblock_signals(void);
 static int tool_is_available(const char* prog);
 static int setup_single_uid_map(uid_t real_uid, gid_t real_gid);
 static int json_escape_string(const char* src, char* dst, size_t dstsz);
@@ -809,6 +812,13 @@ struct container_opts
      * restart_max applies only to on-failure (0 = unlimited). */
     int restart_policy;
     int restart_max;
+
+    /* --stop-timeout N: seconds between the SIGTERM forwarded to (or sent
+     * to) the workload and the SIGKILL that follows when it is still
+     * running.  0 = never escalate.  Unset = DEFAULT_STOP_TIMEOUT_S.  Given
+     * on its own it implies --init so there is a supervisor to enforce it. */
+    long stop_timeout_s;
+    int  stop_timeout_set;
 
     /* --health and friends: run the image HEALTHCHECK (or --health-cmd) inside
      * the container on an interval, surface status in `ps`, fire the --notify
@@ -5655,6 +5665,7 @@ static int run_cmd_internal(char* const argv[], int set_child_umask,
     }
     if (pid == 0)
     {
+        child_unblock_signals();
         if (set_child_umask)
         {
             umask(child_umask);
@@ -5940,6 +5951,7 @@ static pid_t spawn_daemon(char* const argv[])
     }
     if (pid == 0)
     {
+        child_unblock_signals();
         execvp(argv[0], argv);
         perror("execvp");
         _exit(1);
@@ -11960,27 +11972,402 @@ static int enter_workload_context(const struct container_opts* opts,
 
 /* ── init reaper ─────────────────────────────────────────────────────────── */
 
-/*
- * Global child PID used by the init signal forwarding handler.
- * Set before installing signal handlers; only written once.
- */
-static volatile pid_t g_init_child_pid = 0;
+/* ── event-driven supervisor core ────────────────────────────────────────── */
 
-static void init_forward_signal(int sig)
+/*
+ * --init, --restart and --health used to sit in loops of waitpid(WNOHANG)
+ * and nanosleep(200ms), with signal handlers forwarding to a global PID:
+ * health probes drifted by up to a sleep per interval, a child exit was
+ * noticed late, and the kill-after-grace path compared time(2) seconds.
+ *
+ * Everything now waits in one poll(2) on four descriptors:
+ *   signalfd   SIGTERM/SIGINT/SIGHUP/SIGUSR1/SIGUSR2 to forward, SIGCHLD to
+ *              reap — the signals are blocked, so nothing is lost or racy;
+ *   pidfd      the workload's pidfd_open(2) handle: readable the moment it
+ *              exits, and the target of pidfd_send_signal(2), which cannot
+ *              hit a recycled PID.  Kernels without it fall back to SIGCHLD
+ *              plus kill(2) on a PID we have not reaped yet (a zombie's PID
+ *              is not reusable, so the parent is safe there too);
+ *   timerfd    the health cadence as a periodic CLOCK_MONOTONIC timer, so
+ *              probes fire on the interval regardless of how long they run;
+ *   timerfd    the --stop-timeout escalation: SIGTERM forwarded, SIGKILL
+ *              when the workload is still there after the grace period.
+ *
+ * spawn_workload() and run_health_probe() stay the only places that fork the
+ * workload or a probe, and enter_workload_context() the only place that
+ * prepares the exec'd process.
+ */
+
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_send_signal
+#define __NR_pidfd_send_signal 424
+#endif
+
+/* Docker's default stop grace: SIGTERM, then SIGKILL after this many
+ * seconds.  --stop-timeout overrides it; 0 waits forever. */
+#define DEFAULT_STOP_TIMEOUT_S 10
+
+/* Signals the supervisor owns while a workload runs. */
+static void supervisor_sigset(sigset_t* set)
 {
-    if (g_init_child_pid > 0)
+    sigemptyset(set);
+    sigaddset(set, SIGTERM);
+    sigaddset(set, SIGINT);
+    sigaddset(set, SIGHUP);
+    sigaddset(set, SIGUSR1);
+    sigaddset(set, SIGUSR2);
+    sigaddset(set, SIGCHLD);
+}
+
+/* Children must not inherit the supervisor's blocked set: a workload that
+ * never sees SIGTERM cannot shut down.  Called in every fork child. */
+static void child_unblock_signals(void)
+{
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+}
+
+struct supervisor
+{
+    int      sigfd;
+    int      health_tfd;
+    int      stop_tfd;
+    int      pidfd;
+    pid_t    child;
+    int      child_exited;
+    int      child_status;
+    int      stop_requested;   /* SIGTERM/SIGINT seen */
+    long     stop_timeout_s;
+    sigset_t saved_mask;
+};
+
+#define SV_EV_SIGNAL 1
+#define SV_EV_CHILD  2
+#define SV_EV_HEALTH 4
+#define SV_EV_STOP   8
+
+static int supervisor_open(struct supervisor* sv, long stop_timeout_s)
+{
+    memset(sv, 0, sizeof(*sv));
+    sv->sigfd = sv->health_tfd = sv->stop_tfd = sv->pidfd = -1;
+    sv->child = -1;
+    sv->stop_timeout_s = stop_timeout_s;
+    sigset_t set;
+    supervisor_sigset(&set);
+    if (sigprocmask(SIG_BLOCK, &set, &sv->saved_mask) < 0)
     {
-        kill(g_init_child_pid, sig);
+        perror("oci2bin: supervisor sigprocmask");
+        return -1;
+    }
+    sv->sigfd = signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK);
+    if (sv->sigfd < 0)
+    {
+        perror("oci2bin: supervisor signalfd");
+        sigprocmask(SIG_SETMASK, &sv->saved_mask, NULL);
+        return -1;
+    }
+    return 0;
+}
+
+static void supervisor_detach_child(struct supervisor* sv)
+{
+    if (sv->pidfd >= 0)
+    {
+        close(sv->pidfd);
+        sv->pidfd = -1;
+    }
+    if (sv->stop_tfd >= 0)
+    {
+        close(sv->stop_tfd);
+        sv->stop_tfd = -1;
+    }
+    sv->child = -1;
+    sv->child_exited = 0;
+    sv->child_status = 0;
+}
+
+static void supervisor_close(struct supervisor* sv)
+{
+    supervisor_detach_child(sv);
+    if (sv->health_tfd >= 0)
+    {
+        close(sv->health_tfd);
+        sv->health_tfd = -1;
+    }
+    if (sv->sigfd >= 0)
+    {
+        close(sv->sigfd);
+        sv->sigfd = -1;
+    }
+    sigprocmask(SIG_SETMASK, &sv->saved_mask, NULL);
+}
+
+static void supervisor_attach_child(struct supervisor* sv, pid_t child)
+{
+    sv->child = child;
+    sv->child_exited = 0;
+    sv->child_status = 0;
+    sv->pidfd = (int)syscall(__NR_pidfd_open, child, 0);
+    if (sv->pidfd < 0)
+    {
+        debug_log("supervisor.pidfd", "unavailable errno=%d", errno);
+        sv->pidfd = -1;
+    }
+}
+
+/* Signal the live workload.  Nothing is sent once it has been reaped. */
+static void supervisor_signal_child(struct supervisor* sv, int sig)
+{
+    if (sv->child <= 0 || sv->child_exited)
+    {
+        return;
+    }
+    if (sv->pidfd >= 0 &&
+            syscall(__NR_pidfd_send_signal, sv->pidfd, sig, NULL, 0) == 0)
+    {
+        return;
+    }
+    kill(sv->child, sig);
+}
+
+/* A periodic health timer: first expiry after max(start_period, interval),
+ * then every interval, on CLOCK_MONOTONIC. */
+static int supervisor_arm_health(struct supervisor* sv, long interval_s,
+                                 long start_period_s)
+{
+    if (sv->health_tfd < 0)
+    {
+        sv->health_tfd = timerfd_create(CLOCK_MONOTONIC,
+                                        TFD_CLOEXEC | TFD_NONBLOCK);
+        if (sv->health_tfd < 0)
+        {
+            perror("oci2bin: health timerfd");
+            return -1;
+        }
+    }
+    long first = start_period_s > interval_s ? start_period_s : interval_s;
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec    = first > 0 ? first : 1;
+    its.it_interval.tv_sec = interval_s > 0 ? interval_s : 1;
+    if (timerfd_settime(sv->health_tfd, 0, &its, NULL) < 0)
+    {
+        perror("oci2bin: health timerfd_settime");
+        return -1;
+    }
+    return 0;
+}
+
+/* One-shot escalation timer; a second call re-arms it. */
+static int supervisor_arm_stop(struct supervisor* sv, long seconds)
+{
+    if (seconds <= 0)
+    {
+        return 0;
+    }
+    if (sv->stop_tfd < 0)
+    {
+        sv->stop_tfd = timerfd_create(CLOCK_MONOTONIC,
+                                      TFD_CLOEXEC | TFD_NONBLOCK);
+        if (sv->stop_tfd < 0)
+        {
+            perror("oci2bin: stop timerfd");
+            return -1;
+        }
+    }
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = seconds;
+    return timerfd_settime(sv->stop_tfd, 0, &its, NULL);
+}
+
+static void supervisor_disarm_health(struct supervisor* sv)
+{
+    if (sv->health_tfd >= 0)
+    {
+        struct itimerspec zero;
+        memset(&zero, 0, sizeof(zero));
+        timerfd_settime(sv->health_tfd, 0, &zero, NULL);
+    }
+}
+
+static void timerfd_drain(int fd)
+{
+    uint64_t n;
+    while (read(fd, &n, sizeof(n)) == (ssize_t)sizeof(n))
+    {
+    }
+}
+
+/* Reap every finished child; note the workload's own status. */
+static void supervisor_reap(struct supervisor* sv)
+{
+    for (;;)
+    {
+        int   st = 0;
+        pid_t r  = waitpid(-1, &st, WNOHANG);
+        if (r <= 0)
+        {
+            if (r < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            return;
+        }
+        if (r == sv->child)
+        {
+            sv->child_exited = 1;
+            sv->child_status = st;
+        }
     }
 }
 
 /*
+ * Drain the signalfd: forward the workload's signals, remember a stop, and
+ * arm the SIGTERM→SIGKILL escalation on the first stop request.  SIGCHLD
+ * triggers a reap pass.
+ */
+static void supervisor_handle_signals(struct supervisor* sv)
+{
+    struct signalfd_siginfo si;
+    for (;;)
+    {
+        ssize_t n = read(sv->sigfd, &si, sizeof(si));
+        if (n != (ssize_t)sizeof(si))
+        {
+            return;
+        }
+        int sig = (int)si.ssi_signo;
+        if (sig == SIGCHLD)
+        {
+            supervisor_reap(sv);
+            continue;
+        }
+        if (sig == SIGTERM || sig == SIGINT)
+        {
+            if (!sv->stop_requested)
+            {
+                sv->stop_requested = 1;
+                supervisor_arm_stop(sv, sv->stop_timeout_s);
+            }
+        }
+        supervisor_signal_child(sv, sig);
+    }
+}
+
+/*
+ * Wait for the next event (or timeout_ms, -1 = forever).  Returns a mask of
+ * SV_EV_*; signals and child exits are already handled when it returns, so
+ * callers only look at sv->child_exited and the timer bits.
+ */
+static int supervisor_wait(struct supervisor* sv, int timeout_ms)
+{
+    struct pollfd fds[4];
+    int kinds[4];
+    int n = 0;
+    fds[n].fd = sv->sigfd;
+    fds[n].events = POLLIN;
+    kinds[n++] = SV_EV_SIGNAL;
+    if (sv->pidfd >= 0 && !sv->child_exited)
+    {
+        fds[n].fd = sv->pidfd;
+        fds[n].events = POLLIN;
+        kinds[n++] = SV_EV_CHILD;
+    }
+    if (sv->health_tfd >= 0)
+    {
+        fds[n].fd = sv->health_tfd;
+        fds[n].events = POLLIN;
+        kinds[n++] = SV_EV_HEALTH;
+    }
+    if (sv->stop_tfd >= 0)
+    {
+        fds[n].fd = sv->stop_tfd;
+        fds[n].events = POLLIN;
+        kinds[n++] = SV_EV_STOP;
+    }
+    for (int i = 0; i < n; i++)
+    {
+        fds[i].revents = 0;
+    }
+    int r = poll(fds, (nfds_t)n, timeout_ms);
+    if (r < 0)
+    {
+        return 0;    /* EINTR: the caller loops */
+    }
+    int ev = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
+        {
+            continue;
+        }
+        ev |= kinds[i];
+        switch (kinds[i])
+        {
+            case SV_EV_SIGNAL:
+                supervisor_handle_signals(sv);
+                break;
+            case SV_EV_CHILD:
+                supervisor_reap(sv);
+                break;
+            case SV_EV_HEALTH:
+                timerfd_drain(sv->health_tfd);
+                break;
+            case SV_EV_STOP:
+                timerfd_drain(sv->stop_tfd);
+                break;
+            default:
+                break;
+        }
+    }
+    /* Without a pidfd the exit arrives as SIGCHLD; either way a reaped
+     * workload counts as a child event. */
+    if (sv->child_exited)
+    {
+        ev |= SV_EV_CHILD;
+    }
+    return ev;
+}
+
+/* The workload has not exited within the grace period: SIGKILL it. */
+static void supervisor_escalate(struct supervisor* sv, const char* why)
+{
+    if (sv->child <= 0 || sv->child_exited)
+    {
+        return;
+    }
+    fprintf(stderr,
+            "oci2bin: workload still running %lds after SIGTERM (%s);"
+            " sending SIGKILL\n", sv->stop_timeout_s, why);
+    supervisor_signal_child(sv, SIGKILL);
+}
+
+/* Exit code from a wait status, Docker style (128 + signal). */
+static int wait_status_to_code(int status)
+{
+    if (WIFEXITED(status))
+    {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status))
+    {
+        return 128 + WTERMSIG(status);
+    }
+    return 1;
+}
+
+/*
  * spawn_workload: fork the container workload. In the child, restore default
- * signal dispositions, drop to the --user UID/GID if requested, and exec
- * exec_args (never returns there). In the parent, return the child PID, or -1
- * on fork failure (message printed). Shared by run_as_init() and
- * run_supervised() so the fork + privilege-drop + exec sequence is defined
- * once. Must be called AFTER seccomp/capability setup.
+ * signal dispositions and the signal mask (the supervisor blocks its set for
+ * the signalfd), drop to the --user UID/GID if requested, and exec exec_args
+ * (never returns there). In the parent, return the child PID, or -1 on fork
+ * failure (message printed). Shared by run_as_init() and run_supervised() so
+ * the fork + privilege-drop + exec sequence is defined once. Must be called
+ * AFTER seccomp/capability setup.
  */
 static pid_t spawn_workload(char** exec_args,
                             const struct container_opts* opts,
@@ -11994,13 +12381,13 @@ static pid_t spawn_workload(char** exec_args,
     }
     if (child == 0)
     {
-        /* Default signal disposition for the workload (the parent installs
-         * forwarders that must not leak into the child). */
+        child_unblock_signals();
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT, SIG_DFL);
         signal(SIGHUP, SIG_DFL);
         signal(SIGUSR1, SIG_DFL);
         signal(SIGUSR2, SIG_DFL);
+        signal(SIGCHLD, SIG_DFL);
         audit_emit_exec_event(exec_args[0]);
         if (enter_workload_context(opts, id, 0) < 0)
         {
@@ -12013,8 +12400,16 @@ static pid_t spawn_workload(char** exec_args,
     return child;
 }
 
+static long effective_stop_timeout(const struct container_opts* opts)
+{
+    return (opts && opts->stop_timeout_set) ? opts->stop_timeout_s
+           : DEFAULT_STOP_TIMEOUT_S;
+}
+
 /*
- * run_as_init: fork the entrypoint as a child, then loop reaping all zombies.
+ * run_as_init: fork the entrypoint as a child, then wait on the supervisor's
+ * poll loop: forward signals, reap every zombie the moment it appears, and
+ * SIGKILL a workload that outlives --stop-timeout after a stop request.
  * Returns the child's exit code, or 1 on fork failure.
  * Must be called AFTER seccomp/capability setup (both apply to parent+child).
  * The UID drop, PTY and LSM labels are applied only in the child.
@@ -12023,67 +12418,31 @@ static int run_as_init(char** exec_args,
                        const struct container_opts* opts,
                        const struct workload_ident* id)
 {
-    pid_t child = spawn_workload(exec_args, opts, id);
-    if (child < 0)
+    struct supervisor sv;
+    if (supervisor_open(&sv, effective_stop_timeout(opts)) < 0)
     {
         return 1;
     }
-
-    /* Parent: install signal forwarders then reap zombies */
-    g_init_child_pid = child;
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = init_forward_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags   = SA_RESTART;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
-    sigaction(SIGUSR1, &sa, NULL);
-    sigaction(SIGUSR2, &sa, NULL);
-
-    int child_status = 0;
-    for (;;)
+    pid_t child = spawn_workload(exec_args, opts, id);
+    if (child < 0)
     {
-        int   status = 0;
-        pid_t reaped = waitpid(-1, &status, 0);
-        if (reaped < 0)
+        supervisor_close(&sv);
+        return 1;
+    }
+    supervisor_attach_child(&sv, child);
+    while (!sv.child_exited)
+    {
+        int ev = supervisor_wait(&sv, -1);
+        if ((ev & SV_EV_STOP) && !sv.child_exited)
         {
-            if (errno == EINTR)
-            {
-                continue;    /* signal interrupted — restart */
-            }
-            if (errno == ECHILD)
-            {
-                break;    /* no more children */
-            }
-            break;
+            supervisor_escalate(&sv, "stop requested");
         }
-        if (reaped == child)
-        {
-            child_status = status;
-            /* Drain remaining zombies then stop */
-            while (waitpid(-1, NULL, WNOHANG) > 0)
-            {
-            }
-            break;
-        }
-        /* else: reaped an orphaned grandchild — continue */
     }
-
-    if (WIFEXITED(child_status))
-    {
-        audit_emit_wait_status("exit", child, child_status);
-        return WEXITSTATUS(child_status);
-    }
-    if (WIFSIGNALED(child_status))
-    {
-        audit_emit_wait_status("exit", child, child_status);
-        return 128 + WTERMSIG(child_status);
-    }
-    audit_emit_wait_status("exit", child, child_status);
-    return 1;
+    int status = sv.child_status;
+    supervisor_reap(&sv);    /* drain the orphans that were reparented to us */
+    supervisor_close(&sv);
+    audit_emit_wait_status("exit", child, status);
+    return wait_status_to_code(status);
 }
 
 /* ── restart + health supervisor ─────────────────────────────────────────── */
@@ -12307,6 +12666,7 @@ static int run_health_probe(char* const argv[], long timeout_s,
     }
     if (pid == 0)
     {
+        child_unblock_signals();
         int devnull = open("/dev/null", O_RDWR);
         if (devnull >= 0)
         {
@@ -12325,85 +12685,108 @@ static int run_health_probe(char* const argv[], long timeout_s,
         execvp(argv[0], argv);
         _exit(127);
     }
-    long limit_ms  = (timeout_s > 0 ? timeout_s : 30) * 1000L;
-    long waited_ms = 0;
-    for (;;)
+    long limit_ms = (timeout_s > 0 ? timeout_s : 30) * 1000L;
+    int  timed_out = 0;
+    int  pidfd = (int)syscall(__NR_pidfd_open, pid, 0);
+    if (pidfd >= 0)
     {
-        int   status = 0;
-        pid_t r      = waitpid(pid, &status, WNOHANG);
-        if (r == pid)
+        /* Sleep exactly until the probe exits or its deadline passes. */
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (;;)
         {
-            if (WIFEXITED(status))
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
+                              (now.tv_nsec - start.tv_nsec) / 1000000L;
+            long left = limit_ms - elapsed_ms;
+            if (left <= 0)
             {
-                return WEXITSTATUS(status) == 0 ? 0 : 1;
+                timed_out = 1;
+                break;
             }
-            return 1;
-        }
-        if (r < 0)
-        {
-            if (errno == EINTR)
+            struct pollfd pf = { pidfd, POLLIN, 0 };
+            int r = poll(&pf, 1, (int)left);
+            if (r > 0)
             {
-                continue;
+                break;
             }
-            return 1;
-        }
-        if (waited_ms >= limit_ms)
-        {
-            kill(pid, SIGKILL);
-            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+            if (r == 0)
             {
+                timed_out = 1;
+                break;
             }
-            return 1;
+            if (errno != EINTR)
+            {
+                timed_out = 1;
+                break;
+            }
         }
-        struct timespec ts = {0, 100L * 1000L * 1000L};
-        nanosleep(&ts, NULL);
-        waited_ms += 100;
+        close(pidfd);
     }
-}
-
-/* Stop requested via SIGTERM/SIGINT — suppresses "always"/"unless-stopped"
- * relaunches after an explicit stop. */
-static volatile sig_atomic_t g_supervise_stop = 0;
-
-static void supervise_forward_signal(int sig)
-{
-    if (sig == SIGTERM || sig == SIGINT)
+    else
     {
-        g_supervise_stop = 1;
+        /* No pidfd: fall back to polling the wait status. */
+        long waited_ms = 0;
+        for (;;)
+        {
+            int   status = 0;
+            pid_t r      = waitpid(pid, &status, WNOHANG);
+            if (r == pid)
+            {
+                return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
+            }
+            if (r < 0 && errno != EINTR)
+            {
+                return 1;
+            }
+            if (waited_ms >= limit_ms)
+            {
+                timed_out = 1;
+                break;
+            }
+            struct timespec ts = {0, 100L * 1000L * 1000L};
+            nanosleep(&ts, NULL);
+            waited_ms += 100;
+        }
     }
-    if (g_init_child_pid > 0)
+    if (timed_out)
     {
-        kill(g_init_child_pid, sig);
+        kill(pid, SIGKILL);
     }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    {
+    }
+    if (timed_out)
+    {
+        return 1;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
 
 /*
  * Supervising PID-1 loop: (re)launch the workload per the restart policy and,
  * when health monitoring is enabled, probe it on its interval.  Reaps orphaned
  * grandchildren like the --init reaper.  Returns the workload's last exit code.
+ *
+ * Everything waits in supervisor_wait(): the health timerfd keeps probes on
+ * their exact cadence, the pidfd reports the exit instantly, the signalfd
+ * forwards stop signals, and the stop timerfd escalates SIGTERM to SIGKILL
+ * after --stop-timeout, for a user stop and for the SIGTERM sent to an
+ * unhealthy workload alike.
  */
-/* Grace period between the SIGTERM sent to an unhealthy workload and the
- * SIGKILL that follows if it has not exited (Docker's stop timeout). */
-#define SUPERVISE_KILL_GRACE_S 10
-
 static int run_supervised(char** exec_args,
                           const struct container_opts* opts,
                           const struct health_state* hs,
                           const struct workload_ident* id)
 {
-    g_supervise_stop = 0;
-    g_init_child_pid = 0;
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = supervise_forward_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
-    sigaction(SIGUSR1, &sa, NULL);
-    sigaction(SIGUSR2, &sa, NULL);
+    struct supervisor sv;
+    long stop_timeout = effective_stop_timeout(opts);
+    if (supervisor_open(&sv, stop_timeout) < 0)
+    {
+        return 1;
+    }
 
     int restart_count = 0;
     int last_code     = 0;
@@ -12413,10 +12796,10 @@ static int run_supervised(char** exec_args,
         pid_t child = spawn_workload(exec_args, opts, id);
         if (child < 0)
         {
+            supervisor_close(&sv);
             return 1;
         }
-
-        g_init_child_pid = child;
+        supervisor_attach_child(&sv, child);
         if (restart_count > 0)
         {
             char detail[96];
@@ -12426,119 +12809,84 @@ static int run_supervised(char** exec_args,
             notify_event(opts, "container_restart", detail);
         }
 
-        time_t started      = time(NULL);
-        time_t last_probe   = started;
-        int    consec_fail  = 0;
-        int    cur_health   = 0; /* 0 unknown, 1 healthy, 2 unhealthy */
-        int    health_acted = 0;
-        time_t term_sent    = 0;
-        int    status       = 0;
-        int    got_child    = 0;
-
-        while (!got_child)
+        int consec_fail  = 0;
+        int cur_health   = 0; /* 0 unknown, 1 healthy, 2 unhealthy */
+        int health_acted = 0;
+        if (hs && hs->enabled &&
+                supervisor_arm_health(&sv, hs->interval_s,
+                                      hs->start_period_s) < 0)
         {
-            pid_t r = waitpid(-1, &status, WNOHANG);
-            if (r == child)
+            supervisor_close(&sv);
+            return 1;
+        }
+
+        while (!sv.child_exited)
+        {
+            int ev = supervisor_wait(&sv, -1);
+            if (sv.child_exited)
             {
-                got_child = 1;
                 break;
             }
-            if (r > 0)
+            if (ev & SV_EV_STOP)
             {
-                continue; /* reaped an orphaned grandchild */
+                supervisor_escalate(&sv, health_acted && !sv.stop_requested
+                                    ? "unhealthy" : "stop requested");
             }
-            if (r < 0)
+            if ((ev & SV_EV_HEALTH) && hs && hs->enabled && !health_acted &&
+                    !sv.stop_requested)
             {
-                if (errno == EINTR)
+                int probe = run_health_probe(hs->argv, hs->timeout_s, opts,
+                                             id);
+                if (probe == 0)
                 {
-                    continue;
-                }
-                if (errno == ECHILD)
-                {
-                    status    = 0;
-                    got_child = 1;
-                    break;
-                }
-            }
-            /* r == 0: workload still running.  A workload that traps the
-             * SIGTERM sent for failing health checks is killed after the
-             * grace period instead of hanging the supervisor forever. */
-            if (health_acted && term_sent > 0
-                    && time(NULL) - term_sent >= SUPERVISE_KILL_GRACE_S)
-            {
-                kill(child, SIGKILL);
-                term_sent = 0;
-            }
-            if (hs && hs->enabled && !health_acted)
-            {
-                time_t now = time(NULL);
-                if ((now - started) >= hs->start_period_s
-                        && (now - last_probe) >= hs->interval_s)
-                {
-                    last_probe = now;
-                    int probe  = run_health_probe(hs->argv, hs->timeout_s,
-                                                  opts, id);
-                    if (probe == 0)
+                    consec_fail = 0;
+                    if (cur_health != 1)
                     {
-                        consec_fail = 0;
-                        if (cur_health != 1)
-                        {
-                            cur_health = 1;
-                            debug_log("health.healthy", "pid=%d", (int)child);
-                        }
+                        cur_health = 1;
+                        debug_log("health.healthy", "pid=%d", (int)child);
                     }
-                    else
+                }
+                else
+                {
+                    consec_fail++;
+                    debug_log("health.fail", "consec=%d/%d",
+                              consec_fail, hs->retries);
+                    if (consec_fail >= hs->retries && cur_health != 2)
                     {
-                        consec_fail++;
-                        debug_log("health.fail", "consec=%d/%d",
-                                  consec_fail, hs->retries);
-                        if (consec_fail >= hs->retries && cur_health != 2)
+                        cur_health = 2;
+                        fprintf(stderr,
+                                "oci2bin: container unhealthy (%d "
+                                "consecutive health-check failures)\n",
+                                consec_fail);
+                        char d[64];
+                        snprintf(d, sizeof(d), "\"failures\":%d",
+                                 consec_fail);
+                        notify_event(opts, "healthcheck_fail", d);
+                        if (opts->restart_policy != RESTART_NO)
                         {
-                            cur_health = 2;
-                            fprintf(stderr,
-                                    "oci2bin: container unhealthy (%d "
-                                    "consecutive health-check failures)\n",
-                                    consec_fail);
-                            char d[64];
-                            snprintf(d, sizeof(d), "\"failures\":%d",
-                                     consec_fail);
-                            notify_event(opts, "healthcheck_fail", d);
-                            if (opts->restart_policy != RESTART_NO)
-                            {
-                                kill(child, SIGTERM);
-                                health_acted = 1;
-                                term_sent    = time(NULL);
-                            }
+                            /* A workload that traps this SIGTERM is killed
+                             * after the stop timeout; "never escalate" (0)
+                             * would hang the supervisor, so the default
+                             * grace applies then. */
+                            supervisor_signal_child(&sv, SIGTERM);
+                            health_acted = 1;
+                            supervisor_arm_stop(&sv, stop_timeout > 0
+                                                ? stop_timeout
+                                                : DEFAULT_STOP_TIMEOUT_S);
                         }
                     }
                 }
             }
-            struct timespec ts = {0, 200L * 1000L * 1000L};
-            nanosleep(&ts, NULL);
         }
 
-        if (WIFEXITED(status))
-        {
-            last_code = WEXITSTATUS(status);
-        }
-        else if (WIFSIGNALED(status))
-        {
-            last_code = 128 + WTERMSIG(status);
-        }
-        else
-        {
-            last_code = 1;
-        }
-        audit_emit_wait_status("exit", child, status);
-        g_init_child_pid = 0;
-
-        /* Drain any remaining zombies before deciding on a restart. */
-        while (waitpid(-1, NULL, WNOHANG) > 0)
-        {
-        }
+        last_code = wait_status_to_code(sv.child_status);
+        audit_emit_wait_status("exit", child, sv.child_status);
+        supervisor_disarm_health(&sv);
+        supervisor_reap(&sv);    /* drain any remaining zombies */
+        supervisor_detach_child(&sv);
 
         int do_restart = 0;
-        if (!g_supervise_stop)
+        if (!sv.stop_requested)
         {
             switch (opts->restart_policy)
             {
@@ -12568,18 +12916,15 @@ static int run_supervised(char** exec_args,
                 "last exit %d)\n",
                 restart_count, last_code);
         /* Brief backoff to avoid a hot crash loop.  A stop signal landing
-         * here interrupts the sleep (no SA_RESTART for nanosleep) and must
-         * end the loop instead of starting another workload. */
-        struct timespec bo = {1, 0};
-        while (!g_supervise_stop && nanosleep(&bo, &bo) < 0 && errno == EINTR)
-        {
-        }
-        if (g_supervise_stop)
+         * here must end the loop instead of starting another workload. */
+        supervisor_wait(&sv, 1000);
+        if (sv.stop_requested)
         {
             break;
         }
     }
 
+    supervisor_close(&sv);
     return last_code;
 }
 /* ── Landlock LSM filesystem sandbox ─────────────────────────────────────── */
@@ -16869,7 +17214,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
 
     /* --init: run a zombie-reaping init loop; the child enters the workload
      * context (uid, PTY, labels, caps) before exec. */
-    if (opts->use_init)
+    if (opts->use_init || opts->stop_timeout_set)
     {
         return run_as_init(exec_args, opts, &wid);
     }
@@ -17388,6 +17733,9 @@ static void usage(const char* prog)
             " --health-start-period N\n"
             "  --no-health         Disable health monitoring even if the image"
             " declares one\n"
+            "  --stop-timeout N    Seconds between the SIGTERM forwarded to the\n"
+            "                      workload and a SIGKILL (default 10; 0 = never);\n"
+            "                      implies --init\n"
             "  --detach, -d        Run container in background; print PID to stdout\n"
             "  -t, --tty           Allocate a pseudo-terminal for the container\n"
             "  -i, --interactive   Keep stdin open; combine with -t for -it mode\n"
@@ -18852,6 +19200,27 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-health") == 0)
         {
             opts->health_disabled = 1;
+        }
+        else if (strcmp(argv[i], "--stop-timeout") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --stop-timeout requires SECONDS\n");
+                return -1;
+            }
+            char* endp = NULL;
+            errno = 0;
+            long n = strtol(argv[++i], &endp, 10);
+            if (endp == argv[i] || *endp != '\0' || errno != 0 || n < 0 ||
+                    n > 86400)
+            {
+                fprintf(stderr,
+                        "oci2bin: --stop-timeout: expected 0-86400 seconds,"
+                        " got '%s'\n", argv[i]);
+                return -1;
+            }
+            opts->stop_timeout_s   = n;
+            opts->stop_timeout_set = 1;
         }
         else if (strcmp(argv[i], "--health-cmd") == 0)
         {

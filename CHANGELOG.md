@@ -4,7 +4,30 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The `--init` / `--restart` / `--health` supervisor is event-driven.**
+  Both loops polled `waitpid(WNOHANG)` with 200 ms sleeps and forwarded
+  signals from handlers through a global PID; health probes drifted by up to
+  a sleep per interval and the kill-after-grace path compared `time(2)`
+  seconds. They now wait in one `poll(2)` on a `signalfd` (the forwarded
+  signals and `SIGCHLD`, blocked so nothing is lost), the workload's
+  `pidfd_open(2)` handle (readable the instant it exits; signalled with
+  `pidfd_send_signal(2)`, which cannot hit a recycled PID), a periodic
+  `timerfd` for the health cadence and a one-shot one for the stop grace.
+  Kernels without pidfd fall back to `SIGCHLD` plus `kill(2)`. Health probes
+  wait on their own pidfd instead of sleeping in 100 ms steps, forked
+  children clear the inherited signal mask before exec, and
+  `spawn_workload()` / `enter_workload_context()` remain the only places
+  that fork and prepare the workload.
+
 ### Added
+
+- **`--stop-timeout N`**: seconds between the SIGTERM the supervisor
+  forwards to the workload (or sends to an unhealthy one) and the SIGKILL
+  that follows if it is still running. Default 10, as in Docker; `0` never
+  escalates a user stop. Given on its own it implies `--init`.
+
 
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
