@@ -240,6 +240,7 @@ byte-for-byte reproducible.
 | Declarative stack up/down | `oci2bin up`, `oci2bin down` |
 | Stack subcommands | `oci2bin stack up/down/logs/config` |
 | Host capability checks (build host) | `oci2bin doctor`, `oci2bin doctor --json` |
+| Live probes and install of the missing packages | `oci2bin doctor --probe`, `oci2bin doctor --fix` |
 | Host capability checks (runtime host) | `./app.bin --doctor` |
 | MCP server | `oci2bin mcp-serve` |
 | MCP host-mount allowlist (deny by default) | `mcp-serve --allow-mount PATH` / `--allow-mount-rw PATH` |

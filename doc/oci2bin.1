@@ -848,9 +848,22 @@ Combined report: embedded metadata (secrets redacted) plus a host-capability
 check for what the binary needs to run.
 .
 .TP
-.B oci2bin doctor \fR[\fB\-\-json\fR]
+.B oci2bin doctor \fR[\fB\-\-json\fR] [\fB\-\-probe\fR] [\fB\-\-fix\fR]
 Probe the host for the toolchain and kernel features oci2bin uses and print a
 fix command for each missing piece.
+.B \-\-probe
+adds live checks that do what the loader does:
+.BR "unshare \-Ur true" ,
+.BR linkat (2)
+with
+.BR AT_EMPTY_PATH ,
+opening
+.I /dev/kvm
+read-write, and a tar extraction with the loader's flags (reporting the tar
+vendor).
+.B \-\-fix
+runs the distro install command the summary prints (never through a shell;
+the package manager's own prompt applies) and re-checks afterwards.
 .
 .TP
 .B oci2bin sbom \fIBINARY\fR

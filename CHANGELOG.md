@@ -6,6 +6,15 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`oci2bin doctor --probe` and `--fix`.** `--probe` adds live checks
+  that do what the loader does instead of looking for files: `unshare
+  -Ur true` and `-Urm true`, `linkat(AT_EMPTY_PATH)` on a temporary file,
+  `open("/dev/kvm", O_RDWR)`, and a tar extraction with exactly the
+  loader's flags that also reports the tar vendor and that a set-ID bit
+  was dropped. `--fix` runs the distro install command the summary
+  already prints, as an argument list (no shell, `sudo` dropped when
+  root), lists the manual-install items, and re-checks afterwards.
+
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
   `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, keyed by the SHA-256

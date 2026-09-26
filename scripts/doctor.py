@@ -8,6 +8,10 @@ Output:
   - Default: human-readable table to stdout. Exit 0 if everything is
     OK or only DEGRADED, exit 1 if any required check is MISSING.
   - --json: machine-readable list of check results.
+  - --probe: also run the live probes (create a user namespace, link a
+    file by descriptor, open /dev/kvm, extract a tar with the loader's
+    flags) instead of only looking for files and tools.
+  - --fix: run the distro install command the summary prints.
 
 A check yields one of:
   OK        feature is present and works
@@ -20,11 +24,14 @@ Pure stdlib. No external deps.
 import argparse
 import ctypes
 import errno
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 
 
 # ── Result helpers ───────────────────────────────────────────────────────────
@@ -582,6 +589,168 @@ def _check_tar_gzip_zstd():
                    ", ".join(parts), fix)
 
 
+# ── Live probes (--probe) ───────────────────────────────────────────────────
+#
+# The checks above look for files, tools and sysctl knobs.  These do the
+# operation the loader will do and report what the kernel actually answers,
+# which is what matters on a locked-down host (AppArmor userns policies,
+# seccomp'd CI runners, /dev/kvm with the wrong group, a BSD or busybox tar).
+
+def _probe_unshare():
+    """unshare -Ur true: an unprivileged user namespace with a root map,
+    the first thing every launch does."""
+    if _which("unshare") is None:
+        return _result("probe: user namespace", DEGRADED,
+                       "unshare(1) not in PATH; cannot probe",
+                       "apt install util-linux")
+    rc, _out, err = _run(["unshare", "-Ur", "true"])
+    if rc == 0:
+        rc_m, _o, err_m = _run(["unshare", "-Urm", "true"])
+        if rc_m == 0:
+            return _result("probe: user namespace", OK,
+                           "unshare -Ur true and -Urm true succeed")
+        return _result("probe: user namespace", MISSING,
+                       "user namespace works but a mount namespace inside"
+                       " it is refused: " + err_m.strip(),
+                       "sudo sysctl -w kernel.apparmor_restrict_"
+                       "unprivileged_userns=0, or run with --vm")
+    return _result("probe: user namespace", MISSING,
+                   "unshare -Ur true failed: " + (err.strip() or f"rc={rc}"),
+                   "enable unprivileged user namespaces "
+                   "(kernel.unprivileged_userns_clone=1, "
+                   "kernel.apparmor_restrict_unprivileged_userns=0)")
+
+
+_AT_EMPTY_PATH = 0x1000
+
+
+def _probe_linkat_empty_path():
+    """linkat(fd, "", dirfd, name, AT_EMPTY_PATH): how the loader links a
+    staged file into the rootfs by descriptor.  Before Linux 6.10 it needs
+    CAP_DAC_READ_SEARCH; the loader falls back to a /proc/self/fd path,
+    which is slower and what this probe surfaces."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError:
+        return _result("probe: linkat(AT_EMPTY_PATH)", DEGRADED,
+                       "libc not loadable", "")
+    try:
+        with tempfile.TemporaryDirectory(prefix="oci2bin-doctor-") as td:
+            dirfd = os.open(td, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                src = os.open(os.path.join(td, "src"),
+                              os.O_WRONLY | os.O_CREAT, 0o600)
+                try:
+                    rc = libc.linkat(src, b"", dirfd, b"linked",
+                                     _AT_EMPTY_PATH)
+                    e = ctypes.get_errno() if rc < 0 else 0
+                finally:
+                    os.close(src)
+            finally:
+                os.close(dirfd)
+    except OSError as exc:
+        return _result("probe: linkat(AT_EMPTY_PATH)", DEGRADED,
+                       f"could not set up the probe: {exc}", "")
+    if rc == 0:
+        return _result("probe: linkat(AT_EMPTY_PATH)", OK,
+                       "links by descriptor")
+    return _result("probe: linkat(AT_EMPTY_PATH)", DEGRADED,
+                   f"refused ({os.strerror(e)}); the loader falls back to"
+                   " linking via /proc/self/fd (Linux < 6.10 without"
+                   " CAP_DAC_READ_SEARCH)",
+                   "upgrade to Linux 6.10+ for the direct path")
+
+
+def _probe_kvm_open():
+    """open(/dev/kvm, O_RDWR): what --vm needs, group membership included."""
+    try:
+        fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return _result("probe: /dev/kvm", DEGRADED,
+                       "absent — --vm unavailable (no KVM on this host"
+                       " or module not loaded)",
+                       "load kvm_intel/kvm_amd, or use container mode")
+    except PermissionError as exc:
+        return _result("probe: /dev/kvm", DEGRADED,
+                       f"present but open(O_RDWR) refused ({exc.strerror})",
+                       "add your user to the kvm group and log in again")
+    except OSError as exc:
+        return _result("probe: /dev/kvm", DEGRADED,
+                       f"open failed: {exc.strerror}", "")
+    os.close(fd)
+    return _result("probe: /dev/kvm", OK, "opens read-write")
+
+
+# The flags extract_layer() passes to tar; a tar that rejects any of them
+# cannot unpack a layer.  --keep-directory-symlink is added only for GNU tar
+# >= 1.32, as in the loader.
+_LOADER_TAR_FLAGS = ["--no-same-permissions", "--no-same-owner", "--xattrs",
+                     "--xattrs-include=*", "--acls",
+                     "--delay-directory-restore"]
+
+
+def _probe_tar_extract():
+    """Extract a tiny archive with exactly the loader's tar flags and report
+    the tar vendor: GNU, bsdtar and busybox differ in what they accept."""
+    if _which("tar") is None:
+        return _result("probe: tar extraction", MISSING, "tar not in PATH",
+                       "apt install tar")
+    rc, out, _err = _run(["tar", "--version"])
+    first = (out or "").splitlines()[0].strip() if out else ""
+    if "GNU tar" in first:
+        vendor = "GNU tar"
+    elif "bsdtar" in first or "libarchive" in first:
+        vendor = "bsdtar"
+    elif "busybox" in first.lower() or rc != 0:
+        vendor = "busybox or unknown tar"
+    else:
+        vendor = first or "unknown tar"
+    flags = list(_LOADER_TAR_FLAGS)
+    note = _tar_version_note()
+    if vendor == "GNU tar" and "disabled" not in note:
+        flags.append("--keep-directory-symlink")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo("d")
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        tf.addfile(info)
+        data = b"probe\n"
+        info = tarfile.TarInfo("d/f")
+        info.size = len(data)
+        info.mode = 0o4755    # a set-ID bit --no-same-permissions must drop
+        tf.addfile(info, io.BytesIO(data))
+    with tempfile.TemporaryDirectory(prefix="oci2bin-doctor-") as td:
+        archive = os.path.join(td, "probe.tar")
+        with open(archive, "wb") as f:
+            f.write(buf.getvalue())
+        dest = os.path.join(td, "out")
+        os.mkdir(dest)
+        rc, _out, err = _run(["tar", "xf", archive, "-C", dest] + flags)
+        extracted = os.path.join(dest, "d", "f")
+        if rc != 0 or not os.path.isfile(extracted):
+            return _result("probe: tar extraction", MISSING,
+                           f"{vendor}{note}: extraction with the loader's"
+                           " flags failed: " + (err.strip() or f"rc={rc}"),
+                           "install GNU tar >= 1.32")
+        mode = os.stat(extracted).st_mode & 0o7777
+    if mode & 0o6000:
+        return _result("probe: tar extraction", MISSING,
+                       f"{vendor}{note}: --no-same-permissions left a set-ID"
+                       f" bit (mode {mode:o})",
+                       "install GNU tar >= 1.32")
+    return _result("probe: tar extraction", OK,
+                   f"{vendor}{note}; loader flags accepted, set-ID dropped")
+
+
+PROBES = [
+    _probe_unshare,
+    _probe_linkat_empty_path,
+    _probe_kvm_open,
+    _probe_tar_extract,
+]
+
+
 # ── Driver ──────────────────────────────────────────────────────────────────
 
 CHECKS = [
@@ -763,6 +932,59 @@ def _install_summary(results, pkgmgr, install_cmd, pretty):
     return lines
 
 
+def _fix_command(results, pkgmgr, install_cmd):
+    """The install command --fix runs, as an argv list (never a shell
+    string), or None when nothing is packaged for the non-OK checks.
+    `sudo` is dropped when already root: containers often have none."""
+    if pkgmgr is None:
+        return None
+    pkgs = []
+    for r in results:
+        if r["status"] == OK:
+            continue
+        p, _m = _packages(r, pkgmgr)
+        pkgs.extend(p)
+    seen = set()
+    pkgs = [x for x in pkgs if not (x in seen or seen.add(x))]
+    if not pkgs:
+        return None
+    argv = install_cmd.split()
+    if argv and argv[0] == "sudo" and os.geteuid() == 0:
+        argv = argv[1:]
+    return argv + pkgs
+
+
+def _run_fix(results, pkgmgr, install_cmd, pretty):
+    """Run the distro install command for the non-OK checks.  Returns the
+    exit status to report.  The package manager keeps its own confirmation
+    prompt: stdin is inherited, nothing is answered for the user."""
+    if pkgmgr is None:
+        print(f"doctor --fix: unrecognized distro ({pretty}); install the"
+              " packages from the per-check fix: lines by hand",
+              file=sys.stderr)
+        return 1
+    argv = _fix_command(results, pkgmgr, install_cmd)
+    manual = sorted({m for r in results if r["status"] != OK
+                     for m in [_packages(r, pkgmgr)[1]] if m})
+    if argv is None:
+        print("doctor --fix: nothing to install — all checks OK or"
+              " kernel-only.")
+        if manual:
+            print("  install manually: " + "; ".join(manual))
+        return 0
+    print("doctor --fix: running " + " ".join(argv), flush=True)
+    try:
+        rc = subprocess.run(argv).returncode
+    except OSError as exc:
+        print(f"doctor --fix: cannot run {argv[0]}: {exc}", file=sys.stderr)
+        return 1
+    if manual:
+        print("  install manually: " + "; ".join(manual))
+    if rc != 0:
+        print(f"doctor --fix: {argv[0]} exited with {rc}", file=sys.stderr)
+    return rc
+
+
 def _print_table(results):
     name_w = max(len(r["name"]) for r in results) + 2
     status_w = max(len(r["status"]) for r in results) + 2
@@ -782,8 +1004,19 @@ def main():
                     "and kernel features")
     p.add_argument("--json", action="store_true",
                    help="machine-readable JSON output")
+    p.add_argument("--probe", action="store_true",
+                   help="also run the live probes: unshare -Ur, "
+                        "linkat(AT_EMPTY_PATH), open /dev/kvm, a tar "
+                        "extraction with the loader's flags")
+    p.add_argument("--fix", action="store_true",
+                   help="run the distro install command for the missing "
+                        "packages (the one the summary prints)")
     args = p.parse_args()
+    if args.fix and args.json:
+        p.error("--fix cannot be combined with --json")
     results = [c() for c in CHECKS]
+    if args.probe:
+        results.extend(c() for c in PROBES)
     pkgmgr, install_cmd, pretty = _detect_pkgmgr()
     if args.json:
         # Stable shape: a list of check results (consumers depend on this).
@@ -794,6 +1027,12 @@ def main():
         print()
         for line in _install_summary(results, pkgmgr, install_cmd, pretty):
             print(line)
+    if args.fix:
+        rc = _run_fix(results, pkgmgr, install_cmd, pretty)
+        if rc != 0:
+            sys.exit(rc)
+        # Re-check so the exit status reflects the host after the install.
+        results = [c() for c in CHECKS]
     # Exit non-zero only on hard MISSING; DEGRADED is informational.
     if any(r["status"] == MISSING for r in results):
         sys.exit(1)

@@ -156,6 +156,10 @@
 #   --                    End of options; remaining args are CMD
 #
 # Cache subcommands:
+#   doctor [--json] [--probe] [--fix]
+#                         Check this host's toolchain and kernel features;
+#                         --probe runs live checks, --fix installs what is
+#                         missing with the distro package manager
 #   list [--json]         List all cached binaries with image name, size, date
 #   prune [--dry-run] [--max-age DAYS] [--max-size SIZE] [--all]
 #                         Remove superseded build outputs (keep newest per

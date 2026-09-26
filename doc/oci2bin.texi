@@ -952,9 +952,12 @@ Unavailable FUSE or KVM modes are reported as skipped; @option{--json} retains
 the raw samples and host metadata.
 @item oci2bin explain BINARY [--json]
 Inspect plus a host-capability check of what the binary needs to run.
-@item oci2bin doctor [--json]
+@item oci2bin doctor [--json] [--probe] [--fix]
 Probe the host for oci2bin's toolchain/kernel features and print a fix command
-for each missing piece.
+for each missing piece. @option{--probe} adds live checks (@command{unshare -Ur
+true}, @code{linkat(AT_EMPTY_PATH)}, opening @file{/dev/kvm}, a tar extraction
+with the loader's flags); @option{--fix} runs the printed distro install
+command.
 @item oci2bin list [--json]
 List cached binaries.
 @item oci2bin prune [--dry-run] [--max-age DAYS] [--max-size SIZE] [--all]

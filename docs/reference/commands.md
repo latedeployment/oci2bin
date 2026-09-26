@@ -191,7 +191,7 @@ oci2bin logs [-f | --follow] NAME
 oci2bin checkpoint NAME
 oci2bin restore NAME
 oci2bin top [--once] [--interval SEC]
-oci2bin doctor [--json]
+oci2bin doctor [--json] [--probe] [--fix]
 oci2bin mcp-serve [--allow-net] [--allow-mount PATH] [--allow-mount-rw PATH]
 ```
 

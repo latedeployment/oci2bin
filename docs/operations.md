@@ -349,6 +349,8 @@ oci2bin reconstruct redis:7-alpine --label-prefix myorg.loader
 ```bash
 oci2bin doctor          # build host
 oci2bin doctor --json   # build host, machine-readable
+oci2bin doctor --probe  # build host, plus live probes
+oci2bin doctor --fix    # install what the summary lists
 ./app.bin --doctor      # deployment host
 ```
 
@@ -356,6 +358,24 @@ The CLI doctor checks the machine that builds artifacts. The artifact doctor
 checks the machine on which that exact file will run, without extracting it or
 creating namespaces. Use the latter when a deployment host behaves differently
 from the build machine.
+
+`--probe` adds four live checks that do what the loader does rather than
+look for files: `unshare -Ur true` and `unshare -Urm true` (a user namespace,
+and a mount namespace inside it, which AppArmor policies refuse separately),
+`linkat(AT_EMPTY_PATH)` on a temporary file (the by-descriptor link the loader
+uses; before Linux 6.10 it needs `CAP_DAC_READ_SEARCH` and the loader falls
+back to `/proc/self/fd`), `open("/dev/kvm", O_RDWR)` (group membership, not
+just presence) and an extraction of a tiny archive with exactly the loader's
+tar flags, reporting the tar vendor and that `--no-same-permissions` dropped
+a set-ID bit. They appear as `probe: …` rows and in `--json`.
+
+`--fix` runs the distro install command the summary prints, as an argument
+list and never through a shell, with `sudo` dropped when already root. The
+package manager keeps its own confirmation prompt. Items that are not
+packaged (cosign, rekor-cli, a VM backend) are listed for manual install; an
+unrecognized distro exits 1 with nothing run. After a successful install the
+checks run again so the exit status reflects the host as it now is. `--fix`
+cannot be combined with `--json`.
 
 Common checks:
 
