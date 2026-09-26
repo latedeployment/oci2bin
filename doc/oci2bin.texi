@@ -199,7 +199,7 @@ stores (@file{/etc/credstore.encrypted} and friends), needs root and
 @command{systemd-creds}, and is rejected together with @option{--vm}.
 @item --device /dev/H[:C] / --gpus all|N|CDI / --cdi-device KIND=DEV / --no-host-dev
 Expose device nodes, GPUs/CDI devices, or skip the host /dev nodes.
-@item --net host|none|userspace|slirp|pasta|container:PID / -p H:C / --allow-egress H:P
+@item --net host|none|deny-tcp|userspace|slirp|pasta|container:PID / -p H:C / --allow-egress H:P
 Network modes, published ports, default-deny egress allowlist.
 @item --dns IP / --dns-search D / --add-host H:IP / --ipc container:PID
 Custom DNS, /etc/hosts entries, shared IPC namespace.
@@ -290,6 +290,10 @@ without installing, run it directly from the repository root.
 @table @command
 @item make test-unit
 Run the fast unit suite without requiring Docker or Podman.
+@item make check-packaging
+Stage @command{make install} under a temporary DESTDIR and run the installed
+@command{oci2bin} and @command{oci2vm}; with
+@code{CHECK_PACKAGING_FLAGS=--wheel} also build and exercise the wheel.
 @item make test-all
 Run the full unit sweep on native x86_64 and cross-compiled aarch64.
 This target does not require Docker or Podman.
@@ -908,10 +912,18 @@ privileges.
 @cindex PID 1
 
 @option{--init} runs a tiny zombie-reaping init as PID@tie{}1.  The
-entrypoint is forked as a child; the parent loops reaping zombies.
-@code{SIGTERM}, @code{SIGINT}, @code{SIGHUP}, @code{SIGUSR1}, and
+entrypoint is forked as a child; the parent waits in one @code{poll} on a
+signalfd, the child's pidfd and timerfds, reaping zombies the moment they
+appear.  @code{SIGTERM}, @code{SIGINT}, @code{SIGHUP}, @code{SIGUSR1}, and
 @code{SIGUSR2} are forwarded to the child.  When the main child exits,
 remaining zombies are drained and the exit status is returned.
+
+@opindex --stop-timeout
+@option{--stop-timeout N} is the grace between a forwarded @code{SIGTERM}
+(or the one sent to an unhealthy workload) and the @code{SIGKILL} that
+follows when the workload is still running: 10 seconds by default, as in
+Docker; @code{0} never escalates a user stop.  Given on its own it implies
+@option{--init}.
 
 @example
 ./my-app --init
@@ -952,9 +964,12 @@ Unavailable FUSE or KVM modes are reported as skipped; @option{--json} retains
 the raw samples and host metadata.
 @item oci2bin explain BINARY [--json]
 Inspect plus a host-capability check of what the binary needs to run.
-@item oci2bin doctor [--json]
+@item oci2bin doctor [--json] [--probe] [--fix]
 Probe the host for oci2bin's toolchain/kernel features and print a fix command
-for each missing piece.
+for each missing piece. @option{--probe} adds live checks (@command{unshare -Ur
+true}, @code{linkat(AT_EMPTY_PATH)}, opening @file{/dev/kvm}, a tar extraction
+with the loader's flags); @option{--fix} runs the printed distro install
+command.
 @item oci2bin list [--json]
 List cached binaries.
 @item oci2bin prune [--dry-run] [--max-age DAYS] [--max-size SIZE] [--all]
@@ -963,12 +978,18 @@ Remove superseded build outputs and evict cached extracted rootfs trees.
 Compare two binaries' filesystems (@code{+}/@code{-}/@code{M}).
 @item oci2bin diff-fs OVERLAY_PATH
 Classify an overlayfs upperdir (after @option{--overlay-persist}).
-@item oci2bin sbom BINARY
-Generate a Software Bill of Materials for the embedded image.
+@item oci2bin sbom BINARY [--format spdx|cyclonedx]
+Generate a Software Bill of Materials for the embedded image. SPDX output
+DESCRIBES a root package for the image that CONTAINS every OS package;
+CycloneDX lists them as the root component's dependencies.
 @item oci2bin reconstruct SRC [--output PATH]
 Rebuild a polyglot from an image/tar carrying an embedded loader.
 @item oci2bin push BINARY REF
 Push the embedded image payload to an OCI registry.
+@item oci2bin update [--check] [--verify-key PATH] BINARY
+Rebuild BINARY from its image when its digest moved, replaying the build
+options recorded in the metadata block (@code{build_args}); @option{--check}
+only reports.
 @item oci2bin exec PID [--] CMD ...
 Run a command inside a running container's namespaces (needs @command{nsenter}).
 @item oci2bin ps / stop NAME / logs [-f] NAME
@@ -986,6 +1007,8 @@ Dump and restore a running container with CRIU.
 @item oci2bin sign --key KEY --in BIN [--rekor] [--attest A] / verify --key PUB --in BIN
 Sign a binary (optionally publishing a Rekor entry / embedding an attestation)
 and verify it; an embedded attestation must name the binary as its subject.
+On success @code{verify} prints one trust summary line (key id, signed-content
+hash, attestation state, Rekor log index and inclusion state).
 @item oci2bin attest verify --signing-key PUB --in BIN [--recheck] [--key COSIGN_PUB]
 Report (or re-run) the source-image Cosign verification recorded in the
 attestation, after authenticating it with @option{--signing-key}.

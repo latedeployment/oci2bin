@@ -86,7 +86,7 @@ Common runtime options:
 --secret HOST_FILE[:CONTAINER_PATH]
 --entrypoint PATH
 --workdir PATH
---net host|none|userspace|slirp|pasta|container:PID
+--net host|none|deny-tcp|userspace|slirp|pasta|container:PID
 --ipc host|container:PID
 -p HOST_PORT:CONTAINER_PORT
 --add-host HOST:IP
@@ -129,6 +129,7 @@ Common runtime options:
 --strict
 --allow-degraded
 --init
+--stop-timeout N
 --detach
 --name NAME
 --restart POLICY
@@ -180,8 +181,8 @@ oci2bin freeze NAME [-- CMD]
 oci2bin thaw NAME
 oci2bin reconstruct SRC [--output PATH] [--no-strip] [--label-prefix PREFIX]
 oci2bin push BINARY REF
-oci2bin sbom BINARY
-oci2bin update [--check] [--verify-key PATH] BINARY
+oci2bin sbom BINARY [--format spdx|cyclonedx]
+oci2bin update [--check] [--verify-key PATH] BINARY   # replays the recorded build options
 oci2bin run [BUILD_OPTIONS] IMAGE [-- RUNTIME_ARGS...]
 oci2bin systemd BINARY [--user] [--restart POLICY]
 oci2bin healthcheck BINARY [--pid PID]
@@ -191,7 +192,7 @@ oci2bin logs [-f | --follow] NAME
 oci2bin checkpoint NAME
 oci2bin restore NAME
 oci2bin top [--once] [--interval SEC]
-oci2bin doctor [--json]
+oci2bin doctor [--json] [--probe] [--fix]
 oci2bin mcp-serve [--allow-net] [--allow-mount PATH] [--allow-mount-rw PATH]
 ```
 
@@ -199,7 +200,7 @@ oci2bin mcp-serve [--allow-net] [--allow-mount PATH] [--allow-mount-rw PATH]
 
 ```bash
 oci2bin sign --key KEY.pem --in BINARY [--out BINARY] [--rekor] [--attest FILE]
-oci2bin verify --key PUB.pem --in BINARY [--require-attestation] [--rekor]
+oci2bin verify --key PUB.pem --in BINARY [--require-attestation] [--rekor]   # one summary line: keyid, hash, attestation, rekor
 oci2bin attest-show --in BINARY
 oci2bin attest verify --signing-key PUB.pem --in BINARY [--recheck] [--key COSIGN_PUB]
 oci2bin sign-file --key KEY.pem --in FILE --out SIG

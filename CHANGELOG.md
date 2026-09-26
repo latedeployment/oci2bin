@@ -4,7 +4,110 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The `--init` / `--restart` / `--health` supervisor is event-driven.**
+  Both loops polled `waitpid(WNOHANG)` with 200 ms sleeps and forwarded
+  signals from handlers through a global PID; health probes drifted by up to
+  a sleep per interval and the kill-after-grace path compared `time(2)`
+  seconds. They now wait in one `poll(2)` on a `signalfd` (the forwarded
+  signals and `SIGCHLD`, blocked so nothing is lost), the workload's
+  `pidfd_open(2)` handle (readable the instant it exits; signalled with
+  `pidfd_send_signal(2)`, which cannot hit a recycled PID), a periodic
+  `timerfd` for the health cadence and a one-shot one for the stop grace.
+  Kernels without pidfd fall back to `SIGCHLD` plus `kill(2)`. Health probes
+  wait on their own pidfd instead of sleeping in 100 ms steps, forked
+  children clear the inherited signal mask before exec, and
+  `spawn_workload()` / `enter_workload_context()` remain the only places
+  that fork and prepare the workload.
+
+- **One home for the build-side OCI tar helpers.** `scripts/oci_tar.py`
+  now provides `read_manifest_and_config`, `repack_oci_tar`,
+  `rebuild_oci_with_new_config`, `make_tar_info`, `copy_member_info`,
+  `content_name_for` and `layer_diff_id`; `build_polyglot.py`,
+  `add_files.py`, `strip_image.py` and `squash_layers.py` use them instead
+  of their own copies of the manifest/config parsing and tar rewriting.
+  `repack_oci_tar` writes a name once when two rewritten blobs collapse onto
+  the same digest, and `normalize_oci_layout` now materialises the
+  symlinked `<id>/layer.tar` members older multi-image `docker save`
+  output used for shared layers, which the loader could not open.
+
 ### Added
+
+- **Signed and pinned binaries now launch without python3 or openssl.** The
+  loader verifies its own signature block in-process: SHA-256/SHA-512 over
+  the mapped file, strict DER parsing of the ECDSA signature and the PEM
+  public key, and ECDSA over NIST P-256 (Montgomery field arithmetic,
+  Jacobian points). `--verify-key`, the embedded `--require-signed` policy
+  and the `pin_digest` check all take this path; the pinned digest is
+  recomputed natively with the same placeholder substitution the builder
+  used. The embedded python/openssl verifiers remain only as a fallback for
+  keys on another curve (refused when python3 or openssl is missing) and for
+  metadata that spells its keys with JSON `\u` escapes; `--self-update`
+  still uses them. `--debug` shows `verify_key.native`,
+  `require_signed.native` and `pin.native` events.
+
+- **`--stop-timeout N`**: seconds between the SIGTERM the supervisor
+  forwards to the workload (or sends to an unhealthy one) and the SIGKILL
+  that follows if it is still running. Default 10, as in Docker; `0` never
+  escalates a user stop. Given on its own it implies `--init`.
+
+- **The build options are recorded in the metadata block.** Every build
+  stores its canonical option list (the same one `--arch all` forwards and
+  the `--cache` key hashes, plus `--arch`; never the image or output path)
+  as `build_args`. `oci2bin update` replays it against the image's current
+  digest instead of rebuilding with defaults, and `oci2bin inspect` /
+  `explain` show it. Binaries from older builders carry no record and
+  `update` says it is falling back to defaults.
+
+- **SBOMs name what they describe.** SPDX output now carries a root package
+  for the embedded image (`SPDXRef-RootPackage`, purpose `CONTAINER`, the
+  recorded image name and digest, the binary's SHA-256 and a `pkg:oci`
+  purl), a `DESCRIBES` relationship from the document to it and a
+  `CONTAINS` relationship to every OS package; duplicate `name@version`
+  rows collapse to one element. CycloneDX output gives the root
+  (`metadata.component`) and every component a `bom-ref` and lists the
+  packages as the root's `dependencies`. NTIA minimum-element checkers
+  and SPDX validators need the root and `DESCRIBES` to accept a document.
+  Packages now carry their supplier (dpkg `Maintainer`, apk `m:`, rpm
+  vendor or packager) instead of `NOASSERTION` throughout.
+
+- **`verify` prints one trust summary line.** On success stdout carries
+  exactly `Verified OK: PATH keyid=<sha256 of the DER public key>
+  hash=<algo>:<hash of the signed content> attestation=ok|none
+  rekor=<log index>@<server> inclusion=confirmed|unchecked` (or
+  `rekor=none` / `rekor=receipt-mismatch`), the Rekor fields read from the
+  `PATH.rekor.json` receipt `sign --rekor` writes. A failing `--rekor`
+  check now exits 2 with no success line instead of printing `Verified
+  OK` first.
+
+- **`--net deny-tcp`: a TCP cut without a network namespace.** The
+  Landlock ruleset now handles the ABI 4 network rights
+  (`LANDLOCK_ACCESS_NET_BIND_TCP`, `LANDLOCK_ACCESS_NET_CONNECT_TCP`) and
+  grants neither, so every TCP `bind()`/`connect()` in the workload fails
+  with `EACCES` while it keeps the host network namespace (abstract Unix
+  sockets, UDP and raw sockets untouched). Like `--landlock` it asks for
+  the sandbox by name: no Landlock, an ABI below 4 (Linux 6.7+) or a
+  ruleset that fails to install aborts the run; `-p`, `--allow-egress`,
+  `--vm` and `--no-landlock` are rejected with it.
+
+- **`oci2bin doctor --probe` and `--fix`.** `--probe` adds live checks
+  that do what the loader does instead of looking for files: `unshare
+  -Ur true` and `-Urm true`, `linkat(AT_EMPTY_PATH)` on a temporary file,
+  `open("/dev/kvm", O_RDWR)`, and a tar extraction with exactly the
+  loader's flags that also reports the tar vendor and that a set-ID bit
+  was dropped. `--fix` runs the distro install command the summary
+  already prints, as an argument list (no shell, `sudo` dropped when
+  root), lists the manual-install items, and re-checks afterwards.
+
+- **`make check-packaging`.** Stages `make install DESTDIR=<tmp>
+  PREFIX=/usr` and checks what a package would ship: every helper in the
+  manifest, the loader source and binary, the man page, the `oci2vm`
+  symlink, no symlink escaping the staged tree, the `OCI2BIN_HOME`
+  default rewritten to the prefix, every helper compiling; then runs the
+  installed `oci2bin --help`, `oci2vm --help` and `doctor --json` from
+  the staged prefix. `CHECK_PACKAGING_FLAGS=--wheel` also builds the
+  wheel, checks its contents and runs its console scripts.
 
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
@@ -218,6 +321,26 @@ All notable changes to oci2bin are documented here.
   resolved the link on the host.
 
 ### Fixed
+
+- `--arch all` and `--cache` builds without `--compress` aborted silently:
+  the helper that assembles the forwarded option list ended on a failing
+  `[[ ... ]] &&` test, which `set -e` treated as the function failing. It
+  now returns 0 explicitly.
+
+- **`sbom` and `diff` read a truncated payload on some builds.** The
+  embedded-OCI locator in `inspect_image.py` takes the 8-byte value on
+  either side of the patched offset as the size; when an unrelated loader
+  global next to it held a smaller number the real archive can be cut to
+  (a slice that still parses, since tarfile stops quietly at end of data),
+  that slice won and later layers vanished, so `sbom` reported no packages.
+  Both neighbours are now parsed and the one holding the complete archive
+  is used.
+
+- **Dockerfile builder: nested `${A:-${B}}` expands.** The expander took
+  the first `}` as the end of `${…}`, so a default or alternative that
+  was itself a `${…}` came out as `${B` plus a stray `}`. Braces are now
+  matched with nesting, so `${A:-${B:-c}}` and `${A:+${B}}` expand as
+  BuildKit does.
 
 - **No Python on the launch path.** Every start ran the pinned-digest check
   through `python3`, so artifacts failed on hosts without it (Alpine,

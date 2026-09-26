@@ -31,7 +31,7 @@ oci2bin \- convert Docker/OCI images into mostly self-contained rootless contain
 .SY ./OUTPUT
 .OP \-v HOST:CONTAINER
 .OP \-e KEY=VALUE
-.OP \-\-net host|none|container:\fIPID\fR
+.OP \-\-net host|none|deny-tcp|container:\fIPID\fR
 .OP \-\-ipc host|container:\fIPID\fR
 .OP \-\-entrypoint PATH
 .OP \-\-workdir PATH
@@ -449,9 +449,26 @@ Supported types:
 May be repeated.
 .
 .TP
+.BI \-\-stop\-timeout " N"
+Seconds between the
+.B SIGTERM
+the supervisor forwards to the workload (or sends to an unhealthy one) and the
+.B SIGKILL
+that follows when it is still running.
+Default 10;
+.B 0
+never escalates a user stop.
+Implies
+.BR \-\-init .
+.
+.TP
 .B \-\-init
 Run a zombie-reaping init as PID\~1.
-The entrypoint is forked as a child; the parent loop reaps zombies.
+The entrypoint is forked as a child; the parent waits in one
+.BR poll (2)
+on a signalfd, the child's pidfd and timerfds, reaping zombies as they appear
+and enforcing
+.BR \-\-stop\-timeout .
 .BR SIGTERM ,
 .BR SIGINT ,
 .BR SIGHUP ,
@@ -495,6 +512,23 @@ Share the host network stack (default).
 .B \-\-net none
 Create an isolated network namespace with only a loopback interface.
 In libkrun VM mode, disable the implicit TSI/vsock device.
+.
+.TP
+.B \-\-net deny\-tcp
+Keep the host network namespace but have Landlock (ABI 4, Linux 6.7+) refuse
+every TCP
+.BR bind (2)
+and
+.BR connect (2)
+with
+.BR EACCES .
+UDP, Unix and raw sockets are untouched. Aborts when the kernel lacks Landlock
+network rules; cannot be combined with
+.BR \-p ,
+.BR \-\-allow\-egress ,
+.B \-\-vm
+or
+.BR \-\-no\-landlock .
 .
 .TP
 .B \-\-net userspace
@@ -848,13 +882,31 @@ Combined report: embedded metadata (secrets redacted) plus a host-capability
 check for what the binary needs to run.
 .
 .TP
-.B oci2bin doctor \fR[\fB\-\-json\fR]
+.B oci2bin doctor \fR[\fB\-\-json\fR] [\fB\-\-probe\fR] [\fB\-\-fix\fR]
 Probe the host for the toolchain and kernel features oci2bin uses and print a
 fix command for each missing piece.
+.B \-\-probe
+adds live checks that do what the loader does:
+.BR "unshare \-Ur true" ,
+.BR linkat (2)
+with
+.BR AT_EMPTY_PATH ,
+opening
+.I /dev/kvm
+read-write, and a tar extraction with the loader's flags (reporting the tar
+vendor).
+.B \-\-fix
+runs the distro install command the summary prints (never through a shell;
+the package manager's own prompt applies) and re-checks afterwards.
 .
 .TP
-.B oci2bin sbom \fIBINARY\fR
-Generate a Software Bill of Materials for the embedded image.
+.B oci2bin sbom \fIBINARY\fR \fR[\fB\-\-format spdx\fR|\fBcyclonedx\fR]
+Generate a Software Bill of Materials for the embedded image: packages from
+the dpkg, apk or rpm database, each with a purl. The SPDX document DESCRIBES a
+root package for the image (name, digest, SHA-256 of the binary, pkg:oci
+purl) that CONTAINS every package; CycloneDX carries the same root as
+.B metadata.component
+with a dependency list.
 .
 .TP
 .B oci2bin reconstruct \fISRC\fR \fR[\fB\-\-output \fIPATH\fR]
@@ -864,6 +916,21 @@ loader.
 .TP
 .B oci2bin push \fIBINARY\fR \fIREF\fR
 Push the embedded image payload to an OCI registry reference.
+.
+.TP
+.B oci2bin update \fR[\fB\-\-check\fR] [\fB\-\-verify\-key \fIPATH\fR] \fIBINARY\fR
+Rebuild
+.I BINARY
+from its image when the image's digest has moved, replaying the build options
+recorded in the metadata block (the same list
+.B \-\-arch all
+forwards, plus
+.BR \-\-arch ),
+and replace it atomically. The recorded list is printed first; one that is
+not options and their values is refused. With
+.B \-\-check
+only report whether an update is available. A binary made by an older
+oci2bin carries no record and is rebuilt with default options.
 .
 .TP
 .B oci2bin exec \fIPID\fR \fR[\fB\-\-\fR] \fICMD\fR ...
@@ -905,7 +972,17 @@ Sign a binary (optionally publishing a Rekor transparency-log entry and/or an
 in-toto attestation).
 .B oci2bin verify \fB\-\-key \fIPUB\fR \fB\-\-in \fIBINARY\fR
 checks it, including that an embedded attestation names this binary as its
-subject.
+subject, and on success prints one trust summary line:
+.BR keyid ,
+.B hash
+of the signed content,
+.B attestation
+state and the Rekor log index from the
+.I BINARY.rekor.json
+receipt (with
+.B inclusion=confirmed
+after
+.BR \-\-rekor ).
 .
 .TP
 .B oci2bin attest verify \fB\-\-signing\-key \fIPUB\fR \fB\-\-in \fIBINARY\fR [\fB\-\-recheck\fR] [\fB\-\-key \fICOSIGN_PUB\fR]
@@ -1116,6 +1193,15 @@ Loader source code.
 .TP
 .B make test\-unit
 Run the fast unit suite without requiring Docker or Podman.
+.TP
+.B make check\-packaging
+Stage
+.B make install
+under a temporary DESTDIR and run the installed
+.BR oci2bin " and " oci2vm ;
+with
+.B CHECK_PACKAGING_FLAGS=\-\-wheel
+also build and exercise the wheel.
 .TP
 .B make test\-all
 Run the full unit sweep on native x86_64 and cross-compiled aarch64.

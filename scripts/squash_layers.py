@@ -22,6 +22,9 @@ import subprocess
 import sys
 import tarfile
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import oci_tar  # noqa: E402  (shared manifest/repack helpers)
+
 _ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 _XZ_MAGIC = b'\xfd7zXZ\x00'
 
@@ -99,25 +102,13 @@ def squash_oci_tar(input_path, output_path, compress='gzip'):
         print(f"squash: tar error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Read manifest.json
+    # Read manifest.json and the image config
     try:
-        manifest_member = outer_tf.getmember('manifest.json')
-    except KeyError:
-        print("squash: manifest.json not found", file=sys.stderr)
+        manifest, _config_name, config, _ = \
+            oci_tar.read_manifest_and_config_from_tar(outer_tf)
+    except (KeyError, ValueError) as e:
+        print(f"squash: {e}", file=sys.stderr)
         sys.exit(1)
-    manifest = json.loads(outer_tf.extractfile(manifest_member).read())
-
-    # Read config
-    config_name = manifest[0].get('Config', '')
-    if not config_name:
-        print("squash: no Config in manifest", file=sys.stderr)
-        sys.exit(1)
-    try:
-        config_member = outer_tf.getmember(config_name)
-    except KeyError:
-        print(f"squash: config not found: {config_name}", file=sys.stderr)
-        sys.exit(1)
-    config = json.loads(outer_tf.extractfile(config_member).read())
 
     layers_names = manifest[0].get('Layers', [])
 
@@ -264,14 +255,14 @@ def squash_oci_tar(input_path, output_path, compress='gzip'):
     with tarfile.open(output_path, 'w:') as out_tf:
         # manifest.json
         manifest_bytes = json.dumps(new_manifest).encode()
-        mi = tarfile.TarInfo('manifest.json')
-        mi.size = len(manifest_bytes)
-        out_tf.addfile(mi, io.BytesIO(manifest_bytes))
+        out_tf.addfile(oci_tar.make_tar_info('manifest.json',
+                                             len(manifest_bytes)),
+                       io.BytesIO(manifest_bytes))
 
         # config
-        ci = tarfile.TarInfo(new_config_name)
-        ci.size = len(config_bytes)
-        out_tf.addfile(ci, io.BytesIO(config_bytes))
+        out_tf.addfile(oci_tar.make_tar_info(new_config_name,
+                                             len(config_bytes)),
+                       io.BytesIO(config_bytes))
 
         # squashed layer (need dir entry too)
         layer_dir = layer_name.rsplit('/', 1)[0]
@@ -280,9 +271,9 @@ def squash_oci_tar(input_path, output_path, compress='gzip'):
         di.mode = 0o755
         out_tf.addfile(di)
 
-        li = tarfile.TarInfo(layer_name)
-        li.size = len(squashed_compressed)
-        out_tf.addfile(li, io.BytesIO(squashed_compressed))
+        out_tf.addfile(oci_tar.make_tar_info(layer_name,
+                                             len(squashed_compressed)),
+                       io.BytesIO(squashed_compressed))
 
     orig_size = os.path.getsize(input_path)
     new_size  = os.path.getsize(output_path)

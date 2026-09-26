@@ -80,6 +80,7 @@ This page is a checklist of the feature surface documented by the site.
 | Detach | `--detach` or `-d` |
 | Name container | `--name NAME` |
 | Restart policy | `--restart always`, `--restart on-failure:5` |
+| Stop grace before SIGKILL | `--stop-timeout N` (default 10, 0 = never) |
 | Health checks | `--health`, `oci2bin healthcheck` |
 | Health probe override | `--health-cmd`, `--health-interval`, `--health-timeout`, `--health-retries`, `--health-start-period` |
 | Disable health | `--no-health` |
@@ -143,6 +144,7 @@ This page is a checklist of the feature surface documented by the site.
 | Generate seccomp profile | `--gen-seccomp FILE` |
 | Read-only path inside writable subtree | `--seccomp-deny-write PATH` |
 | Landlock filesystem sandbox | automatic; force `--landlock`, disable `--no-landlock` |
+| Landlock TCP deny without a network namespace | `--net deny-tcp` (Landlock ABI 4) |
 | Force single-ID userns fallback | `--no-userns-remap` |
 | Fail-closed on degradations | `--strict` |
 | Opt out of cgroup fail-closed | `--allow-degraded` |
@@ -232,7 +234,7 @@ byte-for-byte reproducible.
 | Generate systemd unit | `oci2bin systemd app.bin` |
 | Generate SBOM | `oci2bin sbom app.bin` |
 | Push image payload | `oci2bin push app.bin REF` |
-| Update a binary from its signed manifest | `oci2bin update [--check] [--verify-key PATH] app.bin` |
+| Update a binary from its signed manifest or image, replaying its recorded build options | `oci2bin update [--check] [--verify-key PATH] app.bin` |
 | Self-update check | `./app.bin --check-update` |
 | Self-update apply | `./app.bin --self-update` |
 | Freeze and thaw | `oci2bin freeze NAME`, `oci2bin thaw NAME` |
@@ -240,6 +242,7 @@ byte-for-byte reproducible.
 | Declarative stack up/down | `oci2bin up`, `oci2bin down` |
 | Stack subcommands | `oci2bin stack up/down/logs/config` |
 | Host capability checks (build host) | `oci2bin doctor`, `oci2bin doctor --json` |
+| Live probes and install of the missing packages | `oci2bin doctor --probe`, `oci2bin doctor --fix` |
 | Host capability checks (runtime host) | `./app.bin --doctor` |
 | MCP server | `oci2bin mcp-serve` |
 | MCP host-mount allowlist (deny by default) | `mcp-serve --allow-mount PATH` / `--allow-mount-rw PATH` |
@@ -254,6 +257,7 @@ byte-for-byte reproducible.
 | Feature | Command |
 | --- | --- |
 | Unit tests without a container engine | `make test-unit` |
+| Staged-install and wheel check | `make check-packaging`, `make check-packaging CHECK_PACKAGING_FLAGS=--wheel` |
 | Full x86_64 and aarch64 unit sweep, without a container engine | `make test-all` |
 | Unit and container-engine integration tests | `make test` |
 | C tests under ASan, UBSan, and LSan | `make test-asan` |

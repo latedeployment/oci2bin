@@ -384,6 +384,7 @@ make test-unit       # unit tests; no Docker required
 make test            # full suite; Docker required
 make lint            # configured linters
 make check-version   # verify release-version consistency
+make check-packaging # stage `make install` and run the installed oci2bin/oci2vm
 ```
 
 Additional integration, VM, sanitizer, coverage, and fuzzing targets are

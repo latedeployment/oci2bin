@@ -296,6 +296,21 @@ databases (rpm's `rpmdb.sqlite` header blobs, under `/usr/lib/sysimage/rpm` or
 `pkg:deb/debian/bash@5.2.15-2?arch=amd64&distro=debian`, which Grype and Trivy
 consume.
 
+Both formats say what the inventory is an inventory of. The SPDX document
+`DESCRIBES` one root package, the embedded image (`SPDXRef-RootPackage`,
+purpose `CONTAINER`), named and versioned from the image name and digest the
+builder recorded, carrying the SHA-256 of the binary file and a `pkg:oci`
+purl; every OS package hangs off it through a `CONTAINS` relationship. The
+CycloneDX document uses `metadata.component` as that root, gives every
+component a `bom-ref` and lists them all as the root's `dependencies`. NTIA
+minimum-element checkers and SPDX validators require the root and the
+`DESCRIBES` relationship; older oci2bin SBOMs had neither. Each package's
+supplier comes from the database that installed it (dpkg `Maintainer`, apk
+`m:`, rpm vendor or packager), as `Person:` or `Organization:` in SPDX and a
+`supplier` entity in CycloneDX; a package without one, and the root package
+(the image publisher is not recorded), stay `NOASSERTION`, which strict NTIA
+checkers still count against the document.
+
 ## Push
 
 ```bash
@@ -326,6 +341,28 @@ Apply an update:
 
 The manifest is signature-verified before replacement.
 
+Rebuild a binary from its image with the same options it was built with:
+
+```bash
+oci2bin update app.bin
+oci2bin update --check app.bin
+```
+
+Every build records its canonical option list (`--arch`, `--strip`,
+`--squash`, `--label`, `--compress-binary`, ... but never the image or output
+path) as `build_args` in the metadata block; `oci2bin inspect` shows it.
+`update` replays exactly that list against the image's current digest, so a
+rebuilt binary keeps its shape. A binary made by an older oci2bin has no
+record and is rebuilt with default options, which `update` says out loud.
+
+The list is data read from the binary. `update` prints it before rebuilding
+and refuses a list that is not options and their values (so it cannot swap
+in another image or output path), but options such as `--add-file` or
+`--password-file` name host paths: review the printed list before updating a
+binary you did not build. A build pinned with an explicit `--pin-digest` is
+replayed with that pin and so refuses to move to a new digest; re-pin and
+rebuild instead.
+
 ## Reconstruct
 
 ```bash
@@ -349,6 +386,8 @@ oci2bin reconstruct redis:7-alpine --label-prefix myorg.loader
 ```bash
 oci2bin doctor          # build host
 oci2bin doctor --json   # build host, machine-readable
+oci2bin doctor --probe  # build host, plus live probes
+oci2bin doctor --fix    # install what the summary lists
 ./app.bin --doctor      # deployment host
 ```
 
@@ -356,6 +395,24 @@ The CLI doctor checks the machine that builds artifacts. The artifact doctor
 checks the machine on which that exact file will run, without extracting it or
 creating namespaces. Use the latter when a deployment host behaves differently
 from the build machine.
+
+`--probe` adds four live checks that do what the loader does rather than
+look for files: `unshare -Ur true` and `unshare -Urm true` (a user namespace,
+and a mount namespace inside it, which AppArmor policies refuse separately),
+`linkat(AT_EMPTY_PATH)` on a temporary file (the by-descriptor link the loader
+uses; before Linux 6.10 it needs `CAP_DAC_READ_SEARCH` and the loader falls
+back to `/proc/self/fd`), `open("/dev/kvm", O_RDWR)` (group membership, not
+just presence) and an extraction of a tiny archive with exactly the loader's
+tar flags, reporting the tar vendor and that `--no-same-permissions` dropped
+a set-ID bit. They appear as `probe: …` rows and in `--json`.
+
+`--fix` runs the distro install command the summary prints, as an argument
+list and never through a shell, with `sudo` dropped when already root. The
+package manager keeps its own confirmation prompt. Items that are not
+packaged (cosign, rekor-cli, a VM backend) are listed for manual install; an
+unrecognized distro exits 1 with nothing run. After a successful install the
+checks run again so the exit status reflects the host as it now is. `--fix`
+cannot be combined with `--json`.
 
 Common checks:
 
@@ -390,6 +447,25 @@ Run the full unit sweep on native x86_64 and cross-compiled aarch64:
 ```bash
 make test-all
 ```
+
+Check what a package would ship:
+
+```bash
+make check-packaging
+make check-packaging CHECK_PACKAGING_FLAGS=--wheel
+```
+
+`check-packaging` stages `make install DESTDIR=<tmp> PREFIX=/usr`, checks the
+tree file by file (every helper in `packaging/oci2bin-scripts.txt`, the
+loader source and binary, the man page, the `oci2vm` symlink, no symlink that
+escapes the staged tree, the `OCI2BIN_HOME` default rewritten to
+`/usr/share/oci2bin`, every helper compiling), then runs the installed
+`oci2bin --help`, `oci2vm --help` and `oci2bin doctor --json` out of the
+staged prefix. With `--wheel` it also builds the wheel, checks that it
+carries the bash wrapper, the loader source and every helper, installs it
+into a scratch target and runs its `oci2bin` and `oci2vm` console scripts.
+The wheel build is pip's isolated build (it fetches `setuptools>=77`); set
+`OCI2BIN_WHEEL_NO_ISOLATION=1` to build with the host's setuptools.
 
 This target does not require Docker or Podman. Container-engine integration
 tests are separate under `make test`.

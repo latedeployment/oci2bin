@@ -195,6 +195,21 @@ it or it cannot be enforced. Without the flag, Landlock is applied when
 available and skipped otherwise — unless `--strict` is set, which also refuses
 to start when the sandbox is unavailable or fails to install.
 
+### Network rules
+
+`--net deny-tcp` uses Landlock's network rules (ABI 4, Linux 6.7+) as a
+`--net none`-style cut that needs no network namespace: the same ruleset
+handles `LANDLOCK_ACCESS_NET_BIND_TCP` and `LANDLOCK_ACCESS_NET_CONNECT_TCP`
+and grants neither on any port, so every TCP `bind()` and `connect()` in the
+workload fails with `EACCES` while the process keeps the caller's network
+namespace. UDP, Unix and raw sockets, and sockets inherited already open, are
+not affected; a workload that needs them, or a host that cannot create a
+network namespace, gets the TCP cut without the namespace. Like `--landlock`,
+the mode asks for the sandbox by name: a kernel without Landlock or with an
+ABI below 4, or a ruleset that fails to install, aborts the run. It cannot
+be combined with `--no-landlock`, `-p`, `--allow-egress` or `--vm` (the
+guest kernel never sees the loader's ruleset).
+
 ## Fail-Closed Mode
 
 `--strict` turns every security-relevant degradation that would otherwise be a
@@ -350,6 +365,23 @@ Verify:
 oci2bin verify --key pub.pem --in app.bin
 ```
 
+On success `verify` prints one trust summary line and nothing else on
+stdout, so a script can pick the fields out:
+
+```
+Verified OK: app.bin keyid=<sha256 of the DER public key> hash=sha512:<hash of the signed content> attestation=ok rekor=1234567@https://rekor.sigstore.dev inclusion=unchecked
+```
+
+`keyid` identifies the key that signed (the first 16 hex digits are what
+`sign` printed), `hash` is the digest the signature covers (the binary
+without its signature block), `attestation` says whether a bound in-toto
+statement was verified, and `rekor` names the log index and server from
+the `app.bin.rekor.json` receipt `sign --rekor` wrote: `inclusion=unchecked`
+until `--rekor` consults the log, `inclusion=confirmed` when it did,
+`rekor=none` without a receipt and `rekor=receipt-mismatch` when the receipt
+belongs to a different artifact. Any failure, the Rekor check included,
+prints `Verification FAILED` on stderr and exits 2 with no success line.
+
 Verify at runtime:
 
 ```bash
@@ -364,11 +396,17 @@ oci2bin sign --key priv.pem --in app.bin
 ./app.bin
 ```
 
-All of these run the ECDSA check through `openssl`, which is resolved by
-absolute path from `/usr/bin`, `/bin`, `/usr/sbin` or `/sbin` — never through
-`$PATH`. An `openssl` reachable only via `$PATH` is treated as missing and the
-check fails closed, so a stub planted in an attacker-writable `$PATH` entry
-cannot make verification report success.
+The produced binary verifies signatures itself: ECDSA over NIST P-256 (the
+curve `oci2bin sign` keys use) with SHA-256 or SHA-512, implemented in the
+loader, so `--verify-key`, `--require-signed` and a `--pin-digest` pin all
+work on a host without `python3` or `openssl`. Only a key on another curve
+is handed to `openssl` through the embedded verifier, and only when both
+`python3` and `openssl` are present; otherwise the launch is refused. That
+`openssl` is resolved by absolute path from `/usr/bin`, `/bin`, `/usr/sbin`
+or `/sbin` — never through `$PATH` — so a stub planted in an
+attacker-writable `$PATH` entry cannot make verification report success.
+The `oci2bin sign` / `verify` commands on the build host still use
+`openssl`, as does `--self-update`.
 
 Detached file signing:
 

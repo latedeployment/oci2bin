@@ -5,9 +5,12 @@ import json
 import os
 import shlex
 import shutil
+import signal
+import struct
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -83,6 +86,23 @@ int main(void)
 """
 
 
+_TRAP_SRC = r"""
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char** argv)
+{
+    /* Ignore SIGTERM so only SIGKILL ends us; exit code from argv[1]. */
+    signal(SIGTERM, SIG_IGN);
+    printf("trap ran\n");
+    fflush(stdout);
+    if (argc > 1) { return atoi(argv[1]); }
+    for (;;) { sleep(1); }
+}
+"""
+
+
 def _program_oci_tar(program_bytes):
     """A one-layer image whose /bin/sh is a static program."""
     layer = io.BytesIO()
@@ -129,6 +149,52 @@ def _program_oci_tar(program_bytes):
             info.size = len(data)
             tf.addfile(info, io.BytesIO(data))
     return buf.getvalue(), config_raw
+
+
+_NETPROBE_SRC = r"""
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+static int try_bind(int type)
+{
+    int s = socket(AF_INET, type, 0);
+    if (s < 0) { return errno; }
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int e = bind(s, (struct sockaddr*)&a, sizeof a) < 0 ? errno : 0;
+    close(s); return e;
+}
+static int try_connect(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { return errno; }
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(9);
+    int e = connect(s, (struct sockaddr*)&a, sizeof a) < 0 ? errno : 0;
+    close(s); return e;
+}
+int main(void)
+{
+    printf("tcp_bind=%d tcp_connect=%d udp_bind=%d\n",
+           try_bind(SOCK_STREAM), try_connect(), try_bind(SOCK_DGRAM));
+    return 0;
+}
+"""
+
+
+def _landlock_abi():
+    """The running kernel's Landlock ABI, or -1."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.syscall(444, None, 0, 1)   # landlock_create_ruleset
+    except (OSError, AttributeError):
+        return -1
 
 
 def _proc_start_ticks(pid):
@@ -194,15 +260,20 @@ class TestCliFeatures(unittest.TestCase):
 
     def _build_writer_binary(self, name):
         """Polyglot whose workload writes /leak.txt; returns (path, config)."""
-        writer_src = self.tmpdir / "writer.c"
-        writer_src.write_text(_WRITER_SRC, encoding="utf-8")
-        writer = self.tmpdir / "writer"
+        return self._build_program_binary(name, _WRITER_SRC)
+
+    def _build_program_binary(self, name, source):
+        """Polyglot whose /bin/sh is the static C program `source`;
+        returns (path, config)."""
+        prog_src = self.tmpdir / f"{name}.c"
+        prog_src.write_text(source, encoding="utf-8")
+        prog = self.tmpdir / f"{name}.prog"
         build = subprocess.run(
-            ["gcc", "-static", "-O2", "-s", "-o", str(writer),
-             str(writer_src)],
+            ["gcc", "-static", "-O2", "-s", "-o", str(prog),
+             str(prog_src)],
             capture_output=True, text=True, timeout=120)
         self.assertEqual(build.returncode, 0, msg=build.stderr)
-        tar_bytes, config_raw = _program_oci_tar(writer.read_bytes())
+        tar_bytes, config_raw = _program_oci_tar(prog.read_bytes())
         tar_path = self.tmpdir / f"{name}.tar"
         tar_path.write_bytes(tar_bytes)
         out_path = self.tmpdir / name
@@ -294,6 +365,151 @@ class TestCliFeatures(unittest.TestCase):
         self.assertEqual(prune.returncode, 0, msg=prune.stderr)
         self.assertIn("1 rootfs cache entry removed", prune.stdout)
         self.assertFalse(entry.exists())
+
+    def test_signed_and_pinned_binary_verifies_natively(self):
+        """--require-signed + --pin-digest are checked in-process.
+
+        The launch must succeed with the native events in --debug output and
+        refuse a tampered copy; python3/openssl are only used here to build
+        and sign the artifact.
+        """
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl needed to sign the test binary")
+        if not _userns_available():
+            self.skipTest("user namespaces unavailable; cannot run binaries")
+        key = self.tmpdir / "native-sign.key"
+        pub = self.tmpdir / "native-sign.pub"
+        subprocess.run(
+            ["openssl", "ecparam", "-name", "prime256v1", "-genkey",
+             "-noout", "-out", str(key)],
+            check=True, capture_output=True, timeout=30)
+        subprocess.run(
+            ["openssl", "ec", "-in", str(key), "-pubout", "-out", str(pub)],
+            check=True, capture_output=True, timeout=30)
+
+        writer_src = self.tmpdir / "writer-native.c"
+        writer_src.write_text(_WRITER_SRC, encoding="utf-8")
+        writer = self.tmpdir / "writer-native"
+        build = subprocess.run(
+            ["gcc", "-static", "-O2", "-s", "-o", str(writer),
+             str(writer_src)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        tar_bytes, _config = _program_oci_tar(writer.read_bytes())
+        tar_path = self.tmpdir / "native-signed.tar"
+        tar_path.write_bytes(tar_bytes)
+        binary = self.tmpdir / "native-signed.bin"
+        result = subprocess.run(
+            ["python3", str(ROOT / "scripts" / "build_polyglot.py"),
+             "--loader", str(self.loader), "--tar", str(tar_path),
+             "--image-name", "native:latest", "--output", str(binary),
+             "--pin-digest", "sha512:auto", "--require-signed", str(pub)],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        sign = subprocess.run(
+            [str(OCI2BIN), "sign", "--key", str(key), "--in", str(binary)],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(sign.returncode, 0, msg=sign.stderr)
+
+        xdg = self.tmpdir / "xdg-native"
+        tmp = self.tmpdir / "runtime-native"
+        tmp.mkdir(parents=True, exist_ok=True)
+        run = self._run_cached(binary, xdg, tmp, "--verify-key", str(pub))
+        self.assertEqual(run.returncode, 0, msg=run.stderr)
+        self.assertIn("writer ran", run.stdout)
+        self.assertIn("event=pin.native algo=sha512 result=ok", run.stderr)
+        self.assertIn("event=require_signed.native result=1", run.stderr)
+        self.assertIn("event=verify_key.native result=1", run.stderr)
+
+        # Flip a byte inside the payload: pin and signature both fail, and
+        # the pin is checked first.
+        tampered = self.tmpdir / "native-tampered.bin"
+        data = bytearray(binary.read_bytes())
+        data[len(data) // 2] ^= 0x01
+        tampered.write_bytes(bytes(data))
+        tampered.chmod(0o755)
+        bad = self._run_cached(tampered, xdg, tmp)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("pinned digest mismatch", bad.stderr)
+        self.assertNotIn("writer ran", bad.stdout)
+
+        # The wrong verify key is refused natively as well.
+        other_pub = self.tmpdir / "other.pub"
+        other_key = self.tmpdir / "other.key"
+        subprocess.run(
+            ["openssl", "ecparam", "-name", "prime256v1", "-genkey",
+             "-noout", "-out", str(other_key)],
+            check=True, capture_output=True, timeout=30)
+        subprocess.run(
+            ["openssl", "ec", "-in", str(other_key), "-pubout", "-out",
+             str(other_pub)],
+            check=True, capture_output=True, timeout=30)
+        wrong = self._run_cached(binary, xdg, tmp, "--verify-key",
+                                 str(other_pub))
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertIn("signature does not match", wrong.stderr)
+
+    def test_stop_timeout_escalates_and_restart_policy_counts(self):
+        """--stop-timeout SIGKILLs a workload that ignores SIGTERM, and
+        --restart on-failure:N relaunches exactly N times."""
+        if not _userns_available():
+            self.skipTest("user namespaces unavailable; cannot run binaries")
+        trap_src = self.tmpdir / "trap.c"
+        trap_src.write_text(_TRAP_SRC, encoding="utf-8")
+        trap = self.tmpdir / "trap"
+        build = subprocess.run(
+            ["gcc", "-static", "-O2", "-s", "-o", str(trap), str(trap_src)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        tar_bytes, _config = _program_oci_tar(trap.read_bytes())
+        tar_path = self.tmpdir / "trap.tar"
+        tar_path.write_bytes(tar_bytes)
+        binary = self.tmpdir / "trap.bin"
+        result = subprocess.run(
+            ["python3", str(ROOT / "scripts" / "build_polyglot.py"),
+             "--loader", str(self.loader), "--tar", str(tar_path),
+             "--image-name", "trap:latest", "--output", str(binary)],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+        xdg = self.tmpdir / "xdg-trap"
+        tmp = self.tmpdir / "runtime-trap"
+        tmp.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, XDG_CACHE_HOME=str(xdg),
+                   OCI2BIN_TMPDIR=str(tmp), TMPDIR=str(tmp))
+
+        # Stop escalation: SIGTERM to the loader is forwarded, ignored by
+        # the workload, and followed by SIGKILL after one second.
+        proc = subprocess.Popen(
+            [str(binary), "--net", "none", "--stop-timeout", "1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=env)
+        line = proc.stdout.readline()
+        self.assertEqual(line.strip(), "trap ran")
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            _out, err = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.fail("loader did not exit after --stop-timeout")
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 137, msg=err)
+        self.assertIn("sending SIGKILL", err)
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 8.0)
+
+        # Restart policy: three runs for on-failure:2, last exit code kept.
+        started = time.monotonic()
+        run = subprocess.run(
+            [str(binary), "--net", "none", "--restart", "on-failure:2",
+             "--", "/bin/sh", "4"],
+            capture_output=True, text=True, timeout=60, env=env)
+        elapsed = time.monotonic() - started
+        self.assertEqual(run.returncode, 4, msg=run.stderr)
+        self.assertEqual(run.stdout.count("trap ran"), 3)
+        self.assertEqual(run.stderr.count("restarting container"), 2)
+        self.assertGreaterEqual(elapsed, 2.0)
 
     def test_systemd_emits_unit_with_label_name(self):
         binary = self._build_binary(
@@ -425,6 +641,43 @@ class TestCliFeatures(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("state path contains symlink component", result.stderr)
+
+    def test_net_deny_tcp_cuts_tcp_without_a_netns(self):
+        """--net deny-tcp on a real binary: the workload keeps the host
+        network namespace, yet TCP bind and connect fail with EACCES while
+        a UDP bind still works.  Without the flag TCP works."""
+        if not _userns_available():
+            self.skipTest("user namespaces unavailable; cannot run binaries")
+        if _landlock_abi() < 4:
+            self.skipTest("kernel Landlock ABI < 4; no network rules")
+        binary, _ = self._build_program_binary("netprobe.bin", _NETPROBE_SRC)
+        env = dict(os.environ, XDG_CACHE_HOME=str(self.tmpdir / "xdg"),
+                   OCI2BIN_TMPDIR=str(self.tmpdir), TMPDIR=str(self.tmpdir))
+
+        def run(*args):
+            return subprocess.run([str(binary), *args], capture_output=True,
+                                  text=True, timeout=120, env=env)
+
+        denied = run("--net", "deny-tcp")
+        self.assertEqual(denied.returncode, 0, msg=denied.stderr)
+        self.assertIn("tcp_bind=13 tcp_connect=13 udp_bind=0", denied.stdout)
+
+        plain = run("--net", "host")
+        self.assertEqual(plain.returncode, 0, msg=plain.stderr)
+        self.assertIn("tcp_bind=0 ", plain.stdout)
+        self.assertIn(" udp_bind=0", plain.stdout)
+        self.assertNotIn("tcp_connect=13", plain.stdout)
+
+        # The mode is enforced by Landlock: refusing the sandbox refuses
+        # the run, before anything starts.
+        refused = run("--net", "deny-tcp", "--no-landlock")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("cannot be combined with --no-landlock", refused.stderr)
+        self.assertEqual(refused.stdout, "")
+        published = run("--net", "deny-tcp", "-p", "8080:80")
+        self.assertNotEqual(published.returncode, 0)
+        self.assertIn("-p cannot be combined with --net deny-tcp",
+                      published.stderr)
 
     def test_run_forwards_new_build_options(self):
         missing_oci = self.tmpdir / "missing-oci-layout"
@@ -695,3 +948,193 @@ class TestCliFeatures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _write_oci_layout(dest, layer_files, cmd=("/bin/true",)):
+    """A one-layer OCI image layout at `dest` (no engine needed to build)."""
+    blobs = dest / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+
+    def put(data):
+        digest = hashlib.sha256(data).hexdigest()
+        (blobs / digest).write_bytes(data)
+        return digest, len(data)
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in layer_files:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o644
+            tf.addfile(info, io.BytesIO(data))
+    layer = buf.getvalue()
+    layer_digest, layer_size = put(layer)
+    config = json.dumps({
+        "architecture": "amd64", "os": "linux",
+        "config": {"Cmd": list(cmd)},
+        "rootfs": {"type": "layers", "diff_ids": ["sha256:" + layer_digest]},
+    }).encode()
+    config_digest, config_size = put(config)
+    manifest = json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": "sha256:" + config_digest, "size": config_size},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": "sha256:" + layer_digest, "size": layer_size}],
+    }).encode()
+    manifest_digest, manifest_size = put(manifest)
+    (dest / "index.json").write_text(json.dumps({
+        "schemaVersion": 2,
+        "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                       "digest": "sha256:" + manifest_digest,
+                       "size": manifest_size,
+                       "annotations": {"org.opencontainers.image.ref.name":
+                                       "latest"}}]}))
+    (dest / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}')
+
+
+class TestBuildArgsReplay(unittest.TestCase):
+    """The wrapper records its build options and `update` replays them.
+
+    Builds go through the real `oci2bin` CLI from a local OCI layout, so
+    no container engine is needed; the loader compiled by TestCliFeatures
+    is reused through a private OCI2BIN_HOME.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if os.uname().machine != "x86_64":
+            raise unittest.SkipTest("wrapper build test assumes x86_64")
+        cls._tmp = tempfile.TemporaryDirectory(prefix="oci2bin-replay-")
+        cls.tmpdir = Path(cls._tmp.name)
+        # A stand-in install tree: the repo's scripts and sources, plus a
+        # prebuilt loader so the wrapper does not compile one.
+        cls.home = cls.tmpdir / "home"
+        (cls.home / "build").mkdir(parents=True)
+        for entry in ("scripts", "src", "VERSION"):
+            if (ROOT / entry).exists():
+                os.symlink(ROOT / entry, cls.home / entry)
+        loader = cls.home / "build" / "loader-x86_64"
+        build = subprocess.run(
+            ["gcc", "-static", "-O2", "-s", "-o", str(loader),
+             str(ROOT / "src" / "loader.c")],
+            capture_output=True, text=True, timeout=300)
+        if build.returncode != 0:
+            raise unittest.SkipTest(f"failed to build loader: {build.stderr}")
+        cls.layout = cls.tmpdir / "layout"
+        _write_oci_layout(cls.layout, [("hello.txt", b"hello\n")])
+        cls.env = dict(os.environ, OCI2BIN_HOME=str(cls.home),
+                       XDG_CACHE_HOME=str(cls.tmpdir / "xdg"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def _wrapper(self, *args, cwd=None):
+        return subprocess.run([str(OCI2BIN), *args], capture_output=True,
+                              text=True, timeout=300, env=self.env,
+                              cwd=cwd or self.tmpdir)
+
+    def _meta(self, binary):
+        return _load_module("inspect_image",
+                            ROOT / "scripts" / "inspect_image.py"
+                            ).read_meta_block(str(binary)) or {}
+
+    def test_build_records_options_and_update_replays_them(self):
+        out = self.tmpdir / "app.bin"
+        build = self._wrapper("--oci-dir", str(self.layout), "--no-libkrun",
+                              "--label", "demo=one",
+                              "--label", "spaced=a b",
+                              "replay-test:latest", str(out))
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        recorded = self._meta(out).get("build_args")
+        self.assertEqual(recorded, ["--arch", "x86_64",
+                                    "--oci-dir", str(self.layout),
+                                    "--no-libkrun",
+                                    "--label", "demo=one",
+                                    "--label", "spaced=a b"])
+        for name in ("replay-test:latest", str(out)):
+            self.assertNotIn(name, recorded)
+
+        shown = self._wrapper("inspect", str(out))
+        self.assertEqual(shown.returncode, 0, msg=shown.stderr)
+        self.assertIn("Build args: --arch x86_64 --oci-dir", shown.stdout)
+        self.assertIn("--label 'spaced=a b'", shown.stdout)
+        as_json = self._wrapper("inspect", "--json", str(out))
+        self.assertEqual(as_json.returncode, 0, msg=as_json.stderr)
+        self.assertIn('"build_args"', as_json.stdout)
+
+        # `update` rebuilds through the recorded list: the labels survive
+        # and, since --oci-dir is part of it, no engine is consulted.
+        before = self._meta(out)
+        update = self._wrapper("update", str(out))
+        self.assertEqual(update.returncode, 0, msg=update.stderr)
+        self.assertIn("with the recorded options:", update.stderr)
+        self.assertIn("--label 'spaced=a b'", shlex.join(recorded))
+        after = self._meta(out)
+        self.assertEqual(after.get("build_args"), before.get("build_args"))
+        shown = self._wrapper("inspect", str(out))
+        self.assertIn("demo=one", shown.stdout)
+        self.assertIn("spaced=a b", shown.stdout)
+
+    def test_update_says_when_no_options_were_recorded(self):
+        """A binary from an older builder carries no build_args: update
+        must say so and fall back to defaults rather than guess."""
+        out = self.tmpdir / "legacy.bin"
+        build = self._wrapper("--oci-dir", str(self.layout), "--no-libkrun",
+                              "legacy-test:latest", str(out))
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        # Strip build_args from the metadata block in place (same length).
+        blob = bytearray(out.read_bytes())
+        magic = blob.rfind(b"OCI2BIN_META\x00")
+        total = struct.unpack_from("<I", blob, magic - 4)[0]
+        start, end = magic + 13, (magic - 4) + total
+        raw = bytes(blob[start:end]).rstrip(b"\x00")
+        meta = json.loads(raw)
+        del meta["build_args"]
+        rewritten = json.dumps(meta).encode().ljust(len(raw), b"\x00")
+        blob[start:start + len(rewritten)] = rewritten
+        out.write_bytes(blob)
+        self.assertNotIn("build_args", self._meta(out))
+        # The default rebuild needs a container engine for a bare image
+        # name; with none in PATH the replay fails after the message.
+        env = dict(self.env, PATH=str(self.tmpdir / "empty-bin")
+                   + os.pathsep + os.path.dirname(shutil.which("python3"))
+                   + os.pathsep + "/usr/bin:/bin")
+        update = subprocess.run([str(OCI2BIN), "update", str(out)],
+                                capture_output=True, text=True, timeout=300,
+                                env=env, cwd=self.tmpdir)
+        self.assertIn("no build options recorded", update.stderr)
+        self.assertNotIn("with the recorded options", update.stderr)
+
+    def test_update_refuses_a_record_that_is_not_options(self):
+        """build_args is data from the binary: a token that could act as a
+        positional (a different image or output) is refused outright."""
+        out = self.tmpdir / "tampered.bin"
+        build = self._wrapper("--oci-dir", str(self.layout), "--no-libkrun",
+                              "tamper-test:latest", str(out))
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        for bad in (["--strip", "evil:latest", "--squash"],
+                    ["--", "x"],
+                    ["evil:latest"],
+                    ["--label"],
+                    ["--not-a-build-option"]):
+            blob = bytearray(out.read_bytes())
+            magic = blob.rfind(b"OCI2BIN_META\x00")
+            total = struct.unpack_from("<I", blob, magic - 4)[0]
+            start, end = magic + 13, (magic - 4) + total
+            raw = bytes(blob[start:end]).rstrip(b"\x00")
+            meta = json.loads(raw)
+            meta["build_args"] = bad
+            rewritten = json.dumps(meta, separators=(",", ":")).encode()
+            self.assertLessEqual(len(rewritten), len(raw) + 1)
+            # The block is NUL padded; a shorter JSON is re-padded to size.
+            blob[start:end] = rewritten.ljust(end - start, b"\x00")
+            tampered = self.tmpdir / "tampered-copy.bin"
+            tampered.write_bytes(blob)
+            self.assertEqual(self._meta(tampered).get("build_args"), bad)
+            update = self._wrapper("update", str(tampered))
+            self.assertNotEqual(update.returncode, 0)
+            self.assertIn("malformed build_args record", update.stderr)
+            self.assertNotIn("rebuilding from", update.stderr)

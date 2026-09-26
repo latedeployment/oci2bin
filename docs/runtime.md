@@ -68,8 +68,9 @@ machine, ask the binary itself to check that host:
 `--doctor` is read-only — it never extracts the image or creates namespaces. It
 reports unprivileged user namespaces (including the AppArmor / `clone` knobs
 above), `newuidmap`/`newgidmap` + `/etc/subuid`, seccomp, landlock, cgroup v2,
-`tar`, `python3` + `openssl` (required only when the artifact carries a pinned
-digest or `--require-signed` policy), and `/dev/kvm` (for `--vm`), then exits
+`tar`, `python3` + `openssl` (needed only for `--self-update` and for
+signature keys that are not P-256; pinned digests and `--require-signed` are
+checked by the loader itself), and `/dev/kvm` (for `--vm`), then exits
 non-zero if a blocking issue is found. You can also probe the kernel knobs by hand:
 
 ```bash
@@ -203,6 +204,19 @@ Disable networking:
 ```bash
 ./app.bin --net none
 ```
+
+Deny TCP without a network namespace:
+
+```bash
+./app.bin --net deny-tcp
+```
+
+The workload stays in the host network namespace (abstract Unix sockets to
+host services, `--net container:PID`-style sharing) but Landlock refuses
+every TCP `bind()` and `connect()` with `EACCES`. UDP, Unix and raw sockets
+are untouched. Needs Landlock ABI 4 (Linux 6.7+); the run aborts otherwise,
+and `-p`, `--allow-egress`, `--vm` and `--no-landlock` cannot be combined
+with it.
 
 Use slirp4netns:
 
@@ -584,13 +598,31 @@ Interactive and TTY mode:
 ./app.bin -it /bin/sh
 ```
 
+Stop grace period:
+
+```bash
+./app.bin --init --stop-timeout 30
+./app.bin --stop-timeout 0      # forward SIGTERM, never escalate
+```
+
 `--init`, `--restart` and `--health` run the workload with the same user
 (`--user`, or the image `User`), PTY, capabilities, LSM labels and seccomp
-profile as a direct run; health probes run as that user too. A stop signal
-during a restart back-off ends the supervisor instead of starting another
-attempt, and a workload that ignores the SIGTERM sent for failing health checks
-is killed after 10 seconds. With `-t`, end-of-file on stdin (`</dev/null`, a
-systemd unit) only closes the input side; the workload keeps running.
+profile as a direct run; health probes run as that user too. The supervisor
+is event-driven: it waits in one `poll` on a `signalfd` (signals to forward),
+the workload's `pidfd` (its exit, and the target of `pidfd_send_signal`), and
+`timerfd`s for the health interval and the stop grace, so probes run on their
+exact cadence, exits are reaped the moment they happen, and no signal can hit
+a recycled PID. A stop signal during a restart back-off ends the supervisor
+instead of starting another attempt.
+
+`--stop-timeout N` is the grace between the SIGTERM the supervisor forwards
+(or sends to an unhealthy workload) and the SIGKILL that follows if the
+workload is still running: the default is 10 seconds, as in Docker, and `0`
+never escalates for a user stop (an unhealthy workload that traps SIGTERM
+still gets the default grace, otherwise the supervisor could never restart
+it). Given on its own the flag implies `--init`. With `-t`, end-of-file on
+stdin (`</dev/null`, a systemd unit) only closes the input side; the workload
+keeps running.
 
 ## VM Mode Runtime
 

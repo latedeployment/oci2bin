@@ -143,6 +143,40 @@ class ReadOciDataTest(unittest.TestCase):
             self.assertEqual(mod.read_oci_data(f.name), blob)
 
 
+    def test_read_oci_data_prefers_complete_archive_over_parsable_prefix(self):
+        """manifest.json first, a layer last: a slice cut right after the
+        second member still parses (tarfile stops at end of data), so the
+        unrelated small global next to the offset used to win and the
+        layer vanished from sbom/diff."""
+        mod = self._mod()
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w") as tf:
+            for name, data in (("manifest.json", b"{}"),
+                               ("blobs/config", b"{}"),
+                               ("blobs/layer", b"x" * 8192)):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        blob = out.getvalue()
+        oci_offset = 4096
+        loader = bytearray(512)
+        for order in ("size,offset,small", "small,offset,size"):
+            values = ([len(blob), oci_offset, 2048] if order[0] == "s" and
+                      order.startswith("size") else [2048, oci_offset, len(blob)])
+            for i, v in enumerate(values):
+                loader[120 + 8 * i:128 + 8 * i] = struct.pack("<Q", v)
+            data = bytes(loader) + b"\0" * (oci_offset - len(loader)) + blob
+            with tempfile.NamedTemporaryFile() as f:
+                f.write(data)
+                f.flush()
+                got = mod.read_oci_data(f.name)
+            self.assertEqual(got, blob, order)
+            with tarfile.open(fileobj=io.BytesIO(got)) as tf:
+                self.assertEqual([m.name for m in tf.getmembers()],
+                                 ["manifest.json", "blobs/config",
+                                  "blobs/layer"], order)
+
+
 class ReadOciDataDiffImagesTest(ReadOciDataTest):
     """diff_images.py used to carry its own copy of read_oci_data without the
     span validation; it must behave exactly like inspect_image.py's."""

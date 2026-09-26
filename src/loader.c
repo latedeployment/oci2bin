@@ -21,6 +21,8 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <sys/signalfd.h>
+#include <sys/timerfd.h>
 #include <sys/file.h>
 #include <stdint.h>
 #include <dirent.h>
@@ -163,12 +165,17 @@ struct mount_attr
 #ifndef LANDLOCK_ACCESS_FS_IOCTL_DEV
 #define LANDLOCK_ACCESS_FS_IOCTL_DEV   (1ULL << 15) /* ABI 5 */
 #endif
+#ifndef LANDLOCK_ACCESS_NET_BIND_TCP
+#define LANDLOCK_ACCESS_NET_BIND_TCP    (1ULL << 0) /* ABI 4 */
+#define LANDLOCK_ACCESS_NET_CONNECT_TCP (1ULL << 1) /* ABI 4 */
+#endif
 
 #ifndef LANDLOCK_RULE_PATH_BENEATH
 #define LANDLOCK_RULE_PATH_BENEATH 1
 struct landlock_ruleset_attr
 {
     unsigned long long handled_access_fs;
+    unsigned long long handled_access_net; /* ABI 4; zero on older kernels */
 };
 struct landlock_path_beneath_attr
 {
@@ -279,6 +286,7 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len);
 static int run_cmd(char* const argv[]);
 static int run_cmd_umask(char* const argv[], mode_t child_umask);
 static void rm_rf_dir(const char* path);
+static void child_unblock_signals(void);
 static int tool_is_available(const char* prog);
 static int setup_single_uid_map(uid_t real_uid, gid_t real_gid);
 static int json_escape_string(const char* src, char* dst, size_t dstsz);
@@ -575,8 +583,10 @@ struct container_opts
     /* --workdir /path  (overrides OCI WorkingDir) */
     char* workdir;
 
-    /* --net host|none|userspace|container:<PID>|slirp|pasta|slirp:H:C
+    /* --net host|none|deny-tcp|userspace|container:<PID>|slirp|pasta|slirp:H:C
      * NULL/"host" = host network; "none" = isolated; container:<PID> = join
+     * "deny-tcp" = host network namespace, Landlock (ABI 4) denies every
+     *              TCP bind(2)/connect(2)
      * "slirp" = userspace TCP/UDP via slirp4netns
      * "pasta" = userspace TCP/UDP via pasta
      * "userspace" = rootless libkrun TSI networking in --vm mode
@@ -809,6 +819,13 @@ struct container_opts
      * restart_max applies only to on-failure (0 = unlimited). */
     int restart_policy;
     int restart_max;
+
+    /* --stop-timeout N: seconds between the SIGTERM forwarded to (or sent
+     * to) the workload and the SIGKILL that follows when it is still
+     * running.  0 = never escalate.  Unset = DEFAULT_STOP_TIMEOUT_S.  Given
+     * on its own it implies --init so there is a supervisor to enforce it. */
+    long stop_timeout_s;
+    int  stop_timeout_set;
 
     /* --health and friends: run the image HEALTHCHECK (or --health-cmd) inside
      * the container on an interval, surface status in `ps`, fire the --notify
@@ -5655,6 +5672,7 @@ static int run_cmd_internal(char* const argv[], int set_child_umask,
     }
     if (pid == 0)
     {
+        child_unblock_signals();
         if (set_child_umask)
         {
             umask(child_umask);
@@ -5940,6 +5958,7 @@ static pid_t spawn_daemon(char* const argv[])
     }
     if (pid == 0)
     {
+        child_unblock_signals();
         execvp(argv[0], argv);
         perror("execvp");
         _exit(1);
@@ -8119,7 +8138,7 @@ static int extract_layers_from_layout(const char* oci_dir,
     char* layers[MAX_LAYERS];
     memset(layers, 0, sizeof(layers));
     int nlayers = json_parse_string_array_strict(layers_json, layers,
-        MAX_LAYERS);
+                  MAX_LAYERS);
     if (nlayers < 0)
     {
         fprintf(stderr, "oci2bin: malformed or oversized Layers array\n");
@@ -11960,27 +11979,402 @@ static int enter_workload_context(const struct container_opts* opts,
 
 /* ── init reaper ─────────────────────────────────────────────────────────── */
 
-/*
- * Global child PID used by the init signal forwarding handler.
- * Set before installing signal handlers; only written once.
- */
-static volatile pid_t g_init_child_pid = 0;
+/* ── event-driven supervisor core ────────────────────────────────────────── */
 
-static void init_forward_signal(int sig)
+/*
+ * --init, --restart and --health used to sit in loops of waitpid(WNOHANG)
+ * and nanosleep(200ms), with signal handlers forwarding to a global PID:
+ * health probes drifted by up to a sleep per interval, a child exit was
+ * noticed late, and the kill-after-grace path compared time(2) seconds.
+ *
+ * Everything now waits in one poll(2) on four descriptors:
+ *   signalfd   SIGTERM/SIGINT/SIGHUP/SIGUSR1/SIGUSR2 to forward, SIGCHLD to
+ *              reap — the signals are blocked, so nothing is lost or racy;
+ *   pidfd      the workload's pidfd_open(2) handle: readable the moment it
+ *              exits, and the target of pidfd_send_signal(2), which cannot
+ *              hit a recycled PID.  Kernels without it fall back to SIGCHLD
+ *              plus kill(2) on a PID we have not reaped yet (a zombie's PID
+ *              is not reusable, so the parent is safe there too);
+ *   timerfd    the health cadence as a periodic CLOCK_MONOTONIC timer, so
+ *              probes fire on the interval regardless of how long they run;
+ *   timerfd    the --stop-timeout escalation: SIGTERM forwarded, SIGKILL
+ *              when the workload is still there after the grace period.
+ *
+ * spawn_workload() and run_health_probe() stay the only places that fork the
+ * workload or a probe, and enter_workload_context() the only place that
+ * prepares the exec'd process.
+ */
+
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_send_signal
+#define __NR_pidfd_send_signal 424
+#endif
+
+/* Docker's default stop grace: SIGTERM, then SIGKILL after this many
+ * seconds.  --stop-timeout overrides it; 0 waits forever. */
+#define DEFAULT_STOP_TIMEOUT_S 10
+
+/* Signals the supervisor owns while a workload runs. */
+static void supervisor_sigset(sigset_t* set)
 {
-    if (g_init_child_pid > 0)
+    sigemptyset(set);
+    sigaddset(set, SIGTERM);
+    sigaddset(set, SIGINT);
+    sigaddset(set, SIGHUP);
+    sigaddset(set, SIGUSR1);
+    sigaddset(set, SIGUSR2);
+    sigaddset(set, SIGCHLD);
+}
+
+/* Children must not inherit the supervisor's blocked set: a workload that
+ * never sees SIGTERM cannot shut down.  Called in every fork child. */
+static void child_unblock_signals(void)
+{
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigprocmask(SIG_SETMASK, &empty, NULL);
+}
+
+struct supervisor
+{
+    int      sigfd;
+    int      health_tfd;
+    int      stop_tfd;
+    int      pidfd;
+    pid_t    child;
+    int      child_exited;
+    int      child_status;
+    int      stop_requested;   /* SIGTERM/SIGINT seen */
+    long     stop_timeout_s;
+    sigset_t saved_mask;
+};
+
+#define SV_EV_SIGNAL 1
+#define SV_EV_CHILD  2
+#define SV_EV_HEALTH 4
+#define SV_EV_STOP   8
+
+static int supervisor_open(struct supervisor* sv, long stop_timeout_s)
+{
+    memset(sv, 0, sizeof(*sv));
+    sv->sigfd = sv->health_tfd = sv->stop_tfd = sv->pidfd = -1;
+    sv->child = -1;
+    sv->stop_timeout_s = stop_timeout_s;
+    sigset_t set;
+    supervisor_sigset(&set);
+    if (sigprocmask(SIG_BLOCK, &set, &sv->saved_mask) < 0)
     {
-        kill(g_init_child_pid, sig);
+        perror("oci2bin: supervisor sigprocmask");
+        return -1;
+    }
+    sv->sigfd = signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK);
+    if (sv->sigfd < 0)
+    {
+        perror("oci2bin: supervisor signalfd");
+        sigprocmask(SIG_SETMASK, &sv->saved_mask, NULL);
+        return -1;
+    }
+    return 0;
+}
+
+static void supervisor_detach_child(struct supervisor* sv)
+{
+    if (sv->pidfd >= 0)
+    {
+        close(sv->pidfd);
+        sv->pidfd = -1;
+    }
+    if (sv->stop_tfd >= 0)
+    {
+        close(sv->stop_tfd);
+        sv->stop_tfd = -1;
+    }
+    sv->child = -1;
+    sv->child_exited = 0;
+    sv->child_status = 0;
+}
+
+static void supervisor_close(struct supervisor* sv)
+{
+    supervisor_detach_child(sv);
+    if (sv->health_tfd >= 0)
+    {
+        close(sv->health_tfd);
+        sv->health_tfd = -1;
+    }
+    if (sv->sigfd >= 0)
+    {
+        close(sv->sigfd);
+        sv->sigfd = -1;
+    }
+    sigprocmask(SIG_SETMASK, &sv->saved_mask, NULL);
+}
+
+static void supervisor_attach_child(struct supervisor* sv, pid_t child)
+{
+    sv->child = child;
+    sv->child_exited = 0;
+    sv->child_status = 0;
+    sv->pidfd = (int)syscall(__NR_pidfd_open, child, 0);
+    if (sv->pidfd < 0)
+    {
+        debug_log("supervisor.pidfd", "unavailable errno=%d", errno);
+        sv->pidfd = -1;
+    }
+}
+
+/* Signal the live workload.  Nothing is sent once it has been reaped. */
+static void supervisor_signal_child(struct supervisor* sv, int sig)
+{
+    if (sv->child <= 0 || sv->child_exited)
+    {
+        return;
+    }
+    if (sv->pidfd >= 0 &&
+            syscall(__NR_pidfd_send_signal, sv->pidfd, sig, NULL, 0) == 0)
+    {
+        return;
+    }
+    kill(sv->child, sig);
+}
+
+/* A periodic health timer: first expiry after max(start_period, interval),
+ * then every interval, on CLOCK_MONOTONIC. */
+static int supervisor_arm_health(struct supervisor* sv, long interval_s,
+                                 long start_period_s)
+{
+    if (sv->health_tfd < 0)
+    {
+        sv->health_tfd = timerfd_create(CLOCK_MONOTONIC,
+                                        TFD_CLOEXEC | TFD_NONBLOCK);
+        if (sv->health_tfd < 0)
+        {
+            perror("oci2bin: health timerfd");
+            return -1;
+        }
+    }
+    long first = start_period_s > interval_s ? start_period_s : interval_s;
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec    = first > 0 ? first : 1;
+    its.it_interval.tv_sec = interval_s > 0 ? interval_s : 1;
+    if (timerfd_settime(sv->health_tfd, 0, &its, NULL) < 0)
+    {
+        perror("oci2bin: health timerfd_settime");
+        return -1;
+    }
+    return 0;
+}
+
+/* One-shot escalation timer; a second call re-arms it. */
+static int supervisor_arm_stop(struct supervisor* sv, long seconds)
+{
+    if (seconds <= 0)
+    {
+        return 0;
+    }
+    if (sv->stop_tfd < 0)
+    {
+        sv->stop_tfd = timerfd_create(CLOCK_MONOTONIC,
+                                      TFD_CLOEXEC | TFD_NONBLOCK);
+        if (sv->stop_tfd < 0)
+        {
+            perror("oci2bin: stop timerfd");
+            return -1;
+        }
+    }
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = seconds;
+    return timerfd_settime(sv->stop_tfd, 0, &its, NULL);
+}
+
+static void supervisor_disarm_health(struct supervisor* sv)
+{
+    if (sv->health_tfd >= 0)
+    {
+        struct itimerspec zero;
+        memset(&zero, 0, sizeof(zero));
+        timerfd_settime(sv->health_tfd, 0, &zero, NULL);
+    }
+}
+
+static void timerfd_drain(int fd)
+{
+    uint64_t n;
+    while (read(fd, &n, sizeof(n)) == (ssize_t)sizeof(n))
+    {
+    }
+}
+
+/* Reap every finished child; note the workload's own status. */
+static void supervisor_reap(struct supervisor* sv)
+{
+    for (;;)
+    {
+        int   st = 0;
+        pid_t r  = waitpid(-1, &st, WNOHANG);
+        if (r <= 0)
+        {
+            if (r < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            return;
+        }
+        if (r == sv->child)
+        {
+            sv->child_exited = 1;
+            sv->child_status = st;
+        }
     }
 }
 
 /*
+ * Drain the signalfd: forward the workload's signals, remember a stop, and
+ * arm the SIGTERM→SIGKILL escalation on the first stop request.  SIGCHLD
+ * triggers a reap pass.
+ */
+static void supervisor_handle_signals(struct supervisor* sv)
+{
+    struct signalfd_siginfo si;
+    for (;;)
+    {
+        ssize_t n = read(sv->sigfd, &si, sizeof(si));
+        if (n != (ssize_t)sizeof(si))
+        {
+            return;
+        }
+        int sig = (int)si.ssi_signo;
+        if (sig == SIGCHLD)
+        {
+            supervisor_reap(sv);
+            continue;
+        }
+        if (sig == SIGTERM || sig == SIGINT)
+        {
+            if (!sv->stop_requested)
+            {
+                sv->stop_requested = 1;
+                supervisor_arm_stop(sv, sv->stop_timeout_s);
+            }
+        }
+        supervisor_signal_child(sv, sig);
+    }
+}
+
+/*
+ * Wait for the next event (or timeout_ms, -1 = forever).  Returns a mask of
+ * SV_EV_*; signals and child exits are already handled when it returns, so
+ * callers only look at sv->child_exited and the timer bits.
+ */
+static int supervisor_wait(struct supervisor* sv, int timeout_ms)
+{
+    struct pollfd fds[4];
+    int kinds[4];
+    int n = 0;
+    fds[n].fd = sv->sigfd;
+    fds[n].events = POLLIN;
+    kinds[n++] = SV_EV_SIGNAL;
+    if (sv->pidfd >= 0 && !sv->child_exited)
+    {
+        fds[n].fd = sv->pidfd;
+        fds[n].events = POLLIN;
+        kinds[n++] = SV_EV_CHILD;
+    }
+    if (sv->health_tfd >= 0)
+    {
+        fds[n].fd = sv->health_tfd;
+        fds[n].events = POLLIN;
+        kinds[n++] = SV_EV_HEALTH;
+    }
+    if (sv->stop_tfd >= 0)
+    {
+        fds[n].fd = sv->stop_tfd;
+        fds[n].events = POLLIN;
+        kinds[n++] = SV_EV_STOP;
+    }
+    for (int i = 0; i < n; i++)
+    {
+        fds[i].revents = 0;
+    }
+    int r = poll(fds, (nfds_t)n, timeout_ms);
+    if (r < 0)
+    {
+        return 0;    /* EINTR: the caller loops */
+    }
+    int ev = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
+        {
+            continue;
+        }
+        ev |= kinds[i];
+        switch (kinds[i])
+        {
+            case SV_EV_SIGNAL:
+                supervisor_handle_signals(sv);
+                break;
+            case SV_EV_CHILD:
+                supervisor_reap(sv);
+                break;
+            case SV_EV_HEALTH:
+                timerfd_drain(sv->health_tfd);
+                break;
+            case SV_EV_STOP:
+                timerfd_drain(sv->stop_tfd);
+                break;
+            default:
+                break;
+        }
+    }
+    /* Without a pidfd the exit arrives as SIGCHLD; either way a reaped
+     * workload counts as a child event. */
+    if (sv->child_exited)
+    {
+        ev |= SV_EV_CHILD;
+    }
+    return ev;
+}
+
+/* The workload has not exited within the grace period: SIGKILL it. */
+static void supervisor_escalate(struct supervisor* sv, const char* why)
+{
+    if (sv->child <= 0 || sv->child_exited)
+    {
+        return;
+    }
+    fprintf(stderr,
+            "oci2bin: workload still running %lds after SIGTERM (%s);"
+            " sending SIGKILL\n", sv->stop_timeout_s, why);
+    supervisor_signal_child(sv, SIGKILL);
+}
+
+/* Exit code from a wait status, Docker style (128 + signal). */
+static int wait_status_to_code(int status)
+{
+    if (WIFEXITED(status))
+    {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status))
+    {
+        return 128 + WTERMSIG(status);
+    }
+    return 1;
+}
+
+/*
  * spawn_workload: fork the container workload. In the child, restore default
- * signal dispositions, drop to the --user UID/GID if requested, and exec
- * exec_args (never returns there). In the parent, return the child PID, or -1
- * on fork failure (message printed). Shared by run_as_init() and
- * run_supervised() so the fork + privilege-drop + exec sequence is defined
- * once. Must be called AFTER seccomp/capability setup.
+ * signal dispositions and the signal mask (the supervisor blocks its set for
+ * the signalfd), drop to the --user UID/GID if requested, and exec exec_args
+ * (never returns there). In the parent, return the child PID, or -1 on fork
+ * failure (message printed). Shared by run_as_init() and run_supervised() so
+ * the fork + privilege-drop + exec sequence is defined once. Must be called
+ * AFTER seccomp/capability setup.
  */
 static pid_t spawn_workload(char** exec_args,
                             const struct container_opts* opts,
@@ -11994,13 +12388,13 @@ static pid_t spawn_workload(char** exec_args,
     }
     if (child == 0)
     {
-        /* Default signal disposition for the workload (the parent installs
-         * forwarders that must not leak into the child). */
+        child_unblock_signals();
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT, SIG_DFL);
         signal(SIGHUP, SIG_DFL);
         signal(SIGUSR1, SIG_DFL);
         signal(SIGUSR2, SIG_DFL);
+        signal(SIGCHLD, SIG_DFL);
         audit_emit_exec_event(exec_args[0]);
         if (enter_workload_context(opts, id, 0) < 0)
         {
@@ -12013,8 +12407,16 @@ static pid_t spawn_workload(char** exec_args,
     return child;
 }
 
+static long effective_stop_timeout(const struct container_opts* opts)
+{
+    return (opts && opts->stop_timeout_set) ? opts->stop_timeout_s
+           : DEFAULT_STOP_TIMEOUT_S;
+}
+
 /*
- * run_as_init: fork the entrypoint as a child, then loop reaping all zombies.
+ * run_as_init: fork the entrypoint as a child, then wait on the supervisor's
+ * poll loop: forward signals, reap every zombie the moment it appears, and
+ * SIGKILL a workload that outlives --stop-timeout after a stop request.
  * Returns the child's exit code, or 1 on fork failure.
  * Must be called AFTER seccomp/capability setup (both apply to parent+child).
  * The UID drop, PTY and LSM labels are applied only in the child.
@@ -12023,67 +12425,31 @@ static int run_as_init(char** exec_args,
                        const struct container_opts* opts,
                        const struct workload_ident* id)
 {
-    pid_t child = spawn_workload(exec_args, opts, id);
-    if (child < 0)
+    struct supervisor sv;
+    if (supervisor_open(&sv, effective_stop_timeout(opts)) < 0)
     {
         return 1;
     }
-
-    /* Parent: install signal forwarders then reap zombies */
-    g_init_child_pid = child;
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = init_forward_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags   = SA_RESTART;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
-    sigaction(SIGUSR1, &sa, NULL);
-    sigaction(SIGUSR2, &sa, NULL);
-
-    int child_status = 0;
-    for (;;)
+    pid_t child = spawn_workload(exec_args, opts, id);
+    if (child < 0)
     {
-        int   status = 0;
-        pid_t reaped = waitpid(-1, &status, 0);
-        if (reaped < 0)
+        supervisor_close(&sv);
+        return 1;
+    }
+    supervisor_attach_child(&sv, child);
+    while (!sv.child_exited)
+    {
+        int ev = supervisor_wait(&sv, -1);
+        if ((ev & SV_EV_STOP) && !sv.child_exited)
         {
-            if (errno == EINTR)
-            {
-                continue;    /* signal interrupted — restart */
-            }
-            if (errno == ECHILD)
-            {
-                break;    /* no more children */
-            }
-            break;
+            supervisor_escalate(&sv, "stop requested");
         }
-        if (reaped == child)
-        {
-            child_status = status;
-            /* Drain remaining zombies then stop */
-            while (waitpid(-1, NULL, WNOHANG) > 0)
-            {
-            }
-            break;
-        }
-        /* else: reaped an orphaned grandchild — continue */
     }
-
-    if (WIFEXITED(child_status))
-    {
-        audit_emit_wait_status("exit", child, child_status);
-        return WEXITSTATUS(child_status);
-    }
-    if (WIFSIGNALED(child_status))
-    {
-        audit_emit_wait_status("exit", child, child_status);
-        return 128 + WTERMSIG(child_status);
-    }
-    audit_emit_wait_status("exit", child, child_status);
-    return 1;
+    int status = sv.child_status;
+    supervisor_reap(&sv);    /* drain the orphans that were reparented to us */
+    supervisor_close(&sv);
+    audit_emit_wait_status("exit", child, status);
+    return wait_status_to_code(status);
 }
 
 /* ── restart + health supervisor ─────────────────────────────────────────── */
@@ -12307,6 +12673,7 @@ static int run_health_probe(char* const argv[], long timeout_s,
     }
     if (pid == 0)
     {
+        child_unblock_signals();
         int devnull = open("/dev/null", O_RDWR);
         if (devnull >= 0)
         {
@@ -12325,85 +12692,108 @@ static int run_health_probe(char* const argv[], long timeout_s,
         execvp(argv[0], argv);
         _exit(127);
     }
-    long limit_ms  = (timeout_s > 0 ? timeout_s : 30) * 1000L;
-    long waited_ms = 0;
-    for (;;)
+    long limit_ms = (timeout_s > 0 ? timeout_s : 30) * 1000L;
+    int  timed_out = 0;
+    int  pidfd = (int)syscall(__NR_pidfd_open, pid, 0);
+    if (pidfd >= 0)
     {
-        int   status = 0;
-        pid_t r      = waitpid(pid, &status, WNOHANG);
-        if (r == pid)
+        /* Sleep exactly until the probe exits or its deadline passes. */
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (;;)
         {
-            if (WIFEXITED(status))
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
+                              (now.tv_nsec - start.tv_nsec) / 1000000L;
+            long left = limit_ms - elapsed_ms;
+            if (left <= 0)
             {
-                return WEXITSTATUS(status) == 0 ? 0 : 1;
+                timed_out = 1;
+                break;
             }
-            return 1;
-        }
-        if (r < 0)
-        {
-            if (errno == EINTR)
+            struct pollfd pf = { pidfd, POLLIN, 0 };
+            int r = poll(&pf, 1, (int)left);
+            if (r > 0)
             {
-                continue;
+                break;
             }
-            return 1;
-        }
-        if (waited_ms >= limit_ms)
-        {
-            kill(pid, SIGKILL);
-            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+            if (r == 0)
             {
+                timed_out = 1;
+                break;
             }
-            return 1;
+            if (errno != EINTR)
+            {
+                timed_out = 1;
+                break;
+            }
         }
-        struct timespec ts = {0, 100L * 1000L * 1000L};
-        nanosleep(&ts, NULL);
-        waited_ms += 100;
+        close(pidfd);
     }
-}
-
-/* Stop requested via SIGTERM/SIGINT — suppresses "always"/"unless-stopped"
- * relaunches after an explicit stop. */
-static volatile sig_atomic_t g_supervise_stop = 0;
-
-static void supervise_forward_signal(int sig)
-{
-    if (sig == SIGTERM || sig == SIGINT)
+    else
     {
-        g_supervise_stop = 1;
+        /* No pidfd: fall back to polling the wait status. */
+        long waited_ms = 0;
+        for (;;)
+        {
+            int   status = 0;
+            pid_t r      = waitpid(pid, &status, WNOHANG);
+            if (r == pid)
+            {
+                return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
+            }
+            if (r < 0 && errno != EINTR)
+            {
+                return 1;
+            }
+            if (waited_ms >= limit_ms)
+            {
+                timed_out = 1;
+                break;
+            }
+            struct timespec ts = {0, 100L * 1000L * 1000L};
+            nanosleep(&ts, NULL);
+            waited_ms += 100;
+        }
     }
-    if (g_init_child_pid > 0)
+    if (timed_out)
     {
-        kill(g_init_child_pid, sig);
+        kill(pid, SIGKILL);
     }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    {
+    }
+    if (timed_out)
+    {
+        return 1;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
 
 /*
  * Supervising PID-1 loop: (re)launch the workload per the restart policy and,
  * when health monitoring is enabled, probe it on its interval.  Reaps orphaned
  * grandchildren like the --init reaper.  Returns the workload's last exit code.
+ *
+ * Everything waits in supervisor_wait(): the health timerfd keeps probes on
+ * their exact cadence, the pidfd reports the exit instantly, the signalfd
+ * forwards stop signals, and the stop timerfd escalates SIGTERM to SIGKILL
+ * after --stop-timeout, for a user stop and for the SIGTERM sent to an
+ * unhealthy workload alike.
  */
-/* Grace period between the SIGTERM sent to an unhealthy workload and the
- * SIGKILL that follows if it has not exited (Docker's stop timeout). */
-#define SUPERVISE_KILL_GRACE_S 10
-
 static int run_supervised(char** exec_args,
                           const struct container_opts* opts,
                           const struct health_state* hs,
                           const struct workload_ident* id)
 {
-    g_supervise_stop = 0;
-    g_init_child_pid = 0;
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = supervise_forward_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
-    sigaction(SIGUSR1, &sa, NULL);
-    sigaction(SIGUSR2, &sa, NULL);
+    struct supervisor sv;
+    long stop_timeout = effective_stop_timeout(opts);
+    if (supervisor_open(&sv, stop_timeout) < 0)
+    {
+        return 1;
+    }
 
     int restart_count = 0;
     int last_code     = 0;
@@ -12413,10 +12803,10 @@ static int run_supervised(char** exec_args,
         pid_t child = spawn_workload(exec_args, opts, id);
         if (child < 0)
         {
+            supervisor_close(&sv);
             return 1;
         }
-
-        g_init_child_pid = child;
+        supervisor_attach_child(&sv, child);
         if (restart_count > 0)
         {
             char detail[96];
@@ -12426,119 +12816,84 @@ static int run_supervised(char** exec_args,
             notify_event(opts, "container_restart", detail);
         }
 
-        time_t started      = time(NULL);
-        time_t last_probe   = started;
-        int    consec_fail  = 0;
-        int    cur_health   = 0; /* 0 unknown, 1 healthy, 2 unhealthy */
-        int    health_acted = 0;
-        time_t term_sent    = 0;
-        int    status       = 0;
-        int    got_child    = 0;
-
-        while (!got_child)
+        int consec_fail  = 0;
+        int cur_health   = 0; /* 0 unknown, 1 healthy, 2 unhealthy */
+        int health_acted = 0;
+        if (hs && hs->enabled &&
+                supervisor_arm_health(&sv, hs->interval_s,
+                                      hs->start_period_s) < 0)
         {
-            pid_t r = waitpid(-1, &status, WNOHANG);
-            if (r == child)
+            supervisor_close(&sv);
+            return 1;
+        }
+
+        while (!sv.child_exited)
+        {
+            int ev = supervisor_wait(&sv, -1);
+            if (sv.child_exited)
             {
-                got_child = 1;
                 break;
             }
-            if (r > 0)
+            if (ev & SV_EV_STOP)
             {
-                continue; /* reaped an orphaned grandchild */
+                supervisor_escalate(&sv, health_acted && !sv.stop_requested
+                                    ? "unhealthy" : "stop requested");
             }
-            if (r < 0)
+            if ((ev & SV_EV_HEALTH) && hs && hs->enabled && !health_acted &&
+                    !sv.stop_requested)
             {
-                if (errno == EINTR)
+                int probe = run_health_probe(hs->argv, hs->timeout_s, opts,
+                                             id);
+                if (probe == 0)
                 {
-                    continue;
-                }
-                if (errno == ECHILD)
-                {
-                    status    = 0;
-                    got_child = 1;
-                    break;
-                }
-            }
-            /* r == 0: workload still running.  A workload that traps the
-             * SIGTERM sent for failing health checks is killed after the
-             * grace period instead of hanging the supervisor forever. */
-            if (health_acted && term_sent > 0
-                    && time(NULL) - term_sent >= SUPERVISE_KILL_GRACE_S)
-            {
-                kill(child, SIGKILL);
-                term_sent = 0;
-            }
-            if (hs && hs->enabled && !health_acted)
-            {
-                time_t now = time(NULL);
-                if ((now - started) >= hs->start_period_s
-                        && (now - last_probe) >= hs->interval_s)
-                {
-                    last_probe = now;
-                    int probe  = run_health_probe(hs->argv, hs->timeout_s,
-                                                  opts, id);
-                    if (probe == 0)
+                    consec_fail = 0;
+                    if (cur_health != 1)
                     {
-                        consec_fail = 0;
-                        if (cur_health != 1)
-                        {
-                            cur_health = 1;
-                            debug_log("health.healthy", "pid=%d", (int)child);
-                        }
+                        cur_health = 1;
+                        debug_log("health.healthy", "pid=%d", (int)child);
                     }
-                    else
+                }
+                else
+                {
+                    consec_fail++;
+                    debug_log("health.fail", "consec=%d/%d",
+                              consec_fail, hs->retries);
+                    if (consec_fail >= hs->retries && cur_health != 2)
                     {
-                        consec_fail++;
-                        debug_log("health.fail", "consec=%d/%d",
-                                  consec_fail, hs->retries);
-                        if (consec_fail >= hs->retries && cur_health != 2)
+                        cur_health = 2;
+                        fprintf(stderr,
+                                "oci2bin: container unhealthy (%d "
+                                "consecutive health-check failures)\n",
+                                consec_fail);
+                        char d[64];
+                        snprintf(d, sizeof(d), "\"failures\":%d",
+                                 consec_fail);
+                        notify_event(opts, "healthcheck_fail", d);
+                        if (opts->restart_policy != RESTART_NO)
                         {
-                            cur_health = 2;
-                            fprintf(stderr,
-                                    "oci2bin: container unhealthy (%d "
-                                    "consecutive health-check failures)\n",
-                                    consec_fail);
-                            char d[64];
-                            snprintf(d, sizeof(d), "\"failures\":%d",
-                                     consec_fail);
-                            notify_event(opts, "healthcheck_fail", d);
-                            if (opts->restart_policy != RESTART_NO)
-                            {
-                                kill(child, SIGTERM);
-                                health_acted = 1;
-                                term_sent    = time(NULL);
-                            }
+                            /* A workload that traps this SIGTERM is killed
+                             * after the stop timeout; "never escalate" (0)
+                             * would hang the supervisor, so the default
+                             * grace applies then. */
+                            supervisor_signal_child(&sv, SIGTERM);
+                            health_acted = 1;
+                            supervisor_arm_stop(&sv, stop_timeout > 0
+                                                ? stop_timeout
+                                                : DEFAULT_STOP_TIMEOUT_S);
                         }
                     }
                 }
             }
-            struct timespec ts = {0, 200L * 1000L * 1000L};
-            nanosleep(&ts, NULL);
         }
 
-        if (WIFEXITED(status))
-        {
-            last_code = WEXITSTATUS(status);
-        }
-        else if (WIFSIGNALED(status))
-        {
-            last_code = 128 + WTERMSIG(status);
-        }
-        else
-        {
-            last_code = 1;
-        }
-        audit_emit_wait_status("exit", child, status);
-        g_init_child_pid = 0;
-
-        /* Drain any remaining zombies before deciding on a restart. */
-        while (waitpid(-1, NULL, WNOHANG) > 0)
-        {
-        }
+        last_code = wait_status_to_code(sv.child_status);
+        audit_emit_wait_status("exit", child, sv.child_status);
+        supervisor_disarm_health(&sv);
+        supervisor_reap(&sv);    /* drain any remaining zombies */
+        supervisor_detach_child(&sv);
 
         int do_restart = 0;
-        if (!g_supervise_stop)
+        if (!sv.stop_requested)
         {
             switch (opts->restart_policy)
             {
@@ -12568,18 +12923,15 @@ static int run_supervised(char** exec_args,
                 "last exit %d)\n",
                 restart_count, last_code);
         /* Brief backoff to avoid a hot crash loop.  A stop signal landing
-         * here interrupts the sleep (no SA_RESTART for nanosleep) and must
-         * end the loop instead of starting another workload. */
-        struct timespec bo = {1, 0};
-        while (!g_supervise_stop && nanosleep(&bo, &bo) < 0 && errno == EINTR)
-        {
-        }
-        if (g_supervise_stop)
+         * here must end the loop instead of starting another workload. */
+        supervisor_wait(&sv, 1000);
+        if (sv.stop_requested)
         {
             break;
         }
     }
 
+    supervisor_close(&sv);
     return last_code;
 }
 /* ── Landlock LSM filesystem sandbox ─────────────────────────────────────── */
@@ -12652,21 +13004,54 @@ static int landlock_add_path_rule(int rs_fd, const char* path,
  * while --strict was documented to refuse exactly this.  Plain AUTO on a
  * kernel that cannot do it keeps skipping.
  */
+/*
+ * --net deny-tcp: stay in the caller's network namespace but let Landlock
+ * (ABI 4, Linux 6.7+) refuse every TCP bind(2) and connect(2).  The ruleset
+ * handles both network rights and adds no LANDLOCK_RULE_NET_PORT rule, so
+ * every port is denied with EACCES.  UDP, unix sockets, raw sockets and
+ * sockets the workload inherits already connected are untouched; this is a
+ * `--net none`-style TCP cut for hosts or workloads that cannot take a
+ * network namespace (abstract unix sockets to host services, a shared netns).
+ */
+static int net_deny_tcp_requested(const struct container_opts* opts)
+{
+    return opts->net && strcmp(opts->net, "deny-tcp") == 0;
+}
+
 static int landlock_degraded(const struct container_opts* opts)
 {
-    return (opts->landlock_mode == LANDLOCK_MODE_ON || opts->strict) ? -1 : 0;
+    /* --net deny-tcp asked for the network cut by name, like --landlock. */
+    return (opts->landlock_mode == LANDLOCK_MODE_ON || opts->strict ||
+            net_deny_tcp_requested(opts)) ? -1 : 0;
 }
 
 static int apply_landlock_sandbox(const struct container_opts* opts)
 {
 #ifdef __NR_landlock_create_ruleset
     int mode = opts->landlock_mode;
+    int deny_tcp = net_deny_tcp_requested(opts);
     if (mode == LANDLOCK_MODE_OFF)
     {
+        if (deny_tcp)
+        {
+            /* validate_network_opts() rejects this pairing up front; never
+             * start a workload that was promised no TCP without the cut. */
+            fprintf(stderr,
+                    "oci2bin: --net deny-tcp is enforced by Landlock;"
+                    " it cannot be combined with --no-landlock\n");
+            return -1;
+        }
         return 0;
     }
     if (!kernel_supports_landlock())
     {
+        if (deny_tcp)
+        {
+            fprintf(stderr,
+                    "oci2bin: --net deny-tcp requested but kernel does not"
+                    " support Landlock (ABI 4, Linux 6.7+ required)\n");
+            return -1;
+        }
         if (mode == LANDLOCK_MODE_ON)
         {
             fprintf(stderr,
@@ -12716,10 +13101,24 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
     {
         handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }
+    if (deny_tcp && abi < 4)
+    {
+        fprintf(stderr,
+                "oci2bin: --net deny-tcp: kernel Landlock ABI %ld has no"
+                " network rules (ABI 4, Linux 6.7+ required)\n", abi);
+        return -1;
+    }
 
+    /* handled_access_net is ABI 4: on older kernels it stays zero, which
+     * copy_struct_from_user() accepts as "not used" for the extra bytes. */
     struct landlock_ruleset_attr ra;
     memset(&ra, 0, sizeof(ra));
     ra.handled_access_fs = handled;
+    if (deny_tcp)
+    {
+        ra.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP |
+                                LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    }
 
     int rs_fd = (int)syscall(__NR_landlock_create_ruleset, &ra,
                              sizeof(ra), 0UL);
@@ -12856,13 +13255,14 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
 
     if (g_debug)
     {
-        debug_log("landlock.applied", "vols=%d tmpfs=%d secrets=%d",
-                  opts->n_vols, opts->n_tmpfs, opts->n_secrets);
+        debug_log("landlock.applied", "vols=%d tmpfs=%d secrets=%d tcp=%s",
+                  opts->n_vols, opts->n_tmpfs, opts->n_secrets,
+                  deny_tcp ? "denied" : "allowed");
     }
-    audit_emit_pid("landlock", getpid(), "");
+    audit_emit_pid("landlock", getpid(), deny_tcp ? "deny-tcp" : "");
     return 0;
 #else
-    if (opts->landlock_mode == LANDLOCK_MODE_ON)
+    if (opts->landlock_mode == LANDLOCK_MODE_ON || net_deny_tcp_requested(opts))
     {
         fprintf(stderr,
                 "oci2bin: --landlock: this build has no Landlock support\n");
@@ -16869,7 +17269,7 @@ static int container_main(const char* rootfs, struct container_opts *opts)
 
     /* --init: run a zombie-reaping init loop; the child enters the workload
      * context (uid, PTY, labels, caps) before exec. */
-    if (opts->use_init)
+    if (opts->use_init || opts->stop_timeout_set)
     {
         return run_as_init(exec_args, opts, &wid);
     }
@@ -17163,8 +17563,10 @@ static int run_runtime_doctor(const char* self_path)
         issues++;
     }
 
-    /* python3 + openssl: needed only when this artifact carries a pinned
-     * digest or a --require-signed policy (and for --verify-key). */
+    /* python3 + openssl: the pinned digest and the signature policy are
+     * checked by the loader itself (ECDSA P-256).  The helpers are needed
+     * only for --self-update and for a verify key on another curve, so a
+     * policy-carrying artifact reports them as optional. */
     {
         char* meta = NULL;
         int   needs_verifier = 0;
@@ -17180,14 +17582,12 @@ static int run_runtime_doctor(const char* self_path)
         if (needs_verifier)
         {
             doctor_row("python3 + openssl", have_py && have_ossl ? "OK"
-                       : "MISSING",
+                       : "optional",
                        have_py && have_ossl
-                       ? "present (pinned digest / signature policy)"
-                       : "required by this artifact's pin/signature policy");
-            if (!have_py || !have_ossl)
-            {
-                issues++;
-            }
+                       ? "present (pin/signature checks are built in;"
+                       " needed for --self-update or non-P-256 keys)"
+                       : "absent; pin/signature checks are built in,"
+                       " --self-update and non-P-256 keys need them");
         }
         else
         {
@@ -17287,8 +17687,11 @@ static void usage(const char* prog)
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
             "  --workdir PATH      Set the working directory inside the container\n"
-            "  --net host|none|userspace|slirp|pasta|slirp:H:C|container:<PID>\n"
+            "  --net host|none|deny-tcp|userspace|slirp|pasta|slirp:H:C|container:<PID>\n"
             "                      Network: host (default), none (isolated),\n"
+            "                      deny-tcp (host namespace, Landlock denies"
+            " TCP\n"
+            "                      bind/connect; needs Landlock ABI 4),\n"
             "                      userspace (rootless libkrun --vm network),\n"
             "                      slirp (userspace via slirp4netns),\n"
             "                      pasta (userspace via pasta),\n"
@@ -17388,6 +17791,9 @@ static void usage(const char* prog)
             " --health-start-period N\n"
             "  --no-health         Disable health monitoring even if the image"
             " declares one\n"
+            "  --stop-timeout N    Seconds between the SIGTERM forwarded to the\n"
+            "                      workload and a SIGKILL (default 10; 0 = never);\n"
+            "                      implies --init\n"
             "  --detach, -d        Run container in background; print PID to stdout\n"
             "  -t, --tty           Allocate a pseudo-terminal for the container\n"
             "  -i, --interactive   Keep stdin open; combine with -t for -it mode\n"
@@ -18493,12 +18899,13 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             if (i + 1 >= argc)
             {
                 fprintf(stderr,
-                        "oci2bin: --net requires host, none, or"
+                        "oci2bin: --net requires host, none, deny-tcp, or"
                         " container:<PID>\n");
                 return -1;
             }
             i++;
-            if (strcmp(argv[i], "host") == 0 || strcmp(argv[i], "none") == 0)
+            if (strcmp(argv[i], "host") == 0 || strcmp(argv[i], "none") == 0 ||
+                    strcmp(argv[i], "deny-tcp") == 0)
             {
                 opts->net = argv[i];
             }
@@ -18554,8 +18961,9 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             else
             {
                 fprintf(stderr,
-                        "oci2bin: --net must be host, none, userspace, slirp,"
-                        " pasta, slirp:H:C, or container:<PID>\n");
+                        "oci2bin: --net must be host, none, deny-tcp,"
+                        " userspace, slirp, pasta, slirp:H:C, or"
+                        " container:<PID>\n");
                 return -1;
             }
         }
@@ -18852,6 +19260,27 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
         else if (strcmp(argv[i], "--no-health") == 0)
         {
             opts->health_disabled = 1;
+        }
+        else if (strcmp(argv[i], "--stop-timeout") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "oci2bin: --stop-timeout requires SECONDS\n");
+                return -1;
+            }
+            char* endp = NULL;
+            errno = 0;
+            long n = strtol(argv[++i], &endp, 10);
+            if (endp == argv[i] || *endp != '\0' || errno != 0 || n < 0 ||
+                    n > 86400)
+            {
+                fprintf(stderr,
+                        "oci2bin: --stop-timeout: expected 0-86400 seconds,"
+                        " got '%s'\n", argv[i]);
+                return -1;
+            }
+            opts->stop_timeout_s   = n;
+            opts->stop_timeout_set = 1;
         }
         else if (strcmp(argv[i], "--health-cmd") == 0)
         {
@@ -19792,6 +20221,1196 @@ static int run_python_helper(const char* script, const char* arg1,
  * Never uses a shell. Returns 0 on success, -1 on failure.
  * Aborts the process on invalid signature.
  */
+/* ── Native signature verification ─────────────────────────────────────── */
+
+/*
+ * The launch-time trust checks — the pinned digest, --require-signed and
+ * --verify-key — used to shell out to python3 and openssl.  A signed and
+ * pinned binary therefore could not start on a host without both, which
+ * defeats the point of a self-contained executable.  Everything below is
+ * the in-process replacement: SHA-256/SHA-512 over the mapped file, DER and
+ * PEM parsing, and ECDSA over NIST P-256, the curve `oci2bin sign` uses.
+ * Keys on another curve fall back to the python/openssl path when it is
+ * available and are refused otherwise.
+ */
+
+/* ── SHA-512 (FIPS 180-4) ── */
+
+struct sha512_ctx
+{
+    uint64_t      h[8];
+    uint64_t      len;      /* bytes; 2^64 bytes is beyond any file here */
+    unsigned char buf[128];
+    size_t        buf_len;
+};
+
+static const uint64_t SHA512_K[80] =
+{
+    0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL,
+    0xe9b5dba58189dbbcULL, 0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
+    0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL, 0xd807aa98a3030242ULL,
+    0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL,
+    0xc19bf174cf692694ULL, 0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL,
+    0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL, 0x2de92c6f592b0275ULL,
+    0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL,
+    0xbf597fc7beef0ee4ULL, 0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL,
+    0x06ca6351e003826fULL, 0x142929670a0e6e70ULL, 0x27b70a8546d22ffcULL,
+    0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL,
+    0x92722c851482353bULL, 0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL,
+    0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL, 0xd192e819d6ef5218ULL,
+    0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL,
+    0x34b0bcb5e19b48a8ULL, 0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL,
+    0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL, 0x748f82ee5defb2fcULL,
+    0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL,
+    0xc67178f2e372532bULL, 0xca273eceea26619cULL, 0xd186b8c721c0c207ULL,
+    0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL, 0x06f067aa72176fbaULL,
+    0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL,
+    0x431d67c49c100d4cULL, 0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
+    0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL,
+};
+
+static uint64_t sha512_rotr(uint64_t x, int n)
+{
+    return (x >> n) | (x << (64 - n));
+}
+
+static void sha512_block(struct sha512_ctx* ctx, const unsigned char* p)
+{
+    uint64_t w[80];
+    for (int i = 0; i < 16; i++)
+    {
+        w[i] = 0;
+        for (int k = 0; k < 8; k++)
+        {
+            w[i] = (w[i] << 8) | p[i * 8 + k];
+        }
+    }
+    for (int i = 16; i < 80; i++)
+    {
+        uint64_t s0 = sha512_rotr(w[i - 15], 1) ^ sha512_rotr(w[i - 15], 8) ^
+                      (w[i - 15] >> 7);
+        uint64_t s1 = sha512_rotr(w[i - 2], 19) ^ sha512_rotr(w[i - 2], 61) ^
+                      (w[i - 2] >> 6);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint64_t a = ctx->h[0], b = ctx->h[1], c = ctx->h[2], d = ctx->h[3];
+    uint64_t e = ctx->h[4], f = ctx->h[5], g = ctx->h[6], h = ctx->h[7];
+    for (int i = 0; i < 80; i++)
+    {
+        uint64_t s1 = sha512_rotr(e, 14) ^ sha512_rotr(e, 18) ^
+                      sha512_rotr(e, 41);
+        uint64_t ch = (e & f) ^ (~e & g);
+        uint64_t t1 = h + s1 + ch + SHA512_K[i] + w[i];
+        uint64_t s0 = sha512_rotr(a, 28) ^ sha512_rotr(a, 34) ^
+                      sha512_rotr(a, 39);
+        uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint64_t t2 = s0 + maj;
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    ctx->h[0] += a;
+    ctx->h[1] += b;
+    ctx->h[2] += c;
+    ctx->h[3] += d;
+    ctx->h[4] += e;
+    ctx->h[5] += f;
+    ctx->h[6] += g;
+    ctx->h[7] += h;
+}
+
+static void sha512_init(struct sha512_ctx* ctx)
+{
+    static const uint64_t iv[8] =
+    {
+        0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+        0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+        0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+        0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL,
+    };
+    memcpy(ctx->h, iv, sizeof(iv));
+    ctx->len     = 0;
+    ctx->buf_len = 0;
+}
+
+static void sha512_update(struct sha512_ctx* ctx, const void* data,
+                          size_t len)
+{
+    const unsigned char* p = data;
+    ctx->len += len;
+    while (len > 0)
+    {
+        if (ctx->buf_len == 0 && len >= 128)
+        {
+            sha512_block(ctx, p);
+            p   += 128;
+            len -= 128;
+            continue;
+        }
+        size_t take = 128 - ctx->buf_len;
+        if (take > len)
+        {
+            take = len;
+        }
+        memcpy(ctx->buf + ctx->buf_len, p, take);
+        ctx->buf_len += take;
+        p   += take;
+        len -= take;
+        if (ctx->buf_len == 128)
+        {
+            sha512_block(ctx, ctx->buf);
+            ctx->buf_len = 0;
+        }
+    }
+}
+
+static void sha512_final(struct sha512_ctx* ctx, unsigned char out[64])
+{
+    uint64_t bits_lo = ctx->len << 3;
+    uint64_t bits_hi = ctx->len >> 61;
+    unsigned char pad = 0x80;
+    sha512_update(ctx, &pad, 1);
+    unsigned char zero = 0;
+    while (ctx->buf_len != 112)
+    {
+        sha512_update(ctx, &zero, 1);
+    }
+    unsigned char lenbuf[16];
+    for (int i = 0; i < 8; i++)
+    {
+        lenbuf[i]     = (unsigned char)(bits_hi >> (56 - 8 * i));
+        lenbuf[8 + i] = (unsigned char)(bits_lo >> (56 - 8 * i));
+    }
+    sha512_update(ctx, lenbuf, 16);
+    for (int i = 0; i < 8; i++)
+    {
+        for (int k = 0; k < 8; k++)
+        {
+            out[i * 8 + k] = (unsigned char)(ctx->h[i] >> (56 - 8 * k));
+        }
+    }
+}
+
+/* One interface over both digests, keyed by the signature block's
+ * hash_alg byte (1 = sha256, 3 = sha512). */
+#define SIG_HASH_SHA256 1
+#define SIG_HASH_SHA512 3
+
+struct sig_hash
+{
+    int alg;
+    struct sha256_ctx s256;
+    struct sha512_ctx s512;
+};
+
+static int sig_hash_init(struct sig_hash* h, int alg)
+{
+    h->alg = alg;
+    if (alg == SIG_HASH_SHA256)
+    {
+        sha256_init(&h->s256);
+        return 0;
+    }
+    if (alg == SIG_HASH_SHA512)
+    {
+        sha512_init(&h->s512);
+        return 0;
+    }
+    return -1;
+}
+
+static void sig_hash_update(struct sig_hash* h, const void* p, size_t n)
+{
+    if (h->alg == SIG_HASH_SHA256)
+    {
+        sha256_update(&h->s256, p, n);
+    }
+    else
+    {
+        sha512_update(&h->s512, p, n);
+    }
+}
+
+/* Writes the digest into out (64 bytes suffice) and returns its length. */
+static size_t sig_hash_final(struct sig_hash* h, unsigned char out[64])
+{
+    if (h->alg == SIG_HASH_SHA256)
+    {
+        sha256_final(&h->s256, out);
+        return 32;
+    }
+    sha512_final(&h->s512, out);
+    return 64;
+}
+
+static int sig_hash_alg_from_name(const char* name)
+{
+    if (strcmp(name, "sha256") == 0)
+    {
+        return SIG_HASH_SHA256;
+    }
+    if (strcmp(name, "sha512") == 0)
+    {
+        return SIG_HASH_SHA512;
+    }
+    return -1;
+}
+
+/* ── NIST P-256 arithmetic ──
+ *
+ * 256-bit values as four little-endian 64-bit limbs.  Field and scalar
+ * operations use Montgomery multiplication (CIOS) modulo either the prime p
+ * or the group order n; both moduli carry their own R^2 mod m and -m^-1 mod
+ * 2^64.  Verification handles only public data, so the code is written for
+ * clarity, not constant time. */
+
+typedef struct
+{
+    uint64_t v[4];
+} fe256;
+
+struct mont_mod
+{
+    fe256    m;
+    fe256    r2;
+    uint64_t mprime;
+};
+
+static const struct mont_mod P256_P =
+{
+    {{
+            0xffffffffffffffffULL, 0x00000000ffffffffULL,
+            0x0000000000000000ULL, 0xffffffff00000001ULL
+        }
+    },
+    {{
+            0x0000000000000003ULL, 0xfffffffbffffffffULL,
+            0xfffffffffffffffeULL, 0x00000004fffffffdULL
+        }
+    },
+    0x0000000000000001ULL,
+};
+
+static const struct mont_mod P256_N =
+{
+    {{
+            0xf3b9cac2fc632551ULL, 0xbce6faada7179e84ULL,
+            0xffffffffffffffffULL, 0xffffffff00000000ULL
+        }
+    },
+    {{
+            0x83244c95be79eea2ULL, 0x4699799c49bd6fa6ULL,
+            0x2845b2392b6bec59ULL, 0x66e12d94f3d95620ULL
+        }
+    },
+    0xccd1c8aaee00bc4fULL,
+};
+
+/* Curve constant b as a plain (non-Montgomery) value. */
+static const fe256 P256_B =
+{
+    {
+        0x3bce3c3e27d2604bULL, 0x651d06b0cc53b0f6ULL,
+        0xb3ebbd55769886bcULL, 0x5ac635d8aa3a93e7ULL
+    }
+};
+static const fe256 FE256_ONE = {{1, 0, 0, 0}};
+
+static int fe_is_zero(const fe256* a)
+{
+    return (a->v[0] | a->v[1] | a->v[2] | a->v[3]) == 0;
+}
+
+static int fe_cmp(const fe256* a, const fe256* b)
+{
+    for (int i = 3; i >= 0; i--)
+    {
+        if (a->v[i] != b->v[i])
+        {
+            return a->v[i] < b->v[i] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+/* r = a + b (no reduction); returns the carry. */
+static uint64_t fe_add_raw(fe256* r, const fe256* a, const fe256* b)
+{
+    unsigned __int128 c = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        c += (unsigned __int128)a->v[i] + b->v[i];
+        r->v[i] = (uint64_t)c;
+        c >>= 64;
+    }
+    return (uint64_t)c;
+}
+
+/* r = a - b (no reduction); returns the borrow. */
+static uint64_t fe_sub_raw(fe256* r, const fe256* a, const fe256* b)
+{
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        uint64_t ai = a->v[i];
+        uint64_t bi = b->v[i];
+        uint64_t d  = ai - bi - borrow;
+        borrow = (ai < bi) || (ai - bi < borrow);
+        r->v[i] = d;
+    }
+    return borrow;
+}
+
+static void fe_add_mod(fe256* r, const fe256* a, const fe256* b,
+                       const struct mont_mod* mod)
+{
+    uint64_t carry = fe_add_raw(r, a, b);
+    if (carry || fe_cmp(r, &mod->m) >= 0)
+    {
+        fe256 t;
+        fe_sub_raw(&t, r, &mod->m);
+        *r = t;
+    }
+}
+
+static void fe_sub_mod(fe256* r, const fe256* a, const fe256* b,
+                       const struct mont_mod* mod)
+{
+    if (fe_sub_raw(r, a, b))
+    {
+        fe256 t;
+        fe_add_raw(&t, r, &mod->m);
+        *r = t;
+    }
+}
+
+/* Montgomery product r = a * b * R^-1 mod m (CIOS). */
+static void fe_mont_mul(fe256* r, const fe256* a, const fe256* b,
+                        const struct mont_mod* mod)
+{
+    uint64_t t[6] = {0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < 4; i++)
+    {
+        unsigned __int128 c = 0;
+        for (int j = 0; j < 4; j++)
+        {
+            c += (unsigned __int128)a->v[j] * b->v[i] + t[j];
+            t[j] = (uint64_t)c;
+            c >>= 64;
+        }
+        c += t[4];
+        t[4] = (uint64_t)c;
+        t[5] = (uint64_t)(c >> 64);
+
+        uint64_t m = t[0] * mod->mprime;
+        c = (unsigned __int128)m * mod->m.v[0] + t[0];
+        c >>= 64;
+        for (int j = 1; j < 4; j++)
+        {
+            c += (unsigned __int128)m * mod->m.v[j] + t[j];
+            t[j - 1] = (uint64_t)c;
+            c >>= 64;
+        }
+        c += t[4];
+        t[3] = (uint64_t)c;
+        c >>= 64;
+        t[4] = t[5] + (uint64_t)c;
+    }
+    fe256 res = {{t[0], t[1], t[2], t[3]}};
+    if (t[4] || fe_cmp(&res, &mod->m) >= 0)
+    {
+        fe256 red;
+        fe_sub_raw(&red, &res, &mod->m);
+        res = red;
+    }
+    *r = res;
+}
+
+static void fe_to_mont(fe256* r, const fe256* a, const struct mont_mod* mod)
+{
+    fe_mont_mul(r, a, &mod->r2, mod);
+}
+
+static void fe_from_mont(fe256* r, const fe256* a, const struct mont_mod* mod)
+{
+    static const fe256 one = {{1, 0, 0, 0}};
+    fe_mont_mul(r, a, &one, mod);
+}
+
+/* r = a^(m-2) in the Montgomery domain: the inverse for prime m. */
+static void fe_mont_inv(fe256* r, const fe256* a, const struct mont_mod* mod)
+{
+    static const fe256 two = {{2, 0, 0, 0}};
+    fe256 e;
+    fe_sub_raw(&e, &mod->m, &two);
+    fe256 result;
+    fe_to_mont(&result, &FE256_ONE, mod);
+    for (int i = 255; i >= 0; i--)
+    {
+        fe_mont_mul(&result, &result, &result, mod);
+        if ((e.v[i / 64] >> (i % 64)) & 1)
+        {
+            fe_mont_mul(&result, &result, a, mod);
+        }
+    }
+    *r = result;
+}
+
+/* Big-endian bytes (at most 32) to fe256, left-padded with zeros. */
+static int fe_from_bytes_be(fe256* r, const unsigned char* b, size_t len)
+{
+    if (len > 32)
+    {
+        return -1;
+    }
+    unsigned char tmp[32];
+    memset(tmp, 0, sizeof(tmp));
+    memcpy(tmp + (32 - len), b, len);
+    for (int i = 0; i < 4; i++)
+    {
+        uint64_t w = 0;
+        for (int k = 0; k < 8; k++)
+        {
+            w = (w << 8) | tmp[(3 - i) * 8 + k];
+        }
+        r->v[i] = w;
+    }
+    return 0;
+}
+
+/* Jacobian point in the Montgomery domain; z == 0 is the point at
+ * infinity. */
+struct p256_pt
+{
+    fe256 x, y, z;
+};
+
+static int pt_is_inf(const struct p256_pt* p)
+{
+    return fe_is_zero(&p->z);
+}
+
+static void pt_set_inf(struct p256_pt* p)
+{
+    memset(p, 0, sizeof(*p));
+}
+
+/* dbl-2001-b (a = -3). */
+static void pt_double(struct p256_pt* r, const struct p256_pt* p)
+{
+    const struct mont_mod* M = &P256_P;
+    if (pt_is_inf(p))
+    {
+        pt_set_inf(r);
+        return;
+    }
+    fe256 delta, gamma, beta, alpha, t1, t2, t3;
+    fe_mont_mul(&delta, &p->z, &p->z, M);            /* Z1^2 */
+    fe_mont_mul(&gamma, &p->y, &p->y, M);            /* Y1^2 */
+    fe_mont_mul(&beta, &p->x, &gamma, M);            /* X1*gamma */
+    fe_sub_mod(&t1, &p->x, &delta, M);               /* X1 - delta */
+    fe_add_mod(&t2, &p->x, &delta, M);               /* X1 + delta */
+    fe_mont_mul(&alpha, &t1, &t2, M);
+    fe_add_mod(&t3, &alpha, &alpha, M);
+    fe_add_mod(&alpha, &t3, &alpha, M);              /* 3*(X1-d)(X1+d) */
+    struct p256_pt out;
+    fe_mont_mul(&t1, &alpha, &alpha, M);             /* alpha^2 */
+    fe_add_mod(&t2, &beta, &beta, M);
+    fe_add_mod(&t2, &t2, &t2, M);
+    fe_add_mod(&t3, &t2, &t2, M);                    /* 8*beta */
+    fe_sub_mod(&out.x, &t1, &t3, M);                 /* X3 */
+    fe_add_mod(&t1, &p->y, &p->z, M);
+    fe_mont_mul(&t1, &t1, &t1, M);                   /* (Y1+Z1)^2 */
+    fe_sub_mod(&t1, &t1, &gamma, M);
+    fe_sub_mod(&out.z, &t1, &delta, M);              /* Z3 */
+    fe_sub_mod(&t1, &t2, &out.x, M);                 /* 4*beta - X3 */
+    fe_mont_mul(&t1, &alpha, &t1, M);
+    fe_mont_mul(&t2, &gamma, &gamma, M);             /* gamma^2 */
+    fe_add_mod(&t2, &t2, &t2, M);
+    fe_add_mod(&t2, &t2, &t2, M);
+    fe_add_mod(&t2, &t2, &t2, M);                    /* 8*gamma^2 */
+    fe_sub_mod(&out.y, &t1, &t2, M);                 /* Y3 */
+    *r = out;
+}
+
+/* add-1998-cmo-2 with the special cases handled explicitly. */
+static void pt_add(struct p256_pt* r, const struct p256_pt* p,
+                   const struct p256_pt* q)
+{
+    const struct mont_mod* M = &P256_P;
+    if (pt_is_inf(p))
+    {
+        *r = *q;
+        return;
+    }
+    if (pt_is_inf(q))
+    {
+        *r = *p;
+        return;
+    }
+    fe256 z1z1, z2z2, u1, u2, s1, s2, h, rr, t;
+    fe_mont_mul(&z1z1, &p->z, &p->z, M);
+    fe_mont_mul(&z2z2, &q->z, &q->z, M);
+    fe_mont_mul(&u1, &p->x, &z2z2, M);
+    fe_mont_mul(&u2, &q->x, &z1z1, M);
+    fe_mont_mul(&t, &q->z, &z2z2, M);
+    fe_mont_mul(&s1, &p->y, &t, M);
+    fe_mont_mul(&t, &p->z, &z1z1, M);
+    fe_mont_mul(&s2, &q->y, &t, M);
+    fe_sub_mod(&h, &u2, &u1, M);
+    fe_sub_mod(&rr, &s2, &s1, M);
+    if (fe_is_zero(&h))
+    {
+        if (fe_is_zero(&rr))
+        {
+            pt_double(r, p);
+        }
+        else
+        {
+            pt_set_inf(r);
+        }
+        return;
+    }
+    fe256 h2, h3, u1h2;
+    struct p256_pt out;
+    fe_mont_mul(&h2, &h, &h, M);
+    fe_mont_mul(&h3, &h2, &h, M);
+    fe_mont_mul(&u1h2, &u1, &h2, M);
+    fe_mont_mul(&t, &rr, &rr, M);                    /* R^2 */
+    fe_sub_mod(&t, &t, &h3, M);
+    fe_sub_mod(&t, &t, &u1h2, M);
+    fe_sub_mod(&out.x, &t, &u1h2, M);                /* X3 */
+    fe_sub_mod(&t, &u1h2, &out.x, M);
+    fe_mont_mul(&t, &rr, &t, M);
+    fe_mont_mul(&h3, &s1, &h3, M);
+    fe_sub_mod(&out.y, &t, &h3, M);                  /* Y3 */
+    fe_mont_mul(&t, &h, &p->z, M);
+    fe_mont_mul(&out.z, &t, &q->z, M);               /* Z3 */
+    *r = out;
+}
+
+/* r = k * p by double-and-add over the scalar's bits (k is a plain
+ * integer, not Montgomery). */
+static void pt_mul(struct p256_pt* r, const fe256* k, const struct p256_pt* p)
+{
+    struct p256_pt acc;
+    pt_set_inf(&acc);
+    for (int i = 255; i >= 0; i--)
+    {
+        pt_double(&acc, &acc);
+        if ((k->v[i / 64] >> (i % 64)) & 1)
+        {
+            pt_add(&acc, &acc, p);
+        }
+    }
+    *r = acc;
+}
+
+/* Affine x of a Jacobian point as a plain integer; -1 for infinity. */
+static int pt_affine_x(fe256* out, const struct p256_pt* p)
+{
+    if (pt_is_inf(p))
+    {
+        return -1;
+    }
+    fe256 zi, zi2, xm;
+    fe_mont_inv(&zi, &p->z, &P256_P);
+    fe_mont_mul(&zi2, &zi, &zi, &P256_P);
+    fe_mont_mul(&xm, &p->x, &zi2, &P256_P);
+    fe_from_mont(out, &xm, &P256_P);
+    return 0;
+}
+
+/* Load an affine public point (plain big-endian coordinates) and check it
+ * lies on the curve: y^2 == x^3 - 3x + b.  Returns 0 or -1. */
+static int p256_load_point(struct p256_pt* out, const unsigned char x[32],
+                           const unsigned char y[32])
+{
+    const struct mont_mod* M = &P256_P;
+    fe256 xp, yp;
+    fe_from_bytes_be(&xp, x, 32);
+    fe_from_bytes_be(&yp, y, 32);
+    if (fe_cmp(&xp, &M->m) >= 0 || fe_cmp(&yp, &M->m) >= 0)
+    {
+        return -1;
+    }
+    fe_to_mont(&out->x, &xp, M);
+    fe_to_mont(&out->y, &yp, M);
+    fe_to_mont(&out->z, &FE256_ONE, M);
+    fe256 lhs, rhs, t, b;
+    fe_mont_mul(&lhs, &out->y, &out->y, M);          /* y^2 */
+    fe_mont_mul(&t, &out->x, &out->x, M);
+    fe_mont_mul(&rhs, &t, &out->x, M);               /* x^3 */
+    fe_add_mod(&t, &out->x, &out->x, M);
+    fe_add_mod(&t, &t, &out->x, M);                  /* 3x */
+    fe_sub_mod(&rhs, &rhs, &t, M);
+    fe_to_mont(&b, &P256_B, M);
+    fe_add_mod(&rhs, &rhs, &b, M);
+    return fe_cmp(&lhs, &rhs) == 0 ? 0 : -1;
+}
+
+/*
+ * ECDSA verification over P-256 (FIPS 186-4 6.4.2).  r and s are plain
+ * integers; the digest's leftmost 32 bytes form e.  Returns 1 valid, 0
+ * invalid, -1 on a malformed public key.
+ */
+static int ecdsa_p256_verify(const unsigned char qx[32],
+                             const unsigned char qy[32],
+                             const fe256* r, const fe256* s,
+                             const unsigned char* digest, size_t dlen)
+{
+    const struct mont_mod* N = &P256_N;
+    struct p256_pt Q, G, A, B, R;
+    if (p256_load_point(&Q, qx, qy) < 0)
+    {
+        return -1;
+    }
+    if (fe_is_zero(r) || fe_is_zero(s) || fe_cmp(r, &N->m) >= 0 ||
+            fe_cmp(s, &N->m) >= 0)
+    {
+        return 0;
+    }
+    fe256 e;
+    fe_from_bytes_be(&e, digest, dlen < 32 ? dlen : 32);
+    if (fe_cmp(&e, &N->m) >= 0)
+    {
+        fe256 t;
+        fe_sub_raw(&t, &e, &N->m);
+        e = t;
+    }
+    fe256 sm, w, em, rm, u1, u2, t;
+    fe_to_mont(&sm, s, N);
+    fe_mont_inv(&w, &sm, N);                         /* s^-1 (Montgomery) */
+    fe_to_mont(&em, &e, N);
+    fe_to_mont(&rm, r, N);
+    fe_mont_mul(&t, &em, &w, N);
+    fe_from_mont(&u1, &t, N);                        /* e * s^-1 mod n */
+    fe_mont_mul(&t, &rm, &w, N);
+    fe_from_mont(&u2, &t, N);                        /* r * s^-1 mod n */
+
+    static const unsigned char gx_be[32] =
+    {
+        0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6,
+        0xe5, 0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb,
+        0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96
+    };
+    static const unsigned char gy_be[32] =
+    {
+        0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb,
+        0x4a, 0x7c, 0x0f, 0x9e, 0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31,
+        0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5
+    };
+    if (p256_load_point(&G, gx_be, gy_be) < 0)
+    {
+        return -1;    /* cannot happen: the generator is on the curve */
+    }
+    pt_mul(&A, &u1, &G);
+    pt_mul(&B, &u2, &Q);
+    pt_add(&R, &A, &B);
+    fe256 xr;
+    if (pt_affine_x(&xr, &R) < 0)
+    {
+        return 0;
+    }
+    if (fe_cmp(&xr, &N->m) >= 0)
+    {
+        fe256 t2;
+        fe_sub_raw(&t2, &xr, &N->m);
+        xr = t2;
+    }
+    return fe_cmp(&xr, r) == 0 ? 1 : 0;
+}
+
+/* ── DER and PEM ── */
+
+/* Read one TLV at *p.  Only definite lengths of up to four bytes. */
+static int der_read_tlv(const unsigned char** p, const unsigned char* end,
+                        unsigned* tag, const unsigned char** val, size_t* len)
+{
+    if (*p >= end)
+    {
+        return -1;
+    }
+    *tag = **p;
+    (*p)++;
+    if (*p >= end)
+    {
+        return -1;
+    }
+    size_t l = **p;
+    (*p)++;
+    if (l & 0x80)
+    {
+        size_t nb = l & 0x7f;
+        if (nb == 0 || nb > 4 || (size_t)(end - *p) < nb)
+        {
+            return -1;
+        }
+        l = 0;
+        for (size_t i = 0; i < nb; i++)
+        {
+            l = (l << 8) | **p;
+            (*p)++;
+        }
+        if (l < 0x80)
+        {
+            return -1;    /* non-minimal length encoding */
+        }
+    }
+    if ((size_t)(end - *p) < l)
+    {
+        return -1;
+    }
+    *val = *p;
+    *len = l;
+    *p  += l;
+    return 0;
+}
+
+/* A DER INTEGER of at most 32 significant bytes into a fe256 (plain). */
+static int der_integer_to_fe(const unsigned char* v, size_t len, fe256* out)
+{
+    if (len == 0 || (v[0] & 0x80))
+    {
+        return -1;    /* negative or empty */
+    }
+    if (len > 1 && v[0] == 0x00 && !(v[1] & 0x80))
+    {
+        return -1;    /* non-minimal */
+    }
+    if (v[0] == 0x00)
+    {
+        v++;
+        len--;
+    }
+    if (len > 32)
+    {
+        return -1;
+    }
+    return fe_from_bytes_be(out, v, len);
+}
+
+/* ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }, strictly DER with
+ * nothing after the sequence — the same shape openssl's verifier accepts. */
+static int parse_ecdsa_sig_der(const unsigned char* sig, size_t len,
+                               fe256* r, fe256* s)
+{
+    const unsigned char* p = sig;
+    const unsigned char* end = sig + len;
+    unsigned tag;
+    const unsigned char* seq;
+    size_t seq_len;
+    if (der_read_tlv(&p, end, &tag, &seq, &seq_len) < 0 || tag != 0x30 ||
+            p != end)
+    {
+        return -1;
+    }
+    const unsigned char* q = seq;
+    const unsigned char* qend = seq + seq_len;
+    const unsigned char* v;
+    size_t vlen;
+    if (der_read_tlv(&q, qend, &tag, &v, &vlen) < 0 || tag != 0x02 ||
+            der_integer_to_fe(v, vlen, r) < 0)
+    {
+        return -1;
+    }
+    if (der_read_tlv(&q, qend, &tag, &v, &vlen) < 0 || tag != 0x02 ||
+            der_integer_to_fe(v, vlen, s) < 0)
+    {
+        return -1;
+    }
+    return q == qend ? 0 : -1;
+}
+
+static int b64_value(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+    {
+        return c - 'A';
+    }
+    if (c >= 'a' && c <= 'z')
+    {
+        return c - 'a' + 26;
+    }
+    if (c >= '0' && c <= '9')
+    {
+        return c - '0' + 52;
+    }
+    if (c == '+')
+    {
+        return 62;
+    }
+    if (c == '/')
+    {
+        return 63;
+    }
+    return -1;
+}
+
+/* Decode the base64 body between the BEGIN/END lines of a PEM block into
+ * out (out_sz bytes).  Returns the DER length or -1. */
+static ssize_t pem_decode_body(const char* pem, unsigned char* out,
+                               size_t out_sz)
+{
+    const char* begin = strstr(pem, "-----BEGIN ");
+    if (!begin)
+    {
+        return -1;
+    }
+    const char* body = strchr(begin + 11, '\n');
+    const char* end  = body ? strstr(body, "-----END ") : NULL;
+    if (!body || !end)
+    {
+        return -1;
+    }
+    size_t   n = 0;
+    unsigned acc = 0;
+    int      bits = 0;
+    for (const char* c = body; c < end; c++)
+    {
+        if (*c == '\n' || *c == '\r' || *c == ' ' || *c == '\t')
+        {
+            continue;
+        }
+        if (*c == '=')
+        {
+            break;
+        }
+        int v = b64_value((unsigned char)*c);
+        if (v < 0)
+        {
+            return -1;
+        }
+        acc  = (acc << 6) | (unsigned)v;
+        bits += 6;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            if (n >= out_sz)
+            {
+                return -1;
+            }
+            out[n++] = (unsigned char)((acc >> bits) & 0xff);
+        }
+    }
+    return (ssize_t)n;
+}
+
+/*
+ * Parse a PEM SubjectPublicKeyInfo.  Returns 1 and the affine coordinates
+ * when it is an uncompressed P-256 point, 0 when it is well-formed but not
+ * a P-256 EC key (the caller may fall back to openssl), -1 when malformed.
+ * spki_der / spki_len receive the DER for the key id when non-NULL.
+ */
+static int parse_p256_spki_pem(const char* pem, unsigned char qx[32],
+                               unsigned char qy[32], unsigned char* spki_der,
+                               size_t spki_cap, size_t* spki_len)
+{
+    static const unsigned char oid_ec_pubkey[] =
+    {
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01
+    };
+    static const unsigned char oid_p256[] =
+    {
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07
+    };
+    unsigned char der[4096];
+    ssize_t dlen = pem_decode_body(pem, der, sizeof(der));
+    if (dlen <= 0)
+    {
+        return -1;
+    }
+    if (spki_der)
+    {
+        if ((size_t)dlen > spki_cap)
+        {
+            return -1;
+        }
+        memcpy(spki_der, der, (size_t)dlen);
+        if (spki_len)
+        {
+            *spki_len = (size_t)dlen;
+        }
+    }
+    const unsigned char* p = der;
+    const unsigned char* end = der + dlen;
+    unsigned tag;
+    const unsigned char* seq;
+    size_t seq_len;
+    if (der_read_tlv(&p, end, &tag, &seq, &seq_len) < 0 || tag != 0x30 ||
+            p != end)
+    {
+        return -1;
+    }
+    const unsigned char* q = seq;
+    const unsigned char* qend = seq + seq_len;
+    const unsigned char* alg;
+    size_t alg_len;
+    if (der_read_tlv(&q, qend, &tag, &alg, &alg_len) < 0 || tag != 0x30)
+    {
+        return -1;
+    }
+    const unsigned char* a = alg;
+    const unsigned char* aend = alg + alg_len;
+    const unsigned char* oid;
+    size_t oid_len;
+    if (der_read_tlv(&a, aend, &tag, &oid, &oid_len) < 0 || tag != 0x06)
+    {
+        return -1;
+    }
+    if (oid_len != sizeof(oid_ec_pubkey) ||
+            memcmp(oid, oid_ec_pubkey, oid_len) != 0)
+    {
+        return 0;    /* RSA, Ed25519, ...: not ours */
+    }
+    if (der_read_tlv(&a, aend, &tag, &oid, &oid_len) < 0 || tag != 0x06)
+    {
+        return -1;
+    }
+    if (oid_len != sizeof(oid_p256) || memcmp(oid, oid_p256, oid_len) != 0)
+    {
+        return 0;    /* another named curve */
+    }
+    const unsigned char* bits;
+    size_t bits_len;
+    if (der_read_tlv(&q, qend, &tag, &bits, &bits_len) < 0 || tag != 0x03 ||
+            q != qend)
+    {
+        return -1;
+    }
+    /* BIT STRING: unused-bits byte, then 0x04 || X || Y. */
+    if (bits_len != 1 + 65 || bits[0] != 0x00 || bits[1] != 0x04)
+    {
+        return -1;
+    }
+    memcpy(qx, bits + 2, 32);
+    memcpy(qy, bits + 34, 32);
+    return 1;
+}
+
+/* ── The embedded signature block ── */
+
+struct sig_block
+{
+    size_t               content_end;   /* offset where the block starts */
+    int                  version;
+    int                  hash_alg;      /* SIG_HASH_* */
+    const unsigned char* keyid;         /* 32 bytes */
+    const unsigned char* sig;
+    size_t               sig_len;
+};
+
+/*
+ * C port of sign_binary.py's _find_sig_block(): returns 1 and fills *out
+ * when the file ends in a well-formed block, 0 when it is not signed (or the
+ * block is inconsistent — the python side treats both as "not signed").
+ */
+static int find_sig_block(const unsigned char* data, size_t size,
+                          struct sig_block* out)
+{
+    static const unsigned char magic[]   = "OCI2BIN_SIG";      /* + NUL */
+    static const unsigned char trailer[] = "OCI2BIN_SIG_END";  /* + NUL */
+    const size_t magic_len   = sizeof(magic);
+    const size_t trailer_len = sizeof(trailer);
+    const size_t footer      = trailer_len + 4;
+    if (size < footer)
+    {
+        return 0;
+    }
+    size_t trailer_pos = size - footer;
+    if (memcmp(data + trailer_pos, trailer, trailer_len) != 0)
+    {
+        return 0;
+    }
+    size_t total = ((size_t)data[size - 4] << 24) |
+                   ((size_t)data[size - 3] << 16) |
+                   ((size_t)data[size - 2] << 8) | (size_t)data[size - 1];
+    size_t min_legacy = magic_len + 1 + 32 + 2 + footer;
+    size_t min_v2     = min_legacy + 1;
+    size_t min_v3     = min_v2 + 4 + 2;
+    if (total > size || total < min_legacy)
+    {
+        return 0;
+    }
+    size_t bs = size - total;
+    if (memcmp(data + bs, magic, magic_len) != 0)
+    {
+        return 0;
+    }
+    size_t off = bs + magic_len;
+    int version = data[off];
+    int alg;
+    if (version == 1)
+    {
+        alg = SIG_HASH_SHA256;
+    }
+    else if (version == 2 || version == 3)
+    {
+        if (total < (version == 3 ? min_v3 : min_v2))
+        {
+            return 0;
+        }
+        off++;
+        alg = data[off];
+        if (alg != SIG_HASH_SHA256 && alg != SIG_HASH_SHA512)
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        return 0;
+    }
+    off++;
+    const unsigned char* keyid = data + off;
+    off += 32;
+    if (off + 2 > trailer_pos)
+    {
+        return 0;
+    }
+    size_t siglen = ((size_t)data[off] << 8) | data[off + 1];
+    off += 2;
+    if (siglen > trailer_pos - off)
+    {
+        return 0;
+    }
+    const unsigned char* sig = data + off;
+    off += siglen;
+    if (version == 3)
+    {
+        if (off + 4 > trailer_pos)
+        {
+            return 0;
+        }
+        size_t attlen = ((size_t)data[off] << 24) | ((size_t)data[off + 1] << 16)
+                        | ((size_t)data[off + 2] << 8) | data[off + 3];
+        off += 4;
+        if (attlen > 256u * 1024u || attlen > trailer_pos - off)
+        {
+            return 0;
+        }
+        off += attlen;
+        if (off + 2 > trailer_pos)
+        {
+            return 0;
+        }
+        size_t attsiglen = ((size_t)data[off] << 8) | data[off + 1];
+        off += 2;
+        if (attsiglen > trailer_pos - off)
+        {
+            return 0;
+        }
+        off += attsiglen;
+    }
+    if (off != trailer_pos)
+    {
+        return 0;    /* trailing junk the signature does not cover */
+    }
+    out->content_end = bs;
+    out->version     = version;
+    out->hash_alg    = alg;
+    out->keyid       = keyid;
+    out->sig         = sig;
+    out->sig_len     = siglen;
+    return 1;
+}
+
+/* Map a whole file read-only.  Returns 0 and sets data and size, or -1. */
+static int map_whole_file(const char* path, const unsigned char** data,
+                          size_t* size)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+    {
+        close(fd);
+        return -1;
+    }
+    void* m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED)
+    {
+        return -1;
+    }
+    *data = m;
+    *size = (size_t)st.st_size;
+    return 0;
+}
+
+/*
+ * Verify the block's ECDSA signature over data[0:content_end] with a PEM
+ * public key.  Returns 1 valid, 0 invalid or unsigned (why set), -1 when
+ * the key is not P-256 (why set; the caller may fall back to openssl).
+ */
+static int native_verify_signature(const unsigned char* data, size_t size,
+                                   const char* pub_pem, const char** why)
+{
+    struct sig_block blk;
+    if (find_sig_block(data, size, &blk) != 1)
+    {
+        *why = "no signature block present";
+        return 0;
+    }
+    unsigned char qx[32], qy[32];
+    int kp = parse_p256_spki_pem(pub_pem, qx, qy, NULL, 0, NULL);
+    if (kp < 0)
+    {
+        *why = "public key is not a valid PEM SubjectPublicKeyInfo";
+        return 0;
+    }
+    if (kp == 0)
+    {
+        *why = "public key is not a P-256 EC key";
+        return -1;
+    }
+    fe256 r, s;
+    if (parse_ecdsa_sig_der(blk.sig, blk.sig_len, &r, &s) < 0)
+    {
+        *why = "signature is not a DER ECDSA signature";
+        return 0;
+    }
+    struct sig_hash h;
+    unsigned char digest[64];
+    if (sig_hash_init(&h, blk.hash_alg) < 0)
+    {
+        *why = "unsupported hash algorithm";
+        return 0;
+    }
+    sig_hash_update(&h, data, blk.content_end);
+    size_t dlen = sig_hash_final(&h, digest);
+    int rc = ecdsa_p256_verify(qx, qy, &r, &s, digest, dlen);
+    if (rc < 0)
+    {
+        *why = "public key point is not on the curve";
+        return 0;
+    }
+    *why = rc == 1 ? "ok" : "signature does not match";
+    return rc;
+}
+
+/* Both python fallbacks need these; a missing helper is what the native
+ * path exists to survive, so only report it when we actually need one. */
+static int python_verifier_available(char* openssl_bin, size_t sz)
+{
+    return access("/usr/bin/python3", X_OK) == 0 &&
+           find_helper_binary("openssl", openssl_bin, sz) == 0;
+}
+
 static int open_verifier_script_fd(char* fd_path, size_t fd_path_size)
 {
     char self_path[PATH_MAX];
@@ -19853,15 +21472,13 @@ static int open_verifier_script_fd(char* fd_path, size_t fd_path_size)
 /*
  * Verify the embedded signature against a caller-supplied public key.
  *
- * The verifier is embedded here rather than loaded from
- * ../scripts/sign_binary.py next to the executable: a generated binary is
- * meant to be copied around on its own, and away from a source checkout that
- * path does not exist, so --verify-key could never succeed on a real
- * deployment. This mirrors what enforce_require_signed() already does, the
- * difference being where the public key comes from — a file here, the
- * embedded metadata there.
- *
- * Needs python3 and openssl at runtime, same as the --require-signed path.
+ * The check runs in-process (native_verify_signature(): SHA-256/512 plus
+ * ECDSA P-256), so a signed binary verifies on a host without python3 or
+ * openssl.  Only a key on another curve is handed to the embedded python
+ * verifier, which drives openssl — resolved by absolute path, never PATH —
+ * and only when both exist; otherwise the run is refused.  The verifier is
+ * embedded rather than loaded from ../scripts/sign_binary.py because a
+ * generated binary is copied around on its own.
  */
 static int verify_signature(const char* self_path, const char* key_path)
 {
@@ -19873,16 +21490,48 @@ static int verify_signature(const char* self_path, const char* key_path)
         return -1;
     }
 
-    /* Resolve openssl ourselves instead of letting subprocess search PATH:
-     * an attacker-writable early PATH entry could otherwise supply a stub
-     * that exits 0, and every signature check in this binary would report
-     * success on an arbitrary payload. */
-    char openssl_bin[PATH_MAX];
-    if (find_helper_binary("openssl", openssl_bin, sizeof(openssl_bin)) < 0)
+    size_t key_sz = 0;
+    char*  key_pem = read_file(key_path, &key_sz);
+    if (!key_pem || key_sz > 65536)
+    {
+        fprintf(stderr, "oci2bin: --verify-key: cannot read %s\n", key_path);
+        free(key_pem);
+        return -1;
+    }
+    const unsigned char* data = NULL;
+    size_t size = 0;
+    if (map_whole_file(self_path, &data, &size) < 0)
+    {
+        fprintf(stderr, "oci2bin: --verify-key: cannot map %s\n", self_path);
+        free(key_pem);
+        return -1;
+    }
+    const char* why = "";
+    int rc = native_verify_signature(data, size, key_pem, &why);
+    munmap((void*)data, size);
+    free(key_pem);
+    debug_log("verify_key.native", "result=%d detail=%s", rc, why);
+    if (rc == 1)
+    {
+        return 0;
+    }
+    if (rc == 0)
     {
         fprintf(stderr,
-                "oci2bin: --verify-key: openssl not found in /usr/bin, /bin,"
-                " /usr/sbin or /sbin; cannot verify\n");
+                "oci2bin: --verify-key: %s — aborting before extraction\n",
+                why);
+        return -1;
+    }
+
+    /* Not a P-256 key: openssl through the embedded verifier, when the
+     * host has it.  Resolved by absolute path so an attacker-writable PATH
+     * entry cannot supply a stub that exits 0. */
+    char openssl_bin[PATH_MAX];
+    if (!python_verifier_available(openssl_bin, sizeof(openssl_bin)))
+    {
+        fprintf(stderr,
+                "oci2bin: --verify-key: %s, and python3/openssl are not"
+                " available to verify it; aborting before extraction\n", why);
         return -1;
     }
 
@@ -19967,14 +21616,170 @@ static int run_python_helper(const char* script, const char* arg1,
     return run_cmd(args);
 }
 
+/*
+ * Where the signed content ends for the pin check: a trailing block is
+ * stripped when the trailer, a sane length and the OCI2BIN_SIG magic all
+ * agree — the same test read_self_metadata() and the python verifiers
+ * apply, so every reader hashes the same bytes.
+ */
+static size_t sig_block_start_loose(const unsigned char* data, size_t size)
+{
+    static const unsigned char magic[]   = "OCI2BIN_SIG";
+    static const unsigned char trailer[] = "OCI2BIN_SIG_END";
+    if (size < 20 || memcmp(data + size - 20, trailer, sizeof(trailer)) != 0)
+    {
+        return size;
+    }
+    size_t total = ((size_t)data[size - 4] << 24) |
+                   ((size_t)data[size - 3] << 16) |
+                   ((size_t)data[size - 2] << 8) | (size_t)data[size - 1];
+    if (total == 0 || total > size)
+    {
+        return size;
+    }
+    size_t bs = size - total;
+    if (bs + sizeof(magic) <= size && memcmp(data + bs, magic,
+            sizeof(magic)) == 0)
+    {
+        return bs;
+    }
+    return size;
+}
+
+/*
+ * Native pinned-digest check.  Returns 0 when the pin matches, 1 when it
+ * does not or is malformed (message printed).  `pin` is the metadata value
+ * verbatim: "<64 hex>" for sha256 or "<algo>:<hex>".  The digest covers the
+ * signed content with the pin's own value replaced by the builder's zero
+ * placeholder, exactly as patch_auto_pin_digest() computed it.
+ */
+static int verify_pin_native(const char* self_path, const char* pin)
+{
+    char algo[16] = "sha256";
+    const char* want = pin;
+    const char* colon = strchr(pin, ':');
+    if (colon)
+    {
+        size_t alen = (size_t)(colon - pin);
+        if (alen == 0 || alen >= sizeof(algo))
+        {
+            fprintf(stderr, "oci2bin: unsupported pin_digest algorithm\n");
+            return 1;
+        }
+        for (size_t i = 0; i < alen; i++)
+        {
+            algo[i] = (char)tolower((unsigned char)pin[i]);
+        }
+        algo[alen] = '\0';
+        want = colon + 1;
+    }
+    int alg = sig_hash_alg_from_name(algo);
+    if (alg < 0)
+    {
+        fprintf(stderr, "oci2bin: unsupported pin_digest algorithm\n");
+        return 1;
+    }
+    size_t want_len = alg == SIG_HASH_SHA256 ? 64 : 128;
+    if (strlen(want) != want_len)
+    {
+        fprintf(stderr, "oci2bin: invalid pin_digest value\n");
+        return 1;
+    }
+    for (size_t i = 0; i < want_len; i++)
+    {
+        if (!isxdigit((unsigned char)want[i]))
+        {
+            fprintf(stderr, "oci2bin: invalid pin_digest value\n");
+            return 1;
+        }
+    }
+
+    char needle[256];
+    char repl[256];
+    char place[160];
+    if (alg == SIG_HASH_SHA256)
+    {
+        memset(place, '0', 64);
+        place[64] = '\0';
+    }
+    else
+    {
+        int pn = snprintf(place, sizeof(place), "%s:", algo);
+        memset(place + pn, '0', 128);
+        place[pn + 128] = '\0';
+    }
+    int nn = snprintf(needle, sizeof(needle), "\"pin_digest\":\"%s\"", pin);
+    int rn = snprintf(repl, sizeof(repl), "\"pin_digest\":\"%s\"", place);
+    if (nn < 0 || (size_t)nn >= sizeof(needle) || rn < 0 ||
+            (size_t)rn >= sizeof(repl))
+    {
+        fprintf(stderr, "oci2bin: invalid pin_digest value\n");
+        return 1;
+    }
+
+    const unsigned char* data = NULL;
+    size_t size = 0;
+    if (map_whole_file(self_path, &data, &size) < 0)
+    {
+        fprintf(stderr, "oci2bin: cannot map %s for the pin check\n",
+                self_path);
+        return 1;
+    }
+    size_t content_end = sig_block_start_loose(data, size);
+    const unsigned char* hit = memmem(data, content_end, needle, (size_t)nn);
+    if (!hit)
+    {
+        munmap((void*)data, size);
+        fprintf(stderr, "oci2bin: pin_digest marker not found in the"
+                        " binary; refusing to run\n");
+        return 1;
+    }
+    size_t idx = (size_t)(hit - data);
+    struct sig_hash h;
+    unsigned char digest[64];
+    sig_hash_init(&h, alg);
+    sig_hash_update(&h, data, idx);
+    sig_hash_update(&h, repl, (size_t)rn);
+    sig_hash_update(&h, data + idx + (size_t)nn,
+                    content_end - idx - (size_t)nn);
+    size_t dlen = sig_hash_final(&h, digest);
+    munmap((void*)data, size);
+
+    char calc[129];
+    static const char hexd[] = "0123456789abcdef";
+    for (size_t i = 0; i < dlen; i++)
+    {
+        calc[i * 2]     = hexd[digest[i] >> 4];
+        calc[i * 2 + 1] = hexd[digest[i] & 0x0f];
+    }
+    calc[dlen * 2] = '\0';
+    int ok = 1;
+    for (size_t i = 0; i < want_len; i++)
+    {
+        if (calc[i] != tolower((unsigned char)want[i]))
+        {
+            ok = 0;
+            break;
+        }
+    }
+    debug_log("pin.native", "algo=%s result=%s", algo, ok ? "ok" : "mismatch");
+    if (!ok)
+    {
+        fprintf(stderr, "oci2bin: pinned digest mismatch\n");
+        return 1;
+    }
+    return 0;
+}
+
 static int verify_pinned_digest(const char* self_path)
 {
-    /* Fast path: no python on the launch path unless the binary actually
-     * carries a pin. The C reader strips the signature block and finds the
-     * last OCI2BIN_META exactly like the script does, so "no block" means
-     * the script would exit 0 too. With a block, only skip python when the
-     * key cannot be present: it is absent verbatim and the JSON carries no
-     * \u escape that could spell it. Anything else goes to the script. */
+    /* The C reader strips the signature block and finds the last
+     * OCI2BIN_META exactly like the python script does, so "no block" and
+     * "no pin" are decided here without any helper.  A pin is checked
+     * natively too (verify_pin_native()).  The python script remains for
+     * one corner: metadata whose JSON spells keys with \u escapes, which the
+     * loader's key lookup does not decode — a JSON-aware reader decides
+     * then, and its absence refuses rather than assumes "no pin". */
     char* meta = NULL;
     int   mrc  = read_self_metadata(self_path, &meta);
     if (mrc < 0)
@@ -19988,12 +21793,31 @@ static int verify_pinned_digest(const char* self_path)
     {
         return 0;
     }
-    int may_pin = strstr(meta, "pin_digest") != NULL ||
-                  strstr(meta, "\\u") != NULL;
+    char* pin = json_get_toplevel_string(meta, "pin_digest");
+    int   has_escape = strstr(meta, "\\u") != NULL;
     free(meta);
-    if (!may_pin)
+    if (pin)
+    {
+        if (pin[0] == '\0')
+        {
+            free(pin);
+            return 0;
+        }
+        int rc = verify_pin_native(self_path, pin);
+        free(pin);
+        return rc;
+    }
+    if (!has_escape)
     {
         return 0;
+    }
+    if (access("/usr/bin/python3", X_OK) != 0)
+    {
+        fprintf(stderr,
+                "oci2bin: embedded metadata uses JSON escapes the built-in"
+                " reader cannot resolve and python3 is unavailable; refusing"
+                " to run\n");
+        return 1;
     }
 
     /* The script strips a trailing signature block only when it really is
@@ -20341,15 +22165,65 @@ static int enforce_require_signed(const char* self_path)
         return 0;
     }
 
+    /* Native check first: the embedded verify_pubkey and the trailing
+     * signature block, verified in-process.  Only a key that is not P-256
+     * goes to the python/openssl script below. */
+    {
+        char* meta = NULL;
+        if (read_self_metadata(self_path, &meta) != 1)
+        {
+            fprintf(stderr,
+                    "oci2bin: --require-signed: embedded metadata block not"
+                    " found; refusing to run\n");
+            return 1;
+        }
+        char* pub = json_get_toplevel_string(meta, "verify_pubkey");
+        free(meta);
+        if (!pub || pub[0] == '\0')
+        {
+            free(pub);
+            fprintf(stderr,
+                    "oci2bin: --require-signed: no valid signature present;"
+                    " refusing to run\n");
+            return 1;
+        }
+        const unsigned char* data = NULL;
+        size_t size = 0;
+        if (map_whole_file(self_path, &data, &size) < 0)
+        {
+            free(pub);
+            fprintf(stderr,
+                    "oci2bin: --require-signed: cannot read %s; refusing to"
+                    " run\n", self_path);
+            return 1;
+        }
+        const char* why = "";
+        int rc = native_verify_signature(data, size, pub, &why);
+        munmap((void*)data, size);
+        free(pub);
+        debug_log("require_signed.native", "result=%d detail=%s", rc, why);
+        if (rc == 1)
+        {
+            return 0;
+        }
+        if (rc == 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --require-signed: %s; refusing to run\n", why);
+            return 1;
+        }
+    }
+
     /* Same reasoning as verify_signature(): the verifier must not be
      * selectable through PATH, or the policy is enforced by whatever
      * 'openssl' the caller's environment happens to point at. */
     char openssl_bin[PATH_MAX];
-    if (find_helper_binary("openssl", openssl_bin, sizeof(openssl_bin)) < 0)
+    if (!python_verifier_available(openssl_bin, sizeof(openssl_bin)))
     {
         fprintf(stderr,
-                "oci2bin: --require-signed: openssl not found in /usr/bin,"
-                " /bin, /usr/sbin or /sbin; refusing to run\n");
+                "oci2bin: --require-signed: the embedded key is not a P-256"
+                " key and python3/openssl are not available to verify it;"
+                " refusing to run\n");
         return 1;
     }
 
@@ -22051,9 +23925,9 @@ static int vm_init_main(void)
     char** host_env = NULL;
     char** one      = NULL;
     int   n_extra    = vm_params_decode_list(vm_params, "oci2bin.argv=",
-        &extra, MAX_ARGS);
+                       &extra, MAX_ARGS);
     int   n_host_env = vm_params_decode_list(vm_params, "oci2bin.env=",
-        &host_env, MAX_ENV);
+                       &host_env, MAX_ENV);
     const char* entrypoint = NULL;
     const char* workdir    = oci_cfg.workdir;
     if (n_extra < 0 || n_host_env < 0)
@@ -25432,6 +27306,39 @@ static void normalize_network_opts(struct container_opts* opts)
 
 static int validate_network_opts(const struct container_opts* opts)
 {
+    if (net_deny_tcp_requested(opts))
+    {
+        /* Landlock lives in the loader process: the guest of a microVM has
+         * its own kernel and never sees this ruleset. */
+        if (opts->use_vm)
+        {
+            fprintf(stderr,
+                    "oci2bin: --net deny-tcp is a container mode (Landlock"
+                    " in the loader); use --net none with --vm\n");
+            return -1;
+        }
+        if (opts->landlock_mode == LANDLOCK_MODE_OFF)
+        {
+            fprintf(stderr,
+                    "oci2bin: --net deny-tcp is enforced by Landlock;"
+                    " it cannot be combined with --no-landlock\n");
+            return -1;
+        }
+        if (opts->n_portfwd > 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: -p cannot be combined with --net deny-tcp"
+                    " (TCP listeners are denied)\n");
+            return -1;
+        }
+        if (opts->n_egress > 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --allow-egress needs --net slirp or"
+                    " --net pasta, not --net deny-tcp\n");
+            return -1;
+        }
+    }
     if (opts->use_vm && opts->n_egress > 0)
     {
         fprintf(stderr,

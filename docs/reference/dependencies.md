@@ -62,7 +62,7 @@ small. Each dependency below is needed **only** for the feature in its row.
 | `sqlite3` | `freeze` / `thaw` (DB-consistent snapshots) | Required for that subcommand |
 | `systemd-creds` | `--secret tpm2:NAME` | Required for TPM2 secrets (root only; also needs a credential in `/etc/credstore.encrypted` or another system credential store) |
 | `gdb` | `--gdb` | Required for that mode |
-| `openssl` + `python3` | `--verify-key`, `--require-signed`, `--pin-digest` runtime checks | Required if the binary enforces a signature/digest. Both are resolved by absolute path (`/usr/bin/python3`; `openssl` from `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and never through `$PATH` — an `openssl` installed elsewhere counts as missing and the check fails closed |
+| `openssl` + `python3` | `--check-update` / `--self-update`; `--verify-key` and `--require-signed` with a non-P-256 key | The signature and pin checks are built into the loader (ECDSA P-256, SHA-256/512) and need neither. Where a helper is still used it is resolved by absolute path (`/usr/bin/python3`; `openssl` from `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`) and never through `$PATH` — an `openssl` installed elsewhere counts as missing and the check fails closed |
 | `curl` | `--notify` | Optional — notifications are silently skipped if absent |
 | `rekor-cli` | `oci2bin verify --rekor` (inclusion check) | Required for that check |
 | `/dev/kvm` | `--vm` (either backend) | Hard for VM mode |

@@ -14,13 +14,23 @@ normalize_oci_layout() is the single place that fixes this up, run once
 after the last transform: it renames every content-addressed blob to the
 digest of its bytes, and — when the image changed — writes a fresh OCI image
 manifest blob and index.json describing exactly what manifest.json lists.
+It also materialises the symlinked `<id>/layer.tar` members older multi-image
+`docker save` output used for shared layers, which the loader cannot open.
+
+The module is also the one home of the small tar/manifest helpers every
+build-side transform needs (read_manifest_and_config, repack_oci_tar,
+rebuild_oci_with_new_config, ...); build_polyglot.py, add_files.py,
+strip_image.py and squash_layers.py load it by file path.
 
 Pure Python, stdlib only.
 """
 
+import gzip
 import hashlib
 import io
 import json
+import os
+import posixpath
 import re
 import tarfile
 
@@ -63,6 +73,150 @@ def layer_media_type(data, docker_style=False):
 
 def _json_bytes(obj):
     return json.dumps(obj, separators=(',', ':')).encode()
+
+
+# ── shared tar / manifest helpers ────────────────────────────────────────────
+
+def make_tar_info(name, size, mode=0o644, mtime=0):
+    """A root-owned regular-file member with fixed metadata (reproducible)."""
+    info = tarfile.TarInfo(name=name)
+    info.size = size
+    info.mode = mode
+    info.uid = 0
+    info.gid = 0
+    info.uname = ''
+    info.gname = ''
+    info.mtime = mtime
+    return info
+
+
+def copy_member_info(member, name=None, size=None):
+    """A member header carrying `member`'s metadata under a new name/size."""
+    info = tarfile.TarInfo(name=name or member.name)
+    info.size = member.size if size is None else size
+    info.mode = member.mode
+    info.uid = member.uid
+    info.gid = member.gid
+    info.uname = member.uname
+    info.gname = member.gname
+    info.mtime = member.mtime
+    info.type = member.type
+    info.linkname = member.linkname
+    return info
+
+
+def read_manifest_and_config_from_tar(tf):
+    """Parse manifest.json and the first entry's config from an open tar.
+
+    Returns (manifest_list, config_name, config_obj, config_raw_bytes).
+    Raises KeyError when manifest.json or the config member is missing and
+    ValueError when either is not the JSON the format requires."""
+    try:
+        manifest_member = tf.getmember('manifest.json')
+    except KeyError:
+        raise KeyError('manifest.json not found') from None
+    f = tf.extractfile(manifest_member)
+    manifest = json.loads(f.read() if f else b'')
+    if not isinstance(manifest, list) or not manifest \
+            or not isinstance(manifest[0], dict):
+        raise ValueError('manifest.json is not a non-empty list')
+    config_name = manifest[0].get('Config') or ''
+    if not config_name:
+        raise ValueError('manifest entry has no Config')
+    try:
+        config_member = tf.getmember(config_name)
+    except KeyError:
+        raise KeyError(f'config not found: {config_name}') from None
+    f = tf.extractfile(config_member)
+    config_raw = f.read() if f else b''
+    config = json.loads(config_raw)
+    if not isinstance(config, dict):
+        raise ValueError('image config is not a JSON object')
+    return manifest, config_name, config, config_raw
+
+
+def read_manifest_and_config(oci_data):
+    """read_manifest_and_config_from_tar() over in-memory tar bytes."""
+    with tarfile.open(fileobj=io.BytesIO(oci_data), mode='r:*') as tf:
+        return read_manifest_and_config_from_tar(tf)
+
+
+def repack_oci_tar(orig_data, replacements, extra_entries):
+    """Rebuild a tar from orig_data, substituting the members named in
+    `replacements` (member name -> (new_tarinfo, new_data_bytes)) and
+    appending `extra_entries` (list of (tarinfo, data_bytes)).
+
+    Members are emitted in their original order.  When two replacements
+    collapse onto one new name (two stale blobs that now hash the same, or
+    a rename onto a member that already exists) the name is written once.
+    Returns the new tar bytes."""
+    buf = io.BytesIO()
+    emitted = set()
+    with tarfile.open(fileobj=buf, mode='w:') as out_tf:
+        with tarfile.open(fileobj=io.BytesIO(orig_data), mode='r:*') as in_tf:
+            for member in in_tf.getmembers():
+                if member.name in replacements:
+                    new_info, new_data = replacements[member.name]
+                    if new_info.name in emitted:
+                        continue
+                    emitted.add(new_info.name)
+                    out_tf.addfile(new_info, io.BytesIO(new_data))
+                    continue
+                if member.name in emitted:
+                    continue
+                emitted.add(member.name)
+                if member.isfile():
+                    out_tf.addfile(member, in_tf.extractfile(member))
+                else:
+                    out_tf.addfile(member)
+        for info, data in extra_entries:
+            if info.name in emitted:
+                continue
+            emitted.add(info.name)
+            out_tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def rebuild_oci_with_new_config(oci_data, manifest, old_config_path,
+                                new_config, extra_entries=()):
+    """Re-serialise new_config under its content-addressed name, point
+    manifest.json (already updated by the caller for layers etc.) at it,
+    and return (new_tar_bytes, new_config_path)."""
+    new_config_raw = _json_bytes(new_config)
+    new_config_path = content_name_for(old_config_path, new_config_raw)
+    manifest[0]['Config'] = new_config_path
+    new_manifest_raw = _json_bytes(manifest)
+    replacements = {
+        old_config_path: (make_tar_info(new_config_path, len(new_config_raw)),
+                          new_config_raw),
+        'manifest.json': (make_tar_info('manifest.json',
+                                        len(new_manifest_raw)),
+                          new_manifest_raw),
+    }
+    return (repack_oci_tar(oci_data, replacements, list(extra_entries)),
+            new_config_path)
+
+
+def content_name_for(old_name, data):
+    """The member name `data` should carry given the naming scheme of
+    old_name: blobs/sha256/<hex> stays content-addressed, a legacy
+    <hex>.json config keeps that shape, anything else (legacy
+    <id>/layer.tar) is left alone."""
+    digest = _sha256(data)
+    if _blob_hex(old_name) is not None:
+        return 'blobs/sha256/' + digest
+    base = os.path.basename(old_name)
+    if '/' not in old_name and base.endswith('.json') \
+            and _SHA256_HEX.fullmatch(base[:-5]):
+        return digest + '.json'
+    return old_name
+
+
+def layer_diff_id(layer_bytes):
+    """The config rootfs.diff_ids entry for a (gzip or raw) layer."""
+    raw = gzip.decompress(layer_bytes) if layer_bytes[:2] == b'\x1f\x8b' \
+        else layer_bytes
+    return 'sha256:' + _sha256(raw)
 
 
 def _find_image_manifest(bodies, index):
@@ -114,6 +268,19 @@ def normalize_oci_layout(oci_data, sort_members=False):
     entry = manifest[0]
     config_name = entry.get('Config', '')
     layer_names = list(entry.get('Layers') or [])
+
+    # 0. Legacy multi-image saves shared a layer by making <id>/layer.tar a
+    # symlink to another image's copy.  The loader opens layers with
+    # openat_beneath() and refuses symlinks, so give each such member its
+    # target's bytes as a regular file.
+    materialize = {}
+    for m in members:
+        if m.issym() and m.name in layer_names and m.name not in bodies:
+            target = posixpath.normpath(
+                posixpath.join(posixpath.dirname(m.name), m.linkname))
+            if target in bodies:
+                bodies[m.name] = bodies[target]
+                materialize[m.name] = target
     if config_name not in bodies or any(n not in bodies for n in layer_names):
         return oci_data  # not ours to repair; the loader will refuse it
 
@@ -199,7 +366,7 @@ def normalize_oci_layout(oci_data, sort_members=False):
             else:
                 old_manifest_blob = None
 
-    if not renames and new_index is None:
+    if not renames and new_index is None and not materialize:
         return oci_data
 
     # 3. Re-emit.  Renamed blobs keep their member metadata; the replaced
@@ -254,7 +421,10 @@ def normalize_oci_layout(oci_data, sort_members=False):
             info.uname = m.uname
             info.gname = m.gname
             info.mtime = m.mtime
-            if m.isfile():
+            if m.name in materialize:
+                info.type = tarfile.REGTYPE
+                info.linkname = ''
+            if m.isfile() or m.name in materialize:
                 # Bodies stay keyed by the original member name; renamed
                 # blobs carry their bytes over under the new name.
                 source = bodies[m.name]

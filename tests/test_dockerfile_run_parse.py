@@ -139,6 +139,31 @@ class ExpandVarsTest(unittest.TestCase):
     def test_escaped_dollar(self):
         self.assertEqual(MOD._expand_vars("\\$A", {"A": "1"}), "$A")
 
+    def test_nested_defaults(self):
+        """${A:-${B}}: the first `}` used to end the expansion, leaving
+        `${B` in the output and a stray `}` after it."""
+        v = {"A": "a", "B": "b", "E": ""}
+        self.assertEqual(MOD._expand_vars("${A:-${B}}", v), "a")
+        self.assertEqual(MOD._expand_vars("${X:-${B}}", v), "b")
+        self.assertEqual(MOD._expand_vars("${E:-${B}}", v), "b")
+        self.assertEqual(MOD._expand_vars("${X:-${Y:-c}}", v), "c")
+        self.assertEqual(MOD._expand_vars("${X:-${Y:-${B}}}x", v), "bx")
+        self.assertEqual(MOD._expand_vars("pre${X:-${B}}post", v),
+                         "prebpost")
+        self.assertEqual(MOD._expand_vars("${A:+${B}}${X:+${B}}", v), "b")
+        self.assertEqual(MOD._expand_vars("${X:-${Y}}", v), "")
+        # Literal braces inside the word, and an unterminated expansion.
+        self.assertEqual(MOD._expand_vars("${X:-{lit}}", v), "{lit}")
+        self.assertEqual(MOD._expand_vars("${X:-unterminated", v),
+                         "${X:-unterminated")
+        self.assertEqual(MOD._expand_vars("${X:-${B}", v), "${X:-${B}")
+
+    def test_matching_brace(self):
+        self.assertEqual(MOD._matching_brace("${A}", 1), 3)
+        self.assertEqual(MOD._matching_brace("${A:-${B}}", 1), 9)
+        self.assertEqual(MOD._matching_brace("${A:-${B}", 1), -1)
+        self.assertEqual(MOD._matching_brace("${A:-\\}}", 1), 7)
+
     def test_run_is_not_expanded_by_the_builder(self):
         self.assertNotIn("RUN", MOD._EXPANDED_INSTRUCTIONS)
         self.assertIn("ENV", MOD._EXPANDED_INSTRUCTIONS)
