@@ -225,6 +225,16 @@ the default static loader invokes cloud-hypervisor when VM mode is requested.
 In both cases the generated file is deployed directly: copy it to the KVM host
 and execute it to start the microVM.
 
+With cloud-hypervisor the loader copies itself into the initramfs as `/init`
+and appends a second, uncompressed cpio archive holding
+`/.oci2bin_vm_params`: the arguments after the image, `-e`, `--entrypoint`,
+`--workdir`, the `-v` mounts and the data-disk flag, hex-encoded. The kernel
+unpacks concatenated archives in order, so the file lands next to `/init`
+without repacking the image; the guest init reads and unlinks it before
+mounting volumes and starting the workload. The kernel command line carries
+only boot flags (`console=`, `init=/init`, `OCI2BIN_VM_INIT=1`, optionally
+`OCI2BIN_DEBUG=1`).
+
 For a libkrun VM, `--net userspace` uses libkrun's implicit
 virtio-vsock/Transparent Socket Impersonation path. The guest does not need a
 virtual NIC or DHCP setup: socket operations are proxied by the VMM in the
