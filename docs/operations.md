@@ -391,6 +391,25 @@ Run the full unit sweep on native x86_64 and cross-compiled aarch64:
 make test-all
 ```
 
+Check what a package would ship:
+
+```bash
+make check-packaging
+make check-packaging CHECK_PACKAGING_FLAGS=--wheel
+```
+
+`check-packaging` stages `make install DESTDIR=<tmp> PREFIX=/usr`, checks the
+tree file by file (every helper in `packaging/oci2bin-scripts.txt`, the
+loader source and binary, the man page, the `oci2vm` symlink, no symlink that
+escapes the staged tree, the `OCI2BIN_HOME` default rewritten to
+`/usr/share/oci2bin`, every helper compiling), then runs the installed
+`oci2bin --help`, `oci2vm --help` and `oci2bin doctor --json` out of the
+staged prefix. With `--wheel` it also builds the wheel, checks that it
+carries the bash wrapper, the loader source and every helper, installs it
+into a scratch target and runs its `oci2bin` and `oci2vm` console scripts.
+The wheel build is pip's isolated build (it fetches `setuptools>=77`); set
+`OCI2BIN_WHEEL_NO_ISOLATION=1` to build with the host's setuptools.
+
 This target does not require Docker or Podman. Container-engine integration
 tests are separate under `make test`.
 

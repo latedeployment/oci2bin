@@ -1117,6 +1117,15 @@ Loader source code.
 .B make test\-unit
 Run the fast unit suite without requiring Docker or Podman.
 .TP
+.B make check\-packaging
+Stage
+.B make install
+under a temporary DESTDIR and run the installed
+.BR oci2bin " and " oci2vm ;
+with
+.B CHECK_PACKAGING_FLAGS=\-\-wheel
+also build and exercise the wheel.
+.TP
 .B make test\-all
 Run the full unit sweep on native x86_64 and cross-compiled aarch64.
 This target does not require Docker or Podman.

@@ -6,6 +6,15 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`make check-packaging`.** Stages `make install DESTDIR=<tmp>
+  PREFIX=/usr` and checks what a package would ship: every helper in the
+  manifest, the loader source and binary, the man page, the `oci2vm`
+  symlink, no symlink escaping the staged tree, the `OCI2BIN_HOME`
+  default rewritten to the prefix, every helper compiling; then runs the
+  installed `oci2bin --help`, `oci2vm --help` and `doctor --json` from
+  the staged prefix. `CHECK_PACKAGING_FLAGS=--wheel` also builds the
+  wheel, checks its contents and runs its console scripts.
+
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
   `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, keyed by the SHA-256

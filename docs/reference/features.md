@@ -254,6 +254,7 @@ byte-for-byte reproducible.
 | Feature | Command |
 | --- | --- |
 | Unit tests without a container engine | `make test-unit` |
+| Staged-install and wheel check | `make check-packaging`, `make check-packaging CHECK_PACKAGING_FLAGS=--wheel` |
 | Full x86_64 and aarch64 unit sweep, without a container engine | `make test-all` |
 | Unit and container-engine integration tests | `make test` |
 | C tests under ASan, UBSan, and LSan | `make test-asan` |

@@ -83,6 +83,7 @@ VMLINUX_OUT    = build/vmlinux
         test-integration-nginx test-integration-encrypt test-integration-live \
         test-integration-services \
         test-c test-c-aarch64 test-c-stubs test-python test-shellcheck check-version \
+        check-packaging \
         test-asan \
         test-all test-all-fuzz \
         test-vm-unit test-vm \
@@ -405,6 +406,17 @@ test-unit-aarch64: test-c-aarch64 test-python
 # (cross-compiled C unit tests run under qemu). No Docker required.
 test-all: test-unit test-c-aarch64
 	@echo "=== test-all: x86_64 + aarch64 unit tests complete ==="
+
+# Stage `make install` under a temporary DESTDIR (PREFIX=/usr, as packages
+# do) and exercise the result: every manifest helper, the loader source and
+# binary, the man page, the oci2vm symlink, no symlink escaping the stage, the
+# baked-in OCI2BIN_HOME, then the installed oci2bin --help, oci2vm --help and
+# doctor --json.  CHECK_PACKAGING_FLAGS=--wheel also builds the wheel, checks
+# its contents and runs its console scripts (pip's isolated build fetches
+# setuptools>=77; OCI2BIN_WHEEL_NO_ISOLATION=1 uses the host's).
+check-packaging: build/loader-$(ARCH)
+	@echo "=== packaging check (staged install) ==="
+	$(TEST_ENV) python3 scripts/check_packaging.py $(CHECK_PACKAGING_FLAGS)
 
 # test-all plus the local fuzz sweep. FUZZ_SECONDS is per-harness wall time
 # (default 300). Fuzzing is x86_64-native only — there is no aarch64 harness.

@@ -290,6 +290,10 @@ without installing, run it directly from the repository root.
 @table @command
 @item make test-unit
 Run the fast unit suite without requiring Docker or Podman.
+@item make check-packaging
+Stage @command{make install} under a temporary DESTDIR and run the installed
+@command{oci2bin} and @command{oci2vm}; with
+@code{CHECK_PACKAGING_FLAGS=--wheel} also build and exercise the wheel.
 @item make test-all
 Run the full unit sweep on native x86_64 and cross-compiled aarch64.
 This target does not require Docker or Podman.
