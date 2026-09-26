@@ -21835,27 +21835,90 @@ static int vm_switch_to_persistent_root(const char* dev)
     return 0;
 }
 
+/* Where the host puts the run-time overrides inside the initramfs (see
+ * vm_params_append_to_initramfs()). */
+#define VM_PARAMS_PATH "/.oci2bin_vm_params"
+
 /*
- * The kernel command line as a malloc'd string ("" if unreadable).  Not
- * read_file(): procfs reports st_size 0, so a size-driven read returned an
- * empty string and every oci2bin.* parameter — the -v mounts included — was
- * silently ignored.
+ * The host's run-time overrides for this boot as a malloc'd string ("" when
+ * the file is absent).  They live in a file appended to the initramfs, not
+ * on the kernel command line: the cmdline is visible to every local user in
+ * the host's process list and to the workload in /proc/cmdline, and is
+ * capped at 2048 bytes.  The file is unlinked once read so the workload
+ * cannot recover -e values from it either.
  */
-static char* vm_read_cmdline(void)
+static char* vm_read_params_from(const char* path)
 {
-    char* buf = calloc(1, 4097);
+    size_t sz = 0;
+    char* buf = read_file(path, &sz);
     if (!buf)
     {
-        return NULL;
+        return calloc(1, 1);
     }
-    int fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
-    if (fd >= 0)
+    /* The syntax is the old cmdline one (key=value separated by spaces), so
+     * a stray newline must not glue two parameters together. */
+    for (size_t i = 0; i < sz; i++)
     {
-        ssize_t n = read_all_fd(fd, buf, 4096);
-        close(fd);
-        buf[n > 0 ? n : 0] = '\0';
+        if (buf[i] == '\n' || buf[i] == '\0')
+        {
+            buf[i] = ' ';
+        }
     }
+    unlink(path);
     return buf;
+}
+
+/*
+ * Decode the hex list stored under `key` in `params` into freshly
+ * allocated storage.  Returns the count (0 when absent) and sets *out to a
+ * malloc'd array of pointers into a malloc'd buffer; both stay allocated for
+ * the life of the guest init.  -1 on malformed input.
+ */
+static int vm_params_decode_list(const char* params, const char* key,
+                                 char*** out, int max_out)
+{
+    *out = NULL;
+    const char* p = params;
+    size_t klen = strlen(key);
+    const char* val = NULL;
+    while ((p = strstr(p, key)) != NULL)
+    {
+        if (p == params || p[-1] == ' ')
+        {
+            val = p + klen;
+            break;
+        }
+        p += klen;
+    }
+    if (!val)
+    {
+        return 0;
+    }
+    size_t hlen = strcspn(val, " ");
+    if (hlen == 0 || hlen % 2 != 0 || hlen / 2 > 64u * 1024u * 1024u)
+    {
+        return -1;
+    }
+    char* hex = strndup(val, hlen);
+    char* buf = malloc(hlen / 2 + 1);
+    char** list = calloc((size_t)max_out, sizeof(*list));
+    if (!hex || !buf || !list)
+    {
+        free(hex);
+        free(buf);
+        free(list);
+        return -1;
+    }
+    int n = vm_hex_decode_list(hex, buf, hlen / 2 + 1, list, max_out);
+    free(hex);
+    if (n < 0)
+    {
+        free(buf);
+        free(list);
+        return -1;
+    }
+    *out = list;
+    return n;
 }
 
 static volatile pid_t g_vm_workload_pid = 0;
@@ -21917,19 +21980,22 @@ static int vm_init_main(void)
     }
     vm_bring_up_lo();
 
-    char* vm_cmdline = vm_read_cmdline();
-    if (!vm_cmdline)
+    /* The host's run-time overrides ride in the initramfs; the kernel
+     * command line carries boot flags only (see vm_ch_build_cmdline()).
+     * Read them before the root switches below, while the initramfs is
+     * still "/". */
+    char* vm_params = vm_read_params_from(VM_PARAMS_PATH);
+    if (!vm_params)
     {
         return 1;
     }
-
-    debug_log("vm.init.cmdline", "value=%s", vm_cmdline);
+    debug_log("vm.init.params", "bytes=%zu", strlen(vm_params));
 
     /* 2. --overlay-persist data disk (before the virtiofs mounts, so those
      *    land inside the root the workload actually sees). */
     {
         char dev[64];
-        if (vm_cmdline_get(vm_cmdline, "oci2bin.data=", dev,
+        if (vm_cmdline_get(vm_params, "oci2bin.data=", dev,
                            sizeof(dev)) == 0 &&
                 vm_switch_to_persistent_root(dev) < 0)
         {
@@ -21938,8 +22004,8 @@ static int vm_init_main(void)
         }
     }
 
-    /* 3. virtiofs mounts from cmdline: oci2bin.mount.N=tag:path */
-    for (int mi = 0; mi < 64; mi++)
+    /* 3. virtiofs mounts: oci2bin.mount.N=<hex list of tag, path> */
+    for (int mi = 0; mi < MAX_VOLUMES; mi++)
     {
         char key[32];
         int kn = snprintf(key, sizeof(key), "oci2bin.mount.%d=", mi);
@@ -21947,26 +22013,20 @@ static int vm_init_main(void)
         {
             break;
         }
-        char spec[PATH_MAX + 256];
-        if (vm_cmdline_get(vm_cmdline, key, spec, sizeof(spec)) < 0)
+        char** spec = NULL;
+        int ns = vm_params_decode_list(vm_params, key, &spec, 2);
+        if (ns <= 0)
         {
             break;
         }
-        /* format: tag:path */
-        char* colon = strchr(spec, ':');
-        if (!colon || colon == spec || (size_t)(colon - spec) >= 256)
-        {
-            break;
-        }
-        *colon = '\0';
-        const char* tag      = spec;
-        const char* mnt_path = colon + 1;
+        const char* tag      = spec[0];
+        const char* mnt_path = ns > 1 ? spec[1] : "";
         /* validate path — reject .. components and require absolute */
-        if (path_has_dotdot_component(mnt_path) || mnt_path[0] != '/')
+        if (ns != 2 || tag[0] == '\0' || strlen(tag) >= 256 ||
+                path_has_dotdot_component(mnt_path) || mnt_path[0] != '/')
         {
             fprintf(stderr,
-                    "oci2bin-init: skipping unsafe mount path: %s\n",
-                    mnt_path);
+                    "oci2bin-init: skipping unsafe mount spec %d\n", mi);
             continue;
         }
         /* mkdir and mount */
@@ -21983,49 +22043,34 @@ static int vm_init_main(void)
     if (read_oci_config("", &oci_cfg) < 0)
     {
         fprintf(stderr, "oci2bin-init: /.oci2bin_config not found\n");
-        free(vm_cmdline);
+        free(vm_params);
         return 1;
     }
 
-    static char hexval[4096];
-    static char args_buf[2048];
-    static char env_buf[2048];
-    static char ep_buf[1024];
-    static char wd_buf[PATH_MAX];
-    char* extra[MAX_ARGS];
-    char* host_env[MAX_ENV];
-    int   n_extra = 0;
-    int   n_host_env = 0;
+    char** extra    = NULL;
+    char** host_env = NULL;
+    char** one      = NULL;
+    int   n_extra    = vm_params_decode_list(vm_params, "oci2bin.argv=",
+        &extra, MAX_ARGS);
+    int   n_host_env = vm_params_decode_list(vm_params, "oci2bin.env=",
+        &host_env, MAX_ENV);
     const char* entrypoint = NULL;
     const char* workdir    = oci_cfg.workdir;
-    if (vm_cmdline_get(vm_cmdline, "oci2bin.argv=", hexval,
-                       sizeof(hexval)) == 0)
+    if (n_extra < 0 || n_host_env < 0)
     {
-        n_extra = vm_hex_decode_list(hexval, args_buf, sizeof(args_buf),
-                                     extra, MAX_ARGS);
-        n_extra = n_extra < 0 ? 0 : n_extra;
+        fprintf(stderr, "oci2bin-init: malformed run-time parameters\n");
+        free(vm_params);
+        return 1;
     }
-    if (vm_cmdline_get(vm_cmdline, "oci2bin.env=", hexval,
-                       sizeof(hexval)) == 0)
-    {
-        n_host_env = vm_hex_decode_list(hexval, env_buf, sizeof(env_buf),
-                                        host_env, MAX_ENV);
-        n_host_env = n_host_env < 0 ? 0 : n_host_env;
-    }
-    char* one[1];
-    if (vm_cmdline_get(vm_cmdline, "oci2bin.ep=", hexval,
-                       sizeof(hexval)) == 0 &&
-            vm_hex_decode_list(hexval, ep_buf, sizeof(ep_buf), one, 1) == 1)
+    if (vm_params_decode_list(vm_params, "oci2bin.ep=", &one, 1) == 1)
     {
         entrypoint = one[0];
     }
-    if (vm_cmdline_get(vm_cmdline, "oci2bin.wd=", hexval,
-                       sizeof(hexval)) == 0 &&
-            vm_hex_decode_list(hexval, wd_buf, sizeof(wd_buf), one, 1) == 1)
+    if (vm_params_decode_list(vm_params, "oci2bin.wd=", &one, 1) == 1)
     {
         workdir = one[0];
     }
-    free(vm_cmdline);
+    free(vm_params);
 
     char* exec_args[MAX_ARGS + 1];
     int exec_argc = build_exec_args(&oci_cfg, entrypoint, extra, n_extra,
@@ -22735,16 +22780,214 @@ static int vm_hex_append_list(char* buf, size_t buf_sz, const char* key,
 #define VM_CMDLINE_MAX 2048
 
 /*
- * Assemble the kernel command line into ctx->cmdline.
- * have_data_disk: 1 if a persistent data disk was prepared.
- *
- * Besides boot parameters it carries the run-time overrides the guest init
- * applies: arguments after the image (`oci2bin.argv`), --entrypoint, -e and
- * --workdir.  They used to be dropped, so `app --vm -- cmd` ran the image
- * default instead of cmd.
+ * The run-time overrides the guest init applies — arguments after the
+ * image, -e, --entrypoint, --workdir, the -v mounts and the data disk — as
+ * one malloc'd "key=value ..." string (values hex-encoded, see
+ * vm_hex_append_list()).  It travels inside the initramfs rather than on
+ * the kernel command line: the cmdline shows up in the host's process list
+ * and the guest's /proc/cmdline, and is capped at 2048 bytes.  Returns 0
+ * and sets *out (possibly ""), or -1.
+ */
+static int vm_params_build(struct container_opts* opts, int have_data_disk,
+                           char** out)
+{
+    *out = NULL;
+    /* Worst case: every byte becomes two hex digits plus a NUL each, and
+     * each key costs a few dozen bytes. */
+    size_t need = 256;
+    for (int i = 0; i < opts->n_extra; i++)
+    {
+        need += 2 * (strlen(opts->extra_args[i]) + 1);
+    }
+    for (int i = 0; i < opts->n_env; i++)
+    {
+        need += 2 * (strlen(opts->env_vars[i]) + 1);
+    }
+    for (int i = 0; i < opts->n_vols; i++)
+    {
+        need += 2 * (strlen(opts->vol_ctr[i]) + 16) + 48;
+    }
+    need += opts->entrypoint ? 2 * (strlen(opts->entrypoint) + 1) + 32 : 0;
+    need += opts->workdir ? 2 * (strlen(opts->workdir) + 1) + 32 : 0;
+    if (need > 64u * 1024u * 1024u)
+    {
+        fprintf(stderr, "oci2bin: --vm: run-time parameters too large\n");
+        return -1;
+    }
+    char* buf = calloc(1, need);
+    if (!buf)
+    {
+        perror("oci2bin: vm params alloc");
+        return -1;
+    }
+    int rc = 0;
+    if (have_data_disk)
+    {
+        rc |= snprintf(buf, need, "oci2bin.data=/dev/vda") >= (int)need;
+    }
+    for (int vi = 0; vi < opts->n_vols && rc == 0; vi++)
+    {
+        if (path_has_dotdot_component(opts->vol_ctr[vi]) ||
+                opts->vol_ctr[vi][0] != '/')
+        {
+            fprintf(stderr, "oci2bin: -v container path invalid: %s\n",
+                    opts->vol_ctr[vi]);
+            free(buf);
+            return -1;
+        }
+        char key[32];
+        char tag[16];
+        if (snprintf(key, sizeof(key), "oci2bin.mount.%d", vi) >=
+                (int)sizeof(key) ||
+                snprintf(tag, sizeof(tag), "vol%d", vi) >= (int)sizeof(tag))
+        {
+            rc = 1;
+            break;
+        }
+        char* spec[2] = { tag, opts->vol_ctr[vi] };
+        rc |= vm_hex_append_list(buf, need, key, spec, 2) < 0;
+    }
+    if (rc == 0 && opts->n_extra > 0)
+    {
+        rc |= vm_hex_append_list(buf, need, "oci2bin.argv", opts->extra_args,
+                                 opts->n_extra) < 0;
+    }
+    if (rc == 0 && opts->n_env > 0)
+    {
+        rc |= vm_hex_append_list(buf, need, "oci2bin.env", opts->env_vars,
+                                 opts->n_env) < 0;
+    }
+    if (rc == 0 && opts->entrypoint)
+    {
+        rc |= vm_hex_append_list(buf, need, "oci2bin.ep", &opts->entrypoint,
+                                 1) < 0;
+    }
+    if (rc == 0 && opts->workdir)
+    {
+        rc |= vm_hex_append_list(buf, need, "oci2bin.wd", &opts->workdir,
+                                 1) < 0;
+    }
+    if (rc != 0)
+    {
+        fprintf(stderr, "oci2bin: --vm: run-time parameters truncated\n");
+        free(buf);
+        return -1;
+    }
+    /* vm_hex_append_list() writes a leading space; the parser accepts one. */
+    *out = buf;
+    return 0;
+}
+
+/*
+ * Append `params` to the initramfs as a second, uncompressed newc cpio
+ * archive holding VM_PARAMS_PATH.  The kernel unpacks concatenated
+ * archives (compressed or not) in order, skipping zero padding between
+ * them, so the file lands in the guest root next to /init without
+ * re-packing the image.  Returns 0 or -1.
+ */
+static int vm_params_append_to_initramfs(const char* initramfs_path,
+        const char* params)
+{
+    static const char member[] = ".oci2bin_vm_params";   /* VM_PARAMS_PATH */
+    size_t data_len = strlen(params);
+    size_t name_len = sizeof(member);                     /* with NUL */
+    size_t hdr_len  = 110;
+    size_t name_pad = (4 - ((hdr_len + name_len) % 4)) % 4;
+    size_t data_pad = (4 - (data_len % 4)) % 4;
+    static const char trailer[] = "TRAILER!!!";
+    size_t trailer_name_len = sizeof(trailer);
+    size_t trailer_pad = (4 - ((hdr_len + trailer_name_len) % 4)) % 4;
+    size_t total = hdr_len + name_len + name_pad + data_len + data_pad +
+                   hdr_len + trailer_name_len + trailer_pad;
+    if (data_len > 64u * 1024u * 1024u)
+    {
+        fprintf(stderr, "oci2bin: --vm: run-time parameters too large\n");
+        return -1;
+    }
+    char* blob = calloc(1, total + 4);
+    if (!blob)
+    {
+        perror("oci2bin: cpio alloc");
+        return -1;
+    }
+    size_t off = 0;
+    /* newc header: magic, then 13 fields of 8 hex digits: ino, mode, uid,
+     * gid, nlink, mtime, filesize, devmajor, devminor, rdevmajor,
+     * rdevminor, namesize, check. */
+    int n = snprintf(blob + off, total + 4 - off,
+                     "070701%08x%08x%08x%08x%08x%08x%08zx%08x%08x%08x%08x%08zx%08x",
+                     1u, 0100600u, 0u, 0u, 1u, 0u, data_len, 0u, 0u, 0u, 0u,
+                     name_len, 0u);
+    if (n != (int)hdr_len)
+    {
+        free(blob);
+        return -1;
+    }
+    off += hdr_len;
+    memcpy(blob + off, member, name_len);
+    off += name_len + name_pad;
+    memcpy(blob + off, params, data_len);
+    off += data_len + data_pad;
+    n = snprintf(blob + off, total + 4 - off,
+                 "070701%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08zx%08x",
+                 0u, 0u, 0u, 0u, 1u, 0u, 0u, 0u, 0u, 0u, 0u,
+                 trailer_name_len, 0u);
+    if (n != (int)hdr_len)
+    {
+        free(blob);
+        return -1;
+    }
+    off += hdr_len;
+    memcpy(blob + off, trailer, trailer_name_len);
+    off += trailer_name_len + trailer_pad;
+
+    int fd = open(initramfs_path, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0)
+    {
+        perror("oci2bin: open initramfs for params");
+        free(blob);
+        return -1;
+    }
+    int rc = 0;
+    struct stat st;
+    if (fstat(fd, &st) < 0)
+    {
+        rc = -1;
+    }
+    else
+    {
+        /* The kernel only recognises a cpio header at a 4-byte aligned
+         * offset; it skips NUL bytes to get there. */
+        size_t align = (size_t)((4 - (st.st_size % 4)) % 4);
+        static const char zeros[4] = {0, 0, 0, 0};
+        if (align && write_all_fd(fd, zeros, align) < 0)
+        {
+            rc = -1;
+        }
+    }
+    if (rc == 0 && write_all_fd(fd, blob, off) < 0)
+    {
+        rc = -1;
+    }
+    if (rc == 0 && fsync(fd) < 0)
+    {
+        rc = -1;
+    }
+    if (rc < 0)
+    {
+        perror("oci2bin: append params to initramfs");
+    }
+    close(fd);
+    free(blob);
+    return rc;
+}
+
+/*
+ * Assemble the kernel command line into ctx->cmdline: boot parameters only.
+ * The run-time overrides go through vm_params_build() and the initramfs.
  */
 static int vm_ch_build_cmdline(struct vm_ch_ctx* ctx,
-                               struct container_opts* opts, int have_data_disk)
+                               struct container_opts* opts)
 {
     /* No pci=off: cloud-hypervisor attaches every virtio device over PCI.
      * `quiet` keeps kernel boot noise off the serial console the workload's
@@ -22775,52 +23018,10 @@ static int vm_ch_build_cmdline(struct vm_ch_ctx* ctx,
     {
         CMDLINE_APPEND(" OCI2BIN_DEBUG=1");
     }
-    if (have_data_disk)
-    {
-        CMDLINE_APPEND(" oci2bin.data=/dev/vda");
-    }
-    for (int vi = 0; vi < opts->n_vols; vi++)
-    {
-        if (path_has_dotdot_component(opts->vol_ctr[vi]) ||
-                opts->vol_ctr[vi][0] != '/' ||
-                strchr(opts->vol_ctr[vi], ' ') != NULL)
-        {
-            fprintf(stderr, "oci2bin: -v container path invalid: %s\n",
-                    opts->vol_ctr[vi]);
-            return -1;
-        }
-        CMDLINE_APPEND(" oci2bin.mount.%d=vol%d:%s", vi, vi,
-                       opts->vol_ctr[vi]);
-    }
 #undef CMDLINE_APPEND
-    int rc = 0;
-    if (opts->n_extra > 0)
+    if (strlen(ctx->cmdline) >= VM_CMDLINE_MAX)
     {
-        rc |= vm_hex_append_list(ctx->cmdline, sizeof(ctx->cmdline),
-                                 "oci2bin.argv", opts->extra_args,
-                                 opts->n_extra);
-    }
-    if (opts->n_env > 0)
-    {
-        rc |= vm_hex_append_list(ctx->cmdline, sizeof(ctx->cmdline),
-                                 "oci2bin.env", opts->env_vars, opts->n_env);
-    }
-    if (opts->entrypoint)
-    {
-        rc |= vm_hex_append_list(ctx->cmdline, sizeof(ctx->cmdline),
-                                 "oci2bin.ep", &opts->entrypoint, 1);
-    }
-    if (opts->workdir)
-    {
-        rc |= vm_hex_append_list(ctx->cmdline, sizeof(ctx->cmdline),
-                                 "oci2bin.wd", &opts->workdir, 1);
-    }
-    if (rc != 0 || strlen(ctx->cmdline) >= VM_CMDLINE_MAX)
-    {
-        fprintf(stderr,
-                "oci2bin: --vm: arguments, -e and -v specs exceed the %d-byte"
-                " kernel command line of the cloud-hypervisor backend\n",
-                VM_CMDLINE_MAX);
+        fprintf(stderr, "oci2bin: --vm: kernel command line too long\n");
         return -1;
     }
     return 0;
@@ -23135,8 +23336,18 @@ static int run_as_vm_ch(const char* rootfs, const char* tmpdir,
         return 1;
     }
 
-    /* 5. Build kernel cmdline */
-    CH_CALL(vm_ch_build_cmdline(ctx, opts, have_data_disk));
+    /* 5. Boot flags on the kernel cmdline; the run-time overrides (argv,
+     *    -e, --entrypoint, --workdir, -v, data disk) into the initramfs. */
+    CH_CALL(vm_ch_build_cmdline(ctx, opts));
+    {
+        char* params = NULL;
+        CH_CALL(vm_params_build(opts, have_data_disk, &params));
+        int prc = vm_params_append_to_initramfs(ctx->initramfs_path, params);
+        debug_log("vm.ch.params", "bytes=%zu appended=%d", strlen(params),
+                  prc == 0);
+        free(params);
+        CH_CALL(prc);
+    }
 
     /* 6. Assemble cloud-hypervisor argv */
     const char* vmm_bin = opts->vmm ? opts->vmm : "cloud-hypervisor";

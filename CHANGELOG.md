@@ -49,6 +49,19 @@ All notable changes to oci2bin are documented here.
 
 ### Security
 
+- **`--vm` no longer puts arguments, `-e` values, `--entrypoint`,
+  `--workdir` or `-v` specs on the kernel command line.** The
+  cloud-hypervisor backend hex-encoded them into `--cmdline`, which every
+  local user could read from the host's process list and the workload from
+  the guest's `/proc/cmdline`, and which the kernel caps at 2048 bytes, so a
+  handful of `-e` values made the launch fail. They now travel in
+  `/.oci2bin_vm_params`, a file the loader appends to the initramfs as a
+  second cpio archive (the kernel unpacks concatenated archives in order) and
+  the guest init reads and unlinks before mounting volumes and starting the
+  workload. The command line keeps boot flags only, there is no size limit,
+  `-v` container paths may contain spaces, and the documented warning to
+  avoid `-e` for secrets on this backend is gone.
+
 - **The loader's JSON reader no longer mistakes string contents for
   structure.** `json_skip_to_value()` substring-searched for `"key"` and
   accepted the match whenever the previous non-space byte was `{` or `,` — a

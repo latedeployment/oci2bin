@@ -8323,6 +8323,258 @@ static void test_parse_opts_rootfs_cache(void)
                   "rootfs-cache: mode name");
 }
 
+/* ── VM run-time parameters (initramfs file, not the kernel cmdline) ────── */
+
+static void test_vm_params_roundtrip(void)
+{
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    char a0[] = "sh";
+    char a1[] = "-c";
+    char a2[] = "echo \"quoted\" 'and spaced' = done";
+    char a3[] = "";
+    char* extra[] = {a0, a1, a2, a3};
+    opts.extra_args = extra;
+    opts.n_extra    = 4;
+    char e0[] = "TOKEN=s3cr3t with space";
+    char e1[] = "EMPTY=";
+    opts.env_vars[0] = e0;
+    opts.env_vars[1] = e1;
+    opts.n_env = 2;
+    char ep[] = "/usr/local/bin/entry point";
+    char wd[] = "/srv/app dir";
+    opts.entrypoint = ep;
+    opts.workdir    = wd;
+    char v0[] = "/data with space";
+    char v1[] = "/mnt/x";
+    opts.vol_ctr[0] = v0;
+    opts.vol_ctr[1] = v1;
+    opts.n_vols = 2;
+
+    char* params = NULL;
+    ASSERT_INT_EQ(vm_params_build(&opts, 1, &params), 0,
+                  "vm params: build succeeds");
+    ASSERT_NOT_NULL(params, "vm params: string produced");
+    if (!params)
+    {
+        return;
+    }
+    ASSERT(strstr(params, "s3cr3t") == NULL,
+           "vm params: values are hex-encoded, not plain text");
+    ASSERT(strncmp(params, "oci2bin.data=/dev/vda", 21) == 0,
+           "vm params: data disk flag first");
+
+    char** argv_out = NULL;
+    int n = vm_params_decode_list(params, "oci2bin.argv=", &argv_out,
+                                  MAX_ARGS);
+    ASSERT_INT_EQ(n, 4, "vm params: argv count");
+    if (n == 4)
+    {
+        ASSERT_STR_EQ(argv_out[2], a2, "vm params: quotes and spaces kept");
+        ASSERT_STR_EQ(argv_out[3], "", "vm params: empty argument kept");
+    }
+    char** env_out = NULL;
+    n = vm_params_decode_list(params, "oci2bin.env=", &env_out, MAX_ENV);
+    ASSERT_INT_EQ(n, 2, "vm params: env count");
+    if (n == 2)
+    {
+        ASSERT_STR_EQ(env_out[0], e0, "vm params: env value with space");
+        ASSERT_STR_EQ(env_out[1], e1, "vm params: empty env value");
+    }
+    char** one = NULL;
+    ASSERT_INT_EQ(vm_params_decode_list(params, "oci2bin.ep=", &one, 1), 1,
+                  "vm params: entrypoint present");
+    if (one)
+    {
+        ASSERT_STR_EQ(one[0], ep, "vm params: entrypoint value");
+    }
+    one = NULL;
+    ASSERT_INT_EQ(vm_params_decode_list(params, "oci2bin.wd=", &one, 1), 1,
+                  "vm params: workdir present");
+    if (one)
+    {
+        ASSERT_STR_EQ(one[0], wd, "vm params: workdir value");
+    }
+    char** m0 = NULL;
+    ASSERT_INT_EQ(vm_params_decode_list(params, "oci2bin.mount.0=", &m0, 2),
+                  2, "vm params: mount 0 has tag and path");
+    if (m0)
+    {
+        ASSERT_STR_EQ(m0[0], "vol0", "vm params: mount 0 tag");
+        ASSERT_STR_EQ(m0[1], v0, "vm params: mount 0 path with space");
+    }
+    char** m2 = NULL;
+    ASSERT_INT_EQ(vm_params_decode_list(params, "oci2bin.mount.2=", &m2, 2),
+                  0, "vm params: absent mount returns 0");
+    char** bad = NULL;
+    ASSERT_INT_EQ(vm_params_decode_list("oci2bin.argv=abc", "oci2bin.argv=",
+                                        &bad, 4), -1,
+                  "vm params: odd-length hex rejected");
+    /* A key that only appears inside another value must not match. */
+    ASSERT_INT_EQ(vm_params_decode_list("x=oci2bin.ep=41 y=1", "oci2bin.ep=",
+                                        &bad, 1), 0,
+                  "vm params: key must start a parameter");
+    free(params);
+
+    /* Nothing to pass: an empty string, still a valid file. */
+    memset(&opts, 0, sizeof(opts));
+    ASSERT_INT_EQ(vm_params_build(&opts, 0, &params), 0,
+                  "vm params: empty build succeeds");
+    ASSERT(params && params[0] == '\0', "vm params: empty string");
+    free(params);
+
+    /* A -v container path with '..' is refused. */
+    char bad_vol[] = "/data/../etc";
+    opts.vol_ctr[0] = bad_vol;
+    opts.n_vols = 1;
+    ASSERT_INT_EQ(vm_params_build(&opts, 0, &params), -1,
+                  "vm params: '..' in -v container path rejected");
+}
+
+static void test_vm_params_cmdline_has_boot_flags_only(void)
+{
+    struct vm_ch_ctx* ctx = calloc(1, sizeof(*ctx));
+    ASSERT_NOT_NULL(ctx, "vm cmdline: alloc ctx");
+    if (!ctx)
+    {
+        return;
+    }
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    char a0[] = "secret-arg";
+    char* extra[] = {a0};
+    opts.extra_args = extra;
+    opts.n_extra    = 1;
+    char e0[] = "PASSWORD=hunter2";
+    opts.env_vars[0] = e0;
+    opts.n_env = 1;
+    char v0[] = "/data";
+    opts.vol_ctr[0] = v0;
+    opts.n_vols = 1;
+    opts.debug = 1;
+    ASSERT_INT_EQ(vm_ch_build_cmdline(ctx, &opts), 0,
+                  "vm cmdline: builds");
+    ASSERT(strstr(ctx->cmdline, "oci2bin.") == NULL,
+           "vm cmdline: no oci2bin.* parameter on the kernel command line");
+    ASSERT(strstr(ctx->cmdline, "hunter2") == NULL &&
+           strstr(ctx->cmdline, "secret-arg") == NULL,
+           "vm cmdline: -e and arguments absent");
+    ASSERT(strstr(ctx->cmdline, "init=/init") != NULL &&
+           strstr(ctx->cmdline, "OCI2BIN_VM_INIT=1") != NULL &&
+           strstr(ctx->cmdline, "OCI2BIN_DEBUG=1") != NULL,
+           "vm cmdline: boot flags present");
+    ASSERT(strlen(ctx->cmdline) < 256, "vm cmdline: short");
+    free(ctx);
+}
+
+/* Parse one newc header at `p`; returns the 8-hex field `idx` (0 = ino). */
+static unsigned long cpio_field(const unsigned char* p, int idx)
+{
+    char tmp[9];
+    memcpy(tmp, p + 6 + idx * 8, 8);
+    tmp[8] = '\0';
+    return strtoul(tmp, NULL, 16);
+}
+
+static void test_vm_params_cpio_append(void)
+{
+    /* Try every alignment of the existing initramfs tail. */
+    for (size_t pre = 0; pre < 4; pre++)
+    {
+        char path[PATH_MAX];
+        cache_test_mkdtemp(path, sizeof(path), "vmcpio");
+        char file[PATH_MAX];
+        snprintf(file, sizeof(file), "%s/rootfs.cpio.gz", path);
+        int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        size_t existing = 13 + pre;    /* 13 % 4 == 1; covers all cases */
+        char junk[20];
+        memset(junk, 'g', sizeof(junk));
+        write_all_fd(fd, junk, existing);
+        close(fd);
+
+        const char* params = "oci2bin.argv=7368006c73000000";   /* odd len */
+        char desc[96];
+        snprintf(desc, sizeof(desc), "vm cpio: append (tail %% 4 == %zu)",
+                 existing % 4);
+        ASSERT_INT_EQ(vm_params_append_to_initramfs(file, params), 0, desc);
+
+        size_t sz = 0;
+        char* raw = read_file(file, &sz);
+        ASSERT_NOT_NULL(raw, "vm cpio: read back");
+        if (!raw)
+        {
+            continue;
+        }
+        size_t start = (existing + 3) & ~(size_t)3;
+        int padded_ok = 1;
+        for (size_t i = existing; i < start; i++)
+        {
+            padded_ok &= (raw[i] == '\0');
+        }
+        ASSERT(padded_ok, "vm cpio: zero padding up to a 4-byte boundary");
+        ASSERT(sz > start + 110 && memcmp(raw + start, "070701", 6) == 0,
+               "vm cpio: newc magic at an aligned offset");
+        const unsigned char* h = (const unsigned char*)raw + start;
+        ASSERT_INT_EQ((int)cpio_field(h, 1), 0100600, "vm cpio: mode 0600");
+        ASSERT_INT_EQ((int)cpio_field(h, 6), (int)strlen(params),
+                      "vm cpio: filesize");
+        ASSERT_INT_EQ((int)cpio_field(h, 11),
+                      (int)strlen(".oci2bin_vm_params") + 1,
+                      "vm cpio: namesize");
+        size_t name_off = start + 110;
+        ASSERT(strcmp(raw + name_off, ".oci2bin_vm_params") == 0,
+               "vm cpio: member name");
+        size_t data_off = (name_off + strlen(".oci2bin_vm_params") + 1 + 3)
+                          & ~(size_t)3;
+        ASSERT(memcmp(raw + data_off, params, strlen(params)) == 0,
+               "vm cpio: member data");
+        size_t trailer_off = (data_off + strlen(params) + 3) & ~(size_t)3;
+        ASSERT(memcmp(raw + trailer_off, "070701", 6) == 0 &&
+               strcmp(raw + trailer_off + 110, "TRAILER!!!") == 0,
+               "vm cpio: TRAILER!!! record closes the archive");
+        ASSERT_INT_EQ((int)(sz % 4), 0, "vm cpio: archive ends aligned");
+        free(raw);
+        unlink(file);
+        rmdir(path);
+    }
+}
+
+static void test_vm_read_params_unlinks(void)
+{
+    char dir[PATH_MAX];
+    cache_test_mkdtemp(dir, sizeof(dir), "vmparams");
+    char file[PATH_MAX];
+    snprintf(file, sizeof(file), "%s/.oci2bin_vm_params", dir);
+    const char* body = "oci2bin.data=/dev/vda\noci2bin.wd=2f746d7000";
+    int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    write_all_fd(fd, body, strlen(body));
+    close(fd);
+
+    char* params = vm_read_params_from(file);
+    ASSERT_NOT_NULL(params, "vm read params: returns a string");
+    struct stat st;
+    ASSERT(lstat(file, &st) < 0 && errno == ENOENT,
+           "vm read params: file unlinked after reading");
+    char dev[64];
+    ASSERT_INT_EQ(vm_cmdline_get(params, "oci2bin.data=", dev, sizeof(dev)),
+                  0, "vm read params: data key found");
+    ASSERT_STR_EQ(dev, "/dev/vda", "vm read params: newline ends a value");
+    char** one = NULL;
+    ASSERT_INT_EQ(vm_params_decode_list(params, "oci2bin.wd=", &one, 1), 1,
+                  "vm read params: second line parsed");
+    if (one)
+    {
+        ASSERT_STR_EQ(one[0], "/tmp", "vm read params: workdir decoded");
+    }
+    free(params);
+
+    char* missing = vm_read_params_from(file);
+    ASSERT(missing && missing[0] == '\0',
+           "vm read params: absent file yields an empty string");
+    free(missing);
+    rmdir(dir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -8436,6 +8688,10 @@ int main(void)
     test_rootfs_cache_root_resolution();
     test_rootfs_cache_publish_verify();
     test_parse_opts_rootfs_cache();
+    test_vm_params_roundtrip();
+    test_vm_params_cmdline_has_boot_flags_only();
+    test_vm_params_cpio_append();
+    test_vm_read_params_unlinks();
 
     printf("1..%d\n", tap_test_num);
 

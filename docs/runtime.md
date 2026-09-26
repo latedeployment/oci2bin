@@ -634,14 +634,14 @@ With cloud-hypervisor, the guest console is the caller's terminal, the
 command after the image (and `--entrypoint`, `-e`, `--workdir`) is passed to
 the guest, and the binary exits with the workload's exit status. The guest
 init reaps orphaned processes, forwards SIGTERM/SIGINT/SIGHUP, brings up
-`lo`, and powers the VM off when the workload exits. Arguments, `-e` values
-and `-v` specs travel on the kernel command line, which is limited to 2048
-bytes. Because they are on the kernel command line, they are visible to other
-local users in the host's process list (`ps` of cloud-hypervisor) and in the
-guest's `/proc/cmdline`: pass secrets with `--secret`-style files or libkrun
-rather than `-e` on this backend. The guest kernel needs `CONFIG_PVH`, virtio-PCI and virtio-fs (see
-`kernel/microvm.config`); `-v` uses `virtiofsd` (also found in
-`/usr/libexec`).
+`lo`, and powers the VM off when the workload exits. Arguments, `-e` values,
+`--entrypoint`, `--workdir` and `-v` specs reach the guest in a file the
+loader appends to the initramfs (`/.oci2bin_vm_params`, unlinked by the guest
+init before the workload starts), not on the kernel command line: they are not
+size-limited and do not show up in the host's process list or in the guest's
+`/proc/cmdline`. The command line carries boot flags only. The guest kernel
+needs `CONFIG_PVH`, virtio-PCI and virtio-fs (see `kernel/microvm.config`);
+`-v` uses `virtiofsd` (also found in `/usr/libexec`).
 
 Persist VM state:
 
