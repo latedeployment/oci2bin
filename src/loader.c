@@ -163,12 +163,17 @@ struct mount_attr
 #ifndef LANDLOCK_ACCESS_FS_IOCTL_DEV
 #define LANDLOCK_ACCESS_FS_IOCTL_DEV   (1ULL << 15) /* ABI 5 */
 #endif
+#ifndef LANDLOCK_ACCESS_NET_BIND_TCP
+#define LANDLOCK_ACCESS_NET_BIND_TCP    (1ULL << 0) /* ABI 4 */
+#define LANDLOCK_ACCESS_NET_CONNECT_TCP (1ULL << 1) /* ABI 4 */
+#endif
 
 #ifndef LANDLOCK_RULE_PATH_BENEATH
 #define LANDLOCK_RULE_PATH_BENEATH 1
 struct landlock_ruleset_attr
 {
     unsigned long long handled_access_fs;
+    unsigned long long handled_access_net; /* ABI 4; zero on older kernels */
 };
 struct landlock_path_beneath_attr
 {
@@ -575,8 +580,10 @@ struct container_opts
     /* --workdir /path  (overrides OCI WorkingDir) */
     char* workdir;
 
-    /* --net host|none|userspace|container:<PID>|slirp|pasta|slirp:H:C
+    /* --net host|none|deny-tcp|userspace|container:<PID>|slirp|pasta|slirp:H:C
      * NULL/"host" = host network; "none" = isolated; container:<PID> = join
+     * "deny-tcp" = host network namespace, Landlock (ABI 4) denies every
+     *              TCP bind(2)/connect(2)
      * "slirp" = userspace TCP/UDP via slirp4netns
      * "pasta" = userspace TCP/UDP via pasta
      * "userspace" = rootless libkrun TSI networking in --vm mode
@@ -12652,21 +12659,54 @@ static int landlock_add_path_rule(int rs_fd, const char* path,
  * while --strict was documented to refuse exactly this.  Plain AUTO on a
  * kernel that cannot do it keeps skipping.
  */
+/*
+ * --net deny-tcp: stay in the caller's network namespace but let Landlock
+ * (ABI 4, Linux 6.7+) refuse every TCP bind(2) and connect(2).  The ruleset
+ * handles both network rights and adds no LANDLOCK_RULE_NET_PORT rule, so
+ * every port is denied with EACCES.  UDP, unix sockets, raw sockets and
+ * sockets the workload inherits already connected are untouched; this is a
+ * `--net none`-style TCP cut for hosts or workloads that cannot take a
+ * network namespace (abstract unix sockets to host services, a shared netns).
+ */
+static int net_deny_tcp_requested(const struct container_opts* opts)
+{
+    return opts->net && strcmp(opts->net, "deny-tcp") == 0;
+}
+
 static int landlock_degraded(const struct container_opts* opts)
 {
-    return (opts->landlock_mode == LANDLOCK_MODE_ON || opts->strict) ? -1 : 0;
+    /* --net deny-tcp asked for the network cut by name, like --landlock. */
+    return (opts->landlock_mode == LANDLOCK_MODE_ON || opts->strict ||
+            net_deny_tcp_requested(opts)) ? -1 : 0;
 }
 
 static int apply_landlock_sandbox(const struct container_opts* opts)
 {
 #ifdef __NR_landlock_create_ruleset
     int mode = opts->landlock_mode;
+    int deny_tcp = net_deny_tcp_requested(opts);
     if (mode == LANDLOCK_MODE_OFF)
     {
+        if (deny_tcp)
+        {
+            /* validate_network_opts() rejects this pairing up front; never
+             * start a workload that was promised no TCP without the cut. */
+            fprintf(stderr,
+                    "oci2bin: --net deny-tcp is enforced by Landlock;"
+                    " it cannot be combined with --no-landlock\n");
+            return -1;
+        }
         return 0;
     }
     if (!kernel_supports_landlock())
     {
+        if (deny_tcp)
+        {
+            fprintf(stderr,
+                    "oci2bin: --net deny-tcp requested but kernel does not"
+                    " support Landlock (ABI 4, Linux 6.7+ required)\n");
+            return -1;
+        }
         if (mode == LANDLOCK_MODE_ON)
         {
             fprintf(stderr,
@@ -12716,10 +12756,24 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
     {
         handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }
+    if (deny_tcp && abi < 4)
+    {
+        fprintf(stderr,
+                "oci2bin: --net deny-tcp: kernel Landlock ABI %ld has no"
+                " network rules (ABI 4, Linux 6.7+ required)\n", abi);
+        return -1;
+    }
 
+    /* handled_access_net is ABI 4: on older kernels it stays zero, which
+     * copy_struct_from_user() accepts as "not used" for the extra bytes. */
     struct landlock_ruleset_attr ra;
     memset(&ra, 0, sizeof(ra));
     ra.handled_access_fs = handled;
+    if (deny_tcp)
+    {
+        ra.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP |
+                                LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    }
 
     int rs_fd = (int)syscall(__NR_landlock_create_ruleset, &ra,
                              sizeof(ra), 0UL);
@@ -12856,13 +12910,14 @@ static int apply_landlock_sandbox(const struct container_opts* opts)
 
     if (g_debug)
     {
-        debug_log("landlock.applied", "vols=%d tmpfs=%d secrets=%d",
-                  opts->n_vols, opts->n_tmpfs, opts->n_secrets);
+        debug_log("landlock.applied", "vols=%d tmpfs=%d secrets=%d tcp=%s",
+                  opts->n_vols, opts->n_tmpfs, opts->n_secrets,
+                  deny_tcp ? "denied" : "allowed");
     }
-    audit_emit_pid("landlock", getpid(), "");
+    audit_emit_pid("landlock", getpid(), deny_tcp ? "deny-tcp" : "");
     return 0;
 #else
-    if (opts->landlock_mode == LANDLOCK_MODE_ON)
+    if (opts->landlock_mode == LANDLOCK_MODE_ON || net_deny_tcp_requested(opts))
     {
         fprintf(stderr,
                 "oci2bin: --landlock: this build has no Landlock support\n");
@@ -17287,8 +17342,11 @@ static void usage(const char* prog)
             "                      (may be repeated; overrides built-in defaults)\n"
             "  --entrypoint PATH   Override the image entrypoint\n"
             "  --workdir PATH      Set the working directory inside the container\n"
-            "  --net host|none|userspace|slirp|pasta|slirp:H:C|container:<PID>\n"
+            "  --net host|none|deny-tcp|userspace|slirp|pasta|slirp:H:C|container:<PID>\n"
             "                      Network: host (default), none (isolated),\n"
+            "                      deny-tcp (host namespace, Landlock denies"
+            " TCP\n"
+            "                      bind/connect; needs Landlock ABI 4),\n"
             "                      userspace (rootless libkrun --vm network),\n"
             "                      slirp (userspace via slirp4netns),\n"
             "                      pasta (userspace via pasta),\n"
@@ -18493,12 +18551,13 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             if (i + 1 >= argc)
             {
                 fprintf(stderr,
-                        "oci2bin: --net requires host, none, or"
+                        "oci2bin: --net requires host, none, deny-tcp, or"
                         " container:<PID>\n");
                 return -1;
             }
             i++;
-            if (strcmp(argv[i], "host") == 0 || strcmp(argv[i], "none") == 0)
+            if (strcmp(argv[i], "host") == 0 || strcmp(argv[i], "none") == 0 ||
+                    strcmp(argv[i], "deny-tcp") == 0)
             {
                 opts->net = argv[i];
             }
@@ -18554,8 +18613,9 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             else
             {
                 fprintf(stderr,
-                        "oci2bin: --net must be host, none, userspace, slirp,"
-                        " pasta, slirp:H:C, or container:<PID>\n");
+                        "oci2bin: --net must be host, none, deny-tcp,"
+                        " userspace, slirp, pasta, slirp:H:C, or"
+                        " container:<PID>\n");
                 return -1;
             }
         }
@@ -25221,6 +25281,39 @@ static void normalize_network_opts(struct container_opts* opts)
 
 static int validate_network_opts(const struct container_opts* opts)
 {
+    if (net_deny_tcp_requested(opts))
+    {
+        /* Landlock lives in the loader process: the guest of a microVM has
+         * its own kernel and never sees this ruleset. */
+        if (opts->use_vm)
+        {
+            fprintf(stderr,
+                    "oci2bin: --net deny-tcp is a container mode (Landlock"
+                    " in the loader); use --net none with --vm\n");
+            return -1;
+        }
+        if (opts->landlock_mode == LANDLOCK_MODE_OFF)
+        {
+            fprintf(stderr,
+                    "oci2bin: --net deny-tcp is enforced by Landlock;"
+                    " it cannot be combined with --no-landlock\n");
+            return -1;
+        }
+        if (opts->n_portfwd > 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: -p cannot be combined with --net deny-tcp"
+                    " (TCP listeners are denied)\n");
+            return -1;
+        }
+        if (opts->n_egress > 0)
+        {
+            fprintf(stderr,
+                    "oci2bin: --allow-egress needs --net slirp or"
+                    " --net pasta, not --net deny-tcp\n");
+            return -1;
+        }
+    }
     if (opts->use_vm && opts->n_egress > 0)
     {
         fprintf(stderr,

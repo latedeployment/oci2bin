@@ -655,6 +655,132 @@ static void test_parse_opts(void)
     }
 }
 
+/* Landlock ABI as the running kernel reports it, or -1. */
+static long landlock_abi_version(void)
+{
+    return syscall(__NR_landlock_create_ruleset, NULL, 0UL,
+                   (unsigned long)LANDLOCK_CREATE_RULESET_VERSION);
+}
+
+/* bind(2) result (0 or errno) for a fresh AF_INET socket on loopback. */
+static int try_loopback_bind(int type)
+{
+    int s = socket(AF_INET, type, 0);
+    if (s < 0)
+    {
+        return errno;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int e = bind(s, (struct sockaddr*)&a, sizeof(a)) < 0 ? errno : 0;
+    close(s);
+    return e;
+}
+
+/* connect(2) result (0 or errno) to loopback port `port`. */
+static int try_loopback_connect(unsigned short port)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0)
+    {
+        return errno;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port        = htons(port);
+    int e = connect(s, (struct sockaddr*)&a, sizeof(a)) < 0 ? errno : 0;
+    close(s);
+    return e;
+}
+
+/*
+ * The real thing on the real kernel: apply_landlock_sandbox() with
+ * --net deny-tcp in a forked child, then try the sockets.  The ruleset is
+ * process-wide and irreversible, hence the fork.  Exit codes carry the
+ * result back: 0 = TCP bind and connect refused with EACCES while a UDP
+ * bind still works, 10 = apply failed, 11.. = a socket call misbehaved.
+ */
+static void test_landlock_deny_tcp_live(void)
+{
+    long abi = landlock_abi_version();
+    if (abi < 4)
+    {
+        printf("ok # SKIP landlock deny-tcp: kernel ABI %ld < 4\n", abi);
+        return;
+    }
+    /* A listener the child will be refused to reach. */
+    int lst = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT(lst >= 0, "deny-tcp: listener socket");
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT(bind(lst, (struct sockaddr*)&a, sizeof(a)) == 0 &&
+           listen(lst, 1) == 0, "deny-tcp: listener bound");
+    socklen_t alen = sizeof(a);
+    ASSERT(getsockname(lst, (struct sockaddr*)&a, &alen) == 0,
+           "deny-tcp: listener port known");
+    unsigned short port = ntohs(a.sin_port);
+    ASSERT_INT_EQ(try_loopback_connect(port), 0,
+                  "deny-tcp: the listener is reachable before the cut");
+
+    struct container_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.net           = "deny-tcp";
+    opts.pty_slave_fd  = -1;
+    opts.pty_master_fd = -1;
+    pid_t child = fork();
+    ASSERT(child >= 0, "deny-tcp: fork");
+    if (child == 0)
+    {
+        if (apply_landlock_sandbox(&opts) != 0)
+        {
+            _exit(10);
+        }
+        if (try_loopback_bind(SOCK_STREAM) != EACCES)
+        {
+            _exit(11);
+        }
+        if (try_loopback_connect(port) != EACCES)
+        {
+            _exit(12);
+        }
+        if (try_loopback_bind(SOCK_DGRAM) != 0)
+        {
+            _exit(13);
+        }
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    ASSERT_INT_EQ(rc, 0,
+                  "deny-tcp: TCP bind/connect EACCES, UDP bind allowed"
+                  " (10=apply failed 11=bind 12=connect 13=udp)");
+
+    /* Without the mode the same ruleset leaves TCP alone. */
+    opts.net = NULL;
+    child = fork();
+    ASSERT(child >= 0, "deny-tcp: fork (control)");
+    if (child == 0)
+    {
+        if (apply_landlock_sandbox(&opts) != 0)
+        {
+            _exit(10);
+        }
+        _exit(try_loopback_bind(SOCK_STREAM) == 0 &&
+              try_loopback_connect(port) == 0 ? 0 : 11);
+    }
+    waitpid(child, &status, 0);
+    rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    ASSERT_INT_EQ(rc, 0, "deny-tcp: control run without the mode keeps TCP");
+    close(lst);
+}
+
 static void test_validate_network_opts(void)
 {
     struct container_opts opts;
@@ -700,6 +826,31 @@ static void test_validate_network_opts(void)
     opts.n_portfwd = 1;
     ASSERT_INT_EQ(validate_network_opts(&opts), -1,
                   "network opts: none rejects port publication");
+
+    /* --net deny-tcp: a Landlock cut in the loader's own process. */
+    memset(&opts, 0, sizeof(opts));
+    opts.net = "deny-tcp";
+    ASSERT_INT_EQ(validate_network_opts(&opts), 0,
+                  "network opts: deny-tcp is valid in container mode");
+    opts.use_vm = 1;
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: deny-tcp rejected with --vm");
+    opts.use_vm = 0;
+    opts.landlock_mode = LANDLOCK_MODE_OFF;
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: deny-tcp rejected with --no-landlock");
+    opts.landlock_mode = LANDLOCK_MODE_AUTO;
+    opts.n_portfwd = 1;
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: deny-tcp rejects port publication");
+    opts.n_portfwd = 0;
+    opts.n_egress = 1;
+    ASSERT_INT_EQ(validate_network_opts(&opts), -1,
+                  "network opts: deny-tcp rejects --allow-egress");
+    opts.n_egress = 0;
+    normalize_network_opts(&opts);
+    ASSERT_STR_EQ(opts.net, "deny-tcp",
+                  "network opts: deny-tcp is not rewritten by normalize");
 
     memset(&opts, 0, sizeof(opts));
     opts.use_vm = 1;
@@ -1699,6 +1850,19 @@ static void test_parse_opts_misc_flags(void)
         ASSERT_INT_EQ(r, 0, "parse_opts: --net none returns 0");
         ASSERT_STR_EQ(opts.net, "none",
                       "parse_opts: --net none sets net=none");
+    }
+
+    /* --net deny-tcp */
+    {
+        char arg[] = "deny-tcp";
+        char* argv[] = {"prog", "--net", arg, NULL};
+        memset(&opts, 0, sizeof(opts));
+        int r = parse_opts(3, argv, &opts);
+        ASSERT_INT_EQ(r, 0, "parse_opts: --net deny-tcp returns 0");
+        ASSERT_STR_EQ(opts.net, "deny-tcp",
+                      "parse_opts: --net deny-tcp sets net=deny-tcp");
+        ASSERT(net_deny_tcp_requested(&opts),
+               "parse_opts: --net deny-tcp is recognised");
     }
 
     /* --net userspace (libkrun VM networking) */
@@ -8344,6 +8508,7 @@ int main(void)
     test_parse_id_value();
     test_parse_opts();
     test_validate_network_opts();
+    test_landlock_deny_tcp_live();
     test_validate_lazy_rootfs_payload();
     test_parse_opts_path_validation();
     test_parse_opts_name();

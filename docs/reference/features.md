@@ -143,6 +143,7 @@ This page is a checklist of the feature surface documented by the site.
 | Generate seccomp profile | `--gen-seccomp FILE` |
 | Read-only path inside writable subtree | `--seccomp-deny-write PATH` |
 | Landlock filesystem sandbox | automatic; force `--landlock`, disable `--no-landlock` |
+| Landlock TCP deny without a network namespace | `--net deny-tcp` (Landlock ABI 4) |
 | Force single-ID userns fallback | `--no-userns-remap` |
 | Fail-closed on degradations | `--strict` |
 | Opt out of cgroup fail-closed | `--allow-degraded` |

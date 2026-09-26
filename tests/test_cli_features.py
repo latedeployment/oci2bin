@@ -131,6 +131,52 @@ def _program_oci_tar(program_bytes):
     return buf.getvalue(), config_raw
 
 
+_NETPROBE_SRC = r"""
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+static int try_bind(int type)
+{
+    int s = socket(AF_INET, type, 0);
+    if (s < 0) { return errno; }
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int e = bind(s, (struct sockaddr*)&a, sizeof a) < 0 ? errno : 0;
+    close(s); return e;
+}
+static int try_connect(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { return errno; }
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(9);
+    int e = connect(s, (struct sockaddr*)&a, sizeof a) < 0 ? errno : 0;
+    close(s); return e;
+}
+int main(void)
+{
+    printf("tcp_bind=%d tcp_connect=%d udp_bind=%d\n",
+           try_bind(SOCK_STREAM), try_connect(), try_bind(SOCK_DGRAM));
+    return 0;
+}
+"""
+
+
+def _landlock_abi():
+    """The running kernel's Landlock ABI, or -1."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.syscall(444, None, 0, 1)   # landlock_create_ruleset
+    except (OSError, AttributeError):
+        return -1
+
+
 def _proc_start_ticks(pid):
     raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").strip()
     rparen = raw.rfind(")")
@@ -194,15 +240,20 @@ class TestCliFeatures(unittest.TestCase):
 
     def _build_writer_binary(self, name):
         """Polyglot whose workload writes /leak.txt; returns (path, config)."""
-        writer_src = self.tmpdir / "writer.c"
-        writer_src.write_text(_WRITER_SRC, encoding="utf-8")
-        writer = self.tmpdir / "writer"
+        return self._build_program_binary(name, _WRITER_SRC)
+
+    def _build_program_binary(self, name, source):
+        """Polyglot whose /bin/sh is the static C program `source`;
+        returns (path, config)."""
+        prog_src = self.tmpdir / f"{name}.c"
+        prog_src.write_text(source, encoding="utf-8")
+        prog = self.tmpdir / f"{name}.prog"
         build = subprocess.run(
-            ["gcc", "-static", "-O2", "-s", "-o", str(writer),
-             str(writer_src)],
+            ["gcc", "-static", "-O2", "-s", "-o", str(prog),
+             str(prog_src)],
             capture_output=True, text=True, timeout=120)
         self.assertEqual(build.returncode, 0, msg=build.stderr)
-        tar_bytes, config_raw = _program_oci_tar(writer.read_bytes())
+        tar_bytes, config_raw = _program_oci_tar(prog.read_bytes())
         tar_path = self.tmpdir / f"{name}.tar"
         tar_path.write_bytes(tar_bytes)
         out_path = self.tmpdir / name
@@ -425,6 +476,43 @@ class TestCliFeatures(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("state path contains symlink component", result.stderr)
+
+    def test_net_deny_tcp_cuts_tcp_without_a_netns(self):
+        """--net deny-tcp on a real binary: the workload keeps the host
+        network namespace, yet TCP bind and connect fail with EACCES while
+        a UDP bind still works.  Without the flag TCP works."""
+        if not _userns_available():
+            self.skipTest("user namespaces unavailable; cannot run binaries")
+        if _landlock_abi() < 4:
+            self.skipTest("kernel Landlock ABI < 4; no network rules")
+        binary, _ = self._build_program_binary("netprobe.bin", _NETPROBE_SRC)
+        env = dict(os.environ, XDG_CACHE_HOME=str(self.tmpdir / "xdg"),
+                   OCI2BIN_TMPDIR=str(self.tmpdir), TMPDIR=str(self.tmpdir))
+
+        def run(*args):
+            return subprocess.run([str(binary), *args], capture_output=True,
+                                  text=True, timeout=120, env=env)
+
+        denied = run("--net", "deny-tcp")
+        self.assertEqual(denied.returncode, 0, msg=denied.stderr)
+        self.assertIn("tcp_bind=13 tcp_connect=13 udp_bind=0", denied.stdout)
+
+        plain = run("--net", "host")
+        self.assertEqual(plain.returncode, 0, msg=plain.stderr)
+        self.assertIn("tcp_bind=0 ", plain.stdout)
+        self.assertIn(" udp_bind=0", plain.stdout)
+        self.assertNotIn("tcp_connect=13", plain.stdout)
+
+        # The mode is enforced by Landlock: refusing the sandbox refuses
+        # the run, before anything starts.
+        refused = run("--net", "deny-tcp", "--no-landlock")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("cannot be combined with --no-landlock", refused.stderr)
+        self.assertEqual(refused.stdout, "")
+        published = run("--net", "deny-tcp", "-p", "8080:80")
+        self.assertNotEqual(published.returncode, 0)
+        self.assertIn("-p cannot be combined with --net deny-tcp",
+                      published.stderr)
 
     def test_run_forwards_new_build_options(self):
         missing_oci = self.tmpdir / "missing-oci-layout"

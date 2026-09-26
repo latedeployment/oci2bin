@@ -199,7 +199,7 @@ stores (@file{/etc/credstore.encrypted} and friends), needs root and
 @command{systemd-creds}, and is rejected together with @option{--vm}.
 @item --device /dev/H[:C] / --gpus all|N|CDI / --cdi-device KIND=DEV / --no-host-dev
 Expose device nodes, GPUs/CDI devices, or skip the host /dev nodes.
-@item --net host|none|userspace|slirp|pasta|container:PID / -p H:C / --allow-egress H:P
+@item --net host|none|deny-tcp|userspace|slirp|pasta|container:PID / -p H:C / --allow-egress H:P
 Network modes, published ports, default-deny egress allowlist.
 @item --dns IP / --dns-search D / --add-host H:IP / --ipc container:PID
 Custom DNS, /etc/hosts entries, shared IPC namespace.

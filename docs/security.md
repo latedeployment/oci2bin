@@ -195,6 +195,21 @@ it or it cannot be enforced. Without the flag, Landlock is applied when
 available and skipped otherwise — unless `--strict` is set, which also refuses
 to start when the sandbox is unavailable or fails to install.
 
+### Network rules
+
+`--net deny-tcp` uses Landlock's network rules (ABI 4, Linux 6.7+) as a
+`--net none`-style cut that needs no network namespace: the same ruleset
+handles `LANDLOCK_ACCESS_NET_BIND_TCP` and `LANDLOCK_ACCESS_NET_CONNECT_TCP`
+and grants neither on any port, so every TCP `bind()` and `connect()` in the
+workload fails with `EACCES` while the process keeps the caller's network
+namespace. UDP, Unix and raw sockets, and sockets inherited already open, are
+not affected; a workload that needs them, or a host that cannot create a
+network namespace, gets the TCP cut without the namespace. Like `--landlock`,
+the mode asks for the sandbox by name: a kernel without Landlock or with an
+ABI below 4, or a ruleset that fails to install, aborts the run. It cannot
+be combined with `--no-landlock`, `-p`, `--allow-egress` or `--vm` (the
+guest kernel never sees the loader's ruleset).
+
 ## Fail-Closed Mode
 
 `--strict` turns every security-relevant degradation that would otherwise be a

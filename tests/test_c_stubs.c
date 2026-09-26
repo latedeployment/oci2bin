@@ -1549,6 +1549,20 @@ static void test_stub_landlock_strict(void)
     opts.strict = 1;
     ASSERT_INT_EQ(apply_landlock_sandbox(&opts), 0,
                   "landlock: --no-landlock is honoured under --strict");
+
+    /* --net deny-tcp asks for the TCP cut by name: no Landlock, no start,
+     * whatever the mode. */
+    stub_reset();
+    memset(&opts, 0, sizeof(opts));
+    opts.net = "deny-tcp";
+    ASSERT_INT_EQ(landlock_degraded(&opts), -1,
+                  "landlock_degraded: --net deny-tcp makes a degraded sandbox fatal");
+    ASSERT_INT_EQ(apply_landlock_sandbox(&opts), -1,
+                  "landlock: --net deny-tcp on an unsupported kernel aborts under auto");
+    stub_reset();
+    opts.landlock_mode = LANDLOCK_MODE_OFF;
+    ASSERT_INT_EQ(apply_landlock_sandbox(&opts), -1,
+                  "landlock: --net deny-tcp with --no-landlock aborts");
 }
 
 /* ── test_stub_container_main ─────────────────────────────────────────────

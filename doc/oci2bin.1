@@ -31,7 +31,7 @@ oci2bin \- convert Docker/OCI images into mostly self-contained rootless contain
 .SY ./OUTPUT
 .OP \-v HOST:CONTAINER
 .OP \-e KEY=VALUE
-.OP \-\-net host|none|container:\fIPID\fR
+.OP \-\-net host|none|deny-tcp|container:\fIPID\fR
 .OP \-\-ipc host|container:\fIPID\fR
 .OP \-\-entrypoint PATH
 .OP \-\-workdir PATH
@@ -495,6 +495,23 @@ Share the host network stack (default).
 .B \-\-net none
 Create an isolated network namespace with only a loopback interface.
 In libkrun VM mode, disable the implicit TSI/vsock device.
+.
+.TP
+.B \-\-net deny\-tcp
+Keep the host network namespace but have Landlock (ABI 4, Linux 6.7+) refuse
+every TCP
+.BR bind (2)
+and
+.BR connect (2)
+with
+.BR EACCES .
+UDP, Unix and raw sockets are untouched. Aborts when the kernel lacks Landlock
+network rules; cannot be combined with
+.BR \-p ,
+.BR \-\-allow\-egress ,
+.B \-\-vm
+or
+.BR \-\-no\-landlock .
 .
 .TP
 .B \-\-net userspace

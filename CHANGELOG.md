@@ -6,6 +6,16 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **`--net deny-tcp`: a TCP cut without a network namespace.** The
+  Landlock ruleset now handles the ABI 4 network rights
+  (`LANDLOCK_ACCESS_NET_BIND_TCP`, `LANDLOCK_ACCESS_NET_CONNECT_TCP`) and
+  grants neither, so every TCP `bind()`/`connect()` in the workload fails
+  with `EACCES` while it keeps the host network namespace (abstract Unix
+  sockets, UDP and raw sockets untouched). Like `--landlock` it asks for
+  the sandbox by name: no Landlock, an ABI below 4 (Linux 6.7+) or a
+  ruleset that fails to install aborts the run; `-p`, `--allow-egress`,
+  `--vm` and `--no-landlock` are rejected with it.
+
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
   `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, keyed by the SHA-256

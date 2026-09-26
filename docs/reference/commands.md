@@ -86,7 +86,7 @@ Common runtime options:
 --secret HOST_FILE[:CONTAINER_PATH]
 --entrypoint PATH
 --workdir PATH
---net host|none|userspace|slirp|pasta|container:PID
+--net host|none|deny-tcp|userspace|slirp|pasta|container:PID
 --ipc host|container:PID
 -p HOST_PORT:CONTAINER_PORT
 --add-host HOST:IP

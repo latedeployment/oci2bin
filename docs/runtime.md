@@ -204,6 +204,19 @@ Disable networking:
 ./app.bin --net none
 ```
 
+Deny TCP without a network namespace:
+
+```bash
+./app.bin --net deny-tcp
+```
+
+The workload stays in the host network namespace (abstract Unix sockets to
+host services, `--net container:PID`-style sharing) but Landlock refuses
+every TCP `bind()` and `connect()` with `EACCES`. UDP, Unix and raw sockets
+are untouched. Needs Landlock ABI 4 (Linux 6.7+); the run aborts otherwise,
+and `-p`, `--allow-egress`, `--vm` and `--no-landlock` cannot be combined
+with it.
+
 Use slirp4netns:
 
 ```bash
