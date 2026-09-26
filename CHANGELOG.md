@@ -4,6 +4,19 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **One home for the build-side OCI tar helpers.** `scripts/oci_tar.py`
+  now provides `read_manifest_and_config`, `repack_oci_tar`,
+  `rebuild_oci_with_new_config`, `make_tar_info`, `copy_member_info`,
+  `content_name_for` and `layer_diff_id`; `build_polyglot.py`,
+  `add_files.py`, `strip_image.py` and `squash_layers.py` use them instead
+  of their own copies of the manifest/config parsing and tar rewriting.
+  `repack_oci_tar` writes a name once when two rewritten blobs collapse onto
+  the same digest, and `normalize_oci_layout` now materialises the
+  symlinked `<id>/layer.tar` members older multi-image `docker save`
+  output used for shared layers, which the loader could not open.
+
 ### Added
 
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The

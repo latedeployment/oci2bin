@@ -929,71 +929,38 @@ def repack_oci_tar_reproducible(oci_data):
     return out_buf.getvalue()
 
 
+_OCI_TAR_MODULE = None
+
+
+def _oci_tar():
+    """The shared scripts/oci_tar.py helpers, loaded once."""
+    global _OCI_TAR_MODULE
+    if _OCI_TAR_MODULE is None:
+        _OCI_TAR_MODULE = _load_oci_tar()
+    return _OCI_TAR_MODULE
+
+
 def _repack_oci_tar(orig_data, replacements, extra_entries):
-    """
-    Rebuild an OCI tar from orig_data, substituting entries in `replacements`
-    (dict of tarinfo.name -> (new_tarinfo, new_data_bytes)) and appending
-    `extra_entries` (list of (tarinfo, data_bytes)).  Returns new tar bytes.
-    """
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode='w:') as out_tf:
-        with tarfile.open(fileobj=io.BytesIO(orig_data), mode='r:*') as in_tf:
-            for member in in_tf.getmembers():
-                if member.name in replacements:
-                    new_info, new_data = replacements[member.name]
-                    out_tf.addfile(new_info, io.BytesIO(new_data))
-                else:
-                    fobj = in_tf.extractfile(member)
-                    out_tf.addfile(member, fobj)
-        for info, data in extra_entries:
-            out_tf.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
+    """See oci_tar.repack_oci_tar()."""
+    return _oci_tar().repack_oci_tar(orig_data, replacements, extra_entries)
 
 
 def _make_tar_info(name, size, mode=0o644):
-    info = tarfile.TarInfo(name=name)
-    info.size = size
-    info.mode = mode
-    info.uid = 0
-    info.gid = 0
-    info.mtime = 0
-    return info
+    """See oci_tar.make_tar_info()."""
+    return _oci_tar().make_tar_info(name, size, mode)
 
 
 def _parse_oci_manifest_and_config(oci_data):
-    """
-    Returns (manifest_list, config_path, config_obj, config_raw_bytes).
-    """
-    with tarfile.open(fileobj=io.BytesIO(oci_data), mode='r:*') as tf:
-        manifest_raw = tf.extractfile(tf.getmember('manifest.json')).read()
-        manifest = json.loads(manifest_raw)
-        config_path = manifest[0]['Config']
-        config_raw = tf.extractfile(tf.getmember(config_path)).read()
-        config = json.loads(config_raw)
-    return manifest, config_path, config, config_raw
+    """See oci_tar.read_manifest_and_config():
+    (manifest_list, config_path, config_obj, config_raw_bytes)."""
+    return _oci_tar().read_manifest_and_config(oci_data)
 
 
-def _rebuild_oci_with_new_config(oci_data, manifest, old_config_path, new_config):
-    """
-    Re-serialize new_config, recompute its sha256, rename the blob, update
-    manifest.json, and return new OCI tar bytes plus the new config path.
-    """
-    new_config_raw = json.dumps(new_config, separators=(',', ':')).encode()
-    new_config_sha = hashlib.sha256(new_config_raw).hexdigest()
-    new_config_path = f'blobs/sha256/{new_config_sha}'
-
-    # Update manifest to point at new config blob
-    manifest[0]['Config'] = new_config_path
-    new_manifest_raw = json.dumps(manifest, separators=(',', ':')).encode()
-
-    new_config_info = _make_tar_info(new_config_path, len(new_config_raw))
-    new_manifest_info = _make_tar_info('manifest.json', len(new_manifest_raw))
-
-    replacements = {
-        old_config_path: (new_config_info, new_config_raw),
-        'manifest.json': (new_manifest_info, new_manifest_raw),
-    }
-    return _repack_oci_tar(oci_data, replacements, []), new_config_path
+def _rebuild_oci_with_new_config(oci_data, manifest, old_config_path,
+                                 new_config):
+    """See oci_tar.rebuild_oci_with_new_config()."""
+    return _oci_tar().rebuild_oci_with_new_config(
+        oci_data, manifest, old_config_path, new_config)
 
 
 DEFAULT_LOADER_DIR    = '.oci2bin'

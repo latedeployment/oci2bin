@@ -16,11 +16,13 @@ Pure Python, stdlib only.
 import argparse
 import hashlib
 import io
-import json
 import os
 import posixpath
 import sys
 import tarfile
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import oci_tar  # noqa: E402  (shared manifest/repack helpers)
 
 
 def _validate_container_path(spec: str, container_path: str) -> str:
@@ -161,79 +163,27 @@ def add_files(input_tar, output_tar, files, dirs):
     layer_dir  = layer_digest[7:71]  # first 64 hex chars of sha256
     layer_name = f'{layer_dir}/layer.tar'
 
-    with tarfile.open(input_tar, 'r') as src_tf:
-        members = src_tf.getmembers()
+    with open(input_tar, 'rb') as f:
+        oci_data = f.read()
+    try:
+        manifest, config_name, config, _ = oci_tar.read_manifest_and_config(
+            oci_data)
+    except (KeyError, ValueError, tarfile.TarError) as e:
+        print(f"add_files: {e}", file=sys.stderr)
+        sys.exit(1)
 
-        # Read and parse manifest.json
-        manifest_bytes = None
-        for m in members:
-            if m.name == 'manifest.json':
-                f = src_tf.extractfile(m)
-                manifest_bytes = f.read() if f else None
-                break
-        if manifest_bytes is None:
-            print("add_files: manifest.json not found", file=sys.stderr)
-            sys.exit(1)
+    # Append the new layer to manifest and config
+    manifest[0].setdefault('Layers', []).append(layer_name)
+    if 'rootfs' in config:
+        config['rootfs'].setdefault('diff_ids', []).append(layer_digest)
 
-        manifest = json.loads(manifest_bytes)
-
-        # Read config to update RootFS.DiffIDs
-        config_name = manifest[0]['Config']
-        config_bytes = None
-        for m in members:
-            if m.name == config_name:
-                f = src_tf.extractfile(m)
-                config_bytes = f.read() if f else None
-                break
-        if config_bytes is None:
-            print(f"add_files: config {config_name} not found", file=sys.stderr)
-            sys.exit(1)
-
-        config = json.loads(config_bytes)
-
-        # Append new layer to manifest and config
-        manifest[0]['Layers'].append(layer_name)
-        if 'rootfs' in config:
-            config['rootfs'].setdefault('diff_ids', []).append(layer_digest)
-
-        new_config_bytes = json.dumps(config).encode()
-        new_config_sha = hashlib.sha256(new_config_bytes).hexdigest()
-        new_config_name = f'blobs/sha256/{new_config_sha}'
-        manifest[0]['Config'] = new_config_name
-        new_manifest_bytes = json.dumps(manifest).encode()
-
-        with tarfile.open(output_tar, 'w') as out_tf:
-            for m in members:
-                f = src_tf.extractfile(m) if m.isfile() else None
-
-                if m.name == 'manifest.json':
-                    info = tarfile.TarInfo(name='manifest.json')
-                    info.size  = len(new_manifest_bytes)
-                    info.mode  = m.mode
-                    info.mtime = m.mtime
-                    out_tf.addfile(info, io.BytesIO(new_manifest_bytes))
-                elif m.name == config_name:
-                    info = tarfile.TarInfo(name=new_config_name)
-                    info.size  = len(new_config_bytes)
-                    info.mode  = m.mode
-                    info.mtime = m.mtime
-                    out_tf.addfile(info, io.BytesIO(new_config_bytes))
-                elif f is not None:
-                    data = f.read()
-                    info = tarfile.TarInfo(name=m.name)
-                    info.size  = len(data)
-                    info.mode  = m.mode
-                    info.mtime = m.mtime
-                    out_tf.addfile(info, io.BytesIO(data))
-                else:
-                    out_tf.addfile(m)
-
-            # Write the new injected layer
-            info = tarfile.TarInfo(name=layer_name)
-            info.size  = len(layer_bytes)
-            info.mode  = 0o644
-            info.mtime = _source_date_epoch() or 0
-            out_tf.addfile(info, io.BytesIO(layer_bytes))
+    layer_info = oci_tar.make_tar_info(layer_name, len(layer_bytes),
+                                       mtime=_source_date_epoch() or 0)
+    new_data, _ = oci_tar.rebuild_oci_with_new_config(
+        oci_data, manifest, config_name, config,
+        extra_entries=[(layer_info, layer_bytes)])
+    with open(output_tar, 'wb') as f:
+        f.write(new_data)
 
     print(f"add_files: injected {len(entries)} item(s) as new layer {layer_dir[:12]}")
 

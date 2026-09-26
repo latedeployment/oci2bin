@@ -27,6 +27,9 @@ import re
 import sys
 import tarfile
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import oci_tar  # noqa: E402  (shared manifest/repack helpers)
+
 # ── built-in defaults ────────────────────────────────────────────────────────
 
 STRIP_PREFIXES = (
@@ -242,48 +245,6 @@ def _sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _is_oci_blob_path(name):
-    parts = name.split('/')
-    return len(parts) == 3 and parts[0] == 'blobs' and \
-        parts[1] == 'sha256' and _SHA256_RE.fullmatch(parts[2]) is not None
-
-
-def _config_name_for_digest(old_name, config_bytes):
-    digest = _sha256(config_bytes)
-    base = os.path.basename(old_name)
-    if _is_oci_blob_path(old_name):
-        return f'blobs/sha256/{digest}'
-    if '/' not in old_name and base.endswith('.json') and \
-            _SHA256_RE.fullmatch(base[:-5]):
-        return f'{digest}.json'
-    return old_name
-
-
-def _layer_name_for_digest(old_name, layer_bytes):
-    if _is_oci_blob_path(old_name):
-        return f'blobs/sha256/{_sha256(layer_bytes)}'
-    return old_name
-
-
-def _layer_diff_id(layer_bytes):
-    raw = gzip.decompress(layer_bytes) if layer_bytes[:2] == b'\x1f\x8b' \
-        else layer_bytes
-    return f'sha256:{_sha256(raw)}'
-
-
-def _copy_member_info(member, name=None, size=None):
-    info = tarfile.TarInfo(name=name or member.name)
-    info.size = member.size if size is None else size
-    info.mode = member.mode
-    info.uid = member.uid
-    info.gid = member.gid
-    info.uname = member.uname
-    info.gname = member.gname
-    info.mtime = member.mtime
-    info.type = member.type
-    return info
-
-
 # ── main entry point ─────────────────────────────────────────────────────────
 
 def strip_image(input_tar, output_tar, prefixes=None, autodetect=False):
@@ -305,20 +266,15 @@ def strip_image(input_tar, output_tar, prefixes=None, autodetect=False):
 
     stripped_total = 0
 
-    with tarfile.open(input_tar, 'r') as src_tf:
-        members = src_tf.getmembers()
-
-        manifest_bytes = None
-        for m in members:
-            if m.name == 'manifest.json':
-                f = src_tf.extractfile(m)
-                manifest_bytes = f.read() if f else None
-                break
-        if manifest_bytes is None:
+    with open(input_tar, 'rb') as f:
+        oci_data = f.read()
+    with tarfile.open(fileobj=io.BytesIO(oci_data), mode='r:*') as src_tf:
+        try:
+            manifest_member = src_tf.getmember('manifest.json')
+        except KeyError:
             print("strip_image: manifest.json not found", file=sys.stderr)
             sys.exit(1)
-
-        manifest = json.loads(manifest_bytes)
+        manifest = json.loads(src_tf.extractfile(manifest_member).read())
         layer_names = []
         for entry in manifest:
             layer_names.extend(entry.get('Layers', []))
@@ -342,8 +298,8 @@ def strip_image(input_tar, output_tar, prefixes=None, autodetect=False):
             layer_records[layer_name] = {
                 'member': member,
                 'bytes': stripped,
-                'name': _layer_name_for_digest(layer_name, stripped),
-                'diff_id': _layer_diff_id(stripped),
+                'name': oci_tar.content_name_for(layer_name, stripped),
+                'diff_id': oci_tar.layer_diff_id(stripped),
             }
 
         config_records = {}
@@ -378,8 +334,8 @@ def strip_image(input_tar, output_tar, prefixes=None, autodetect=False):
             ]
             config_bytes = json.dumps(
                 config, separators=(',', ':')).encode()
-            new_config_name = _config_name_for_digest(config_name,
-                                                      config_bytes)
+            new_config_name = oci_tar.content_name_for(config_name,
+                                                       config_bytes)
             config_records[config_name] = {
                 'member': config_member,
                 'bytes': config_bytes,
@@ -390,49 +346,24 @@ def strip_image(input_tar, output_tar, prefixes=None, autodetect=False):
 
         rewritten_manifest_bytes = json.dumps(
             rewritten_manifest, separators=(',', ':')).encode()
-        layer_name_set = set(layer_records)
-        config_name_set = set(config_records)
-        written_names = set()
 
-        with tarfile.open(output_tar, 'w') as out_tf:
-            for member in members:
-                f = src_tf.extractfile(member) if member.isfile() else None
+        # Replaced members keep their metadata under their new names; two
+        # old blobs that now hash the same are written once (repack_oci_tar).
+        replacements = {}
+        for records in (layer_records, config_records):
+            for old_name, rec in records.items():
+                replacements[old_name] = (
+                    oci_tar.copy_member_info(rec['member'], name=rec['name'],
+                                             size=len(rec['bytes'])),
+                    rec['bytes'])
+        replacements['manifest.json'] = (
+            oci_tar.copy_member_info(manifest_member,
+                                     size=len(rewritten_manifest_bytes)),
+            rewritten_manifest_bytes)
 
-                if member.name in layer_name_set:
-                    rec = layer_records[member.name]
-                    if rec['name'] in written_names:
-                        continue
-                    info = _copy_member_info(
-                        rec['member'], name=rec['name'],
-                        size=len(rec['bytes']))
-                    out_tf.addfile(info, io.BytesIO(rec['bytes']))
-                    written_names.add(rec['name'])
-                elif member.name in config_name_set:
-                    rec = config_records[member.name]
-                    if rec['name'] in written_names:
-                        continue
-                    info = _copy_member_info(
-                        rec['member'], name=rec['name'],
-                        size=len(rec['bytes']))
-                    out_tf.addfile(info, io.BytesIO(rec['bytes']))
-                    written_names.add(rec['name'])
-                elif member.name == 'manifest.json':
-                    info = tarfile.TarInfo(name='manifest.json')
-                    info.size = len(rewritten_manifest_bytes)
-                    info.mode = member.mode
-                    info.mtime = member.mtime
-                    out_tf.addfile(info, io.BytesIO(rewritten_manifest_bytes))
-                elif f is not None:
-                    data = f.read()
-                    if member.name in written_names:
-                        continue
-                    info = _copy_member_info(member, size=len(data))
-                    out_tf.addfile(info, io.BytesIO(data))
-                    written_names.add(member.name)
-                else:
-                    if member.name not in written_names:
-                        out_tf.addfile(member)
-                        written_names.add(member.name)
+    new_data = oci_tar.repack_oci_tar(oci_data, replacements, [])
+    with open(output_tar, 'wb') as f:
+        f.write(new_data)
 
     print(f"strip_image: stripped ~{stripped_total // 1024} KiB")
 
