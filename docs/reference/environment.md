@@ -9,6 +9,9 @@ read **at run time** (by a produced `./binary`), **at build time** (by the
 | Variable | Effect |
 | --- | --- |
 | `OCI2BIN_DEBUG` | Set to any value to print verbose runtime diagnostics (same as `--debug`). |
+| `OCI2BIN_ROOTFS_CACHE` | `auto` (default), `off` or `always`: whether a launch reuses the extracted rootfs from `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs`. `--rootfs-cache` on the command line wins. `always` also caches the decrypted tree of an encrypted image. |
+| `OCI2BIN_ROOTFS_LAYER` | `auto` (default), `overlay`, `fuse-overlayfs` or `copy`: pin the private writable layer placed over a cached rootfs instead of trying them in that order. |
+| `XDG_CACHE_HOME` | Base of the extracted rootfs cache (`$XDG_CACHE_HOME/oci2bin/rootfs`, default `~/.cache/oci2bin/rootfs`). Unset together with `HOME`, the cache is disabled. |
 | `OCI2BIN_TMPDIR` | Directory for the runtime extraction tmpdir. Tried first, before `TMPDIR`; point it at an execution-capable tmpfs for speed and to keep the extracted rootfs and any decrypted payload tar off disk. A `noexec` tmpfs cannot run the extracted workload. |
 | `TMPDIR` | Fallback extraction directory (then `/tmp`, then `/var/tmp`). |
 | `OCI2BIN_IDENTITY` | Path to an age identity file (which may contain multiple identities) or SSH private key used to decrypt an `--encrypt` recipient image. If unset, the loader tries `~/.config/oci2bin/identity`, then — only for images encrypted to an SSH recipient — `~/.ssh/id_ed25519` and `~/.ssh/id_rsa`. |

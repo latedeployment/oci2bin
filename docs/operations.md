@@ -44,6 +44,19 @@ oci2bin prune --dry-run
 oci2bin prune
 ```
 
+`prune` covers two caches. Superseded `--cache` build outputs under
+`~/.cache/oci2bin` are removed, keeping the newest per image. The extracted
+rootfs trees the produced binaries keep under
+`${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs` (see the runtime guide) are
+evicted when unused for 30 days; `--max-age DAYS` changes that, `--max-size
+SIZE` then evicts least-recently-used trees until the cache fits, and `--all`
+empties it. Trees a running container still uses are skipped.
+
+```bash
+oci2bin prune --max-age 7 --max-size 5G
+oci2bin prune --all
+```
+
 Build using the output cache:
 
 ```bash

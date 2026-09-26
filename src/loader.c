@@ -21,6 +21,8 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <sys/file.h>
+#include <stdint.h>
 #include <dirent.h>
 #include <ftw.h>
 #include <poll.h>
@@ -277,6 +279,8 @@ static char* run_cmd_capture(char* const argv[], size_t* out_len);
 static int run_cmd(char* const argv[]);
 static int run_cmd_umask(char* const argv[], mode_t child_umask);
 static void rm_rf_dir(const char* path);
+static int tool_is_available(const char* prog);
+static int setup_single_uid_map(uid_t real_uid, gid_t real_gid);
 static int json_escape_string(const char* src, char* dst, size_t dstsz);
 static int path_has_dotdot_component(const char* path);
 static int openat_beneath(int rootfs_fd, const char* relpath,
@@ -600,6 +604,11 @@ struct container_opts
 
     /* --overlay-persist DIR  (persist overlay upper layer across runs) */
     char* overlay_persist;
+
+    /* --rootfs-cache auto|off|always  (reuse the extracted rootfs across
+     * runs; see prepare_rootfs()).  0 = unset: OCI2BIN_ROOTFS_CACHE, then
+     * auto. */
+    int rootfs_cache_mode;
 
     /* --ssh-agent  (forward host SSH_AUTH_SOCK into the container) */
     int ssh_agent;
@@ -1456,6 +1465,49 @@ static const char* opts_net_mode(const struct container_opts* opts)
     return opts->net ? opts->net : "host";
 }
 
+/* --rootfs-cache modes (see prepare_rootfs()). */
+enum rootfs_cache_mode
+{
+    ROOTFS_CACHE_UNSET = 0,
+    ROOTFS_CACHE_AUTO,     /* cache unless the payload is encrypted */
+    ROOTFS_CACHE_OFF,      /* extract into the runtime tmpdir, as before */
+    ROOTFS_CACHE_ALWAYS,   /* cache the plaintext of encrypted images too */
+};
+
+static int parse_rootfs_cache_mode(const char* value)
+{
+    if (!value)
+    {
+        return -1;
+    }
+    if (strcmp(value, "auto") == 0)
+    {
+        return ROOTFS_CACHE_AUTO;
+    }
+    if (strcmp(value, "off") == 0 || strcmp(value, "none") == 0)
+    {
+        return ROOTFS_CACHE_OFF;
+    }
+    if (strcmp(value, "always") == 0)
+    {
+        return ROOTFS_CACHE_ALWAYS;
+    }
+    return -1;
+}
+
+static const char* rootfs_cache_mode_name(int mode)
+{
+    switch (mode)
+    {
+        case ROOTFS_CACHE_OFF:
+            return "off";
+        case ROOTFS_CACHE_ALWAYS:
+            return "always";
+        default:
+            return "auto";
+    }
+}
+
 static void debug_dump_opts(const struct container_opts* opts)
 {
     debug_log("opts.summary",
@@ -1500,6 +1552,10 @@ static void debug_dump_opts(const struct container_opts* opts)
     {
         debug_log("opts.overlay_persist", "dir=%s", opts->overlay_persist);
     }
+    debug_log("opts.rootfs_cache", "mode=%s%s",
+              rootfs_cache_mode_name(opts->rootfs_cache_mode),
+              opts->rootfs_cache_mode == ROOTFS_CACHE_UNSET
+              ? " (default)" : "");
     if (opts->verify_key)
     {
         debug_log("opts.verify_key", "path=%s", opts->verify_key);
@@ -5897,6 +5953,15 @@ static pid_t spawn_daemon(char* const argv[])
 static char s_oci_rootfs[PATH_MAX];
 static pid_t s_lazy_squash_pid = -1;
 static pid_t s_lazy_overlay_pid = -1;
+/* The runtime tmpdir of this run (always removed at exit) and, when a
+ * freshly built rootfs cache tree could not be published, the private
+ * build directory that holds it instead.  See prepare_rootfs(). */
+static char s_runtime_tmpdir[PATH_MAX];
+static char s_private_build_dir[PATH_MAX];
+static int  s_rootfs_cache_lock_fd = -1;
+static int mount_fuse_overlay(const char* lower, const char* upper,
+                              const char* work, const char* target,
+                              const char* what);
 
 /* Defined with the cleanup helpers below. */
 static int mountinfo_unescape(const char* src, char* dst, size_t dst_sz);
@@ -5953,7 +6018,7 @@ static int path_is_mountpoint(const char* path)
  * subsequently reused process ID.
  */
 static int wait_for_fuse_mount(const char* path, pid_t* helper_pid,
-                               const char* helper_name)
+                               const char* helper_name, const char* what)
 {
     struct timespec pause = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 };
     for (int attempt = 0; attempt < 250; attempt++)
@@ -5968,15 +6033,15 @@ static int wait_for_fuse_mount(const char* path, pid_t* helper_pid,
         {
             *helper_pid = -1;
             fprintf(stderr,
-                    "oci2bin: --lazy: %s exited before mounting %s"
+                    "oci2bin: %s: %s exited before mounting %s"
                     " (is it installed and is /dev/fuse usable?)\n",
-                    helper_name, path);
+                    what, helper_name, path);
             return -1;
         }
         nanosleep(&pause, NULL);
     }
-    fprintf(stderr, "oci2bin: --lazy: timed out waiting for %s to mount %s\n",
-            helper_name, path);
+    fprintf(stderr, "oci2bin: %s: timed out waiting for %s to mount %s\n",
+            what, helper_name, path);
     return -1;
 }
 
@@ -6006,6 +6071,7 @@ static void discard_failed_lazy_mount(const char* tmpdir)
     nanosleep(&pause, NULL);
     rm_rf_dir(tmpdir);
     s_oci_rootfs[0] = '\0';
+    s_runtime_tmpdir[0] = '\0';
 }
 
 static int validate_lazy_rootfs_payload(const char* self_path)
@@ -6144,6 +6210,13 @@ static char* mount_lazy_rootfs(const char* self_path,
         rm_rf_dir(tmpdir);
         return NULL;
     }
+    if (snprintf(s_runtime_tmpdir, sizeof(s_runtime_tmpdir), "%s",
+                 tmpdir) >= (int)sizeof(s_runtime_tmpdir))
+    {
+        fprintf(stderr, "oci2bin: --lazy: runtime path too long\n");
+        rm_rf_dir(tmpdir);
+        return NULL;
+    }
 
     char lower[PATH_MAX], upper[PATH_MAX], work[PATH_MAX];
     if (path_join_suffix(s_oci_rootfs, sizeof(s_oci_rootfs),
@@ -6192,31 +6265,13 @@ static char* mount_lazy_rootfs(const char* self_path,
     s_lazy_squash_pid = spawn_daemon(squash_argv);
     if (s_lazy_squash_pid < 0 ||
             wait_for_fuse_mount(lower, &s_lazy_squash_pid,
-                                "squashfuse") < 0)
+                                "squashfuse", "--lazy") < 0)
     {
         discard_failed_lazy_mount(tmpdir);
         return NULL;
     }
 
-    char overlay_opts[PATH_MAX * 3 + 96];
-    n = snprintf(overlay_opts, sizeof(overlay_opts),
-                 "lowerdir=%s,upperdir=%s,workdir=%s,allow_other,auto_unmount",
-                 lower, upper, work);
-    if (n < 0 || (size_t)n >= sizeof(overlay_opts))
-    {
-        fprintf(stderr, "oci2bin: --lazy: overlay options truncated\n");
-        discard_failed_lazy_mount(tmpdir);
-        return NULL;
-    }
-    char* overlay_argv[] =
-    {
-        "fuse-overlayfs", "-f", "-o", overlay_opts,
-        s_oci_rootfs, NULL
-    };
-    s_lazy_overlay_pid = spawn_daemon(overlay_argv);
-    if (s_lazy_overlay_pid < 0 ||
-            wait_for_fuse_mount(s_oci_rootfs, &s_lazy_overlay_pid,
-                                "fuse-overlayfs") < 0)
+    if (mount_fuse_overlay(lower, upper, work, s_oci_rootfs, "--lazy") < 0)
     {
         discard_failed_lazy_mount(tmpdir);
         return NULL;
@@ -6881,18 +6936,1105 @@ static int verify_oci_descriptors(const char* oci_dir,
     return rc;
 }
 
-/*
- * Extract the OCI tar data from ourselves into a temp directory,
- * then parse manifest.json and extract layers into a rootfs.
- *
- * Returns path to rootfs (static buffer) or NULL on failure.
- */
-static char* extract_oci_rootfs_into(const char* self_path,
-                                     const char* tmpdir);
+/* ── Cached extracted rootfs ─────────────────────────────────────────────── */
 
 /*
- * Extract the embedded image into a fresh runtime tmpdir.  Every failure
- * inside removes the tmpdir: it can hold the decrypted payload
+ * Repeat launches of the same image skip layer extraction.  The merged
+ * rootfs is kept under ${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>,
+ * where <key> is the SHA-256 of the image config (its rootfs.diff_ids pin
+ * the layer contents, so the same config always yields the same tree).  An
+ * entry is built in a sibling temp directory and renamed into place, so a
+ * half-written entry is never visible.  The cached tree is never mounted
+ * or executed directly: every run puts a private writable layer on top
+ * (see prepare_private_rootfs()).
+ *
+ * Entry layout:
+ *   <key>/rootfs/   the merged tree, including .oci2bin_config
+ *   <key>/meta      completion marker: format version, key, fingerprint
+ *   <key>.lock      flock: LOCK_EX while building or pruning, LOCK_SH for
+ *                   the life of every run that uses the entry
+ *
+ * Every hit re-derives the tree fingerprint (path, type, mode, size and
+ * link target of every entry) and compares it with the marker; a mismatch
+ * evicts the entry and rebuilds it rather than trusting it.
+ */
+
+#define ROOTFS_CACHE_KEY_PREFIX "oci2bin-rootfs-cache-v1\n"
+#define ROOTFS_CACHE_META_MAGIC "oci2bin-rootfs-cache 1"
+#define ROOTFS_CACHE_MAX_MANIFEST (1024u * 1024u)
+#define ROOTFS_CACHE_MAX_CONFIG   (64u * 1024u * 1024u)
+
+/* ── SHA-256 (FIPS 180-4) ── used only for cache keys, not for trust. */
+
+struct sha256_ctx
+{
+    uint32_t      h[8];
+    uint64_t      len;
+    unsigned char buf[64];
+    size_t        buf_len;
+};
+
+static const uint32_t SHA256_K[64] =
+{
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+static uint32_t sha256_rotr(uint32_t x, int n)
+{
+    return (x >> n) | (x << (32 - n));
+}
+
+static void sha256_block(struct sha256_ctx* ctx, const unsigned char* p)
+{
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+    {
+        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+               ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+    }
+    for (int i = 16; i < 64; i++)
+    {
+        uint32_t s0 = sha256_rotr(w[i - 15], 7) ^ sha256_rotr(w[i - 15], 18) ^
+                      (w[i - 15] >> 3);
+        uint32_t s1 = sha256_rotr(w[i - 2], 17) ^ sha256_rotr(w[i - 2], 19) ^
+                      (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = ctx->h[0], b = ctx->h[1], c = ctx->h[2], d = ctx->h[3];
+    uint32_t e = ctx->h[4], f = ctx->h[5], g = ctx->h[6], h = ctx->h[7];
+    for (int i = 0; i < 64; i++)
+    {
+        uint32_t s1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^
+                      sha256_rotr(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + s1 + ch + SHA256_K[i] + w[i];
+        uint32_t s0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^
+                      sha256_rotr(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = s0 + maj;
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    ctx->h[0] += a;
+    ctx->h[1] += b;
+    ctx->h[2] += c;
+    ctx->h[3] += d;
+    ctx->h[4] += e;
+    ctx->h[5] += f;
+    ctx->h[6] += g;
+    ctx->h[7] += h;
+}
+
+static void sha256_init(struct sha256_ctx* ctx)
+{
+    static const uint32_t iv[8] =
+    {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    };
+    memcpy(ctx->h, iv, sizeof(iv));
+    ctx->len     = 0;
+    ctx->buf_len = 0;
+}
+
+static void sha256_update(struct sha256_ctx* ctx, const void* data,
+                          size_t len)
+{
+    const unsigned char* p = data;
+    ctx->len += len;
+    while (len > 0)
+    {
+        if (ctx->buf_len == 0 && len >= 64)
+        {
+            sha256_block(ctx, p);
+            p   += 64;
+            len -= 64;
+            continue;
+        }
+        size_t take = 64 - ctx->buf_len;
+        if (take > len)
+        {
+            take = len;
+        }
+        memcpy(ctx->buf + ctx->buf_len, p, take);
+        ctx->buf_len += take;
+        p   += take;
+        len -= take;
+        if (ctx->buf_len == 64)
+        {
+            sha256_block(ctx, ctx->buf);
+            ctx->buf_len = 0;
+        }
+    }
+}
+
+static void sha256_final(struct sha256_ctx* ctx, unsigned char out[32])
+{
+    uint64_t bits = ctx->len * 8;
+    unsigned char pad = 0x80;
+    sha256_update(ctx, &pad, 1);
+    unsigned char zero = 0;
+    while (ctx->buf_len != 56)
+    {
+        sha256_update(ctx, &zero, 1);
+    }
+    unsigned char lenbuf[8];
+    for (int i = 0; i < 8; i++)
+    {
+        lenbuf[i] = (unsigned char)(bits >> (56 - 8 * i));
+    }
+    sha256_update(ctx, lenbuf, 8);
+    for (int i = 0; i < 8; i++)
+    {
+        out[i * 4]     = (unsigned char)(ctx->h[i] >> 24);
+        out[i * 4 + 1] = (unsigned char)(ctx->h[i] >> 16);
+        out[i * 4 + 2] = (unsigned char)(ctx->h[i] >> 8);
+        out[i * 4 + 3] = (unsigned char)(ctx->h[i]);
+    }
+}
+
+static void sha256_to_hex(const unsigned char digest[32], char out[65])
+{
+    static const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++)
+    {
+        out[i * 2]     = hexd[digest[i] >> 4];
+        out[i * 2 + 1] = hexd[digest[i] & 0x0f];
+    }
+    out[64] = '\0';
+}
+
+/* The cache key for an image config: SHA-256 over a format prefix and the
+ * config bytes.  Bumping the prefix orphans every existing entry, which is
+ * what a change to the extraction rules needs. */
+static void rootfs_cache_key_from_config(const char* config, size_t len,
+        char key_out[65])
+{
+    struct sha256_ctx ctx;
+    unsigned char digest[32];
+    sha256_init(&ctx);
+    sha256_update(&ctx, ROOTFS_CACHE_KEY_PREFIX,
+                  strlen(ROOTFS_CACHE_KEY_PREFIX));
+    sha256_update(&ctx, config, len);
+    sha256_final(&ctx, digest);
+    sha256_to_hex(digest, key_out);
+}
+
+static int is_hex_key(const char* s)
+{
+    if (!s || strlen(s) != 64)
+    {
+        return 0;
+    }
+    for (int i = 0; i < 64; i++)
+    {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* ── Reading manifest.json and the config straight out of the embedded tar.
+ *
+ * A plaintext, uncompressed payload is a docker-save tar sitting inside
+ * the executable.  Walking its headers costs a few pread()s per member,
+ * so a cache hit never copies the payload out or unpacks the layout. */
+
+static unsigned long tar_field_number(const unsigned char* p, size_t n)
+{
+    /* GNU base-256 encoding for values that do not fit in octal. */
+    if (p[0] & 0x80)
+    {
+        unsigned long v = p[0] & 0x7f;
+        for (size_t i = 1; i < n; i++)
+        {
+            if (v > (ULONG_MAX >> 8))
+            {
+                return ULONG_MAX;
+            }
+            v = (v << 8) | p[i];
+        }
+        return v;
+    }
+    unsigned long v = 0;
+    for (size_t i = 0; i < n; i++)
+    {
+        unsigned char c = p[i];
+        if (c == ' ' || c == '\0')
+        {
+            if (v == 0 && c == ' ')
+            {
+                continue;    /* leading blanks */
+            }
+            break;
+        }
+        if (c < '0' || c > '7')
+        {
+            return ULONG_MAX;
+        }
+        if (v > (ULONG_MAX >> 3))
+        {
+            return ULONG_MAX;
+        }
+        v = (v << 3) | (unsigned long)(c - '0');
+    }
+    return v;
+}
+
+static int tar_header_checksum_ok(const unsigned char* h)
+{
+    unsigned long want = tar_field_number(h + 148, 8);
+    unsigned long sum  = 0;
+    for (int i = 0; i < 512; i++)
+    {
+        sum += (i >= 148 && i < 156) ? 32u : h[i];
+    }
+    return want != ULONG_MAX && sum == want;
+}
+
+/* Pull "path=" out of a pax extended header body ("%d key=value\n"...). */
+static int pax_extract_path(const char* body, size_t len,
+                            char* out, size_t out_sz)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        char* end = NULL;
+        unsigned long rec_len = strtoul(body + off, &end, 10);
+        if (!end || end == body + off || *end != ' ' || rec_len < 2 ||
+                rec_len > len - off)
+        {
+            return -1;
+        }
+        const char* kv     = end + 1;
+        const char* rec_end = body + off + rec_len;
+        if (rec_end[-1] != '\n')
+        {
+            return -1;
+        }
+        size_t kv_len = (size_t)(rec_end - 1 - kv);
+        if (kv_len > 5 && memcmp(kv, "path=", 5) == 0)
+        {
+            size_t vlen = kv_len - 5;
+            if (vlen + 1 > out_sz)
+            {
+                return -1;
+            }
+            memcpy(out, kv + 5, vlen);
+            out[vlen] = '\0';
+            return 1;
+        }
+        off += rec_len;
+    }
+    return 0;
+}
+
+/*
+ * Find the regular member `want` in the uncompressed tar occupying
+ * [base, base+size) of `fd`.  Handles ustar name/prefix, GNU ././@LongLink
+ * and pax "path=" overrides.  On success stores the member's data offset and
+ * length and returns 1; returns 0 when the archive ends without it and -1
+ * when the stream is not a tar we can walk (caller falls back to unpacking).
+ */
+static int embedded_tar_find_member(int fd, unsigned long base,
+                                    unsigned long size, const char* want,
+                                    unsigned long* off_out,
+                                    unsigned long* len_out)
+{
+    unsigned long pos = 0;
+    char long_name[PATH_MAX];
+    int  have_long = 0;
+    unsigned char h[512];
+
+    for (unsigned long guard = 0; guard < 4000000UL; guard++)
+    {
+        if (size - pos < 512)
+        {
+            return 0;
+        }
+        ssize_t n = pread(fd, h, sizeof(h), (off_t)(base + pos));
+        if (n != (ssize_t)sizeof(h))
+        {
+            return -1;
+        }
+        int all_zero = 1;
+        for (int i = 0; i < 512; i++)
+        {
+            if (h[i])
+            {
+                all_zero = 0;
+                break;
+            }
+        }
+        if (all_zero)
+        {
+            return 0;    /* end-of-archive marker */
+        }
+        if (!tar_header_checksum_ok(h))
+        {
+            return -1;
+        }
+        unsigned long entry_size = tar_field_number(h + 124, 12);
+        if (entry_size == ULONG_MAX || entry_size > size - pos - 512)
+        {
+            return -1;
+        }
+        unsigned long data_off = pos + 512;
+        unsigned long padded   = (entry_size + 511UL) & ~511UL;
+        if (padded < entry_size || padded > size - data_off)
+        {
+            return -1;
+        }
+        unsigned char type = h[156];
+
+        if (type == 'L' || type == 'x')
+        {
+            /* GNU long name / pax header: the body names the next member. */
+            if (entry_size == 0 || entry_size >= 64u * 1024u)
+            {
+                return -1;
+            }
+            char* body = malloc(entry_size + 1);
+            if (!body)
+            {
+                return -1;
+            }
+            ssize_t got = pread(fd, body, entry_size,
+                                (off_t)(base + data_off));
+            if (got != (ssize_t)entry_size)
+            {
+                free(body);
+                return -1;
+            }
+            body[entry_size] = '\0';
+            if (type == 'L')
+            {
+                size_t l = strnlen(body, entry_size);
+                if (l + 1 > sizeof(long_name))
+                {
+                    free(body);
+                    return -1;
+                }
+                memcpy(long_name, body, l);
+                long_name[l] = '\0';
+                have_long = 1;
+            }
+            else
+            {
+                int pr = pax_extract_path(body, entry_size, long_name,
+                                          sizeof(long_name));
+                if (pr < 0)
+                {
+                    free(body);
+                    return -1;
+                }
+                if (pr == 1)
+                {
+                    have_long = 1;
+                }
+            }
+            free(body);
+            pos = data_off + padded;
+            continue;
+        }
+
+        char name[PATH_MAX];
+        if (have_long)
+        {
+            memcpy(name, long_name, strlen(long_name) + 1);
+            have_long = 0;
+        }
+        else
+        {
+            char base_name[101];
+            char prefix[156];
+            memcpy(base_name, h, 100);
+            base_name[100] = '\0';
+            prefix[0] = '\0';
+            if (memcmp(h + 257, "ustar", 5) == 0)
+            {
+                memcpy(prefix, h + 345, 155);
+                prefix[155] = '\0';
+            }
+            int pn = prefix[0]
+                     ? snprintf(name, sizeof(name), "%s/%s", prefix, base_name)
+                     : snprintf(name, sizeof(name), "%s", base_name);
+            if (pn < 0 || (size_t)pn >= sizeof(name))
+            {
+                return -1;
+            }
+        }
+        /* docker save writes "./" for the archive root of some members. */
+        const char* cmp = name;
+        while (cmp[0] == '.' && cmp[1] == '/')
+        {
+            cmp += 2;
+        }
+        int regular = (type == '0' || type == '\0' || type == '7');
+        if (regular && strcmp(cmp, want) == 0)
+        {
+            *off_out = base + data_off;
+            *len_out = entry_size;
+            return 1;
+        }
+        pos = data_off + padded;
+    }
+    return -1;
+}
+
+/* Byte-range member reader for embedded_tar_find_member() results. */
+static char* pread_range(int fd, unsigned long off, unsigned long len)
+{
+    char* buf = malloc(len + 1);
+    if (!buf)
+    {
+        return NULL;
+    }
+    unsigned long done = 0;
+    while (done < len)
+    {
+        ssize_t n = pread(fd, buf + done, len - done, (off_t)(off + done));
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n <= 0)
+        {
+            free(buf);
+            return NULL;
+        }
+        done += (unsigned long)n;
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+/* Validate the manifest's "Config" member path the way extraction does. */
+static int config_member_path_is_safe(const char* rel)
+{
+    return rel && rel[0] && rel[0] != '/' && !path_has_dotdot_component(rel);
+}
+
+/*
+ * Derive the cache key without unpacking anything: walk the embedded tar
+ * for manifest.json, then hash the config member it names.  Returns 0 and
+ * fills key_out, or -1 when the payload is not a plain uncompressed tar
+ * (encrypted, zstd, unexpected format) — the caller then takes the slow
+ * path through extract_embedded_oci_layout().
+ */
+static int rootfs_cache_key_from_embedded_tar(const char* self_path,
+        char key_out[65])
+{
+    int fd = open(self_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    int rc = -1;
+    char* manifest = NULL;
+    char* config_rel = NULL;
+    unsigned long moff = 0, mlen = 0;
+
+    /* Refuse a payload that does not begin like a tar header: encrypted
+     * (age) and compressed (zstd) blobs must go through the slow path. */
+    unsigned char head[8];
+    if (pread(fd, head, sizeof(head), (off_t)OCI_DATA_OFFSET) !=
+            (ssize_t)sizeof(head))
+    {
+        goto out;
+    }
+    if (head[0] == 0x28 && head[1] == 0xB5 && head[2] == 0x2F &&
+            head[3] == 0xFD)
+    {
+        goto out;
+    }
+    if (memcmp(head, "age-enc", 7) == 0 || memcmp(head, "-----BE", 7) == 0)
+    {
+        goto out;
+    }
+
+    if (embedded_tar_find_member(fd, OCI_DATA_OFFSET, OCI_DATA_SIZE,
+                                 "manifest.json", &moff, &mlen) != 1 ||
+            mlen == 0 || mlen > ROOTFS_CACHE_MAX_MANIFEST)
+    {
+        goto out;
+    }
+    manifest = pread_range(fd, moff, mlen);
+    if (!manifest)
+    {
+        goto out;
+    }
+    config_rel = json_get_string(manifest, "Config");
+    if (!config_member_path_is_safe(config_rel))
+    {
+        goto out;
+    }
+    unsigned long coff = 0, clen = 0;
+    if (embedded_tar_find_member(fd, OCI_DATA_OFFSET, OCI_DATA_SIZE,
+                                 config_rel, &coff, &clen) != 1 ||
+            clen == 0 || clen > ROOTFS_CACHE_MAX_CONFIG)
+    {
+        goto out;
+    }
+
+    struct sha256_ctx ctx;
+    unsigned char digest[32];
+    sha256_init(&ctx);
+    sha256_update(&ctx, ROOTFS_CACHE_KEY_PREFIX,
+                  strlen(ROOTFS_CACHE_KEY_PREFIX));
+    unsigned char chunk[65536];
+    unsigned long done = 0;
+    while (done < clen)
+    {
+        size_t want = clen - done < sizeof(chunk) ? (size_t)(clen - done)
+                      : sizeof(chunk);
+        ssize_t n = pread(fd, chunk, want, (off_t)(coff + done));
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n <= 0)
+        {
+            goto out;
+        }
+        sha256_update(&ctx, chunk, (size_t)n);
+        done += (unsigned long)n;
+    }
+    sha256_final(&ctx, digest);
+    sha256_to_hex(digest, key_out);
+    rc = 0;
+
+out:
+    free(manifest);
+    free(config_rel);
+    close(fd);
+    return rc;
+}
+
+/* ── Cache directory, locking and the completion marker ── */
+
+/*
+ * ${XDG_CACHE_HOME:-$HOME/.cache}/oci2bin/rootfs.  Returns -1 when neither
+ * variable yields an absolute, traversal-free path, or when the path would
+ * be unusable as an overlayfs lowerdir (',' and ':' end/split mount
+ * options); the caller then runs uncached.
+ */
+static int rootfs_cache_root(char* out, size_t out_sz)
+{
+    const char* xdg  = getenv("XDG_CACHE_HOME");
+    const char* home = getenv("HOME");
+    char base[PATH_MAX];
+    int n;
+    if (xdg && xdg[0] == '/')
+    {
+        n = snprintf(base, sizeof(base), "%s", xdg);
+    }
+    else if (home && home[0] == '/')
+    {
+        n = snprintf(base, sizeof(base), "%s/.cache", home);
+    }
+    else
+    {
+        return -1;
+    }
+    if (n < 0 || (size_t)n >= sizeof(base))
+    {
+        return -1;
+    }
+    /* ~/.cache is often a symlink; mkdir_p_secure() refuses symlink
+     * components, so resolve the base when it already exists. */
+    char real[PATH_MAX];
+    if (realpath(base, real))
+    {
+        n = snprintf(out, out_sz, "%s/oci2bin/rootfs", real);
+    }
+    else
+    {
+        n = snprintf(out, out_sz, "%s/oci2bin/rootfs", base);
+    }
+    if (n < 0 || (size_t)n >= out_sz)
+    {
+        return -1;
+    }
+    if (path_has_dotdot_component(out) || strchr(out, ',') ||
+            strchr(out, ':'))
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/* Open (creating) <root>/<key>.lock.  The fd stays open for the life of the
+ * process while the entry is in use; prune takes LOCK_EX|LOCK_NB and skips
+ * busy entries.  Returns the fd or -1. */
+static int rootfs_cache_lock_open(const char* root, const char* key)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s.lock", root, key);
+    if (n < 0 || (size_t)n >= sizeof(path))
+    {
+        return -1;
+    }
+    return open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+}
+
+/* FNV-1a over the tree's structure.  Deterministic for a given extraction
+ * and cheap enough to run on every hit: one lstat per entry. */
+#define FNV64_OFFSET 14695981039346656037ULL
+#define FNV64_PRIME  1099511628211ULL
+
+static void fnv64_mix(uint64_t* h, const void* data, size_t len)
+{
+    const unsigned char* p = data;
+    for (size_t i = 0; i < len; i++)
+    {
+        *h ^= p[i];
+        *h *= FNV64_PRIME;
+    }
+}
+
+static int cmp_names(const void* a, const void* b)
+{
+    return strcmp(*(char* const*)a, *(char* const*)b);
+}
+
+/* Sorted copy of a directory's entry names ("." and ".." excluded).
+ * Returns the count, or -1; the caller frees names[i] and names. */
+static int read_dir_sorted(int dir_fd, char*** names_out)
+{
+    int dup_fd = dup(dir_fd);
+    if (dup_fd < 0)
+    {
+        return -1;
+    }
+    DIR* d = fdopendir(dup_fd);
+    if (!d)
+    {
+        close(dup_fd);
+        return -1;
+    }
+    rewinddir(d);
+    char** names = NULL;
+    size_t n = 0, cap = 0;
+    struct dirent* de;
+    errno = 0;
+    while ((de = readdir(d)) != NULL)
+    {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+        {
+            continue;
+        }
+        if (n == cap)
+        {
+            size_t ncap = cap ? cap * 2 : 64;
+            char** nn = realloc(names, ncap * sizeof(*names));
+            if (!nn)
+            {
+                goto fail;
+            }
+            names = nn;
+            cap   = ncap;
+        }
+        names[n] = strdup(de->d_name);
+        if (!names[n])
+        {
+            goto fail;
+        }
+        n++;
+        errno = 0;
+    }
+    if (errno != 0)
+    {
+        goto fail;
+    }
+    closedir(d);
+    if (n > 1)
+    {
+        qsort(names, n, sizeof(*names), cmp_names);
+    }
+    *names_out = names;
+    return (int)n;
+
+fail:
+    closedir(d);
+    for (size_t i = 0; i < n; i++)
+    {
+        free(names[i]);
+    }
+    free(names);
+    return -1;
+}
+
+static void free_names(char** names, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        free(names[i]);
+    }
+    free(names);
+}
+
+struct tree_fingerprint
+{
+    uint64_t hash;
+    uint64_t entries;
+    uint64_t bytes;
+};
+
+static int fingerprint_walk(int dir_fd, const char* rel, size_t rel_len,
+                            int depth, struct tree_fingerprint* fp)
+{
+    if (depth > 128)
+    {
+        return -1;
+    }
+    char** names = NULL;
+    int n = read_dir_sorted(dir_fd, &names);
+    if (n < 0)
+    {
+        return -1;
+    }
+    int rc = 0;
+    for (int i = 0; i < n && rc == 0; i++)
+    {
+        struct stat st;
+        if (fstatat(dir_fd, names[i], &st, AT_SYMLINK_NOFOLLOW) < 0)
+        {
+            rc = -1;
+            break;
+        }
+        char path[PATH_MAX];
+        int pn = rel_len
+                 ? snprintf(path, sizeof(path), "%s/%s", rel, names[i])
+                 : snprintf(path, sizeof(path), "%s", names[i]);
+        if (pn < 0 || (size_t)pn >= sizeof(path))
+        {
+            rc = -1;
+            break;
+        }
+        char type = S_ISDIR(st.st_mode) ? 'd' : S_ISREG(st.st_mode) ? 'f'
+                    : S_ISLNK(st.st_mode) ? 'l' : 'o';
+        uint32_t mode = (uint32_t)(st.st_mode & 07777);
+        uint64_t size = S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0;
+        fnv64_mix(&fp->hash, path, (size_t)pn + 1);
+        fnv64_mix(&fp->hash, &type, 1);
+        fnv64_mix(&fp->hash, &mode, sizeof(mode));
+        fnv64_mix(&fp->hash, &size, sizeof(size));
+        fp->entries++;
+        fp->bytes += size;
+        if (S_ISLNK(st.st_mode))
+        {
+            char target[PATH_MAX];
+            ssize_t tl = readlinkat(dir_fd, names[i], target,
+                                    sizeof(target) - 1);
+            if (tl < 0)
+            {
+                rc = -1;
+                break;
+            }
+            target[tl] = '\0';
+            fnv64_mix(&fp->hash, target, (size_t)tl + 1);
+        }
+        else if (S_ISDIR(st.st_mode))
+        {
+            int sub = openat(dir_fd, names[i],
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (sub < 0)
+            {
+                rc = -1;
+                break;
+            }
+            rc = fingerprint_walk(sub, path, (size_t)pn, depth + 1, fp);
+            close(sub);
+        }
+    }
+    free_names(names, n);
+    return rc;
+}
+
+static int rootfs_tree_fingerprint(const char* dir, struct tree_fingerprint* fp)
+{
+    fp->hash    = FNV64_OFFSET;
+    fp->entries = 0;
+    fp->bytes   = 0;
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    int rc = fingerprint_walk(fd, "", 0, 0, fp);
+    close(fd);
+    return rc;
+}
+
+static int rootfs_cache_write_meta(const char* entry_dir, const char* key,
+                                   const struct tree_fingerprint* fp)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/meta", entry_dir);
+    if (n < 0 || (size_t)n >= sizeof(path))
+    {
+        return -1;
+    }
+    char body[512];
+    n = snprintf(body, sizeof(body),
+                 ROOTFS_CACHE_META_MAGIC "\n"
+                 "key %s\n"
+                 "fingerprint %016llx\n"
+                 "entries %llu\n"
+                 "bytes %llu\n"
+                 "created %lld\n",
+                 key,
+                 (unsigned long long)fp->hash,
+                 (unsigned long long)fp->entries,
+                 (unsigned long long)fp->bytes,
+                 (long long)time(NULL));
+    if (n < 0 || (size_t)n >= sizeof(body))
+    {
+        return -1;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    int rc = write_all_fd(fd, body, (size_t)n);
+    if (rc == 0 && fsync(fd) < 0)
+    {
+        rc = -1;
+    }
+    close(fd);
+    return rc;
+}
+
+/* Parse <entry>/meta.  Returns 0 and fills key/fp, -1 if absent or malformed. */
+static int rootfs_cache_read_meta(const char* entry_dir, char key_out[65],
+                                  struct tree_fingerprint* fp)
+{
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/meta", entry_dir);
+    if (n < 0 || (size_t)n >= sizeof(path))
+    {
+        return -1;
+    }
+    size_t sz = 0;
+    char* body = read_file(path, &sz);
+    if (!body)
+    {
+        return -1;
+    }
+    int rc = -1;
+    size_t magic_len = strlen(ROOTFS_CACHE_META_MAGIC);
+    if (sz < magic_len + 1 || memcmp(body, ROOTFS_CACHE_META_MAGIC,
+                                     magic_len) != 0 ||
+            body[magic_len] != '\n')
+    {
+        goto out;
+    }
+    char key_buf[80] = {0};
+    unsigned long long hash = 0, entries = 0, bytes = 0;
+    int have = 0;
+    char* save = NULL;
+    for (char* line = strtok_r(body + magic_len + 1, "\n", &save); line;
+            line = strtok_r(NULL, "\n", &save))
+    {
+        if (sscanf(line, "key %79s", key_buf) == 1)
+        {
+            have |= 1;
+        }
+        else if (sscanf(line, "fingerprint %llx", &hash) == 1)
+        {
+            have |= 2;
+        }
+        else if (sscanf(line, "entries %llu", &entries) == 1)
+        {
+            have |= 4;
+        }
+        else if (sscanf(line, "bytes %llu", &bytes) == 1)
+        {
+            have |= 8;
+        }
+    }
+    if (have != 15 || !is_hex_key(key_buf))
+    {
+        goto out;
+    }
+    memcpy(key_out, key_buf, 65);
+    fp->hash    = hash;
+    fp->entries = entries;
+    fp->bytes   = bytes;
+    rc = 0;
+out:
+    free(body);
+    return rc;
+}
+
+/*
+ * Verify an existing entry: marker present and well-formed, key matches,
+ * and the tree's fingerprint equals the recorded one.  Returns 0 when the
+ * entry is trustworthy, -1 otherwise.
+ */
+static int rootfs_cache_verify_entry(const char* entry_dir, const char* key)
+{
+    char stored_key[65];
+    struct tree_fingerprint want, have;
+    if (rootfs_cache_read_meta(entry_dir, stored_key, &want) < 0)
+    {
+        debug_log("cache.verify", "entry=%s result=no-marker", entry_dir);
+        return -1;
+    }
+    if (strcmp(stored_key, key) != 0)
+    {
+        debug_log("cache.verify", "entry=%s result=key-mismatch", entry_dir);
+        return -1;
+    }
+    char tree[PATH_MAX];
+    if (path_join_suffix(tree, sizeof(tree), entry_dir, "/rootfs") < 0)
+    {
+        return -1;
+    }
+    if (rootfs_tree_fingerprint(tree, &have) < 0)
+    {
+        debug_log("cache.verify", "entry=%s result=unreadable", entry_dir);
+        return -1;
+    }
+    if (have.hash != want.hash || have.entries != want.entries ||
+            have.bytes != want.bytes)
+    {
+        debug_log("cache.verify",
+                  "entry=%s result=fingerprint-mismatch entries=%llu/%llu"
+                  " bytes=%llu/%llu", entry_dir,
+                  (unsigned long long)have.entries,
+                  (unsigned long long)want.entries,
+                  (unsigned long long)have.bytes,
+                  (unsigned long long)want.bytes);
+        return -1;
+    }
+    debug_log("cache.verify", "entry=%s result=ok entries=%llu bytes=%llu",
+              entry_dir, (unsigned long long)have.entries,
+              (unsigned long long)have.bytes);
+    return 0;
+}
+
+/* Move a bad entry out of the way (so a concurrent lookup never sees it
+ * half-deleted) and remove it.  Best effort. */
+static void rootfs_cache_discard_entry(const char* root, const char* key,
+                                       const char* entry_dir)
+{
+    char trash[PATH_MAX];
+    int n = snprintf(trash, sizeof(trash), "%s/.trash-%s-%d", root, key,
+                     (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof(trash))
+    {
+        return;
+    }
+    if (rename(entry_dir, trash) == 0)
+    {
+        rm_rf_dir(trash);
+    }
+    else if (errno == ENOENT)
+    {
+        return;
+    }
+    else
+    {
+        rm_rf_dir(entry_dir);
+    }
+}
+
+/*
+ * Publish a freshly built tree: write the marker into build_dir and rename
+ * it to entry_dir.  If another process won the race (entry_dir exists), our
+ * copy is discarded and theirs is verified instead.  Returns 0 when
+ * entry_dir now holds a verified tree, -1 otherwise (build_dir is left in
+ * place for the caller to use privately).
+ */
+static int rootfs_cache_publish(const char* root, const char* key,
+                                const char* build_dir, const char* entry_dir)
+{
+    char tree[PATH_MAX];
+    struct tree_fingerprint fp;
+    if (path_join_suffix(tree, sizeof(tree), build_dir, "/rootfs") < 0 ||
+            rootfs_tree_fingerprint(tree, &fp) < 0 ||
+            rootfs_cache_write_meta(build_dir, key, &fp) < 0)
+    {
+        debug_log("cache.publish", "key=%s result=marker-failed", key);
+        return -1;
+    }
+    if (rename(build_dir, entry_dir) == 0)
+    {
+        debug_log("cache.publish", "key=%s entry=%s entries=%llu bytes=%llu",
+                  key, entry_dir, (unsigned long long)fp.entries,
+                  (unsigned long long)fp.bytes);
+        return 0;
+    }
+    if (errno == EEXIST || errno == ENOTEMPTY)
+    {
+        /* Lost the race: use the other builder's entry if it checks out. */
+        if (rootfs_cache_verify_entry(entry_dir, key) == 0)
+        {
+            rm_rf_dir(build_dir);
+            debug_log("cache.publish", "key=%s result=raced-using-existing",
+                      key);
+            return 0;
+        }
+        rootfs_cache_discard_entry(root, key, entry_dir);
+        if (rename(build_dir, entry_dir) == 0)
+        {
+            return 0;
+        }
+    }
+    debug_log("cache.publish", "key=%s result=rename-failed errno=%d", key,
+              errno);
+    return -1;
+}
+
+static int extract_layers_from_layout(const char* oci_dir,
+                                      const char* tmpdir,
+                                      const char* rootfs,
+                                      char key_out[65]);
+
+/*
+ * Copy the embedded OCI tar out of ourselves (decrypting / inflating as
+ * needed), unpack the layout into <tmpdir>/oci and merge its layers into
+ * the directory `rootfs`, which must not exist yet.  Staging directories
+ * live under tmpdir.  key_out, when non-NULL, receives the rootfs cache key
+ * of the image config.  Returns 0 or -1 (diagnostic printed).
+ */
+static int extract_oci_rootfs_into(const char* self_path, const char* tmpdir,
+                                   const char* rootfs, char key_out[65])
+{
+    char oci_dir[PATH_MAX];
+    if (extract_embedded_oci_layout(self_path, tmpdir,
+                                    oci_dir, sizeof(oci_dir)) < 0)
+    {
+        return -1;    /* diagnostic already printed */
+    }
+    return extract_layers_from_layout(oci_dir, tmpdir, rootfs, key_out);
+}
+
+/*
+ * Extract the embedded image into a fresh runtime tmpdir, uncached.  Every
+ * failure inside removes the tmpdir: it can hold the decrypted payload
  * (image.dec.tar) and a partial rootfs, and main() only registers its
  * atexit cleanup once extraction has succeeded.
  */
@@ -6900,42 +8042,49 @@ static char* extract_oci_rootfs(const char* self_path)
 {
     char tmpdir[PATH_MAX];
 
-    debug_log("extract.begin", "self=%s oci_offset=0x%lx oci_size=0x%lx",
-              self_path, OCI_DATA_OFFSET, OCI_DATA_SIZE);
-
     if (make_runtime_tmpdir(tmpdir, sizeof(tmpdir), "oci2bin.") < 0)
     {
         perror("mkdtemp");
         return NULL;
     }
-    char* rootfs = extract_oci_rootfs_into(self_path, tmpdir);
-    if (!rootfs)
+    if (snprintf(s_runtime_tmpdir, sizeof(s_runtime_tmpdir), "%s",
+                 tmpdir) >= (int)sizeof(s_runtime_tmpdir) ||
+            path_join_suffix(s_oci_rootfs, sizeof(s_oci_rootfs), tmpdir,
+                             "/rootfs") < 0)
+    {
+        fprintf(stderr, "oci2bin: rootfs path too long\n");
+        rm_rf_dir(tmpdir);
+        s_runtime_tmpdir[0] = '\0';
+        return NULL;
+    }
+    if (extract_oci_rootfs_into(self_path, tmpdir, s_oci_rootfs, NULL) < 0)
     {
         rm_rf_dir(tmpdir);
+        s_runtime_tmpdir[0] = '\0';
+        s_oci_rootfs[0] = '\0';
+        return NULL;
     }
-    return rootfs;
+    return s_oci_rootfs;
 }
 
-static char* extract_oci_rootfs_into(const char* self_path,
-                                     const char* tmpdir)
+/*
+ * Steps 3-6 of extraction: parse manifest.json in oci_dir, merge the layers
+ * into `rootfs` (created here) and write .oci2bin_config from the image
+ * config.  Returns 0 or -1.
+ */
+static int extract_layers_from_layout(const char* oci_dir,
+                                      const char* tmpdir,
+                                      const char* rootfs,
+                                      char key_out[65])
 {
-    char* rootfs = s_oci_rootfs;
-
-    /* 1-2. Copy the embedded OCI tar out of ourselves, decrypt/inflate it as
-     * needed, prescan it, and extract it into tmpdir/oci/. */
-    char oci_dir[PATH_MAX];
-    if (extract_embedded_oci_layout(self_path, tmpdir,
-                                    oci_dir, sizeof(oci_dir)) < 0)
-    {
-        return NULL;    /* diagnostic already printed */
-    }
+    debug_log("extract.begin", "oci_dir=%s rootfs=%s", oci_dir, rootfs);
 
     /* 3. Read manifest.json */
     int oci_dir_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (oci_dir_fd < 0)
     {
         perror("oci2bin: open OCI layout");
-        return NULL;
+        return -1;
     }
     size_t manifest_size;
     char* manifest = read_file_beneath(oci_dir_fd, "manifest.json",
@@ -6944,7 +8093,7 @@ static char* extract_oci_rootfs_into(const char* self_path,
     if (!manifest)
     {
         fprintf(stderr, "oci2bin: cannot read manifest.json\n");
-        return NULL;
+        return -1;
     }
 
     /* 4. Parse manifest to get Config and Layers */
@@ -6954,38 +8103,30 @@ static char* extract_oci_rootfs_into(const char* self_path,
     {
         fprintf(stderr, "oci2bin: cannot parse manifest.json\n");
         free(manifest);
-        return NULL;
+        return -1;
     }
 
     /* 5. Extract layers in order into rootfs */
-    if (path_join_suffix(rootfs, sizeof(s_oci_rootfs), tmpdir, "/rootfs") < 0)
-    {
-        fprintf(stderr, "oci2bin: rootfs path too long\n");
-        free(config_path_rel);
-        free(layers_json);
-        free(manifest);
-        return NULL;
-    }
     if (mkdir(rootfs, 0755) < 0)
     {
         perror("mkdir rootfs");
         free(config_path_rel);
         free(layers_json);
         free(manifest);
-        return NULL;
+        return -1;
     }
 
     char* layers[MAX_LAYERS];
     memset(layers, 0, sizeof(layers));
     int nlayers = json_parse_string_array_strict(layers_json, layers,
-                  MAX_LAYERS);
+        MAX_LAYERS);
     if (nlayers < 0)
     {
         fprintf(stderr, "oci2bin: malformed or oversized Layers array\n");
         free(config_path_rel);
         free(layers_json);
         free(manifest);
-        return NULL;
+        return -1;
     }
     debug_log("extract.manifest", "config=%s layers=%d",
               safe_str(config_path_rel), nlayers);
@@ -6999,7 +8140,7 @@ static char* extract_oci_rootfs_into(const char* self_path,
         {
             free(layers[i]);
         }
-        return NULL;
+        return -1;
     }
 
     int layer_failed = 0;
@@ -7068,7 +8209,7 @@ static char* extract_oci_rootfs_into(const char* self_path,
         free(config_path_rel);
         free(layers_json);
         free(manifest);
-        return NULL;
+        return -1;
     }
 
     /* 6. Read the image config to get Cmd/Entrypoint */
@@ -7081,7 +8222,7 @@ static char* extract_oci_rootfs_into(const char* self_path,
         free(config_path_rel);
         free(layers_json);
         free(manifest);
-        return NULL;
+        return -1;
     }
     oci_dir_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (oci_dir_fd < 0)
@@ -7090,12 +8231,16 @@ static char* extract_oci_rootfs_into(const char* self_path,
         free(config_path_rel);
         free(layers_json);
         free(manifest);
-        return NULL;
+        return -1;
     }
     size_t config_size;
     char* config = read_file_beneath(oci_dir_fd, config_path_rel,
                                      &config_size);
     close(oci_dir_fd);
+    if (config && key_out)
+    {
+        rootfs_cache_key_from_config(config, config_size, key_out);
+    }
     if (config)
     {
         /* Write parsed entrypoint/env info for use inside the container */
@@ -7183,7 +8328,1025 @@ static char* extract_oci_rootfs_into(const char* self_path,
     free(manifest);
 
     debug_log("extract.done", "rootfs=%s", rootfs);
-    return rootfs;
+    return 0;
+}
+
+/* Cache key from an unpacked layout: hash the config file manifest.json
+ * names (the slow path, used for compressed and encrypted payloads). */
+static int rootfs_cache_key_from_layout(const char* oci_dir, char key_out[65])
+{
+    int dir_fd = open(oci_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0)
+    {
+        return -1;
+    }
+    size_t manifest_size = 0;
+    char* manifest = read_file_beneath(dir_fd, "manifest.json",
+                                       &manifest_size);
+    char* config_rel = manifest ? json_get_string(manifest, "Config") : NULL;
+    char* config = NULL;
+    size_t config_size = 0;
+    if (config_member_path_is_safe(config_rel))
+    {
+        config = read_file_beneath(dir_fd, config_rel, &config_size);
+    }
+    close(dir_fd);
+    int rc = -1;
+    if (config && config_size > 0)
+    {
+        rootfs_cache_key_from_config(config, config_size, key_out);
+        rc = 0;
+    }
+    free(config);
+    free(config_rel);
+    free(manifest);
+    return rc;
+}
+
+
+/* ── Private writable layer over a cached tree ──────────────────────────── */
+
+/*
+ * The cached tree is shared by every run of the image and is never written
+ * to.  Each run gets its own writable view at <tmpdir>/rootfs, chosen in
+ * this order:
+ *
+ *   overlay-ns    kernel overlayfs mounted from inside the container's user
+ *                 and mount namespaces (Linux 5.11+); probed with a throwaway
+ *                 namespace first so the fallbacks below can still be set up
+ *                 host-side when it is not available.
+ *   overlay-host  kernel overlayfs mounted before any namespace, when the
+ *                 loader itself runs as root (VM mode, or a root launch).
+ *   fuse-overlayfs
+ *                 the same helper --lazy uses, mounted host-side.
+ *   copy          a reflink (FICLONE) or byte copy of the tree into tmpdir;
+ *                 still cheaper than gunzip + tar + merge, and always works.
+ *
+ * --ephemeral-root is satisfied by any of these; --overlay-persist DIR
+ * makes the overlay kinds put upper/work in DIR (VM mode keeps its own
+ * data-disk persistence and is not affected).
+ */
+
+enum rootfs_layer_kind
+{
+    ROOTFS_LAYER_NONE = 0,     /* rootfs is a private extracted tree */
+    ROOTFS_LAYER_OVERLAY_NS,   /* kernel overlayfs, mounted after unshare */
+    ROOTFS_LAYER_OVERLAY_HOST, /* kernel overlayfs mounted host-side (root) */
+    ROOTFS_LAYER_FUSE,         /* fuse-overlayfs, host-side */
+    ROOTFS_LAYER_COPY,         /* reflink/copy of the cached tree */
+};
+
+static struct
+{
+    int  kind;
+    char lower[PATH_MAX];
+    char upper[PATH_MAX];
+    char work[PATH_MAX];
+} s_rootfs_layer;
+
+
+static const char* rootfs_layer_kind_name(int kind)
+{
+    switch (kind)
+    {
+        case ROOTFS_LAYER_OVERLAY_NS:
+            return "overlay-ns";
+        case ROOTFS_LAYER_OVERLAY_HOST:
+            return "overlay-host";
+        case ROOTFS_LAYER_FUSE:
+            return "fuse-overlayfs";
+        case ROOTFS_LAYER_COPY:
+            return "copy";
+        default:
+            return "none";
+    }
+}
+
+static int mount_kernel_overlay(const char* lower, const char* upper,
+                                const char* work, const char* target)
+{
+    char overlay_opts[PATH_MAX * 3 + 64];
+    int n = snprintf(overlay_opts, sizeof(overlay_opts),
+                     "lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work);
+    if (n < 0 || (size_t)n >= sizeof(overlay_opts))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return mount("overlay", target, "overlay", 0, overlay_opts);
+}
+
+/*
+ * Mount a fuse-overlayfs view of lower+upper at target and wait for it to
+ * appear.  Shared by --lazy and the rootfs cache.  The helper PID is kept
+ * in s_lazy_overlay_pid so cleanup_oci_rootfs() stops it.
+ */
+static int mount_fuse_overlay(const char* lower, const char* upper,
+                              const char* work, const char* target,
+                              const char* what)
+{
+    char overlay_opts[PATH_MAX * 3 + 96];
+    int n = snprintf(overlay_opts, sizeof(overlay_opts),
+                     "lowerdir=%s,upperdir=%s,workdir=%s,allow_other,auto_unmount",
+                     lower, upper, work);
+    if (n < 0 || (size_t)n >= sizeof(overlay_opts))
+    {
+        fprintf(stderr, "oci2bin: %s: overlay options truncated\n", what);
+        return -1;
+    }
+    char* overlay_argv[] =
+    {
+        "fuse-overlayfs", "-f", "-o", overlay_opts, (char*)target, NULL
+    };
+    s_lazy_overlay_pid = spawn_daemon(overlay_argv);
+    if (s_lazy_overlay_pid < 0 ||
+            wait_for_fuse_mount(target, &s_lazy_overlay_pid,
+                                "fuse-overlayfs", what) < 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Can this user mount overlayfs from inside a user namespace?  Try it in a
+ * throwaway child: unshare user+mount, map the single id, mount, exit.  The
+ * child's stderr is silenced — the real launch reports namespace problems
+ * with its own diagnostics.
+ */
+static int probe_overlay_in_userns(const char* lower, const char* upper,
+                                   const char* work, const char* target)
+{
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        return -1;
+    }
+    if (pid == 0)
+    {
+        int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDERR_FILENO);
+        }
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) < 0 ||
+                setup_single_uid_map(uid, gid) < 0 ||
+                mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0 ||
+                mount_kernel_overlay(lower, upper, work, target) < 0)
+        {
+            _exit(1);
+        }
+        umount2(target, MNT_DETACH);
+        _exit(0);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    {
+        ;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+/* ── reflink / copy fallback ── */
+
+#ifndef FICLONE
+#define FICLONE _IOW(0x94, 9, int)
+#endif
+
+struct copy_link
+{
+    dev_t dev;
+    ino_t ino;
+    char* path;    /* relative to the destination root */
+};
+
+struct copy_ctx
+{
+    int               dst_root_fd;
+    struct copy_link* links;
+    size_t            n_links;
+    size_t            cap_links;
+    unsigned long     files;
+    unsigned long     reflinked;
+    unsigned long long bytes;
+};
+
+static int copy_file_contents(int in_fd, int out_fd, off_t size,
+                              struct copy_ctx* ctx)
+{
+    if (size == 0)
+    {
+        return 0;
+    }
+    if (ioctl(out_fd, FICLONE, in_fd) == 0)
+    {
+        ctx->reflinked++;
+        return 0;
+    }
+    off_t done = 0;
+    int   use_cfr = 1;
+    while (done < size)
+    {
+        ssize_t n;
+        if (use_cfr)
+        {
+            n = copy_file_range(in_fd, NULL, out_fd, NULL,
+                                (size_t)(size - done), 0);
+            if (n < 0 && (errno == EXDEV || errno == ENOSYS ||
+                          errno == EINVAL || errno == EOPNOTSUPP))
+            {
+                use_cfr = 0;
+                continue;
+            }
+        }
+        else
+        {
+            char buf[65536];
+            ssize_t r = read(in_fd, buf, sizeof(buf));
+            if (r < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            if (r <= 0)
+            {
+                return r == 0 ? 0 : -1;
+            }
+            if (write_all_fd(out_fd, buf, (size_t)r) < 0)
+            {
+                return -1;
+            }
+            n = r;
+        }
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n <= 0)
+        {
+            return n == 0 ? 0 : -1;
+        }
+        done += n;
+    }
+    return 0;
+}
+
+static const char* copy_link_lookup(struct copy_ctx* ctx, dev_t dev,
+                                    ino_t ino)
+{
+    for (size_t i = 0; i < ctx->n_links; i++)
+    {
+        if (ctx->links[i].dev == dev && ctx->links[i].ino == ino)
+        {
+            return ctx->links[i].path;
+        }
+    }
+    return NULL;
+}
+
+static void copy_link_remember(struct copy_ctx* ctx, dev_t dev, ino_t ino,
+                               const char* path)
+{
+    if (ctx->n_links >= 65536)
+    {
+        return;    /* beyond this the tree just gets independent copies */
+    }
+    if (ctx->n_links == ctx->cap_links)
+    {
+        size_t ncap = ctx->cap_links ? ctx->cap_links * 2 : 64;
+        struct copy_link* nl = realloc(ctx->links, ncap * sizeof(*nl));
+        if (!nl)
+        {
+            return;
+        }
+        ctx->links     = nl;
+        ctx->cap_links = ncap;
+    }
+    char* dup_path = strdup(path);
+    if (!dup_path)
+    {
+        return;
+    }
+    ctx->links[ctx->n_links].dev  = dev;
+    ctx->links[ctx->n_links].ino  = ino;
+    ctx->links[ctx->n_links].path = dup_path;
+    ctx->n_links++;
+}
+
+static void copy_apply_times(int fd, const struct stat* st)
+{
+    struct timespec ts[2] = { st->st_atim, st->st_mtim };
+    (void)futimens(fd, ts);
+}
+
+static int copy_tree_walk(int src_fd, int dst_fd, const char* rel,
+                          size_t rel_len, int depth, struct copy_ctx* ctx)
+{
+    if (depth > 128)
+    {
+        errno = ELOOP;
+        return -1;
+    }
+    char** names = NULL;
+    int n = read_dir_sorted(src_fd, &names);
+    if (n < 0)
+    {
+        return -1;
+    }
+    int rc = 0;
+    for (int i = 0; i < n && rc == 0; i++)
+    {
+        const char* name = names[i];
+        struct stat st;
+        if (fstatat(src_fd, name, &st, AT_SYMLINK_NOFOLLOW) < 0)
+        {
+            rc = -1;
+            break;
+        }
+        char path[PATH_MAX];
+        int pn = rel_len ? snprintf(path, sizeof(path), "%s/%s", rel, name)
+                 : snprintf(path, sizeof(path), "%s", name);
+        if (pn < 0 || (size_t)pn >= sizeof(path))
+        {
+            errno = ENAMETOOLONG;
+            rc = -1;
+            break;
+        }
+        mode_t perm = st.st_mode & 07777;
+
+        if (S_ISDIR(st.st_mode))
+        {
+            if (mkdirat(dst_fd, name, 0700) < 0)
+            {
+                rc = -1;
+                break;
+            }
+            int sub_src = openat(src_fd, name, O_RDONLY | O_DIRECTORY |
+                                 O_NOFOLLOW | O_CLOEXEC);
+            int sub_dst = openat(dst_fd, name, O_RDONLY | O_DIRECTORY |
+                                 O_NOFOLLOW | O_CLOEXEC);
+            if (sub_src < 0 || sub_dst < 0)
+            {
+                if (sub_src >= 0)
+                {
+                    close(sub_src);
+                }
+                if (sub_dst >= 0)
+                {
+                    close(sub_dst);
+                }
+                rc = -1;
+                break;
+            }
+            rc = copy_tree_walk(sub_src, sub_dst, path, (size_t)pn,
+                                depth + 1, ctx);
+            if (rc == 0)
+            {
+                (void)copy_fd_xattrs(sub_src, sub_dst);
+                if (fchmod(sub_dst, perm) < 0)
+                {
+                    rc = -1;
+                }
+                copy_apply_times(sub_dst, &st);
+            }
+            close(sub_src);
+            close(sub_dst);
+        }
+        else if (S_ISREG(st.st_mode))
+        {
+            if (st.st_nlink > 1)
+            {
+                const char* first = copy_link_lookup(ctx, st.st_dev,
+                                                     st.st_ino);
+                if (first)
+                {
+                    if (linkat(ctx->dst_root_fd, first, dst_fd, name, 0) < 0)
+                    {
+                        rc = -1;
+                    }
+                    continue;
+                }
+            }
+            int in = openat(src_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (in < 0)
+            {
+                rc = -1;
+                break;
+            }
+            int out = openat(dst_fd, name, O_WRONLY | O_CREAT | O_EXCL |
+                             O_CLOEXEC, 0600);
+            if (out < 0)
+            {
+                close(in);
+                rc = -1;
+                break;
+            }
+            if (copy_file_contents(in, out, st.st_size, ctx) < 0 ||
+                    fchmod(out, perm) < 0)
+            {
+                rc = -1;
+            }
+            else
+            {
+                (void)copy_fd_xattrs(in, out);
+                copy_apply_times(out, &st);
+                ctx->files++;
+                ctx->bytes += (unsigned long long)st.st_size;
+                if (st.st_nlink > 1)
+                {
+                    copy_link_remember(ctx, st.st_dev, st.st_ino, path);
+                }
+            }
+            close(in);
+            close(out);
+        }
+        else if (S_ISLNK(st.st_mode))
+        {
+            char target[PATH_MAX];
+            ssize_t tl = readlinkat(src_fd, name, target, sizeof(target) - 1);
+            if (tl < 0)
+            {
+                rc = -1;
+                break;
+            }
+            target[tl] = '\0';
+            if (symlinkat(target, dst_fd, name) < 0)
+            {
+                rc = -1;
+                break;
+            }
+            struct timespec ts[2] = { st.st_atim, st.st_mtim };
+            (void)utimensat(dst_fd, name, ts, AT_SYMLINK_NOFOLLOW);
+        }
+        else if (S_ISFIFO(st.st_mode))
+        {
+            if (mkfifoat(dst_fd, name, perm) < 0)
+            {
+                rc = -1;
+                break;
+            }
+        }
+        else
+        {
+            /* Device and socket nodes cannot be recreated unprivileged and
+             * the extraction never produces them; skip rather than fail. */
+            debug_log("cache.copy_skip", "path=%s mode=%o", path,
+                      (unsigned)st.st_mode);
+        }
+    }
+    free_names(names, n);
+    return rc;
+}
+
+/*
+ * Copy the tree at src into the existing, empty directory dst, preserving
+ * modes, symlinks, hardlinks, allowed xattrs and timestamps.  Regular files
+ * are reflinked when the filesystem supports it.  Never follows symlinks.
+ */
+static int copy_tree_private(const char* src, const char* dst)
+{
+    int src_fd = open(src, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (src_fd < 0)
+    {
+        return -1;
+    }
+    int dst_fd = open(dst, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dst_fd < 0)
+    {
+        close(src_fd);
+        return -1;
+    }
+    struct copy_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.dst_root_fd = dst_fd;
+    int rc = copy_tree_walk(src_fd, dst_fd, "", 0, 0, &ctx);
+    int saved = errno;
+    if (rc == 0)
+    {
+        struct stat st;
+        if (fstat(src_fd, &st) == 0)
+        {
+            (void)fchmod(dst_fd, st.st_mode & 07777);
+        }
+    }
+    for (size_t i = 0; i < ctx.n_links; i++)
+    {
+        free(ctx.links[i].path);
+    }
+    free(ctx.links);
+    close(src_fd);
+    close(dst_fd);
+    debug_log("cache.copy", "src=%s dst=%s files=%lu reflinked=%lu bytes=%llu"
+              " rc=%d", src, dst, ctx.files, ctx.reflinked, ctx.bytes, rc);
+    errno = saved;
+    return rc;
+}
+
+static int mkdir_existing_ok(const char* path, mode_t mode)
+{
+    if (mkdir(path, mode) < 0 && errno != EEXIST)
+    {
+        return -1;
+    }
+    struct stat st;
+    if (lstat(path, &st) < 0 || !S_ISDIR(st.st_mode))
+    {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Establish this run's writable view of `lower` at <tmpdir>/rootfs
+ * (s_oci_rootfs).  host_side forces a layer that exists before any
+ * namespace is entered (VM mode).  Returns 0 or -1 (message printed).
+ */
+static int prepare_private_rootfs(const char* lower, const char* tmpdir,
+                                  const struct container_opts* opts,
+                                  int host_side)
+{
+    if (path_join_suffix(s_oci_rootfs, sizeof(s_oci_rootfs), tmpdir,
+                         "/rootfs") < 0 ||
+            snprintf(s_rootfs_layer.lower, sizeof(s_rootfs_layer.lower), "%s",
+                     lower) >= (int)sizeof(s_rootfs_layer.lower))
+    {
+        fprintf(stderr, "oci2bin: rootfs cache: runtime path too long\n");
+        return -1;
+    }
+    if (mkdir(s_oci_rootfs, 0755) < 0)
+    {
+        perror("oci2bin: rootfs cache: mkdir rootfs");
+        return -1;
+    }
+
+    /* Overlay upper/work: --overlay-persist DIR in container mode (its
+     * ',' / ':' safety was checked in parse_opts), else the runtime tmpdir.
+     * VM mode persists through its own data disk, not a host overlay. */
+    const char* base = (!opts->use_vm && opts->overlay_persist)
+                       ? opts->overlay_persist : tmpdir;
+    int overlay_paths_ok = !(strchr(tmpdir, ',') || strchr(tmpdir, ':'));
+    if (overlay_paths_ok &&
+            (path_join_suffix(s_rootfs_layer.upper,
+                              sizeof(s_rootfs_layer.upper), base,
+                              "/upper") < 0 ||
+             path_join_suffix(s_rootfs_layer.work, sizeof(s_rootfs_layer.work),
+                              base, "/work") < 0))
+    {
+        overlay_paths_ok = 0;
+    }
+    if (overlay_paths_ok &&
+            ((base == opts->overlay_persist &&
+              mkdir_existing_ok(base, 0755) < 0) ||
+             mkdir_existing_ok(s_rootfs_layer.upper, 0755) < 0 ||
+             mkdir_existing_ok(s_rootfs_layer.work, 0755) < 0))
+    {
+        fprintf(stderr, "oci2bin: rootfs cache: cannot prepare overlay"
+                        " upper/work: %s\n", strerror(errno));
+        overlay_paths_ok = 0;
+    }
+
+    /* OCI2BIN_ROOTFS_LAYER=overlay|fuse-overlayfs|copy pins one kind
+     * (diagnostics, tests, or working around an overlayfs bug). */
+    int allow_overlay = 1, allow_fuse = 1, allow_copy = 1;
+    const char* want = getenv("OCI2BIN_ROOTFS_LAYER");
+    if (want && want[0] && strcmp(want, "auto") != 0)
+    {
+        allow_overlay = (strcmp(want, "overlay") == 0);
+        allow_fuse    = (strcmp(want, "fuse-overlayfs") == 0);
+        allow_copy    = (strcmp(want, "copy") == 0);
+        if (!allow_overlay && !allow_fuse && !allow_copy)
+        {
+            fprintf(stderr, "oci2bin: warning: ignoring OCI2BIN_ROOTFS_LAYER=%s"
+                            " (want auto|overlay|fuse-overlayfs|copy)\n", want);
+            allow_overlay = allow_fuse = allow_copy = 1;
+        }
+    }
+
+    int kind = ROOTFS_LAYER_NONE;
+    if (overlay_paths_ok && allow_overlay && !host_side &&
+            probe_overlay_in_userns(lower, s_rootfs_layer.upper,
+                                    s_rootfs_layer.work, s_oci_rootfs) == 0)
+    {
+        kind = ROOTFS_LAYER_OVERLAY_NS;
+    }
+    else if (overlay_paths_ok && allow_overlay && host_side &&
+             geteuid() == 0 &&
+             mount_kernel_overlay(lower, s_rootfs_layer.upper,
+                                  s_rootfs_layer.work, s_oci_rootfs) == 0)
+    {
+        kind = ROOTFS_LAYER_OVERLAY_HOST;
+    }
+    else if (overlay_paths_ok && allow_fuse &&
+             tool_is_available("fuse-overlayfs") &&
+             fuse_allow_other_available() &&
+             access("/dev/fuse", R_OK | W_OK) == 0 &&
+             mount_fuse_overlay(lower, s_rootfs_layer.upper,
+                                s_rootfs_layer.work, s_oci_rootfs,
+                                "rootfs cache") == 0)
+    {
+        kind = ROOTFS_LAYER_FUSE;
+    }
+    else if (allow_copy)
+    {
+        stop_lazy_helper(&s_lazy_overlay_pid);
+        if (copy_tree_private(lower, s_oci_rootfs) < 0)
+        {
+            fprintf(stderr, "oci2bin: rootfs cache: copying the cached tree"
+                            " failed: %s\n", strerror(errno));
+            return -1;
+        }
+        kind = ROOTFS_LAYER_COPY;
+    }
+    else
+    {
+        stop_lazy_helper(&s_lazy_overlay_pid);
+        fprintf(stderr, "oci2bin: rootfs cache: OCI2BIN_ROOTFS_LAYER=%s is not"
+                        " available on this host\n", want);
+        return -1;
+    }
+    s_rootfs_layer.kind = kind;
+    debug_log("rootfs.layer", "kind=%s lower=%s rootfs=%s",
+              rootfs_layer_kind_name(kind), lower, s_oci_rootfs);
+    return 0;
+}
+
+/*
+ * Called from main() once the container's user and mount namespaces exist:
+ * mount the overlay the probe promised.  Should the real mount fail anyway
+ * (a different id map, a stricter LSM), fall back to a private copy so the
+ * run still starts and the cached tree stays untouched.
+ */
+static int finish_deferred_rootfs_layer(void)
+{
+    if (s_rootfs_layer.kind != ROOTFS_LAYER_OVERLAY_NS)
+    {
+        return 0;
+    }
+    if (mount_kernel_overlay(s_rootfs_layer.lower, s_rootfs_layer.upper,
+                             s_rootfs_layer.work, s_oci_rootfs) == 0)
+    {
+        debug_log("rootfs.layer", "kind=overlay-ns mounted=%s", s_oci_rootfs);
+        return 0;
+    }
+    fprintf(stderr, "oci2bin: warning: overlayfs mount in the user namespace"
+                    " failed (%s); copying the cached rootfs instead\n",
+            strerror(errno));
+    if (copy_tree_private(s_rootfs_layer.lower, s_oci_rootfs) < 0)
+    {
+        fprintf(stderr, "oci2bin: rootfs cache: copying the cached tree"
+                        " failed: %s\n", strerror(errno));
+        return -1;
+    }
+    s_rootfs_layer.kind = ROOTFS_LAYER_COPY;
+    return 0;
+}
+
+/* ── Putting it together: prepare_rootfs() ── */
+
+static int effective_rootfs_cache_mode(const struct container_opts* opts)
+{
+    if (opts->rootfs_cache_mode != ROOTFS_CACHE_UNSET)
+    {
+        return opts->rootfs_cache_mode;
+    }
+    const char* env = getenv("OCI2BIN_ROOTFS_CACHE");
+    if (env && env[0])
+    {
+        int m = parse_rootfs_cache_mode(env);
+        if (m > 0)
+        {
+            return m;
+        }
+        fprintf(stderr, "oci2bin: warning: ignoring OCI2BIN_ROOTFS_CACHE=%s"
+                        " (want auto|off|always)\n", env);
+    }
+    return ROOTFS_CACHE_AUTO;
+}
+
+/* Does the embedded payload begin with an age header? */
+static int embedded_payload_is_encrypted(const char* self_path)
+{
+    int fd = open(self_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return -1;
+    }
+    char head[64];
+    ssize_t n = pread(fd, head, sizeof(head) - 1, (off_t)OCI_DATA_OFFSET);
+    close(fd);
+    if (n < 0)
+    {
+        return -1;
+    }
+    head[n] = '\0';
+    size_t bin_len = strlen(AGE_MAGIC_BINARY);
+    size_t arm_len = strlen(AGE_MAGIC_ARMOR);
+    if (((size_t)n >= bin_len && memcmp(head, AGE_MAGIC_BINARY, bin_len) == 0)
+            || ((size_t)n >= arm_len &&
+                memcmp(head, AGE_MAGIC_ARMOR, arm_len) == 0))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+/* Remove the payload copies the slow key path left in the runtime tmpdir
+ * (they can hold a decrypted image) once the cached tree is being used. */
+static void discard_layout_scratch(const char* tmpdir)
+{
+    static const char* const names[] =
+    {
+        "/oci", "/image.tar", "/image.dec.tar", "/image.unz.tar", NULL
+    };
+    for (int i = 0; names[i]; i++)
+    {
+        char p[PATH_MAX];
+        if (path_join_suffix(p, sizeof(p), tmpdir, names[i]) == 0)
+        {
+            struct stat st;
+            if (lstat(p, &st) == 0)
+            {
+                if (S_ISDIR(st.st_mode))
+                {
+                    rm_rf_dir(p);
+                }
+                else
+                {
+                    unlink(p);
+                }
+            }
+        }
+    }
+}
+
+/* Use a tree we built but could not publish: it is private to this run.
+ * The entry lock is kept (shared) so `oci2bin prune` sees the scratch
+ * directory as in use for as long as the container runs. */
+static char* use_private_build_dir(const char* build_dir, int lock_fd)
+{
+    if (snprintf(s_private_build_dir, sizeof(s_private_build_dir), "%s",
+                 build_dir) >= (int)sizeof(s_private_build_dir) ||
+            path_join_suffix(s_oci_rootfs, sizeof(s_oci_rootfs), build_dir,
+                             "/rootfs") < 0)
+    {
+        s_private_build_dir[0] = '\0';
+        close(lock_fd);
+        return NULL;
+    }
+    if (flock(lock_fd, LOCK_SH) < 0)
+    {
+        debug_log("cache.lock", "downgrade failed errno=%d", errno);
+    }
+    s_rootfs_cache_lock_fd = lock_fd;
+    s_rootfs_layer.kind = ROOTFS_LAYER_NONE;
+    debug_log("cache.private", "rootfs=%s", s_oci_rootfs);
+    return s_oci_rootfs;
+}
+
+/*
+ * Prepare the rootfs for this run.  With the cache enabled and usable:
+ * derive the key, reuse a verified entry or build and publish one, then put
+ * a private writable layer over it.  Any reason the cache cannot be used
+ * falls back to the plain per-run extraction.  Returns the rootfs path
+ * (s_oci_rootfs) or NULL.
+ */
+static char* prepare_rootfs(const char* self_path,
+                            const struct container_opts* opts)
+{
+    int mode = effective_rootfs_cache_mode(opts);
+    char root[PATH_MAX];
+    if (mode == ROOTFS_CACHE_OFF)
+    {
+        debug_log("cache.disabled", "reason=mode-off");
+        return extract_oci_rootfs(self_path);
+    }
+    if (rootfs_cache_root(root, sizeof(root)) < 0)
+    {
+        debug_log("cache.disabled", "reason=no-cache-dir");
+        return extract_oci_rootfs(self_path);
+    }
+    int enc = embedded_payload_is_encrypted(self_path);
+    if (enc < 0)
+    {
+        perror("oci2bin: reading embedded payload");
+        return NULL;
+    }
+    if (enc == 1 && mode != ROOTFS_CACHE_ALWAYS)
+    {
+        debug_log("cache.disabled",
+                  "reason=encrypted-payload hint=--rootfs-cache always");
+        return extract_oci_rootfs(self_path);
+    }
+
+    char tmpdir[PATH_MAX];
+    if (make_runtime_tmpdir(tmpdir, sizeof(tmpdir), "oci2bin.") < 0)
+    {
+        perror("mkdtemp");
+        return NULL;
+    }
+    if (snprintf(s_runtime_tmpdir, sizeof(s_runtime_tmpdir), "%s",
+                 tmpdir) >= (int)sizeof(s_runtime_tmpdir))
+    {
+        rm_rf_dir(tmpdir);
+        return NULL;
+    }
+
+    /* 1. Key: straight from the embedded tar when it is plain, else via the
+     * unpacked layout (encrypted with --rootfs-cache always, zstd). */
+    char key[65] = {0};
+    char oci_dir[PATH_MAX];
+    int  have_layout = 0;
+    if (rootfs_cache_key_from_embedded_tar(self_path, key) == 0)
+    {
+        debug_log("cache.key", "key=%s source=embedded-tar", key);
+    }
+    else
+    {
+        if (extract_embedded_oci_layout(self_path, tmpdir, oci_dir,
+                                        sizeof(oci_dir)) < 0)
+        {
+            goto fail;
+        }
+        have_layout = 1;
+        if (rootfs_cache_key_from_layout(oci_dir, key) < 0)
+        {
+            debug_log("cache.disabled", "reason=no-config-key");
+            goto uncached;
+        }
+        debug_log("cache.key", "key=%s source=layout", key);
+    }
+
+    /* 2. Take the entry lock: shared for use, exclusive to (re)build. */
+    if (mkdir_p_secure(root, 0700, "rootfs cache") < 0)
+    {
+        debug_log("cache.disabled", "reason=cache-dir-unwritable");
+        goto uncached;
+    }
+    char entry_dir[PATH_MAX];
+    char lower[PATH_MAX];
+    if (snprintf(entry_dir, sizeof(entry_dir), "%s/%s", root, key) >=
+            (int)sizeof(entry_dir) ||
+            path_join_suffix(lower, sizeof(lower), entry_dir, "/rootfs") < 0)
+    {
+        goto uncached;
+    }
+    int lock_fd = rootfs_cache_lock_open(root, key);
+    if (lock_fd < 0 || flock(lock_fd, LOCK_SH) < 0)
+    {
+        debug_log("cache.disabled", "reason=lock-failed errno=%d", errno);
+        if (lock_fd >= 0)
+        {
+            close(lock_fd);
+        }
+        goto uncached;
+    }
+
+    if (rootfs_cache_verify_entry(entry_dir, key) == 0)
+    {
+        goto hit;
+    }
+
+    /* Miss or corrupt entry: take the exclusive lock.  If the entry exists
+     * and is bad, someone may still be running from it — never yank a tree
+     * from under a live container; run uncached instead. */
+    {
+        struct stat st;
+        int exists = (lstat(entry_dir, &st) == 0);
+        if (flock(lock_fd, LOCK_EX | (exists ? LOCK_NB : 0)) < 0)
+        {
+            debug_log("cache.corrupt", "entry=%s action=in-use-run-uncached",
+                      entry_dir);
+            close(lock_fd);
+            goto uncached;
+        }
+        /* Another builder may have finished while we waited. */
+        if (rootfs_cache_verify_entry(entry_dir, key) == 0)
+        {
+            if (flock(lock_fd, LOCK_SH) < 0)
+            {
+                close(lock_fd);
+                goto uncached;
+            }
+            goto hit;
+        }
+        if (lstat(entry_dir, &st) == 0)
+        {
+            fprintf(stderr, "oci2bin: rootfs cache entry %s failed"
+                            " verification; rebuilding it\n", entry_dir);
+            debug_log("cache.corrupt", "entry=%s action=rebuild", entry_dir);
+            rootfs_cache_discard_entry(root, key, entry_dir);
+        }
+    }
+    debug_log("cache.miss", "key=%s", key);
+
+    /* 3. Build the tree in a sibling temp dir, then publish it atomically. */
+    char build_dir[PATH_MAX];
+    char dest[PATH_MAX];
+    if (snprintf(build_dir, sizeof(build_dir), "%s/.build-%s-XXXXXX", root,
+                 key) >= (int)sizeof(build_dir) || !mkdtemp(build_dir))
+    {
+        debug_log("cache.disabled", "reason=build-dir errno=%d", errno);
+        close(lock_fd);
+        goto uncached;
+    }
+    if (path_join_suffix(dest, sizeof(dest), build_dir, "/rootfs") < 0)
+    {
+        rm_rf_dir(build_dir);
+        close(lock_fd);
+        goto uncached;
+    }
+    {
+        char built_key[65] = {0};
+        int  rc = have_layout
+                  ? extract_layers_from_layout(oci_dir, tmpdir, dest,
+                                               built_key)
+                  : extract_oci_rootfs_into(self_path, tmpdir, dest,
+                                            built_key);
+        if (rc < 0)
+        {
+            rm_rf_dir(build_dir);
+            close(lock_fd);
+            goto fail;
+        }
+        if (strcmp(built_key, key) != 0)
+        {
+            /* Cannot happen for a well-formed payload; never publish a tree
+             * under a key that was not derived from the same bytes. */
+            debug_log("cache.publish", "key=%s result=key-disagreement built=%s",
+                      key, built_key);
+            return use_private_build_dir(build_dir, lock_fd);
+        }
+    }
+    if (rootfs_cache_publish(root, key, build_dir, entry_dir) < 0)
+    {
+        return use_private_build_dir(build_dir, lock_fd);
+    }
+    if (flock(lock_fd, LOCK_SH) < 0)
+    {
+        /* Cannot happen once we hold LOCK_EX; treat as unlocked use. */
+        debug_log("cache.lock", "downgrade failed errno=%d", errno);
+    }
+    if (have_layout)
+    {
+        discard_layout_scratch(tmpdir);
+    }
+    debug_log("cache.stored", "key=%s entry=%s", key, entry_dir);
+    s_rootfs_cache_lock_fd = lock_fd;
+    if (prepare_private_rootfs(lower, tmpdir, opts, opts->use_vm) < 0)
+    {
+        goto fail;
+    }
+    return s_oci_rootfs;
+
+hit:
+    s_rootfs_cache_lock_fd = lock_fd;
+    debug_log("cache.hit", "key=%s entry=%s", key, entry_dir);
+    {
+        char meta[PATH_MAX];
+        if (path_join_suffix(meta, sizeof(meta), entry_dir, "/meta") == 0)
+        {
+            (void)utimensat(AT_FDCWD, meta, NULL, 0);    /* last used */
+        }
+    }
+    if (have_layout)
+    {
+        discard_layout_scratch(tmpdir);
+    }
+    if (prepare_private_rootfs(lower, tmpdir, opts, opts->use_vm) < 0)
+    {
+        goto fail;
+    }
+    return s_oci_rootfs;
+
+uncached:
+    /* Plain per-run extraction into the runtime tmpdir. */
+    s_rootfs_layer.kind = ROOTFS_LAYER_NONE;
+    if (path_join_suffix(s_oci_rootfs, sizeof(s_oci_rootfs), tmpdir,
+                         "/rootfs") < 0)
+    {
+        fprintf(stderr, "oci2bin: rootfs path too long\n");
+        goto fail;
+    }
+    if (have_layout
+            ? extract_layers_from_layout(oci_dir, tmpdir, s_oci_rootfs,
+                                         NULL) < 0
+            : extract_oci_rootfs_into(self_path, tmpdir, s_oci_rootfs,
+                                      NULL) < 0)
+    {
+        goto fail;
+    }
+    return s_oci_rootfs;
+
+fail:
+    /* Nothing below tmpdir is mounted yet on these paths; the FUSE helper,
+     * if one was started, is stopped by cleanup_oci_rootfs(). */
+    stop_lazy_helper(&s_lazy_overlay_pid);
+    rm_rf_dir(tmpdir);
+    s_runtime_tmpdir[0] = '\0';
+    s_oci_rootfs[0] = '\0';
+    return NULL;
 }
 
 /* ── namespace + container entry ─────────────────────────────────────────── */
@@ -13798,6 +15961,18 @@ static int setup_overlay_root(const char* rootfs,
     {
         return 0;
     }
+    /* A cached rootfs already sits under a private writable layer (see
+     * prepare_private_rootfs()): that layer is the ephemeral root, and the
+     * overlay kinds put upper/work in --overlay-persist DIR themselves.  Only
+     * the copy fallback still needs a persistent overlay mounted here. */
+    if (s_rootfs_layer.kind != ROOTFS_LAYER_NONE &&
+            (opts->ephemeral_root ||
+             s_rootfs_layer.kind != ROOTFS_LAYER_COPY))
+    {
+        debug_log("overlay_root.skip", "layer=%s",
+                  rootfs_layer_kind_name(s_rootfs_layer.kind));
+        return 0;
+    }
 
     char upper[PATH_MAX];
     char work[PATH_MAX];
@@ -15140,6 +17315,12 @@ static void usage(const char* prog)
             "  --overlay-persist DIR\n"
             "                      Persist the overlay upper layer to DIR;\n"
             "                      state accumulates across runs\n"
+            "  --rootfs-cache auto|off|always\n"
+            "                      Reuse the extracted rootfs across runs from\n"
+            "                      ${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs\n"
+            "                      (default auto: on, except for encrypted\n"
+            "                      images; always: cache those too; off: extract\n"
+            "                      per run). --no-rootfs-cache = off.\n"
             "  --ssh-agent         Forward host SSH_AUTH_SOCK into the container\n"
             "  --no-seccomp        Disable the default seccomp syscall filter\n"
             "  --seccomp-profile FILE\n"
@@ -16456,6 +18637,29 @@ static int parse_opts(int argc, char* argv[], struct container_opts *opts)
             opts->read_only = 0;
             opts->ephemeral_root = 0;
             opts->overlay_persist = argv[i];
+        }
+        else if (strcmp(argv[i], "--rootfs-cache") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr,
+                        "oci2bin: --rootfs-cache requires auto|off|always\n");
+                return -1;
+            }
+            i++;
+            int mode = parse_rootfs_cache_mode(argv[i]);
+            if (mode < 0)
+            {
+                fprintf(stderr,
+                        "oci2bin: --rootfs-cache: expected auto, off or"
+                        " always, got '%s'\n", argv[i]);
+                return -1;
+            }
+            opts->rootfs_cache_mode = mode;
+        }
+        else if (strcmp(argv[i], "--no-rootfs-cache") == 0)
+        {
+            opts->rootfs_cache_mode = ROOTFS_CACHE_OFF;
         }
         else if (strcmp(argv[i], "--ssh-agent") == 0)
         {
@@ -19095,24 +21299,36 @@ static void unmount_tree_below(const char* prefix)
 
 static void cleanup_oci_rootfs(void)
 {
-    if (s_oci_rootfs_cleaned || s_oci_rootfs[0] == '\0')
+    if (s_oci_rootfs_cleaned)
     {
         return;
     }
     s_oci_rootfs_cleaned = 1;
-    /* s_oci_rootfs points at "<tmpdir>/rootfs"; strip the suffix and
-     * remove the whole tmpdir. rm_rf_dir is a no-op on a missing path. */
-    char* last_slash = strrchr(s_oci_rootfs, '/');
-    if (last_slash)
+    /* The runtime tmpdir holds the rootfs mount point or copy plus the
+     * overlay upper/work dirs; the cached tree itself lives elsewhere and is
+     * only ever reached through a mount here.  Detach everything below
+     * first, then remove.  rm_rf_dir() refuses to cross a mount that is
+     * still there, so a slow FUSE detach can leak a tmpdir but never delete
+     * through it. */
+    if (s_runtime_tmpdir[0] != '\0')
     {
-        *last_slash = '\0';
-        unmount_tree_below(s_oci_rootfs);
+        unmount_tree_below(s_runtime_tmpdir);
         /* FUSE mounts normally disappear via auto_unmount. Terminate the
          * daemons as a backstop, rescan, and only then remove the tree. */
         stop_lazy_helper(&s_lazy_overlay_pid);
         stop_lazy_helper(&s_lazy_squash_pid);
-        unmount_tree_below(s_oci_rootfs);
-        rm_rf_dir(s_oci_rootfs);
+        unmount_tree_below(s_runtime_tmpdir);
+        rm_rf_dir(s_runtime_tmpdir);
+    }
+    if (s_private_build_dir[0] != '\0')
+    {
+        unmount_tree_below(s_private_build_dir);
+        rm_rf_dir(s_private_build_dir);
+    }
+    if (s_rootfs_cache_lock_fd >= 0)
+    {
+        close(s_rootfs_cache_lock_fd);    /* releases the shared lock */
+        s_rootfs_cache_lock_fd = -1;
     }
 }
 
@@ -23321,10 +25537,11 @@ int main(int argc, char* argv[])
     /* 4. Prepare the rootfs. SquashFS artifacts can skip layer extraction;
      * ordinary artifacts retain the existing OCI merge path. */
     char* rootfs = opts.lazy ? mount_lazy_rootfs(self_path, &opts)
-                   : extract_oci_rootfs(self_path);
+                   : prepare_rootfs(self_path, &opts);
     if (!rootfs)
     {
         fprintf(stderr, "oci2bin: failed to prepare rootfs\n");
+        cleanup_oci_rootfs();
         return 1;
     }
     /* Ensure the tmpdir is removed on every exit path — explicit returns
@@ -23532,15 +25749,25 @@ int main(int argc, char* argv[])
 
     /* Single-ID fallback needs passwd/group rewrites and privilege-drop shims.
      * Full subordinate-ID remap exposes the container's normal 0-65535 range,
-     * so keep the image metadata intact in that mode. */
-    if (!userns_plan.use_subid_remap)
+     * so keep the image metadata intact in that mode.
+     *
+     * With a cached rootfs whose writable layer is an overlay mounted inside
+     * the namespaces (overlay-ns), the rootfs path is still an empty mount
+     * point here; both edits are applied right after that mount instead, so
+     * they land in this run's upper layer and never in the shared tree. */
+    int rootfs_edits_deferred =
+        (s_rootfs_layer.kind == ROOTFS_LAYER_OVERLAY_NS);
+    if (!userns_plan.use_subid_remap && !rootfs_edits_deferred)
     {
         patch_rootfs_ids(rootfs);
     }
     /* DNS is needed in both userns modes; it used to be installed only from
      * patch_rootfs_ids(), so hosts with a working newuidmap + /etc/subuid
      * setup got no resolver in images that ship none. */
-    install_resolv_conf(rootfs);
+    if (!rootfs_edits_deferred)
+    {
+        install_resolv_conf(rootfs);
+    }
 
     /* 6a. Set up cgroup v2 resource limits (before unshare, uses host cgroupfs) */
     int cg_limits_failed = 0;
@@ -23806,6 +26033,21 @@ int main(int argc, char* argv[])
     if (make_mount_tree_private() < 0)
     {
         return 1;
+    }
+
+    /* 10a. Cached rootfs: mount this run's overlay now that the user and
+     * mount namespaces exist, then apply the edits deferred above. */
+    if (finish_deferred_rootfs_layer() < 0)
+    {
+        return 1;
+    }
+    if (rootfs_edits_deferred)
+    {
+        if (!userns_plan.use_subid_remap)
+        {
+            patch_rootfs_ids(rootfs);
+        }
+        install_resolv_conf(rootfs);
     }
 
     /* 10c. Time namespace: shift monotonic and boottime clocks when

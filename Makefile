@@ -45,7 +45,9 @@ TEST_C_BIN         = build/test_c_units
 TEST_C_BIN_AARCH64 = build/test_c_units-aarch64
 TEST_C_STUBS_BIN   = build/test_c_stubs
 TEST_TMPDIR       ?= $(CURDIR)/build/test-tmp
-TEST_ENV           = TMPDIR=$(TEST_TMPDIR) OCI2BIN_TMPDIR=$(TEST_TMPDIR)
+# XDG_CACHE_HOME keeps the loader's extracted-rootfs cache (and any test
+# that runs a built binary) out of the developer's ~/.cache.
+TEST_ENV           = TMPDIR=$(TEST_TMPDIR) OCI2BIN_TMPDIR=$(TEST_TMPDIR) XDG_CACHE_HOME=$(TEST_TMPDIR)/xdg-cache
 
 MAKEINFO  ?= $(or $(shell command -v texi2any 2>/dev/null),\
                $(shell command -v makeinfo 2>/dev/null),\
