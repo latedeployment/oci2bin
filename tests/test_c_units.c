@@ -8323,6 +8323,538 @@ static void test_parse_opts_rootfs_cache(void)
                   "rootfs-cache: mode name");
 }
 
+/* ── native signature verification ───────────────────────────────────────── */
+
+static int hex_to_bytes(const char* hex, unsigned char* out, size_t out_sz)
+{
+    size_t n = strlen(hex) / 2;
+    if (n > out_sz)
+    {
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++)
+    {
+        unsigned v;
+        if (sscanf(hex + 2 * i, "%2x", &v) != 1)
+        {
+            return -1;
+        }
+        out[i] = (unsigned char)v;
+    }
+    return (int)n;
+}
+
+/* Vectors produced once with openssl (P-256 key, pkeyutl -sign over the
+ * SHA-256 / SHA-512 digest of the message). */
+static const char* const SIG_TEST_MSG =
+    "The quick brown fox jumps over the lazy dog";
+static const char* const SIG_TEST_PUB_PEM =
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDBqn++iI0O0nN1NDFQyY8Y224p8e\n"
+    "JNb5gTDsbBHaXEdu1tDAWhOFD5COex0wF2bL5ipxGsmB4G76VloEXoagOg==\n"
+    "-----END PUBLIC KEY-----\n";
+static const char* const SIG_TEST_P384_PEM =
+    "-----BEGIN PUBLIC KEY-----\n"
+    "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEANLNrf1PKqP7wbiJ3elm9JKBNYl0+h6T\n"
+    "IjgRJbyjMaTwA1/p//0Snp2foUz8ch2XUd6Xcenkn8dSajbwMRNFnLqk91gAgElR\n"
+    "NFUNrmRM+IG3jHO2LyKs7Ncz2OaYcTNQ\n"
+    "-----END PUBLIC KEY-----\n";
+static const char* const SIG_TEST_SIG256_HEX =
+    "304502201b0aa68cd0a4d673179bc92fcc0f9c4f3a0074cadacbd4e687924e50eee31d38"
+    "022100968a03039a2bacf276ef02af5feb64b282c1c5e1f70d28a9980ea16db3e6ca81";
+static const char* const SIG_TEST_SIG512_HEX =
+    "304402204bf08c1f0e063924ba18d1ee32a7b127cef4b02b71bb5edcbe736bd139e85b82"
+    "02206bfa007d4e321c09bf2ea2d17514cefa3a7f0212ee22a036fd15a3e62e22629f";
+
+static void test_sha512_vectors(void)
+{
+    struct sha512_ctx ctx;
+    unsigned char d[64];
+    char hex[129];
+    static const char hexd[] = "0123456789abcdef";
+
+    sha512_init(&ctx);
+    sha512_update(&ctx, "abc", 3);
+    sha512_final(&ctx, d);
+    for (int i = 0; i < 64; i++)
+    {
+        hex[i * 2] = hexd[d[i] >> 4];
+        hex[i * 2 + 1] = hexd[d[i] & 15];
+    }
+    hex[128] = '\0';
+    ASSERT_STR_EQ(hex,
+                  "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+                  "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+                  "sha512: abc");
+
+    sha512_init(&ctx);
+    char chunk[1000];
+    memset(chunk, 'a', sizeof(chunk));
+    for (int i = 0; i < 1000; i++)
+    {
+        sha512_update(&ctx, chunk, sizeof(chunk));
+    }
+    sha512_final(&ctx, d);
+    for (int i = 0; i < 64; i++)
+    {
+        hex[i * 2] = hexd[d[i] >> 4];
+        hex[i * 2 + 1] = hexd[d[i] & 15];
+    }
+    ASSERT_STR_EQ(hex,
+                  "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973eb"
+                  "de0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b",
+                  "sha512: one million a");
+
+    struct sig_hash h;
+    unsigned char out[64];
+    ASSERT_INT_EQ(sig_hash_init(&h, SIG_HASH_SHA256), 0, "sig_hash: sha256");
+    sig_hash_update(&h, SIG_TEST_MSG, strlen(SIG_TEST_MSG));
+    ASSERT_INT_EQ((int)sig_hash_final(&h, out), 32, "sig_hash: sha256 length");
+    ASSERT(out[0] == 0xd7 && out[31] == 0x92, "sig_hash: sha256 of the message");
+    ASSERT_INT_EQ(sig_hash_init(&h, SIG_HASH_SHA512), 0, "sig_hash: sha512");
+    sig_hash_update(&h, SIG_TEST_MSG, strlen(SIG_TEST_MSG));
+    ASSERT_INT_EQ((int)sig_hash_final(&h, out), 64, "sig_hash: sha512 length");
+    ASSERT(out[0] == 0x07 && out[63] == 0xe6, "sig_hash: sha512 of the message");
+    ASSERT_INT_EQ(sig_hash_init(&h, 7), -1, "sig_hash: unknown algorithm");
+}
+
+static void test_p256_arithmetic(void)
+{
+    /* n * G is the point at infinity; (n-1) * G has G's x. */
+    unsigned char gx[32], gy[32];
+    hex_to_bytes("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+                 gx, 32);
+    hex_to_bytes("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+                 gy, 32);
+    struct p256_pt G, R;
+    ASSERT_INT_EQ(p256_load_point(&G, gx, gy), 0, "p256: generator on curve");
+    pt_mul(&R, &P256_N.m, &G);
+    ASSERT(pt_is_inf(&R), "p256: n*G is infinity");
+    fe256 nm1;
+    static const fe256 one = {{1, 0, 0, 0}};
+    fe_sub_raw(&nm1, &P256_N.m, &one);
+    pt_mul(&R, &nm1, &G);
+    fe256 x, gxf;
+    ASSERT_INT_EQ(pt_affine_x(&x, &R), 0, "p256: (n-1)*G is finite");
+    fe_from_bytes_be(&gxf, gx, 32);
+    ASSERT(fe_cmp(&x, &gxf) == 0, "p256: (n-1)*G has the generator's x");
+
+    /* 2G computed by doubling and by adding agree. */
+    struct p256_pt d, a;
+    pt_double(&d, &G);
+    pt_add(&a, &G, &G);
+    fe256 xd, xa;
+    pt_affine_x(&xd, &d);
+    pt_affine_x(&xa, &a);
+    ASSERT(fe_cmp(&xd, &xa) == 0, "p256: double and add agree on 2G");
+    unsigned char two_gx[32];
+    hex_to_bytes("7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978",
+                 two_gx, 32);
+    fe256 want;
+    fe_from_bytes_be(&want, two_gx, 32);
+    ASSERT(fe_cmp(&xd, &want) == 0, "p256: 2G matches the known value");
+
+    /* Modular inverse round trip in both moduli. */
+    fe256 v = {{0x1234567890abcdefULL, 0xfedcba0987654321ULL, 7, 9}};
+    for (int which = 0; which < 2; which++)
+    {
+        const struct mont_mod* M = which ? &P256_N : &P256_P;
+        fe256 vm, inv, prod, back;
+        fe_to_mont(&vm, &v, M);
+        fe_mont_inv(&inv, &vm, M);
+        fe_mont_mul(&prod, &vm, &inv, M);
+        fe_from_mont(&back, &prod, M);
+        ASSERT(fe_cmp(&back, &one) == 0,
+               which ? "p256: inverse mod n" : "p256: inverse mod p");
+    }
+
+    /* Off-curve points are refused. */
+    gy[31] ^= 1;
+    ASSERT_INT_EQ(p256_load_point(&G, gx, gy), -1,
+                  "p256: off-curve point rejected");
+}
+
+static void test_ecdsa_p256_vectors(void)
+{
+    unsigned char qx[32], qy[32], der[128];
+    ASSERT_INT_EQ(parse_p256_spki_pem(SIG_TEST_PUB_PEM, qx, qy, der,
+                                      sizeof(der), NULL), 1,
+                  "spki: P-256 key parses");
+    ASSERT_INT_EQ(parse_p256_spki_pem(SIG_TEST_P384_PEM, qx, qy, NULL, 0,
+                                      NULL), 0,
+                  "spki: P-384 key reported as unsupported, not malformed");
+    ASSERT_INT_EQ(parse_p256_spki_pem("-----BEGIN PUBLIC KEY-----\nAAAA\n"
+                                      "-----END PUBLIC KEY-----\n", qx, qy,
+                                      NULL, 0, NULL), -1,
+                                      "spki: garbage rejected");
+    ASSERT_INT_EQ(parse_p256_spki_pem("not pem at all", qx, qy, NULL, 0,
+                                      NULL), -1,
+                  "spki: missing PEM armour rejected");
+    parse_p256_spki_pem(SIG_TEST_PUB_PEM, qx, qy, NULL, 0, NULL);
+
+    unsigned char sig256[80], sig512[80];
+    int l256 = hex_to_bytes(SIG_TEST_SIG256_HEX, sig256, sizeof(sig256));
+    int l512 = hex_to_bytes(SIG_TEST_SIG512_HEX, sig512, sizeof(sig512));
+    fe256 r, s;
+    ASSERT_INT_EQ(parse_ecdsa_sig_der(sig256, (size_t)l256, &r, &s), 0,
+                  "der: sha256 signature parses");
+    unsigned char d256[32], d512[64];
+    struct sha256_ctx c256;
+    sha256_init(&c256);
+    sha256_update(&c256, SIG_TEST_MSG, strlen(SIG_TEST_MSG));
+    sha256_final(&c256, d256);
+    ASSERT_INT_EQ(ecdsa_p256_verify(qx, qy, &r, &s, d256, 32), 1,
+                  "ecdsa: valid sha256 signature verifies");
+    d256[5] ^= 0x01;
+    ASSERT_INT_EQ(ecdsa_p256_verify(qx, qy, &r, &s, d256, 32), 0,
+                  "ecdsa: altered digest fails");
+    d256[5] ^= 0x01;
+    fe256 s2 = s;
+    s2.v[0] ^= 1;
+    ASSERT_INT_EQ(ecdsa_p256_verify(qx, qy, &r, &s2, d256, 32), 0,
+                  "ecdsa: altered s fails");
+    fe256 zero = {{0, 0, 0, 0}};
+    ASSERT_INT_EQ(ecdsa_p256_verify(qx, qy, &zero, &s, d256, 32), 0,
+                  "ecdsa: r = 0 rejected");
+    ASSERT_INT_EQ(ecdsa_p256_verify(qx, qy, &r, &P256_N.m, d256, 32), 0,
+                  "ecdsa: s = n rejected");
+
+    ASSERT_INT_EQ(parse_ecdsa_sig_der(sig512, (size_t)l512, &r, &s), 0,
+                  "der: sha512 signature parses");
+    struct sha512_ctx c512;
+    sha512_init(&c512);
+    sha512_update(&c512, SIG_TEST_MSG, strlen(SIG_TEST_MSG));
+    sha512_final(&c512, d512);
+    ASSERT_INT_EQ(ecdsa_p256_verify(qx, qy, &r, &s, d512, 64), 1,
+                  "ecdsa: valid sha512 signature verifies (truncated digest)");
+    ASSERT_INT_EQ(ecdsa_p256_verify(qx, qy, &r, &s, d256, 32), 0,
+                  "ecdsa: sha512 signature does not verify a sha256 digest");
+
+    /* DER strictness: trailing byte, non-minimal integer, wrong tag. */
+    unsigned char bad[90];
+    memcpy(bad, sig256, (size_t)l256);
+    bad[l256] = 0x00;
+    ASSERT_INT_EQ(parse_ecdsa_sig_der(bad, (size_t)l256 + 1, &r, &s), -1,
+                  "der: trailing byte rejected");
+    memcpy(bad, sig512, (size_t)l512);
+    /* sig512's r has no leading zero: insert one to make it non-minimal. */
+    memmove(bad + 5, bad + 4, (size_t)l512 - 4);
+    bad[4] = 0x00;
+    bad[1] += 1;
+    bad[3] += 1;
+    ASSERT_INT_EQ(parse_ecdsa_sig_der(bad, (size_t)l512 + 1, &r, &s), -1,
+                  "der: non-minimal INTEGER rejected");
+    memcpy(bad, sig256, (size_t)l256);
+    bad[0] = 0x31;
+    ASSERT_INT_EQ(parse_ecdsa_sig_der(bad, (size_t)l256, &r, &s), -1,
+                  "der: wrong outer tag rejected");
+}
+
+/* Build "<content><OCI2BIN_SIG block>" the way sign_binary.py lays it out. */
+static size_t sig_test_make_block(unsigned char* out, int version, int alg,
+                                  const unsigned char* sig, size_t siglen,
+                                  size_t attlen)
+{
+    size_t off = 0;
+    memcpy(out + off, "OCI2BIN_SIG", 12);
+    off += 12;
+    out[off++] = (unsigned char)version;
+    if (version >= 2)
+    {
+        out[off++] = (unsigned char)alg;
+    }
+    memset(out + off, 0xab, 32);            /* keyid */
+    off += 32;
+    out[off++] = (unsigned char)(siglen >> 8);
+    out[off++] = (unsigned char)siglen;
+    memcpy(out + off, sig, siglen);
+    off += siglen;
+    if (version == 3)
+    {
+        out[off++] = (unsigned char)(attlen >> 24);
+        out[off++] = (unsigned char)(attlen >> 16);
+        out[off++] = (unsigned char)(attlen >> 8);
+        out[off++] = (unsigned char)attlen;
+        memset(out + off, '{', attlen);
+        off += attlen;
+        out[off++] = 0;
+        out[off++] = 0;                     /* attsiglen = 0 */
+    }
+    memcpy(out + off, "OCI2BIN_SIG_END", 16);
+    off += 16;
+    size_t total = off + 4;
+    out[off++] = (unsigned char)(total >> 24);
+    out[off++] = (unsigned char)(total >> 16);
+    out[off++] = (unsigned char)(total >> 8);
+    out[off++] = (unsigned char)total;
+    return off;
+}
+
+static void test_native_signature_end_to_end(void)
+{
+    unsigned char sig512[80];
+    int l512 = hex_to_bytes(SIG_TEST_SIG512_HEX, sig512, sizeof(sig512));
+    size_t msg_len = strlen(SIG_TEST_MSG);
+    unsigned char file[1024];
+    memcpy(file, SIG_TEST_MSG, msg_len);
+
+    for (int version = 2; version <= 3; version++)
+    {
+        size_t blen = sig_test_make_block(file + msg_len, version,
+                                          SIG_HASH_SHA512, sig512,
+                                          (size_t)l512, version == 3 ? 9 : 0);
+        size_t size = msg_len + blen;
+        struct sig_block blk;
+        char desc[64];
+        snprintf(desc, sizeof(desc), "sig block: v%d parses", version);
+        ASSERT_INT_EQ(find_sig_block(file, size, &blk), 1, desc);
+        ASSERT_INT_EQ((int)blk.content_end, (int)msg_len,
+                      "sig block: content ends where the block starts");
+        ASSERT_INT_EQ(blk.hash_alg, SIG_HASH_SHA512, "sig block: hash alg");
+        ASSERT_INT_EQ((int)blk.sig_len, l512, "sig block: signature length");
+        const char* why = "";
+        ASSERT_INT_EQ(native_verify_signature(file, size, SIG_TEST_PUB_PEM,
+                                              &why), 1,
+                      "native verify: signed content verifies");
+        ASSERT_INT_EQ(native_verify_signature(file, size, SIG_TEST_P384_PEM,
+                                              &why), -1,
+                      "native verify: non-P-256 key reports unsupported");
+        file[3] ^= 0x20;
+        ASSERT_INT_EQ(native_verify_signature(file, size, SIG_TEST_PUB_PEM,
+                                              &why), 0,
+                      "native verify: tampered content fails");
+        file[3] ^= 0x20;
+        /* Junk between the signature and the trailer is not signed. */
+        file[msg_len + 12 + 1 + 1 + 32 + 2 + l512 - 1] ^= 0xff;
+        ASSERT_INT_EQ(native_verify_signature(file, size, SIG_TEST_PUB_PEM,
+                                              &why), 0,
+                      "native verify: corrupted signature fails");
+        file[msg_len + 12 + 1 + 1 + 32 + 2 + l512 - 1] ^= 0xff;
+    }
+    /* Unsigned file, a v1 block with the wrong hash, and a bad trailer
+     * length all read as "not signed". */
+    struct sig_block blk;
+    ASSERT_INT_EQ(find_sig_block(file, msg_len, &blk), 0,
+                  "sig block: unsigned file");
+    size_t blen = sig_test_make_block(file + msg_len, 2, 9, sig512,
+                                      (size_t)l512, 0);
+    ASSERT_INT_EQ(find_sig_block(file, msg_len + blen, &blk), 0,
+                  "sig block: unknown hash algorithm is not a block");
+    blen = sig_test_make_block(file + msg_len, 2, SIG_HASH_SHA512, sig512,
+                               (size_t)l512, 0);
+    file[msg_len + blen - 1] += 7;    /* total length points elsewhere */
+    ASSERT_INT_EQ(find_sig_block(file, msg_len + blen, &blk), 0,
+                  "sig block: inconsistent total length is not a block");
+
+    /* The whole --verify-key path through files: key file + signed file. */
+    char dir[PATH_MAX];
+    cache_test_mkdtemp(dir, sizeof(dir), "vk");
+    char bin[PATH_MAX], key[PATH_MAX];
+    snprintf(bin, sizeof(bin), "%s/signed.bin", dir);
+    snprintf(key, sizeof(key), "%s/pub.pem", dir);
+    blen = sig_test_make_block(file + msg_len, 2, SIG_HASH_SHA512, sig512,
+                               (size_t)l512, 0);
+    int fd = open(bin, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    write_all_fd(fd, (char*)file, msg_len + blen);
+    close(fd);
+    fd = open(key, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    write_all_fd(fd, SIG_TEST_PUB_PEM, strlen(SIG_TEST_PUB_PEM));
+    close(fd);
+    ASSERT_INT_EQ(verify_signature(bin, key), 0,
+                  "verify-key: signed file passes without python or openssl");
+    fd = open(bin, O_WRONLY);
+    pwrite(fd, "X", 1, 0);
+    close(fd);
+    ASSERT_INT_EQ(verify_signature(bin, key), -1,
+                  "verify-key: tampered file is refused");
+    unlink(bin);
+    unlink(key);
+    rmdir(dir);
+}
+
+/* A metadata block as build_meta_block() frames it. */
+static size_t sig_test_meta_block(unsigned char* out, const char* json)
+{
+    size_t jlen = strlen(json) + 1;    /* NUL pad */
+    size_t total = 4 + 13 + jlen;
+    out[0] = (unsigned char)total;
+    out[1] = (unsigned char)(total >> 8);
+    out[2] = (unsigned char)(total >> 16);
+    out[3] = (unsigned char)(total >> 24);
+    memcpy(out + 4, "OCI2BIN_META", 13);
+    memcpy(out + 17, json, jlen);
+    return total;
+}
+
+static void test_native_pin_check(void)
+{
+    static const char hexd[] = "0123456789abcdef";
+    char dir[PATH_MAX];
+    cache_test_mkdtemp(dir, sizeof(dir), "pin");
+    for (int alg = 0; alg < 2; alg++)
+    {
+        char place[160];
+        if (alg == 0)
+        {
+            memset(place, '0', 64);
+            place[64] = '\0';
+        }
+        else
+        {
+            memcpy(place, "sha512:", 7);
+            memset(place + 7, '0', 128);
+            place[135] = '\0';
+        }
+        char json[512];
+        snprintf(json, sizeof(json),
+                 "{\"image\":\"t:1\",\"pin_digest\":\"%s\"}", place);
+        unsigned char file[2048];
+        size_t body = 700;
+        memset(file, 0x5a, body);
+        size_t mlen = sig_test_meta_block(file + body, json);
+        size_t size = body + mlen;
+
+        /* The builder's digest: the file with the placeholder in place. */
+        unsigned char d[64];
+        size_t dlen;
+        if (alg == 0)
+        {
+            struct sha256_ctx c;
+            sha256_init(&c);
+            sha256_update(&c, file, size);
+            sha256_final(&c, d);
+            dlen = 32;
+        }
+        else
+        {
+            struct sha512_ctx c;
+            sha512_init(&c);
+            sha512_update(&c, file, size);
+            sha512_final(&c, d);
+            dlen = 64;
+        }
+        char hex[129];
+        for (size_t i = 0; i < dlen; i++)
+        {
+            hex[i * 2] = hexd[d[i] >> 4];
+            hex[i * 2 + 1] = hexd[d[i] & 15];
+        }
+        hex[dlen * 2] = '\0';
+        /* The JSON starts after the LE32 length and the magic. */
+        char* zeros = strstr((char*)file + body + 17,
+                             alg == 0 ? "\"0000" : ":0000");
+        ASSERT_NOT_NULL(zeros, "pin: placeholder present in the block");
+        if (!zeros)
+        {
+            continue;
+        }
+        memcpy(zeros + 1, hex, dlen * 2);    /* patch the pin in place */
+
+        char bin[PATH_MAX];
+        snprintf(bin, sizeof(bin), "%s/pinned-%d.bin", dir, alg);
+        int fd = open(bin, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        write_all_fd(fd, (char*)file, size);
+        close(fd);
+        ASSERT_INT_EQ(verify_pinned_digest(bin), 0,
+                      alg == 0 ? "pin: sha256 pin verifies natively"
+                      : "pin: sha512 pin verifies natively");
+
+        /* A signature block appended after the pin is not part of the
+         * pinned content. */
+        unsigned char sig512[80];
+        int l512 = hex_to_bytes(SIG_TEST_SIG512_HEX, sig512, sizeof(sig512));
+        size_t blen = sig_test_make_block(file + size, 2, SIG_HASH_SHA512,
+                                          sig512, (size_t)l512, 0);
+        fd = open(bin, O_WRONLY | O_TRUNC);
+        write_all_fd(fd, (char*)file, size + blen);
+        close(fd);
+        ASSERT_INT_EQ(verify_pinned_digest(bin), 0,
+                      "pin: trailing signature block is stripped first");
+
+        /* Tampering with the body is caught. */
+        fd = open(bin, O_WRONLY);
+        pwrite(fd, "!", 1, 10);
+        close(fd);
+        ASSERT_INT_EQ(verify_pinned_digest(bin), 1,
+                      "pin: tampered body refused");
+        unlink(bin);
+    }
+
+    /* Malformed pins refuse; absent pins pass. */
+    const char* cases[][2] =
+    {
+        {"{\"pin_digest\":\"md5:abc\"}", "pin: unsupported algorithm refused"},
+        {"{\"pin_digest\":\"zz\"}", "pin: wrong length refused"},
+        {"{\"image\":\"t\"}", "pin: no pin passes"},
+        {"{\"pin_digest\":\"\"}", "pin: empty pin passes"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        unsigned char file[1024];
+        memset(file, 0x11, 100);
+        size_t mlen = sig_test_meta_block(file + 100, cases[i][0]);
+        char bin[PATH_MAX];
+        snprintf(bin, sizeof(bin), "%s/case-%zu.bin", dir, i);
+        int fd = open(bin, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        write_all_fd(fd, (char*)file, 100 + mlen);
+        close(fd);
+        ASSERT_INT_EQ(verify_pinned_digest(bin), i >= 2 ? 0 : 1, cases[i][1]);
+        unlink(bin);
+    }
+    rmdir(dir);
+}
+
+static void test_native_require_signed(void)
+{
+    /* Policy present, key embedded, but no signature block: refused. */
+    char dir[PATH_MAX];
+    cache_test_mkdtemp(dir, sizeof(dir), "rs");
+    char bin[PATH_MAX];
+    snprintf(bin, sizeof(bin), "%s/policy.bin", dir);
+    char json[1024];
+    /* The PEM's newlines become \\n escapes inside the JSON string. */
+    snprintf(json, sizeof(json),
+             "{\"require_signed\":true,\"verify_pubkey\":\""
+             "-----BEGIN PUBLIC KEY-----\\n"
+             "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEDBqn++iI0O0nN1NDFQyY8Y224p8e\\n"
+             "JNb5gTDsbBHaXEdu1tDAWhOFD5COex0wF2bL5ipxGsmB4G76VloEXoagOg==\\n"
+             "-----END PUBLIC KEY-----\\n\"}");
+    unsigned char file[2048];
+    memset(file, 0x42, 300);
+    size_t mlen = sig_test_meta_block(file + 300, json);
+    int fd = open(bin, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    write_all_fd(fd, (char*)file, 300 + mlen);
+    close(fd);
+    ASSERT_INT_EQ(enforce_require_signed(bin), 1,
+                  "require-signed: policy without a signature refuses");
+
+    /* A signature by a different key (our vector key signs a different
+     * message) is refused natively — no python involved. */
+    unsigned char sig512[80];
+    int l512 = hex_to_bytes(SIG_TEST_SIG512_HEX, sig512, sizeof(sig512));
+    size_t blen = sig_test_make_block(file + 300 + mlen, 2, SIG_HASH_SHA512,
+                                      sig512, (size_t)l512, 0);
+    fd = open(bin, O_WRONLY | O_TRUNC);
+    write_all_fd(fd, (char*)file, 300 + mlen + blen);
+    close(fd);
+    ASSERT_INT_EQ(enforce_require_signed(bin), 1,
+                  "require-signed: signature over other content refuses");
+
+    /* The verify_pubkey is read back through the JSON unescape: the PEM
+     * must parse as a P-256 key. */
+    char* meta = NULL;
+    ASSERT_INT_EQ(read_self_metadata(bin, &meta), 1,
+                  "require-signed: metadata block readable");
+    char* pub = json_get_toplevel_string(meta, "verify_pubkey");
+    unsigned char qx[32], qy[32];
+    ASSERT(pub && parse_p256_spki_pem(pub, qx, qy, NULL, 0, NULL) == 1,
+           "require-signed: embedded PEM decodes to the P-256 key");
+    free(pub);
+    free(meta);
+    unlink(bin);
+    rmdir(dir);
+}
+
 int main(void)
 {
     /* TAP plan printed after we know the count — use streaming output instead */
@@ -8436,6 +8968,12 @@ int main(void)
     test_rootfs_cache_root_resolution();
     test_rootfs_cache_publish_verify();
     test_parse_opts_rootfs_cache();
+    test_sha512_vectors();
+    test_p256_arithmetic();
+    test_ecdsa_p256_vectors();
+    test_native_signature_end_to_end();
+    test_native_pin_check();
+    test_native_require_signed();
 
     printf("1..%d\n", tap_test_num);
 

@@ -295,6 +295,89 @@ class TestCliFeatures(unittest.TestCase):
         self.assertIn("1 rootfs cache entry removed", prune.stdout)
         self.assertFalse(entry.exists())
 
+    def test_signed_and_pinned_binary_verifies_natively(self):
+        """--require-signed + --pin-digest are checked in-process.
+
+        The launch must succeed with the native events in --debug output and
+        refuse a tampered copy; python3/openssl are only used here to build
+        and sign the artifact.
+        """
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl needed to sign the test binary")
+        if not _userns_available():
+            self.skipTest("user namespaces unavailable; cannot run binaries")
+        key = self.tmpdir / "native-sign.key"
+        pub = self.tmpdir / "native-sign.pub"
+        subprocess.run(
+            ["openssl", "ecparam", "-name", "prime256v1", "-genkey",
+             "-noout", "-out", str(key)],
+            check=True, capture_output=True, timeout=30)
+        subprocess.run(
+            ["openssl", "ec", "-in", str(key), "-pubout", "-out", str(pub)],
+            check=True, capture_output=True, timeout=30)
+
+        writer_src = self.tmpdir / "writer-native.c"
+        writer_src.write_text(_WRITER_SRC, encoding="utf-8")
+        writer = self.tmpdir / "writer-native"
+        build = subprocess.run(
+            ["gcc", "-static", "-O2", "-s", "-o", str(writer),
+             str(writer_src)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(build.returncode, 0, msg=build.stderr)
+        tar_bytes, _config = _program_oci_tar(writer.read_bytes())
+        tar_path = self.tmpdir / "native-signed.tar"
+        tar_path.write_bytes(tar_bytes)
+        binary = self.tmpdir / "native-signed.bin"
+        result = subprocess.run(
+            ["python3", str(ROOT / "scripts" / "build_polyglot.py"),
+             "--loader", str(self.loader), "--tar", str(tar_path),
+             "--image-name", "native:latest", "--output", str(binary),
+             "--pin-digest", "sha512:auto", "--require-signed", str(pub)],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        sign = subprocess.run(
+            [str(OCI2BIN), "sign", "--key", str(key), "--in", str(binary)],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(sign.returncode, 0, msg=sign.stderr)
+
+        xdg = self.tmpdir / "xdg-native"
+        tmp = self.tmpdir / "runtime-native"
+        tmp.mkdir(parents=True, exist_ok=True)
+        run = self._run_cached(binary, xdg, tmp, "--verify-key", str(pub))
+        self.assertEqual(run.returncode, 0, msg=run.stderr)
+        self.assertIn("writer ran", run.stdout)
+        self.assertIn("event=pin.native algo=sha512 result=ok", run.stderr)
+        self.assertIn("event=require_signed.native result=1", run.stderr)
+        self.assertIn("event=verify_key.native result=1", run.stderr)
+
+        # Flip a byte inside the payload: pin and signature both fail, and
+        # the pin is checked first.
+        tampered = self.tmpdir / "native-tampered.bin"
+        data = bytearray(binary.read_bytes())
+        data[len(data) // 2] ^= 0x01
+        tampered.write_bytes(bytes(data))
+        tampered.chmod(0o755)
+        bad = self._run_cached(tampered, xdg, tmp)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("pinned digest mismatch", bad.stderr)
+        self.assertNotIn("writer ran", bad.stdout)
+
+        # The wrong verify key is refused natively as well.
+        other_pub = self.tmpdir / "other.pub"
+        other_key = self.tmpdir / "other.key"
+        subprocess.run(
+            ["openssl", "ecparam", "-name", "prime256v1", "-genkey",
+             "-noout", "-out", str(other_key)],
+            check=True, capture_output=True, timeout=30)
+        subprocess.run(
+            ["openssl", "ec", "-in", str(other_key), "-pubout", "-out",
+             str(other_pub)],
+            check=True, capture_output=True, timeout=30)
+        wrong = self._run_cached(binary, xdg, tmp, "--verify-key",
+                                 str(other_pub))
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertIn("signature does not match", wrong.stderr)
+
     def test_systemd_emits_unit_with_label_name(self):
         binary = self._build_binary(
             "svc.bin",

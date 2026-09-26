@@ -6,6 +6,19 @@ All notable changes to oci2bin are documented here.
 
 ### Added
 
+- **Signed and pinned binaries now launch without python3 or openssl.** The
+  loader verifies its own signature block in-process: SHA-256/SHA-512 over
+  the mapped file, strict DER parsing of the ECDSA signature and the PEM
+  public key, and ECDSA over NIST P-256 (Montgomery field arithmetic,
+  Jacobian points). `--verify-key`, the embedded `--require-signed` policy
+  and the `pin_digest` check all take this path; the pinned digest is
+  recomputed natively with the same placeholder substitution the builder
+  used. The embedded python/openssl verifiers remain only as a fallback for
+  keys on another curve (refused when python3 or openssl is missing) and for
+  metadata that spells its keys with JSON `\u` escapes; `--self-update`
+  still uses them. `--debug` shows `verify_key.native`,
+  `require_signed.native` and `pin.native` events.
+
 - **Extracted rootfs cache: repeat launches skip layer extraction.** The
   first launch of a binary merges its image layers once into
   `${XDG_CACHE_HOME:-~/.cache}/oci2bin/rootfs/<key>/`, keyed by the SHA-256

@@ -364,11 +364,17 @@ oci2bin sign --key priv.pem --in app.bin
 ./app.bin
 ```
 
-All of these run the ECDSA check through `openssl`, which is resolved by
-absolute path from `/usr/bin`, `/bin`, `/usr/sbin` or `/sbin` — never through
-`$PATH`. An `openssl` reachable only via `$PATH` is treated as missing and the
-check fails closed, so a stub planted in an attacker-writable `$PATH` entry
-cannot make verification report success.
+The produced binary verifies signatures itself: ECDSA over NIST P-256 (the
+curve `oci2bin sign` keys use) with SHA-256 or SHA-512, implemented in the
+loader, so `--verify-key`, `--require-signed` and a `--pin-digest` pin all
+work on a host without `python3` or `openssl`. Only a key on another curve
+is handed to `openssl` through the embedded verifier, and only when both
+`python3` and `openssl` are present; otherwise the launch is refused. That
+`openssl` is resolved by absolute path from `/usr/bin`, `/bin`, `/usr/sbin`
+or `/sbin` — never through `$PATH` — so a stub planted in an
+attacker-writable `$PATH` entry cannot make verification report success.
+The `oci2bin sign` / `verify` commands on the build host still use
+`openssl`, as does `--self-update`.
 
 Detached file signing:
 
