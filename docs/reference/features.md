@@ -234,7 +234,7 @@ byte-for-byte reproducible.
 | Generate systemd unit | `oci2bin systemd app.bin` |
 | Generate SBOM | `oci2bin sbom app.bin` |
 | Push image payload | `oci2bin push app.bin REF` |
-| Update a binary from its image, replaying its recorded build options | `oci2bin update [--check] app.bin` |
+| Update a binary from its image, replaying its recorded build options | `oci2bin update [--check\|--no-pull] app.bin` |
 | Freeze and thaw | `oci2bin freeze NAME`, `oci2bin thaw NAME` |
 | Checkpoint and restore | `oci2bin checkpoint NAME`, `oci2bin restore NAME` |
 | Declarative stack up/down | `oci2bin up`, `oci2bin down` |

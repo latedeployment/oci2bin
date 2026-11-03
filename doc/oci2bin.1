@@ -918,10 +918,14 @@ loader.
 Push the embedded image payload to an OCI registry reference.
 .
 .TP
-.B oci2bin update \fR[\fB\-\-check\fR] \fIBINARY\fR
-Rebuild
+.B oci2bin update \fR[\fB\-\-check\fR|\fB\-\-no\-pull\fR] \fIBINARY\fR
+Pull the image, unless
+.B \-\-no\-pull
+or
+.B \-\-offline\-only
+is set, the name is pinned by digest, or the image has no registry origin. Then rebuild
 .I BINARY
-from its image when the image's digest has moved, replaying the build options
+from it, replaying the build options
 recorded in the metadata block (the same list
 .B \-\-arch all
 forwards, plus

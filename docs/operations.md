@@ -326,6 +326,7 @@ Rebuild a binary from its image with the same options it was built with:
 ```bash
 oci2bin update app.bin
 oci2bin update --check app.bin
+oci2bin update --no-pull app.bin
 ```
 
 Every build records its canonical option list (`--arch`, `--strip`,
@@ -336,6 +337,19 @@ rebuilt binary keeps its shape. A binary made by an older oci2bin has no
 record and is rebuilt with default options, which `update` says out loud.
 For older artifacts that recorded `--self-update-url`, `update` skips that
 retired option and replays the remaining build options.
+
+`update` pulls the image and any `--layer` images first, so the rebuild picks
+up new content. A failed pull stops the update and keeps the binary. It does
+not pull when the binary recorded `--offline-only` or `--oci-dir`, when the
+image name is pinned by digest, or when the local image did not come from the
+registry its name points at (built on this host, loaded from a file, or
+retagged), since pulling that name could fetch someone else's image. Docker
+before the `Identity` image field, on its containerd image store, cannot report
+this, so `update` tries the pull there. Use `oci2bin update --no-pull app.bin`
+to rebuild from the local copy. It fails if an image is not in the local store,
+and with the skopeo backend, which has no local store. `--check` refuses an
+image with no registry origin and cannot be combined with `--no-pull`. Options
+go before `BINARY`; anything after it is an error.
 
 The rebuilt binary keeps the existing file's mode plus owner execute, without
 setuid or setgid. Updating through a symlink rewrites its target, so the

@@ -38,7 +38,7 @@ read **at run time** (by a produced `./binary`), **at build time** (by the
 ## Internal (set by oci2bin, not for direct use)
 
 `OCI2BIN_INSPECT`, `OCI2BIN_VM_INIT`, `OCI2BIN_GOSU_DEPTH`, `OCI2BIN_META`,
-`OCI2BIN_SELF`, `OCI2BIN_ENGINE`, `OCI2BIN_INVOKED_AS`, and
+`OCI2BIN_SELF`, `OCI2BIN_ENGINE`, `OCI2BIN_INVOKED_AS`, `OCI2BIN_UPDATE_PULL`, and
 `OCI2BIN_COSIGN_REF`/`OCI2BIN_COSIGN_KEY`/`OCI2BIN_COSIGN_RESULT` are set by
 oci2bin itself (mode switches, the gosu recursion guard, the container engine
 the wrapper resolved — `docker` or `podman`, honoring `--pull-with` — so helper

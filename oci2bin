@@ -176,7 +176,7 @@
 #                         ~/.local/share/oci2bin/checkpoints/NAME
 #   restore NAME          Restore a CRIU checkpoint from the same directory
 #   top                   Live stats for named running containers
-#   update [--check] BINARY
+#   update [--check|--no-pull] BINARY
 #                         Rebuild BINARY from its image with the build
 #                         options it recorded (--check: report only)
 #   reconstruct <src>     Rebuild polyglot from an image built with
@@ -240,6 +240,75 @@ build_option_arity() {
         --compress-binary)
             echo optional ;;
     esac
+}
+
+# Normalize a Docker/OCI short name to a fully-qualified docker.io reference,
+# the way `docker` does implicitly. podman and skopeo do NOT assume docker.io
+# for bare names unless the host configures unqualified-search-registries, so a
+# plain `redis:7-alpine` fails to resolve out of the box on those backends.
+# Already-qualified references are returned unchanged:
+#   - a first path component that looks like a registry host (has '.' or ':')
+#     or is exactly "localhost"  ->  left alone (registry[:port]/...)
+#   - otherwise "user/repo[:tag]"  ->  "docker.io/user/repo[:tag]"
+#   - otherwise "name[:tag]"       ->  "docker.io/library/name[:tag]"
+# Digest pins (`name@sha256:...`) ride along on the name part unchanged.
+qualify_image_ref() {
+    local ref="$1"
+    if [[ "$ref" == *"/"* ]]; then
+        local first="${ref%%/*}"
+        if [[ "$first" == *.* || "$first" == *:* || "$first" == "localhost" ]]; then
+            printf '%s' "$ref"
+        else
+            printf 'docker.io/%s' "$ref"
+        fi
+    else
+        printf 'docker.io/library/%s' "$ref"
+    fi
+}
+
+# The repository REF names, in the form Docker normalizes it to.
+image_repo_name() {
+    local repo tail
+    repo="$(qualify_image_ref "$1")"
+    repo="${repo%%@*}"
+    tail="${repo##*/}"
+    repo="${repo%"$tail"}${tail%%:*}"
+    case "$repo" in
+        index.docker.io/*) repo="docker.io/${repo#*/}" ;;
+    esac
+    if [[ "$repo" == docker.io/* && "${repo#docker.io/}" != */* ]]; then
+        repo="docker.io/library/${repo#docker.io/}"
+    fi
+    printf '%s' "$repo"
+}
+
+# True when ENGINE's local IMAGE did not come from the registry its name points
+# at: built here, loaded from a file, or another image retagged. Pulling that
+# name could fetch whatever someone else published under it, not a newer copy.
+# Only Docker's containerd store sets .Descriptor, and there Identity records
+# the real source, so no pull entry means local. Other engines fail this
+# template (podman, older Docker) or print nothing (Docker's classic store); use
+# RepoDigests there, where podman files its local builds under localhost/.
+# Docker's containerd store without Identity reports a digest for local builds
+# too, so those cannot be told apart and count as pulled.
+image_is_local_only() {
+    local origins repo line
+    repo="$(image_repo_name "$2")"
+    if origins="$("$1" image inspect --format \
+        '{{if .Descriptor}}{{println "identity"}}{{if .Identity}}{{range .Identity.Pull}}{{println .Repository}}{{end}}{{end}}{{end}}' \
+        "$2" 2>/dev/null)" && [[ -n "$origins" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == "$repo" ]] && return 1
+        done <<< "$origins"
+        return 0
+    fi
+    origins="$("$1" image inspect --format \
+        '{{range .RepoDigests}}{{println .}}{{end}}' "$2" 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == localhost/* ]] && continue
+        [[ "$(image_repo_name "$line")" == "$repo" ]] && return 1
+    done <<< "$origins"
+    return 0
 }
 
 case "${BASH_SOURCE[0]}" in
@@ -821,10 +890,15 @@ fi
 if [[ "${1:-}" == "update" ]]; then
     shift
     UPDATE_CHECK_ONLY=0
+    UPDATE_PULL=1
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --check)
                 UPDATE_CHECK_ONLY=1
+                shift
+                ;;
+            --no-pull)
+                UPDATE_PULL=0
                 shift
                 ;;
             *)
@@ -832,8 +906,12 @@ if [[ "${1:-}" == "update" ]]; then
                 ;;
         esac
     done
-    if [[ $# -lt 1 ]]; then
-        echo "Usage: oci2bin update [--check] BINARY" >&2
+    if [[ $# -ne 1 ]]; then
+        echo "Usage: oci2bin update [--check|--no-pull] BINARY" >&2
+        exit 1
+    fi
+    if [[ "$UPDATE_CHECK_ONLY" -eq 1 && "$UPDATE_PULL" -eq 0 ]]; then
+        echo "oci2bin update: --check needs the registry and cannot use --no-pull" >&2
         exit 1
     fi
     UPDATE_BINARY="$1"
@@ -896,6 +974,10 @@ PYEOF
 
     if [[ "$UPDATE_CHECK_ONLY" -eq 1 ]]; then
         need docker
+        if image_is_local_only docker "$IMAGE_NAME"; then
+            echo "oci2bin update: $IMAGE_NAME has no registry origin to check" >&2
+            exit 1
+        fi
         if ! docker pull "$IMAGE_NAME" >/dev/null; then
             echo "oci2bin update: failed to pull $IMAGE_NAME; cannot check for updates" >&2
             exit 1
@@ -1013,6 +1095,8 @@ PYEOF
     # when no options precede it, or be taken as the codec of a trailing
     # --compress-binary, which turns the temp path into the image.
     UPDATE_BUILD_ARGS+=(--)
+    # A normal build reuses a local image; a rebuild must fetch newer content.
+    export OCI2BIN_UPDATE_PULL="$UPDATE_PULL"
     "$0" "${UPDATE_BUILD_ARGS[@]}" "$IMAGE_NAME" "$UPDATE_TMP"
 
     if [[ ! -s "$UPDATE_TMP" ]]; then
@@ -1869,7 +1953,7 @@ if [[ "${1:-}" == "pod" ]]; then
     [[ $POD_NET_SHARED -eq 1 ]] && PAUSE_NET_FLAG="--net"
     [[ $POD_IPC_SHARED -eq 1 ]] && PAUSE_IPC_FLAG="--ipc"
     # shellcheck disable=SC2086
-    unshare $PAUSE_NET_FLAG $PAUSE_IPC_FLAG -- sh -c "echo \$\$ > \"$PAUSE_PID_FILE\"; exec sleep infinity" &
+    unshare $PAUSE_NET_FLAG $PAUSE_IPC_FLAG -- sh -c 'echo $$ > "$1"; exec sleep infinity' sh "$PAUSE_PID_FILE" &
     PAUSE_BG=$!
     # Give unshare a moment to start
     sleep 0.1
@@ -2736,30 +2820,6 @@ skopeo_arch_name() {
     esac
 }
 
-# Normalize a Docker/OCI short name to a fully-qualified docker.io reference,
-# the way `docker` does implicitly. podman and skopeo do NOT assume docker.io
-# for bare names unless the host configures unqualified-search-registries, so a
-# plain `redis:7-alpine` fails to resolve out of the box on those backends.
-# Already-qualified references are returned unchanged:
-#   - a first path component that looks like a registry host (has '.' or ':')
-#     or is exactly "localhost"  ->  left alone (registry[:port]/...)
-#   - otherwise "user/repo[:tag]"  ->  "docker.io/user/repo[:tag]"
-#   - otherwise "name[:tag]"       ->  "docker.io/library/name[:tag]"
-# Digest pins (`name@sha256:...`) ride along on the name part unchanged.
-qualify_image_ref() {
-    local ref="$1"
-    if [[ "$ref" == *"/"* ]]; then
-        local first="${ref%%/*}"
-        if [[ "$first" == *.* || "$first" == *:* || "$first" == "localhost" ]]; then
-            printf '%s' "$ref"
-        else
-            printf 'docker.io/%s' "$ref"
-        fi
-    else
-        printf 'docker.io/library/%s' "$ref"
-    fi
-}
-
 resolve_pull_backend() {
     # Not needed when an OCI layout is supplied directly, or already resolved.
     [[ -n "$OCI_DIR" || -n "$PULL_BACKEND" ]] && return 0
@@ -2797,6 +2857,42 @@ require_engine() {
     exit 1
 }
 
+# Whether the build must fetch REF. A normal build uses a local copy; `update`
+# sets OCI2BIN_UPDATE_PULL=1 because reusing one would rebuild stale content.
+# --offline-only, a digest-pinned ref and an image with no registry origin stay
+# local.
+image_needs_pull() {
+    if ! "$CONTAINER_ENGINE" image inspect "$1" >/dev/null 2>&1; then
+        if [[ "${OCI2BIN_UPDATE_PULL:-}" == 0 ]]; then
+            echo "oci2bin update: --no-pull set but '$1' is not in the local store." >&2
+            exit 1
+        fi
+        return 0
+    fi
+    [[ "${OCI2BIN_UPDATE_PULL:-0}" == 1 && "$OFFLINE_ONLY" -eq 0 &&
+       "$1" != *@sha256:* ]] || return 1
+    if image_is_local_only "$CONTAINER_ENGINE" "$1"; then
+        echo "oci2bin: $1 has no registry origin; using the local copy" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Pull REF for the build's target: a bare pull fetches the host's architecture
+# and would retag a cross-arch image the build already has.
+pull_image() {
+    local args=(pull)
+    if [[ "$TARGET_ARCH" != "$HOST_ARCH" ]]; then
+        args+=(--platform "linux/$(skopeo_arch_name "$TARGET_ARCH")")
+    fi
+    "$CONTAINER_ENGINE" "${args[@]}" "$1" && return 0
+    if [[ "${OCI2BIN_UPDATE_PULL:-0}" == 1 ]]; then
+        echo "oci2bin update: could not pull $1; the binary is unchanged." \
+             "Use --no-pull to rebuild from the local copy." >&2
+    fi
+    exit 1
+}
+
 # Cumulative temp-dir cleanup: a single EXIT trap that removes every path
 # registered below. (A plain `trap '...' EXIT` per branch would overwrite the
 # previous one, so e.g. the skopeo layout + the converted-tar dir could not
@@ -2828,6 +2924,10 @@ if [[ -z "$OCI_DIR" && "$PULL_BACKEND" == "skopeo" ]]; then
     fi
     if [[ "$OFFLINE_ONLY" -eq 1 ]]; then
         echo "oci2bin: --offline-only requires the docker/podman backend (local image store)." >&2
+        exit 1
+    fi
+    if [[ "${OCI2BIN_UPDATE_PULL:-}" == 0 ]]; then
+        echo "oci2bin update: --no-pull requires the docker/podman backend (local image store)." >&2
         exit 1
     fi
     # skopeo (like podman) won't assume docker.io for bare names; qualify so a
@@ -2875,7 +2975,7 @@ else
 # ── pull image if not local ───────────────────────────────────────────────
 
 require_engine
-if ! "$CONTAINER_ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
+if image_needs_pull "$IMAGE"; then
     if [[ "$OFFLINE_ONLY" -eq 1 ]]; then
         echo "oci2bin: --offline-only set but image '$IMAGE' is not in the local store." >&2
         echo "         Run '$CONTAINER_ENGINE pull $IMAGE' before building, or use --oci-dir." >&2
@@ -2893,7 +2993,7 @@ if ! "$CONTAINER_ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
         fi
     fi
     echo "oci2bin: pulling $IMAGE..."
-    "$CONTAINER_ENGINE" pull "$IMAGE"
+    pull_image "$IMAGE"
 fi
 
 # ── validate a content-pinned (digest) reference ──────────────────────────
@@ -3029,13 +3129,16 @@ if [[ "${#LAYER_IMAGES[@]}" -gt 0 ]]; then
     # Save each --layer image
     idx=0
     for layer_img in "${LAYER_IMAGES[@]}"; do
-        if ! "$CONTAINER_ENGINE" image inspect "$layer_img" >/dev/null 2>&1; then
+        if image_needs_pull "$layer_img"; then
             if [[ "$OFFLINE_ONLY" -eq 1 ]]; then
                 echo "oci2bin: --offline-only set but layer image '$layer_img' is not in the local store." >&2
                 exit 1
             fi
+            # podman won't assume docker.io for a bare name, as for IMAGE above.
+            [[ "$CONTAINER_ENGINE" == podman ]] && \
+                layer_img="$(qualify_image_ref "$layer_img")"
             echo "oci2bin: pulling layer image $layer_img..."
-            "$CONTAINER_ENGINE" pull "$layer_img"
+            pull_image "$layer_img"
         fi
         layer_tar="$MERGE_TMPDIR/layer${idx}.tar"
         echo "oci2bin: saving layer image $layer_img..."

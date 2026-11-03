@@ -115,6 +115,7 @@ for threat boundaries, requirements, and complete hardening examples.
 | Inspect or compare artifacts | `oci2bin inspect ./myapp.bin` / `oci2bin diff old.bin new.bin` |
 | Compare extraction, lazy, and VM startup | `oci2bin benchmark ./myapp.bin --modes extract,lazy,vm` |
 | Generate an SBOM | `oci2bin sbom ./myapp.bin` |
+| Pull the image and rebuild a binary with its recorded options | `oci2bin update [--check\|--no-pull] ./myapp.bin` |
 | Use GPUs or CDI devices | `./myapp.bin --gpus all` |
 | Reload the default artifact into Docker | `docker load < myapp.bin` |
 

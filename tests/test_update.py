@@ -297,5 +297,222 @@ class UpdateReplacesBinaryTest(unittest.TestCase):
                 self.assertEqual(binary.read_bytes(), original)
 
 
+class UpdatePullTest(unittest.TestCase):
+    """Which images a rebuild refreshes. The fake engine has the image locally,
+    logs each call and fails `save`, so a rebuild stops right after the pull
+    decision and nothing real is reached."""
+
+    REGISTRY = "example@sha256:" + "a" * 64
+
+    def _run(self, *args, image="example:latest", build_args=None,
+             digests=REGISTRY, identity=None, pull_rc=0, save_rc=1,
+             engine="docker", extra_env=None, local=True, trailing=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "app.bin"
+            binary.write_bytes(_meta_block(image, build_args=build_args))
+            original = binary.read_bytes()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            log = root / "engine.log"
+            # None is an engine without the field: its template fails. False is
+            # Docker's classic store: it has the field and leaves it unset.
+            if identity is None:
+                identity_case = "      *Identity*) exit 1 ;;\n"
+            elif identity is False:
+                identity_case = "      *Identity*) exit 0 ;;\n"
+            else:
+                identity_case = (
+                    "      *Identity*) "
+                    f"printf '%s\\n' identity '{identity}'; exit 0 ;;\n")
+            _executable(fake_bin / engine, (
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$*\" >> '{log}'\n"
+                "case \"$1 $2\" in\n"
+                "  'image inspect')\n"
+                + ("" if local else "    exit 1\n") +
+                "    case \"$*\" in\n"
+                + identity_case +
+                f"      *--format*) printf '%s\\n' '{digests}' ;;\n"
+                "    esac\n"
+                "    exit 0 ;;\n"
+                "esac\n"
+                f"[ \"$1\" = inspect ] && {{ printf '%s\\n' '{digests}'; exit 0; }}\n"
+                f"[ \"$1\" = pull ] && exit {pull_rc}\n"
+                f"[ \"$1\" = save ] && exit {save_rc}\n"
+                "exit 1\n"))
+            env = _hermetic_env(root)
+            build = Path(env["OCI2BIN_HOME"]) / "build"
+            for arch in ("x86_64", "aarch64"):
+                (build / f"loader-{arch}").touch()
+                (build / f"loader-libkrun-{arch}").touch()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env.update(extra_env or {})
+            result = subprocess.run(
+                [str(OCI2BIN), *args, str(binary), *trailing],
+                cwd=root, capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(binary.read_bytes(), original)
+            return result, log.read_text() if log.exists() else ""
+
+    def _pulls(self, calls):
+        return [c for c in calls.splitlines() if c.startswith("pull ")]
+
+    def test_update_pulls_an_image_it_already_has(self):
+        _, calls = self._run("update")
+        self.assertEqual(self._pulls(calls), ["pull example:latest"])
+
+    def test_failed_pull_stops_the_rebuild(self):
+        result, calls = self._run("update", pull_rc=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._pulls(calls), ["pull example:latest"])
+        # The digest lookup is the build's next step after the pull.
+        self.assertNotIn("\ninspect --format", calls)
+        self.assertIn("Use --no-pull", result.stderr)
+
+    def test_no_pull_uses_the_local_copy(self):
+        # An inherited value must not override the flag.
+        _, calls = self._run("update", "--no-pull",
+                             extra_env={"OCI2BIN_UPDATE_PULL": "1"})
+        self.assertIn("\ninspect --format", calls)
+        self.assertEqual(self._pulls(calls), [])
+
+    def test_no_pull_never_fetches_a_missing_image(self):
+        result, calls = self._run("update", "--no-pull", local=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not in the local store", result.stderr)
+        self.assertEqual(self._pulls(calls), [])
+
+    def test_no_pull_refuses_skopeo(self):
+        result, calls = self._run("update", "--no-pull", engine="skopeo",
+                                  build_args=["--pull-with", "skopeo"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--no-pull requires", result.stderr)
+        self.assertEqual(calls, "")
+
+    def test_flag_after_the_binary_is_refused(self):
+        for flag in ("--no-pull", "--check"):
+            with self.subTest(flag=flag):
+                result, calls = self._run("update", trailing=[flag])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Usage:", result.stderr)
+                self.assertEqual(calls, "")
+
+    def test_classic_store_falls_back_to_repo_digests(self):
+        # That store has no Identity to read: a digest is the pull record.
+        _, calls = self._run("update", identity=False)
+        self.assertEqual(self._pulls(calls), ["pull example:latest"])
+        result, calls = self._run("update", identity=False, digests="")
+        self.assertIn("no registry origin", result.stderr)
+        self.assertEqual(self._pulls(calls), [])
+
+    def test_retag_keeps_the_source_digest_but_is_not_pulled(self):
+        digests = "docker.io/library/alpine@sha256:" + "a" * 64
+        for name, extra in (("docker", {}),
+                            ("podman", {"build_args": ["--pull-with", "podman"]})):
+            with self.subTest(engine=name):
+                _, calls = self._run("update", image="acme/app:1", engine=name,
+                                     digests=digests, **extra)
+                self.assertEqual(self._pulls(calls), [])
+
+    def test_locally_built_image_is_never_pulled(self):
+        result, calls = self._run("update", digests="")
+        self.assertIn("no registry origin", result.stderr)
+        self.assertEqual(self._pulls(calls), [])
+
+    def test_identity_shows_the_image_was_pulled(self):
+        for image in ("example:latest", "docker.io/library/example:latest",
+                      "docker.io/example:latest",
+                      "index.docker.io/library/example:latest"):
+            with self.subTest(image=image):
+                _, calls = self._run(
+                    "update", image=image,
+                    identity="docker.io/library/example")
+                self.assertEqual(self._pulls(calls), [f"pull {image}"])
+
+    def test_identity_without_pull_is_local_despite_a_digest(self):
+        # Docker's containerd store reports a digest for local builds too.
+        result, calls = self._run("update", identity="")
+        self.assertIn("no registry origin", result.stderr)
+        self.assertEqual(self._pulls(calls), [])
+
+    def test_retagged_image_does_not_pull_its_new_name(self):
+        _, calls = self._run("update", image="acme/app:1",
+                             identity="docker.io/library/alpine")
+        self.assertEqual(self._pulls(calls), [])
+
+    def test_podman_localhost_digest_is_not_a_registry_origin(self):
+        digest = "localhost/app@sha256:" + "b" * 64
+        for image in ("app:1", "localhost/app:1"):
+            with self.subTest(image=image):
+                _, calls = self._run("update", image=image, digests=digest,
+                                     engine="podman",
+                                     build_args=["--pull-with", "podman"])
+                self.assertEqual(self._pulls(calls), [])
+
+    def test_offline_only_is_never_pulled(self):
+        _, calls = self._run("update", build_args=["--offline-only"])
+        self.assertEqual(self._pulls(calls), [])
+        # The rebuild goes on from the local copy instead of refusing.
+        self.assertIn("\ninspect --format", calls)
+
+    def test_digest_pinned_image_is_never_pulled(self):
+        _, calls = self._run("update", image=self.REGISTRY)
+        self.assertEqual(self._pulls(calls), [])
+
+    def test_cross_arch_pull_keeps_the_target_arch(self):
+        machine = platform.machine()
+        target, name = (("x86_64", "amd64") if machine == "aarch64"
+                        else ("aarch64", "arm64"))
+        _, calls = self._run("update", build_args=["--arch", target])
+        self.assertEqual(self._pulls(calls),
+                         [f"pull --platform linux/{name} example:latest"])
+
+    def test_recorded_layer_is_refreshed_too(self):
+        # `save` must succeed for the build to reach the layer images.
+        digests = self.REGISTRY + "\nextra@sha256:" + "a" * 64
+        _, calls = self._run("update", build_args=["--layer", "extra:1"],
+                             digests=digests, save_rc=0)
+        self.assertIn("pull extra:1", self._pulls(calls))
+
+    def test_podman_layer_pull_is_qualified(self):
+        digests = ("docker.io/library/example@sha256:" + "a" * 64 +
+                   "\ndocker.io/library/extra@sha256:" + "a" * 64)
+        _, calls = self._run("update", engine="podman", digests=digests,
+                             build_args=["--pull-with", "podman",
+                                         "--layer", "extra:1"], save_rc=0)
+        self.assertIn("pull docker.io/library/extra:1", self._pulls(calls))
+
+    def test_check_refuses_a_locally_built_image(self):
+        result, calls = self._run("update", "--check", digests="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no registry origin to check", result.stderr)
+        self.assertEqual(self._pulls(calls), [])
+
+    def test_check_cannot_combine_with_no_pull(self):
+        result, calls = self._run("update", "--check", "--no-pull")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot use --no-pull", result.stderr)
+        self.assertEqual(calls, "")
+
+
+class PodPauseTest(unittest.TestCase):
+    def test_tmpdir_is_not_evaluated_by_the_pause_shell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crafted = root / "tmp$(touch marker)"
+            crafted.mkdir()
+            member = root / "member"
+            _executable(member, "#!/bin/sh\nexit 0\n")
+            env = _hermetic_env(root)
+            env["TMPDIR"] = str(crafted)
+
+            result = subprocess.run(
+                [str(OCI2BIN), "pod", "run", str(member)],
+                cwd=root, capture_output=True, text=True, env=env, timeout=30)
+
+            self.assertFalse((root / "marker").exists(), result.stderr)
+            self.assertRegex(result.stderr, r"pause PID=\d+")
+
+
 if __name__ == "__main__":
     unittest.main()

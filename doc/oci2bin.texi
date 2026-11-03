@@ -984,8 +984,10 @@ CycloneDX lists them as the root component's dependencies.
 Rebuild a polyglot from an image/tar carrying an embedded loader.
 @item oci2bin push BINARY REF
 Push the embedded image payload to an OCI registry.
-@item oci2bin update [--check] BINARY
-Rebuild BINARY from its image when its digest moved, replaying the build
+@item oci2bin update [--check|--no-pull] BINARY
+Pull the image, unless @option{--no-pull} or @option{--offline-only} is set,
+the name is pinned by digest, or the image has no registry origin. Then rebuild
+BINARY from it, replaying the build
 options recorded in the metadata block (@code{build_args}); @option{--check}
 only reports.
 @item oci2bin exec PID [--] CMD ...

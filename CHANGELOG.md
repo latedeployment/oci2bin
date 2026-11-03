@@ -8,6 +8,11 @@ All notable changes to oci2bin are documented here.
 
 ### Security
 
+- `oci2bin pod run` no longer evaluates the pause PID file path in a shell. A
+  `TMPDIR` containing shell syntax could run commands as the caller.
+- `oci2bin update --check` no longer pulls an image with no registry origin
+  (built locally, loaded from a file, or retagged), which could fetch an
+  unrelated image published under the same name.
 - Dockerfile `RUN` now gives host helpers a fixed environment and exports
   image `ENV` and build arguments only after entering the image rootfs.
   Image-controlled `PATH` and `LD_PRELOAD` cannot redirect host helpers.
@@ -354,6 +359,12 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- `oci2bin update` now pulls the image and any `--layer` images before
+  rebuilding. It previously reused a local copy, so it could report success on
+  stale content. A failed pull stops the update and keeps the binary. Recorded
+  `--offline-only`, digest-pinned names, and images with no registry origin are
+  not pulled, and a new `--no-pull` flag rebuilds from the local copy.
+- Pulls for a cross-architecture build now request the target platform.
 - `--arch all` and `--cache` builds without `--compress` aborted silently:
   the helper that assembles the forwarded option list ended on a failing
   `[[ ... ]] &&` test, which `set -e` treated as the function failing. It
