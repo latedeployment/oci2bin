@@ -841,6 +841,10 @@ if [[ "${1:-}" == "update" ]]; then
         echo "oci2bin update: binary not found: $UPDATE_BINARY" >&2
         exit 1
     fi
+    # An absolute path cannot be read as an option by dirname, mv or the
+    # rebuild, and resolving a symlink updates the file it names instead of
+    # replacing the link with a copy.
+    UPDATE_BINARY="$(readlink -f -- "$UPDATE_BINARY")"
 
     # Read image name from embedded metadata block
     META_JSON="$(python3 - "$UPDATE_BINARY" "$OCI2BIN_HOME" <<'PYEOF'
@@ -877,6 +881,11 @@ PYEOF
         echo "oci2bin update: could not read image name from $UPDATE_BINARY" >&2
         exit 1
     fi
+    # The name is data read from the binary: docker would parse this as an option.
+    if [[ "$IMAGE_NAME" == -* ]]; then
+        echo "oci2bin update: $UPDATE_BINARY records an invalid image name: $IMAGE_NAME" >&2
+        exit 1
+    fi
 
     CURRENT_DIGEST="$(python3 - "$META_JSON" <<'PYEOF'
 import json, sys
@@ -887,7 +896,10 @@ PYEOF
 
     if [[ "$UPDATE_CHECK_ONLY" -eq 1 ]]; then
         need docker
-        docker pull "$IMAGE_NAME" >/dev/null 2>&1 || true
+        if ! docker pull "$IMAGE_NAME" >/dev/null; then
+            echo "oci2bin update: failed to pull $IMAGE_NAME; cannot check for updates" >&2
+            exit 1
+        fi
         NEW_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_NAME" 2>/dev/null || true)"
         if [[ -z "$CURRENT_DIGEST" || -z "$NEW_DIGEST" ]]; then
             echo "oci2bin update: unable to compare digests for $IMAGE_NAME" >&2
@@ -916,9 +928,19 @@ PYEOF
 import json, sys
 meta = json.loads(sys.argv[1])
 args = meta.get("build_args")
+def replayable(a):
+    # A NUL would split the token below; a lone surrogate would kill the
+    # writer below partway, and mapfile cannot see that it failed.
+    if not isinstance(a, str) or "\0" in a:
+        return False
+    try:
+        a.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return False
+    return True
 if args is None:
     print("absent")
-elif isinstance(args, list) and all(isinstance(a, str) for a in args):
+elif isinstance(args, list) and all(replayable(a) for a in args):
     print("present")
 else:
     print("invalid")
@@ -944,6 +966,13 @@ PYEOF
                 fi
                 _i=$((_i + 2))
                 continue
+            fi
+            # No build records `--arch all`, which writes sibling per-arch
+            # binaries next to the temp file that nothing would clean up.
+            if [[ "${UPDATE_BUILD_ARGS[$_i]}" == "--arch" &&
+                  "${UPDATE_BUILD_ARGS[$((_i + 1))]:-}" == "all" ]]; then
+                UPDATE_ARGS_STATE="invalid"
+                break
             fi
             _start="$_i"
             case "$(build_option_arity "${UPDATE_BUILD_ARGS[$_i]}")" in
@@ -978,13 +1007,23 @@ PYEOF
     # Build to a temp file in the same directory (for atomic rename)
     UPDATE_DIR="$(dirname "$UPDATE_BINARY")"
     UPDATE_TMP="$(mktemp "$UPDATE_DIR/.oci2bin-update.XXXXXX")"
-    # shellcheck disable=SC2064
-    trap "rm -f \"$UPDATE_TMP\"" EXIT
+    trap 'rm -f -- "$UPDATE_TMP"' EXIT
 
+    # `--` keeps IMAGE_NAME positional: otherwise it could name a subcommand
+    # when no options precede it, or be taken as the codec of a trailing
+    # --compress-binary, which turns the temp path into the image.
+    UPDATE_BUILD_ARGS+=(--)
     "$0" "${UPDATE_BUILD_ARGS[@]}" "$IMAGE_NAME" "$UPDATE_TMP"
 
-    mv "$UPDATE_TMP" "$UPDATE_BINARY"
-    chmod +x "$UPDATE_BINARY"
+    if [[ ! -s "$UPDATE_TMP" ]]; then
+        echo "oci2bin update: rebuild wrote no output; keeping $UPDATE_BINARY" >&2
+        exit 1
+    fi
+    # Set the mode before the rename so the new file is never visible with
+    # the builder's 0755: a binary restricted to its owner stays that way.
+    chmod --reference="$UPDATE_BINARY" -- "$UPDATE_TMP"
+    chmod u+x,u-s,g-s -- "$UPDATE_TMP"
+    mv -fT -- "$UPDATE_TMP" "$UPDATE_BINARY"
     trap - EXIT
 
     echo "oci2bin update: done → $UPDATE_BINARY" >&2

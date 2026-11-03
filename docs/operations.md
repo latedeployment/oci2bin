@@ -337,6 +337,11 @@ record and is rebuilt with default options, which `update` says out loud.
 For older artifacts that recorded `--self-update-url`, `update` skips that
 retired option and replays the remaining build options.
 
+The rebuilt binary keeps the existing file's mode plus owner execute, without
+setuid or setgid. Updating through a symlink rewrites its target, so the
+target's directory must be writable. If the rebuild writes no output, the
+existing binary is kept and `update` fails.
+
 The list is data read from the binary. `update` prints the options it will
 replay before rebuilding and refuses a list that is not options and their
 values (so it cannot swap

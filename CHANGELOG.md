@@ -14,6 +14,21 @@ All notable changes to oci2bin are documented here.
   host cache directories.
 - Rootfs cache keys now hash the exact embedded payload. Distinct layers
   cannot share a cache entry by claiming the same image configuration.
+- `oci2bin update` no longer evaluates the temp file path in its cleanup trap.
+  A directory name containing shell syntax could run commands as the caller.
+- `oci2bin update --check` now fails when `docker pull` fails. It previously
+  compared against the cached image and could report a stale binary as up to
+  date.
+- `oci2bin update` treats the image name and build options recorded in a binary
+  as untrusted. An image name cannot be read as an option or select a
+  subcommand, and a record with a NUL, an unencodable token, or `--arch all` is
+  refused. Refused tokens previously could drop later options such as
+  `--require-cosign` from the rebuild.
+- `oci2bin update` keeps the existing binary when a rebuild writes no output.
+  It previously could replace the binary with an empty file and report success.
+- `oci2bin update` no longer widens permissions: the new binary keeps the
+  existing mode plus owner execute, without setuid or setgid. Updating through
+  a symlink now rewrites its target and keeps the link.
 
 ### Changed
 
@@ -1914,9 +1929,3 @@ Initial public release.
   `MS_NOSUID|MS_NODEV` mounts, `..` path validation on all external inputs,
   `snprintf` truncation checks on all `PATH_MAX` buffers, no `system()`/`popen()`
   anywhere in the codebase.
-
-[0.14.0]: https://github.com/latedeployment/oci2bin/compare/v0.13.0...v0.14.0
-[0.13.0]: https://github.com/latedeployment/oci2bin/compare/v0.12.0...v0.13.0
-[0.3.0]: https://github.com/latedeployment/oci2bin/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/latedeployment/oci2bin/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/latedeployment/oci2bin/releases/tag/v0.1.0
