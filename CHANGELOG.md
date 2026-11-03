@@ -4,6 +4,8 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-03
+
 ### Security
 
 - Dockerfile `RUN` now gives host helpers a fixed environment and exports
