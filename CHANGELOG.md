@@ -359,6 +359,17 @@ All notable changes to oci2bin are documented here.
 
 ### Fixed
 
+- `oci2bin update --check` now follows the options a binary recorded. It uses
+  the recorded `--pull-with` (otherwise docker, then podman) and pulls the
+  recorded `--arch`, so checking a cross-architecture binary no longer retags
+  the local image to the host's architecture.
+- `oci2bin update --check` refuses a binary built with `--offline-only` or one
+  that records no usable digest before pulling anything. It previously pulled,
+  which moved the local tag, and for a binary with no digest could only then
+  fail. A failed `inspect` or a malformed digest now fails the check.
+- `oci2bin update --check` no longer reports a false update when an engine lists
+  several digests for an image or writes its name in a different form. A
+  malformed `build_args` record now fails `--check` as it does a rebuild.
 - `oci2bin update` now pulls the image and any `--layer` images before
   rebuilding. It previously reused a local copy, so it could report success on
   stale content. A failed pull stops the update and keeps the binary. Recorded

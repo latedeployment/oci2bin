@@ -989,7 +989,7 @@ Pull the image, unless @option{--no-pull} or @option{--offline-only} is set,
 the name is pinned by digest, or the image has no registry origin. Then rebuild
 BINARY from it, replaying the build
 options recorded in the metadata block (@code{build_args}); @option{--check}
-only reports.
+only reports, using the recorded @option{--pull-with} and @option{--arch}.
 @item oci2bin exec PID [--] CMD ...
 Run a command inside a running container's namespaces (needs @command{nsenter}).
 @item oci2bin ps / stop NAME / logs [-f] NAME

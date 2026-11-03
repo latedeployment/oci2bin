@@ -347,8 +347,14 @@ retagged), since pulling that name could fetch someone else's image. Docker
 before the `Identity` image field, on its containerd image store, cannot report
 this, so `update` tries the pull there. Use `oci2bin update --no-pull app.bin`
 to rebuild from the local copy. It fails if an image is not in the local store,
-and with the skopeo backend, which has no local store. `--check` refuses an
-image with no registry origin and cannot be combined with `--no-pull`. Options
+and with the skopeo backend, which has no local store. `--check` pulls with
+the binary's recorded `--pull-with` and `--arch` (otherwise docker, then
+podman). It refuses, before touching anything, a binary built with
+`--offline-only` or one that records no usable digest (built from a local image
+or `--oci-dir`, or with skopeo). It also refuses an image with no registry
+origin and cannot be combined with `--no-pull`. It exits 0 when the binary is up
+to date, 10 when an update is available, and 1 otherwise. It compares only the
+base image, because a binary records no digest for its `--layer` images. Options
 go before `BINARY`; anything after it is an error.
 
 The rebuilt binary keeps the existing file's mode plus owner execute, without

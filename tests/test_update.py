@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import platform
 import stat
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -306,11 +307,13 @@ class UpdatePullTest(unittest.TestCase):
 
     def _run(self, *args, image="example:latest", build_args=None,
              digests=REGISTRY, identity=None, pull_rc=0, save_rc=1,
-             engine="docker", extra_env=None, local=True, trailing=()):
+             engine="docker", extra_env=None, local=True, trailing=(),
+             meta_digest=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             binary = root / "app.bin"
-            binary.write_bytes(_meta_block(image, build_args=build_args))
+            binary.write_bytes(_meta_block(image, digest=meta_digest,
+                                           build_args=build_args))
             original = binary.read_bytes()
             fake_bin = root / "bin"
             fake_bin.mkdir()
@@ -483,7 +486,8 @@ class UpdatePullTest(unittest.TestCase):
         self.assertIn("pull docker.io/library/extra:1", self._pulls(calls))
 
     def test_check_refuses_a_locally_built_image(self):
-        result, calls = self._run("update", "--check", digests="")
+        result, calls = self._run("update", "--check", digests="",
+                                  meta_digest=self.REGISTRY)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no registry origin to check", result.stderr)
         self.assertEqual(self._pulls(calls), [])
@@ -492,6 +496,173 @@ class UpdatePullTest(unittest.TestCase):
         result, calls = self._run("update", "--check", "--no-pull")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot use --no-pull", result.stderr)
+        self.assertEqual(calls, "")
+
+
+class UpdateCheckTest(unittest.TestCase):
+    """`--check` follows what the binary recorded. The fake engines log every
+    call, so a test can assert that a refused check touched nothing."""
+
+    CURRENT = "example@sha256:" + "a" * 64
+    NEWER = "example@sha256:" + "b" * 64
+
+    def _check(self, build_args=None, digest=CURRENT, listed=None,
+               engines=("docker", "podman"), pull_rc=0, inspect_rc=0,
+               path_only=False, hermetic=False):
+        listed = self.CURRENT if listed is None else listed
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "app.bin"
+            binary.write_bytes(_meta_block("example:latest", digest=digest,
+                                           offline_only=hermetic,
+                                           build_args=build_args))
+            original = binary.read_bytes()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            log = root / "engine.log"
+            for engine in engines:
+                _executable(fake_bin / engine, (
+                    "#!/bin/sh\n"
+                    f"printf '{engine} %s\\n' \"$*\" >> '{log}'\n"
+                    "case \"$1\" in\n"
+                    f"  pull) exit {pull_rc} ;;\n"
+                    f"  inspect) printf '%s\\n' '{listed}'; exit {inspect_rc} ;;\n"
+                    "esac\n"
+                    "exit 1\n"))
+            env = _hermetic_env(root)
+            # python3, uname and the coreutils the script needs stay reachable
+            # through symlinks, so a missing engine is really missing.
+            if path_only:
+                for tool in ("python3", "uname", "readlink", "dirname", "sed",
+                             "cat", "grep", "mktemp", "rm", "mkdir", "bash"):
+                    found = shutil.which(tool)
+                    if found:
+                        (fake_bin / tool).symlink_to(found)
+                env["PATH"] = str(fake_bin)
+            else:
+                env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            result = subprocess.run(
+                [str(OCI2BIN), "update", "--check", str(binary)],
+                cwd=root, capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(binary.read_bytes(), original)
+            return result, log.read_text() if log.exists() else ""
+
+    def _pulls(self, calls):
+        return [c for c in calls.splitlines() if " pull " in f" {c} "]
+
+    def test_up_to_date_and_update_available(self):
+        result, _ = self._check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("up to date", result.stderr)
+        result, _ = self._check(listed=self.NEWER)
+        self.assertEqual(result.returncode, 10, result.stderr)
+        self.assertIn("update available", result.stderr)
+
+    def test_any_listed_digest_of_this_name_counts_as_current(self):
+        # podman lists the index digest and the platform digest.
+        listed = f"{self.NEWER}\n{self.CURRENT}"
+        result, _ = self._check(listed=listed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_matching_digest_under_another_name_does_not_count(self):
+        other = "other/app@sha256:" + "a" * 64
+        result, _ = self._check(listed=f"{other}\n{self.NEWER}")
+        self.assertEqual(result.returncode, 10, result.stderr)
+        self.assertIn(self.NEWER, result.stderr)
+
+    def test_engines_format_their_digests_differently(self):
+        # Built with one engine and checked with the other.
+        podman_form = "docker.io/library/example@sha256:" + "a" * 64
+        result, _ = self._check(listed=podman_form)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_recorded_pull_with_is_used(self):
+        _, calls = self._check(build_args=["--pull-with", "podman"])
+        self.assertEqual(self._pulls(calls),
+                         ["podman pull docker.io/library/example:latest"])
+        self.assertNotIn("docker ", calls.replace("docker.io", ""))
+
+    def test_auto_detect_falls_back_to_podman(self):
+        result, calls = self._check(engines=("podman",), path_only=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._pulls(calls),
+                         ["podman pull docker.io/library/example:latest"])
+
+    def test_no_engine_is_a_clear_error(self):
+        result, _ = self._check(engines=(), path_only=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("needs docker or podman", result.stderr)
+
+    def test_recorded_skopeo_is_refused_before_any_call(self):
+        result, calls = self._check(build_args=["--pull-with", "skopeo"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not 'skopeo'", result.stderr)
+        self.assertEqual(calls, "")
+
+    def test_offline_only_is_refused_before_any_call(self):
+        result, calls = self._check(build_args=["--offline-only"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--offline-only", result.stderr)
+        self.assertEqual(calls, "")
+
+    def test_older_offline_binary_is_refused_before_any_call(self):
+        result, calls = self._check(hermetic=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--offline-only", result.stderr)
+        self.assertEqual(calls, "")
+
+    def test_malformed_build_args_are_refused_before_any_call(self):
+        result, calls = self._check(build_args=["--not-an-option"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("malformed build_args", result.stderr)
+        self.assertEqual(calls, "")
+
+    def test_no_recorded_digest_is_refused_before_any_call(self):
+        result, calls = self._check(digest=None,
+                                    build_args=["--oci-dir", "/nonexistent"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("records no image digest", result.stderr)
+        self.assertEqual(calls, "")
+
+    def test_malformed_recorded_digest_is_refused_before_any_call(self):
+        for digest in ("garbage", "example@", "@", 123, "x@*",
+                       "sha256:" + "a" * 64):
+            with self.subTest(digest=digest):
+                result, calls = self._check(digest=digest)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("malformed image digest", result.stderr)
+                self.assertEqual(calls, "")
+
+    def test_malformed_engine_line_is_not_a_digest(self):
+        result, _ = self._check(listed="example\nexample@")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("unable to compare", result.stderr)
+
+    def test_failed_or_empty_inspect_is_not_a_result(self):
+        for listed, rc in ((self.CURRENT, 1), (self.NEWER, 1), ("", 1), ("", 0)):
+            with self.subTest(listed=listed, rc=rc):
+                result, _ = self._check(listed=listed, inspect_rc=rc)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("unable to compare", result.stderr)
+
+    def test_value_that_looks_like_an_option_is_not_one(self):
+        # --label takes a value, so this is not an offline build.
+        result, calls = self._check(build_args=["--label", "--offline-only"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._pulls(calls), ["docker pull example:latest"])
+
+    def test_cross_arch_pull_keeps_the_target_arch(self):
+        target, name = (("x86_64", "amd64")
+                        if platform.machine() == "aarch64"
+                        else ("aarch64", "arm64"))
+        _, calls = self._check(build_args=["--arch", target])
+        self.assertEqual(self._pulls(calls),
+                         [f"docker pull --platform linux/{name} example:latest"])
+
+    def test_unknown_arch_is_refused_before_any_call(self):
+        result, calls = self._check(build_args=["--arch", "--evil"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unsupported --arch", result.stderr)
         self.assertEqual(calls, "")
 
 

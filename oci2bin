@@ -885,6 +885,30 @@ if [[ "${1:-}" == "sbom" ]]; then
     exec python3 "$OCI2BIN_HOME/scripts/sbom_generate.py" "$@"
 fi
 
+# Map oci2bin's target arch onto skopeo/OCI platform arch names.
+skopeo_arch_name() {
+    case "$1" in
+        x86_64)  echo amd64 ;;
+        aarch64) echo arm64 ;;
+        *)       echo "$1" ;;
+    esac
+}
+
+# Pull REF for the build's target: a bare pull fetches the host's architecture
+# and would retag a cross-arch image the build already has.
+pull_image() {
+    local args=(pull)
+    if [[ "$TARGET_ARCH" != "$HOST_ARCH" ]]; then
+        args+=(--platform "linux/$(skopeo_arch_name "$TARGET_ARCH")")
+    fi
+    "$CONTAINER_ENGINE" "${args[@]}" "$1" && return 0
+    if [[ "${OCI2BIN_UPDATE_PULL:-0}" == 1 ]]; then
+        echo "oci2bin update: could not pull $1; the binary is unchanged." \
+             "Use --no-pull to rebuild from the local copy." >&2
+    fi
+    return 1
+}
+
 # ── update subcommand ─────────────────────────────────────────────────────
 
 if [[ "${1:-}" == "update" ]]; then
@@ -972,31 +996,6 @@ print(meta.get("digest",""))
 PYEOF
 )"
 
-    if [[ "$UPDATE_CHECK_ONLY" -eq 1 ]]; then
-        need docker
-        if image_is_local_only docker "$IMAGE_NAME"; then
-            echo "oci2bin update: $IMAGE_NAME has no registry origin to check" >&2
-            exit 1
-        fi
-        if ! docker pull "$IMAGE_NAME" >/dev/null; then
-            echo "oci2bin update: failed to pull $IMAGE_NAME; cannot check for updates" >&2
-            exit 1
-        fi
-        NEW_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_NAME" 2>/dev/null || true)"
-        if [[ -z "$CURRENT_DIGEST" || -z "$NEW_DIGEST" ]]; then
-            echo "oci2bin update: unable to compare digests for $IMAGE_NAME" >&2
-            exit 1
-        fi
-        if [[ "$CURRENT_DIGEST" == "$NEW_DIGEST" ]]; then
-            echo "oci2bin update: $UPDATE_BINARY is up to date ($NEW_DIGEST)" >&2
-            exit 0
-        fi
-        echo "oci2bin update: update available" >&2
-        echo "  current: $CURRENT_DIGEST" >&2
-        echo "  latest:  $NEW_DIGEST" >&2
-        exit 10
-    fi
-
     # Replay the build options the binary recorded (build_args in the
     # metadata block) so the rebuilt artifact keeps its --strip, --squash,
     # --label, --arch, ... choices.  Older binaries carry none: say so and
@@ -1006,6 +1005,9 @@ PYEOF
     # different IMAGE or OUTPUT positional; a malformed list is an error,
     # not a silent default build.
     UPDATE_BUILD_ARGS=()
+    UPDATE_REC_ARCH=""
+    UPDATE_REC_PULL_WITH=""
+    UPDATE_REC_OFFLINE=0
     UPDATE_ARGS_STATE="$(python3 - "$META_JSON" <<'PYEOF'
 import json, sys
 meta = json.loads(sys.argv[1])
@@ -1056,6 +1058,12 @@ PYEOF
                 UPDATE_ARGS_STATE="invalid"
                 break
             fi
+            # Only at an option position: a value may look like an option.
+            case "${UPDATE_BUILD_ARGS[$_i]}" in
+                --arch)         UPDATE_REC_ARCH="${UPDATE_BUILD_ARGS[$((_i + 1))]:-}" ;;
+                --pull-with)    UPDATE_REC_PULL_WITH="${UPDATE_BUILD_ARGS[$((_i + 1))]:-}" ;;
+                --offline-only) UPDATE_REC_OFFLINE=1 ;;
+            esac
             _start="$_i"
             case "$(build_option_arity "${UPDATE_BUILD_ARGS[$_i]}")" in
                 flag)     _i=$((_i + 1)) ;;
@@ -1078,6 +1086,92 @@ PYEOF
         echo "oci2bin update: $UPDATE_BINARY carries a malformed build_args record; refusing to replay it" >&2
         exit 1
     fi
+    if [[ "$UPDATE_CHECK_ONLY" -eq 1 ]]; then
+        # Refuse before pulling: a check that cannot compare must not move the
+        # local tag. Only the docker/podman path records a digest.
+        # Binaries older than build_args record the same choice as hermetic.
+        if [[ "$UPDATE_REC_OFFLINE" -eq 1 ]] || python3 - "$META_JSON" <<'PYEOF'
+import json, sys
+sys.exit(0 if json.loads(sys.argv[1]).get("hermetic") == "yes" else 1)
+PYEOF
+        then
+            echo "oci2bin update: $UPDATE_BINARY was built with --offline-only; not checking a registry" >&2
+            exit 1
+        fi
+        if [[ -z "$CURRENT_DIGEST" ]]; then
+            echo "oci2bin update: $UPDATE_BINARY records no image digest (built from a local image or --oci-dir, or with skopeo); cannot check for updates" >&2
+            exit 1
+        fi
+        # NAME@ALGO:HEX is the only form that can be compared.
+        UPDATE_DIGEST_RE='^[^@]+@[a-z0-9]+:[0-9a-f]+$'
+        if [[ ! "$CURRENT_DIGEST" =~ $UPDATE_DIGEST_RE ]]; then
+            echo "oci2bin update: $UPDATE_BINARY records a malformed image digest: $CURRENT_DIGEST" >&2
+            exit 1
+        fi
+        case "$UPDATE_REC_PULL_WITH" in
+            docker|podman) CONTAINER_ENGINE="$UPDATE_REC_PULL_WITH"; need "$CONTAINER_ENGINE" ;;
+            "")
+                if command -v docker >/dev/null 2>&1; then
+                    CONTAINER_ENGINE=docker
+                elif command -v podman >/dev/null 2>&1; then
+                    CONTAINER_ENGINE=podman
+                else
+                    echo "oci2bin update: --check needs docker or podman" >&2
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "oci2bin update: --check needs docker or podman, not '$UPDATE_REC_PULL_WITH'" >&2
+                exit 1
+                ;;
+        esac
+        HOST_ARCH="$(uname -m)"
+        TARGET_ARCH="${UPDATE_REC_ARCH:-$HOST_ARCH}"
+        case "$TARGET_ARCH" in
+            x86_64|aarch64) ;;
+            *)
+                echo "oci2bin update: $UPDATE_BINARY records an unsupported --arch: $TARGET_ARCH" >&2
+                exit 1
+                ;;
+        esac
+        # podman rejects a bare name; docker assumes docker.io for one.
+        UPDATE_REF="$IMAGE_NAME"
+        [[ "$CONTAINER_ENGINE" == podman ]] && UPDATE_REF="$(qualify_image_ref "$IMAGE_NAME")"
+        if image_is_local_only "$CONTAINER_ENGINE" "$UPDATE_REF"; then
+            echo "oci2bin update: $IMAGE_NAME has no registry origin to check" >&2
+            exit 1
+        fi
+        unset OCI2BIN_UPDATE_PULL
+        if ! pull_image "$UPDATE_REF" >/dev/null; then
+            echo "oci2bin update: failed to pull $IMAGE_NAME; cannot check for updates" >&2
+            exit 1
+        fi
+        # An image can list several digests (podman keeps both the index and the
+        # platform's), so the binary is current if any of this name's matches.
+        NEW_DIGEST=""
+        UPDATE_REPO="$(image_repo_name "$UPDATE_REF")"
+        # A failed inspect compares nothing, even if it printed something first.
+        UPDATE_LISTED="$("$CONTAINER_ENGINE" inspect --format \
+            '{{range .RepoDigests}}{{println .}}{{end}}' "$UPDATE_REF" 2>/dev/null)" || UPDATE_LISTED=""
+        while IFS= read -r _digest; do
+            [[ "$_digest" =~ $UPDATE_DIGEST_RE ]] || continue
+            [[ "$(image_repo_name "${_digest%%@*}")" == "$UPDATE_REPO" ]] || continue
+            [[ -z "$NEW_DIGEST" ]] && NEW_DIGEST="$_digest"
+            if [[ "${_digest##*@}" == "${CURRENT_DIGEST##*@}" ]]; then
+                echo "oci2bin update: $UPDATE_BINARY is up to date ($_digest)" >&2
+                exit 0
+            fi
+        done <<< "$UPDATE_LISTED"
+        if [[ -z "$NEW_DIGEST" ]]; then
+            echo "oci2bin update: unable to compare digests for $IMAGE_NAME" >&2
+            exit 1
+        fi
+        echo "oci2bin update: update available" >&2
+        echo "  current: $CURRENT_DIGEST" >&2
+        echo "  latest:  $NEW_DIGEST" >&2
+        exit 10
+    fi
+
     if [[ "$UPDATE_ARGS_STATE" == "present" ]]; then
         echo "oci2bin update: rebuilding from $IMAGE_NAME with the recorded options:" \
              "${UPDATE_BUILD_ARGS[*]}" >&2
@@ -2811,15 +2905,6 @@ fi
 CONTAINER_ENGINE=""        # docker|podman when the daemon/CLI path is used
 PULL_BACKEND=""            # resolved backend for the default path
 
-# Map oci2bin's target arch onto skopeo/OCI platform arch names.
-skopeo_arch_name() {
-    case "$1" in
-        x86_64)  echo amd64 ;;
-        aarch64) echo arm64 ;;
-        *)       echo "$1" ;;
-    esac
-}
-
 resolve_pull_backend() {
     # Not needed when an OCI layout is supplied directly, or already resolved.
     [[ -n "$OCI_DIR" || -n "$PULL_BACKEND" ]] && return 0
@@ -2876,21 +2961,6 @@ image_needs_pull() {
         return 1
     fi
     return 0
-}
-
-# Pull REF for the build's target: a bare pull fetches the host's architecture
-# and would retag a cross-arch image the build already has.
-pull_image() {
-    local args=(pull)
-    if [[ "$TARGET_ARCH" != "$HOST_ARCH" ]]; then
-        args+=(--platform "linux/$(skopeo_arch_name "$TARGET_ARCH")")
-    fi
-    "$CONTAINER_ENGINE" "${args[@]}" "$1" && return 0
-    if [[ "${OCI2BIN_UPDATE_PULL:-0}" == 1 ]]; then
-        echo "oci2bin update: could not pull $1; the binary is unchanged." \
-             "Use --no-pull to rebuild from the local copy." >&2
-    fi
-    exit 1
 }
 
 # Cumulative temp-dir cleanup: a single EXIT trap that removes every path
