@@ -4,6 +4,12 @@ All notable changes to oci2bin are documented here.
 
 ## [Unreleased]
 
+### Documentation
+
+- The documentation site has a new look: dark by default with a light
+  toggle, honey-on-slate colours, a flat header and Geist type. The fonts
+  are self-hosted, so the site no longer loads anything from Google Fonts.
+
 ## [0.20.0] - 2026-11-03
 
 ### Security

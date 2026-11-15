@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <title>oci2bin</title>
+  <rect width="32" height="32" rx="7" fill="#0d1117"/>
+  <path d="M16 5.5 26 10.75 16 16 6 10.75Z" fill="#f2b134"/>
+  <path d="M6 10.75 16 16v10.5L6 21.25Z" fill="#f2b134" opacity=".7"/>
+  <path d="M26 10.75 16 16v10.5l10-5.25Z" fill="#f2b134" opacity=".45"/>
+</svg>
