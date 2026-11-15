@@ -1,20 +1,28 @@
 name: docs
 
+# Builds the mkdocs site and publishes it to GitHub Pages.
+#
+# Supply chain: only GitHub-created actions, each pinned to a full commit
+# SHA (the repository allows no other publishers). Python is the runner's
+# own; mkdocs-material and its dependencies come from requirements-docs.txt,
+# which is exported from uv.lock with a sha256 for every file and installed
+# as prebuilt wheels only, so no package build script runs. Regenerate it
+# after changing the docs group:
+#   uv export --locked --only-group docs --no-emit-project \
+#     --format requirements-txt -o requirements-docs.txt
+
 on:
   push:
     branches: [main]
     paths:
       - docs/**
       - mkdocs.yml
-      - pyproject.toml
-      - uv.lock
+      - requirements-docs.txt
       - .github/workflows/pages.yml
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+# Nothing by default; each job asks for only what it needs.
+permissions: {}
 
 concurrency:
   group: pages
@@ -22,24 +30,40 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          python-version: "3.x"
-      - uses: astral-sh/setup-uv@v8.1.0
-      - run: uv run --locked --group docs mkdocs build --strict
-      - uses: actions/upload-pages-artifact@v5
+          persist-credentials: false
+
+      - name: Install mkdocs-material (hash-locked wheels)
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          python3 -m venv "$RUNNER_TEMP/docs-venv"
+          "$RUNNER_TEMP/docs-venv/bin/pip" install --no-cache-dir --no-deps \
+            --require-hashes --only-binary :all: -r requirements-docs.txt
+
+      - name: Build site
+        run: '"$RUNNER_TEMP/docs-venv/bin/mkdocs" build --strict'
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site
 
   deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
